@@ -28,7 +28,7 @@ import { closeAttempt, openAttempt as managedOpenAttempt, prepareManagedClaim } 
 import { processStart } from '../src/runtime/process-identity.js';
 import type { ModelCall } from '../src/runtime/model-usage.js';
 import { readModelCallRecovery, prepareLateModelReceipt } from '../src/discovery/model-call-recovery.js';
-import { CycleCommitPhase, H10A_COMMIT, H15_BASE_COMMIT, MP1_COMMIT, MP2_BASE_COMMIT, MP3_NOTES, MP3_PRIOR_COMMIT, completionE1, completionSnapshot, confirmed, currentPacketWire, cycleCommitPhase, cycleCommitPhases, decode, deeplyFrozen, e4AnalysisFixture, e4CannotAnswer, e4Fact, e4Fixture, e4ManagedAnalysisFixture, e4ManagedClose, e4ManagedFixture, e4WorksFixture, e4NeedSource, e4Node, ensureFixtureProject, envelope, fixtureCheckpoint, fixtureDriver, h15AtCommit, h15CannotAnswer, h15Heads, h15Refusal, h15Unserved, h15Written, killFixtureDriver, killFixtureProvider, lp4Root, mp2IssuedBy, mp2Managed, mp2Refused, mp2Step, mp2StopAfter, mp3Carried, mp3Close, mp3Cycle, mp3Delivered, mp3Open, mp3PriorAttempt, mp3Readings, mp3SearchDelivery, omit, processResult, publicRecovery, refusesLiveRecovery, request, requestId, signalFixtureProvider, unknownConfirmed, usage, valueOf } from './om-model-call-fixture.js';
+import { CycleCommitPhase, H10A_COMMIT, H15_BASE_COMMIT, MP1_COMMIT, MP2_BASE_COMMIT, MP3_NOTES, MP3_PRIOR_COMMIT, completionE1, completionSnapshot, confirmed, currentPacketWire, cycleCommitPhase, cycleCommitPhases, decode, deeplyFrozen, e4CannotAnswer, e4Fact, e4Fixture, e4ManagedAnalysisFixture, e4ManagedClose, e4ManagedFixture, e4WorksFixture, e4NeedSource, e4Node, ensureFixtureProject, envelope, fixtureCheckpoint, fixtureDriver, h15AtCommit, h15CannotAnswer, h15Heads, h15Refusal, h15Unserved, h15Written, killFixtureDriver, killFixtureProvider, lp4Root, mp2IssuedBy, mp2Managed, mp2Refused, mp2Step, mp2StopAfter, mp3Carried, mp3Close, mp3Cycle, mp3Delivered, mp3Open, mp3PriorAttempt, mp3Readings, mp3SearchDelivery, omit, processResult, publicRecovery, refusesLiveRecovery, request, requestId, signalFixtureProvider, unknownConfirmed, usage, valueOf } from './om-model-call-fixture.js';
 
 
 
@@ -575,7 +575,7 @@ test('E4 control completion cannot replace an outcome saved after the control re
 
 test('E4 restarts every durable cycle prefix with one physical send and one settlement for content and cannot_answer', async t => {
   for (const action of ['fact', 'cannot_answer'] as const) {
-    const baseline = e4Fixture(t);
+    const baseline = e4Fixture(t, 'fact', 100_000, 0, 1000, true);
     baseline.steps([{ research: action === 'fact' ? e4Fact(baseline) : e4CannotAnswer(baseline), usage }]);
     const baselineWrite = baseline.store.writeMany.bind(baseline.store), actualPhases: CycleCommitPhase[] = [];
     baseline.store.writeMany = ((writes, guards) => {
@@ -589,7 +589,7 @@ test('E4 restarts every durable cycle prefix with one physical send and one sett
     // at the authorized boundary is exercised by the driver/provider recovery tests below.
     for (const stopAfter of cycleCommitPhases.filter(phase => phase !== 'authorized')) {
       await t.test(`${action}: durable ${stopAfter}`, async nested => {
-        const f = e4Fixture(nested);
+        const f = e4Fixture(nested, 'fact', 100_000, 0, 1000, true);
         f.steps([{ research: action === 'fact' ? e4Fact(f) : e4CannotAnswer(f), usage }]);
         const writeMany = f.store.writeMany.bind(f.store), phases: CycleCommitPhase[] = [];
         let stopped = false;
@@ -642,8 +642,12 @@ test('E4 restarts every durable cycle prefix with one physical send and one sett
         if (action === 'fact') {
           assert.equal(current.value.attempts[0]!.outcome, null); assert.equal(current.revision, f.series.revision);
         } else {
-          assert.equal(current.value.attempts[0]!.outcome?.reason, 'refused');
-          assert.equal(current.revision, f.series.revision + 1); assert.equal(current.value.withoutProgress, 1);
+          // LG07: the managed refusal journal is durable but the attempt stays open until the explicit G7.
+          assert.equal(current.value.attempts[0]!.outcome, null);
+          e4ManagedClose(f);
+          const closed = f.store.get<{attempts: {outcome: {reason: string} | null}[]; withoutProgress: number}>(f.series.id)!;
+          assert.equal(closed.value.attempts[0]!.outcome?.reason, 'refused');
+          assert.equal(closed.revision, f.series.revision + 1); assert.equal(closed.value.withoutProgress, 1);
           assert.ok(actual.last.diagnostic);
         }
         const call = f.store.list<{status: string; usage: typeof usage}>('call-record')[0]!;
@@ -668,7 +672,7 @@ test('E4 restarts every durable cycle prefix with one physical send and one sett
 test('E4 resumes saved source deliveries and continuation packets before content or cannot_answer without duplicate sources or sends', async t => {
   for (const action of ['fact', 'cannot_answer'] as const) for (const stopAfter of ['source', 'deliveries', 'continuation'] as const) {
     await t.test(`${action}: durable ${stopAfter}`, async nested => {
-      const f = e4Fixture(nested);
+      const f = e4Fixture(nested, 'fact', 100_000, 0, 1000, true);
       const read = { action: 'read', path: 'e4-source.txt', media: 'text/plain' };
       f.steps([{ research: e4NeedSource(f, [read]), usage },
         { research: action === 'fact' ? e4Fact(f) : e4CannotAnswer(f), usage }]);
@@ -701,8 +705,13 @@ test('E4 resumes saved source deliveries and continuation packets before content
         assert.equal(f.store.history(call.id).length, 2);
       }
       const attempt = f.store.get<{attempts: {outcome: {reason: string} | null}[]}>(f.series.id)!;
-      assert.equal(attempt.value.attempts[0]!.outcome?.reason ?? null, action === 'fact' ? null : 'refused');
-      assert.equal(attempt.revision, f.series.revision + (action === 'fact' ? 0 : 1));
+      assert.equal(attempt.value.attempts[0]!.outcome, null);
+      if (action !== 'fact') { // LG07: managed — refusal journal durable; explicit G7 owns the outcome
+        e4ManagedClose(f);
+        const closed = f.store.get<{attempts: {outcome: {reason: string} | null}[]}>(f.series.id)!;
+        assert.equal(closed.value.attempts[0]!.outcome?.reason, 'refused');
+        assert.equal(closed.revision, f.series.revision + 1);
+      } else assert.equal(attempt.revision, f.series.revision);
       const saved = f.store.list(); f.restart();
       assert.equal(valueOf(await runModelCycle(f.store, f.request)).repeated, true);
       assert.deepEqual(f.store.list(), saved); assert.equal(f.sent().length, 2);
@@ -716,7 +725,7 @@ test('E4 restarts a later node part after receipt or application and assembles o
   for (const action of ['node', 'cannot_answer'] as const) for (const stopAfter of ['received', 'applied', 'settled', 'assembly'] as const) {
     if (stopAfter === 'assembly' && action === 'cannot_answer') continue;
     await t.test(`${action}: later part ${stopAfter}`, async nested => {
-      const f = e4Fixture(nested, 'node'), config = f.environment(currentPacketWire(f.packet.value.packet) - 1);
+      const f = e4Fixture(nested, 'node', 100_000, 0, 1000, true), config = f.environment(currentPacketWire(f.packet.value.packet) - 1);
       const packet = valueOf(writeQuestionPacket(f.store, { ...f.packetRequest, environment: reference(config) })).record;
       assert.equal(packet.value.state, 'ready'); assert.equal(packet.value.plan!.mode, 'parts');
       const total = packet.value.plan!.assignments.length; assert.ok(total > 1);
@@ -743,8 +752,13 @@ test('E4 restarts a later node part after receipt or application and assembles o
       assert.equal(actual.record.value.terminal, action === 'node' ? 'assembled' : 'outcome');
       assert.equal(f.sent().length, action === 'node' ? total : 2);
       const attempt = f.store.get<{attempts: {outcome: {reason: string} | null}[]}>(f.series.id)!;
-      assert.equal(attempt.value.attempts[0]!.outcome?.reason ?? null, action === 'node' ? null : 'refused');
-      assert.equal(attempt.revision, f.series.revision + (action === 'node' ? 0 : 1));
+      assert.equal(attempt.value.attempts[0]!.outcome, null);
+      if (action !== 'node') { // LG07: managed — refusal journal durable; explicit G7 derives the outcome
+        e4ManagedClose(f);
+        const closed = f.store.get<{attempts: {outcome: {reason: string} | null}[]}>(f.series.id)!;
+        assert.equal(closed.value.attempts[0]!.outcome?.reason, 'refused');
+        assert.equal(closed.revision, f.series.revision + 1);
+      } else assert.equal(attempt.revision, f.series.revision);
       const calls = f.store.list<{usage: typeof usage; status: string}>('call-record');
       assert.equal(calls.length, action === 'node' ? total : 2);
       for (const call of calls) {
@@ -770,45 +784,61 @@ test('E4 restarts a later node part after receipt or application and assembles o
 test('E4 public recovery closes a truly lost pre-spawn owner for products and analysis without sending or inventing usage', async t => {
   for (const purpose of ['fact', 'node', 'stop-analysis', 'origin-analysis'] as const) await t.test(purpose, async nested => {
     const product = purpose === 'fact' || purpose === 'node';
-    const f = product ? e4Fixture(nested, purpose, 100_000, 0, 30_000) : e4AnalysisFixture(nested, purpose, 30_000);
+    const f = product ? e4Fixture(nested, purpose, 100_000, 0, 30_000, true) : await e4ManagedAnalysisFixture(nested, purpose, 30_000);
     ensureFixtureProject(f.store, f.project);
     const checkpoint = join(f.root, 'claimed.json');
     const research = product ? (purpose === 'fact' ? e4Fact(f as ReturnType<typeof e4Fixture>) : e4Node(f as ReturnType<typeof e4Fixture>))
       : { cause: 'Unsent local analysis', hypothesis: true };
     writeFileSync(f.scenario, JSON.stringify({ steps: [{ research, usage }] }));
-    const originalSeries = reference(f.store.get(f.series.id)!);
+    const originalSeries = reference(f.store.get(f.series.id)!), exchangeCount = f.store.list('om-model-exchange').length,
+      partCount = f.store.list('part-response').length;
     const driver = fixtureDriver(nested, f.database, f.root, product ? 'call' : 'transport', f.request,
       { path: checkpoint, kind: 'model-call', matches: [{ path: ['execution', 'phase'], value: 'claimed' }] });
     const paused = await fixtureCheckpoint(checkpoint, driver.child);
     assert.equal(paused.pid, driver.child.pid); assert.equal(f.sent().length, 0);
-    const claimed = f.store.list<ModelCall>('model-call')[0]!;
+    const claimed = f.store.list<ModelCall>('model-call').find(row => row.value.status === 'running')!;
     assert.equal(claimed.value.execution?.owner.pid, paused.pid); assert.equal(claimed.value.execution?.provider, null);
     const unchanged = f.store.list(); refusesLiveRecovery(f.store, f.project, reference(claimed));
     assert.deepEqual(f.store.list(), unchanged);
+    await killFixtureDriver(driver);
     let completed: Revision<unknown> | null = null;
+    // LG07: the lawful competitor is the same public recovery reaching the terminal close first —
+    // no standalone completeAttempt over an unpaid managed registry.
     if (purpose === 'fact') {
       const other = new Store(f.database);
-      try { completed = valueOf(completeAttempt(other, { ...seriesRequestOf(f.series.value), attempt: 1,
-        outcome: { reason: 'interrupted', achieved: [], cancelled: [], refusals: [] } })); }
+      try { publicRecovery(other, f.project, reference(claimed)); completed = other.get(f.series.id); }
       finally { other.close(); }
     }
-    await killFixtureDriver(driver);
     const recovered = publicRecovery(f.store, f.project, reference(claimed));
     assert.equal(recovered.value.status, 'failed'); assert.equal(recovered.value.error, 'process_lost');
     const proof = readModelCallRecovery(f.store, f.project, reference(recovered));
     assert.equal(proof.proof!.request, 'not-authorized'); assert.equal(proof.proof!.physical, 'unknown');
     assert.equal(recovered.value.usage, null); assert.equal(recovered.value.response, null);
-    const call = f.store.list<{status: string;usage: unknown}>('call-record')[0]!;
+    const call = product ? f.store.list<{status: string;usage: unknown}>('call-record')[0]!
+      : f.store.get<{status: string;usage: unknown}>((f.request as ModelTransportRequest).call.id)!;
     assert.equal(call.value.status, 'open'); assert.equal(call.value.usage, null); assert.equal(f.store.history(call.id).length, 1);
-    assert.equal(f.store.list('om-model-exchange').length, 0); assert.equal(f.store.list('part-response').length, 0);
+    assert.equal(f.store.list('om-model-exchange').length, exchangeCount); assert.equal(f.store.list('part-response').length, partCount);
     if (product) {
       assert.equal((recovered.value as OmModelCall).om.application, 'recovered');
       const series = f.store.get<{attempts:{outcome:{reason:string}|null}[]}>(f.series.id)!;
-      assert.equal(series.value.attempts[0]!.outcome?.reason, 'interrupted'); assert.equal(series.revision, originalSeries.revision + 1);
+      // LG07: the physical recovery is terminal but the managed attempt stays open; the concurrent recovery
+      // commits the same transition, om.completion names the written unit refusal, completion is owner-set.
+      assert.equal(series.value.attempts[0]!.outcome, null);
       if (completed) {
         assert.deepEqual(series, completed);
-        assert.deepEqual((recovered.value as OmModelCall).om.completion, reference(completed));
-        assert.equal((recovered.value as OmModelCall).om.diagnostic, null);
+        assert.ok((recovered.value as OmModelCall).om.diagnostic, 'The interrupted outcome is a written managed unit refusal');
+      }
+      if (purpose === 'fact') { // the complete registry closes at the explicit G7 as 'interrupted'
+        e4ManagedClose(f as ReturnType<typeof e4Fixture>);
+        const closed = f.store.get<{attempts:{outcome:{reason:string}|null}[]}>(f.series.id)!;
+        assert.equal(closed.value.attempts[0]!.outcome?.reason, 'interrupted'); assert.equal(closed.revision, originalSeries.revision + 1);
+      } else {
+        // LG07: the still-owed node parts keep the registry honestly incomplete; the durable physical outcome is
+        // the written unit refusal and no managed close can be fabricated over the lost call.
+        assert.ok((recovered.value as OmModelCall).om.diagnostic, 'The interrupted outcome is a written managed unit refusal');
+        const unclosed = prepareManagedClaim(f.store, { ...seriesRequestOf(f.series.value), attempt: 1,
+          outcome: { reason: 'interrupted', accepting: [], cancelling: [], refusals: [] } });
+        assert.equal(unclosed.ok, false); if (!unclosed.ok) assert.equal(unclosed.refusal.code, 'completion_incomplete');
       }
       const expected = valueOf(readModelCall(f.store, { project: f.project, record: reference(recovered) }));
       const snapshot = f.store.list(); f.restart();
@@ -831,17 +861,17 @@ test('E4 public recovery closes a truly lost pre-spawn owner for products and an
 test('E4 actual owner and provider loss recover both product calls and analysis purposes through the public command', async t => {
   for (const purpose of ['fact', 'node', 'stop-analysis', 'origin-analysis'] as const) await t.test(purpose, async nested => {
     const product = purpose === 'fact' || purpose === 'node';
-    const f = product ? e4Fixture(nested, purpose, 100_000, 0, 30_000) : e4AnalysisFixture(nested, purpose, 30_000);
+    const f = product ? e4Fixture(nested, purpose, 100_000, 0, 30_000, true) : await e4ManagedAnalysisFixture(nested, purpose, 30_000);
     ensureFixtureProject(f.store, f.project);
     const checkpoint = join(f.root, 'provider.json');
     const research = product ? (purpose === 'fact' ? e4Fact(f as ReturnType<typeof e4Fixture>) : e4Node(f as ReturnType<typeof e4Fixture>))
       : { cause: 'Local analysis evidence', hypothesis: true };
     writeFileSync(f.scenario, JSON.stringify({ steps: [{ research, usage, pauseAfterRequest: checkpoint }] }));
-    const originalSeries = reference(f.store.get(f.series.id)!);
+    const originalSeries = reference(f.store.get(f.series.id)!), exchangeCount = f.store.list('om-model-exchange').length;
     const driver = fixtureDriver(nested, f.database, f.root, product ? 'call' : 'transport', f.request);
     const supplier = await fixtureCheckpoint(checkpoint, driver.child);
     assert.equal(supplier.parent, driver.child.pid); assert.equal(f.sent().length, 1);
-    const running = f.store.list<ModelCall>('model-call')[0]!, provider = running.value.execution!.provider!;
+    const running = f.store.list<ModelCall>('model-call').find(row => row.value.status === 'running')!, provider = running.value.execution!.provider!;
     assert.equal(running.value.execution!.phase, 'authorized'); assert.equal(provider.pid, supplier.pid);
     nested.after(() => {
       signalFixtureProvider(provider.pid, provider.started);
@@ -855,13 +885,27 @@ test('E4 actual owner and provider loss recover both product calls and analysis 
     assert.equal(recovered.value.usage, null); assert.equal(recovered.value.response, null);
     const proof = readModelCallRecovery(f.store, f.project, reference(recovered));
     assert.equal(proof.proof!.request, 'unknown'); assert.equal(proof.proof!.physical, 'group-terminated');
-    const admitted = f.store.list<{status: string;usage: unknown}>('call-record')[0]!;
+    const admitted = product ? f.store.list<{status: string;usage: unknown}>('call-record')[0]!
+      : f.store.get<{status: string;usage: unknown}>((f.request as ModelTransportRequest).call.id)!;
     assert.equal(admitted.value.status, 'open'); assert.equal(admitted.value.usage, null); assert.equal(f.store.history(admitted.id).length, 1);
-    assert.equal(f.store.list('om-model-exchange').length, 0);
+    assert.equal(f.store.list('om-model-exchange').length, exchangeCount);
     if (product) {
       assert.equal((recovered.value as OmModelCall).om.application, 'recovered');
       const series = f.store.get<{attempts:{outcome:{reason:string}|null}[]}>(f.series.id)!;
-      assert.equal(series.value.attempts[0]!.outcome?.reason, 'interrupted'); assert.equal(series.revision, originalSeries.revision + 1);
+      // LG07: the managed attempt stays open after the terminal recovery.
+      assert.equal(series.value.attempts[0]!.outcome, null);
+      if (purpose === 'fact') { // the complete registry closes at the explicit G7 as 'interrupted'
+        e4ManagedClose(f as ReturnType<typeof e4Fixture>);
+        const closed = f.store.get<{attempts:{outcome:{reason:string}|null}[]}>(f.series.id)!;
+        assert.equal(closed.value.attempts[0]!.outcome?.reason, 'interrupted'); assert.equal(closed.revision, originalSeries.revision + 1);
+      } else {
+        // LG07: the still-owed node parts keep the registry honestly incomplete; the durable physical outcome is
+        // the written unit refusal and no managed close can be fabricated over the lost call.
+        assert.ok((recovered.value as OmModelCall).om.diagnostic, 'The interrupted outcome is a written managed unit refusal');
+        const unclosed = prepareManagedClaim(f.store, { ...seriesRequestOf(f.series.value), attempt: 1,
+          outcome: { reason: 'interrupted', accepting: [], cancelling: [], refusals: [] } });
+        assert.equal(unclosed.ok, false); if (!unclosed.ok) assert.equal(unclosed.refusal.code, 'completion_incomplete');
+      }
       const expected = valueOf(readModelCall(f.store, { project: f.project, record: reference(recovered) }));
       const snapshot = f.store.list(); f.restart();
       assert.deepEqual(valueOf(await runModelCall(f.store, f.request as ModelCallRequest)), expected);
@@ -881,7 +925,7 @@ test('E4 actual owner and provider loss recover both product calls and analysis 
 
 
 test('E4 competing public recoveries commit one terminal product transition and one A3 outcome', async t => {
-  const f = e4Fixture(t, 'fact', 100_000, 0, 30_000), checkpoint = join(f.root, 'claimed-race.json');
+  const f = e4Fixture(t, 'fact', 100_000, 0, 30_000, true), checkpoint = join(f.root, 'claimed-race.json');
   f.steps([{ research: e4Fact(f), usage }]);
   const driver = fixtureDriver(t, f.database, f.root, 'call', f.request,
     { path: checkpoint, kind: 'model-call', matches: [{ path: ['execution', 'phase'], value: 'claimed' }] });
@@ -902,8 +946,12 @@ test('E4 competing public recoveries commit one terminal product transition and 
   } finally { f.store.writeMany = writeMany; }
   assert.ok(winner); assert.deepEqual(f.store.get(running.id), winner);
   assert.equal(f.store.list('model-call-recovery').length, 1); assert.equal(f.sent().length, 0);
+  // LG07: the winning recovery is the terminal physical transition; the managed attempt closes at explicit G7.
   const series = f.store.get<{attempts:{outcome:{reason:string}|null}[]}>(f.series.id)!;
-  assert.equal(series.value.attempts[0]!.outcome?.reason, 'interrupted'); assert.equal(series.revision, f.series.revision + 1);
+  assert.equal(series.value.attempts[0]!.outcome, null);
+  e4ManagedClose(f);
+  const closed = f.store.get<{attempts:{outcome:{reason:string}|null}[]}>(f.series.id)!;
+  assert.equal(closed.value.attempts[0]!.outcome?.reason, 'interrupted'); assert.equal(closed.revision, f.series.revision + 1);
   const historical = valueOf(readModelCall(f.store, { project: f.project, record: reference(f.store.get(running.id)!) }));
   const saved = f.store.list(); f.restart();
   assert.deepEqual(valueOf(await runModelCall(f.store, f.request)), historical);
@@ -913,7 +961,7 @@ test('E4 competing public recoveries commit one terminal product transition and 
 
 
 test('E4 records real local supplier death while its owner survives as one interrupted MC2 attempt', async t => {
-  const f = e4Fixture(t, 'node', 100_000, 0, 30_000), checkpoint = join(f.root, 'child-only.json');
+  const f = e4Fixture(t, 'node', 100_000, 0, 30_000, true), checkpoint = join(f.root, 'child-only.json');
   f.steps([{ research: e4Node(f), usage, pauseAfterRequest: checkpoint }]);
   const driver = fixtureDriver(t, f.database, f.root, 'call', f.request);
   const paused = await fixtureCheckpoint(checkpoint, driver.child);
@@ -926,8 +974,14 @@ test('E4 records real local supplier death while its owner survives as one inter
   const recovered = f.store.get<OmModelCall>(running.id)!;
   assert.equal(recovered.value.om.application, 'applied'); assert.equal(recovered.value.status, 'failed');
   assert.equal(recovered.value.usage, null); assert.equal(f.store.list('om-model-exchange').length, 1);
+  // LG07: the interrupted physical outcome is a written managed unit refusal; the still-owed node parts keep
+  // the registry honestly incomplete — the attempt stays open and no managed close can be fabricated over it.
   const series = f.store.get<{attempts:{outcome:{reason:string}|null}[]}>(f.series.id)!;
-  assert.equal(series.value.attempts[0]!.outcome?.reason, 'interrupted'); assert.equal(series.revision, f.series.revision + 1);
+  assert.equal(series.value.attempts[0]!.outcome, null);
+  assert.ok(recovered.value.om.diagnostic, 'The interrupted outcome is a written managed unit refusal');
+  const unclosed = prepareManagedClaim(f.store, { ...seriesRequestOf(f.series.value), attempt: 1,
+    outcome: { reason: 'interrupted', accepting: [], cancelling: [], refusals: [] } });
+  assert.equal(unclosed.ok, false); if (!unclosed.ok) assert.equal(unclosed.refusal.code, 'completion_incomplete');
   const call = f.store.list<{status:string;usage:unknown}>('call-record')[0]!;
   assert.equal(call.value.status, 'open'); assert.equal(call.value.usage, null);
   const expected = valueOf(readModelCall(f.store, { project: f.project, record: reference(recovered) }));
@@ -941,7 +995,7 @@ test('E4 records real local supplier death while its owner survives as one inter
 test('E4 owner loss after spawn but before authorization proves no request transfer without claiming supplier termination', async t => {
   for (const purpose of ['fact', 'stop-analysis'] as const) await t.test(purpose, async nested => {
     const product = purpose === 'fact';
-    const f = product ? e4Fixture(nested, 'fact', 100_000, 0, 30_000) : e4AnalysisFixture(nested, 'stop-analysis', 30_000);
+    const f = product ? e4Fixture(nested, 'fact', 100_000, 0, 30_000, true) : await e4ManagedAnalysisFixture(nested, 'stop-analysis', 30_000);
     ensureFixtureProject(f.store, f.project);
     const checkpoint = join(f.root, 'spawned-uncommitted.json');
     const research = product ? e4Fact(f as ReturnType<typeof e4Fixture>) : { cause: 'Authorization not committed', hypothesis: true };
@@ -953,7 +1007,7 @@ test('E4 owner loss after spawn but before authorization proves no request trans
     const provider = pending.execution!.provider!;
     assert.notEqual(provider.pid, paused.pid); assert.equal(processStart(provider.pid), provider.started, 'The supplier really was spawned');
     nested.after(() => { signalFixtureProvider(provider.pid, provider.started); });
-    const claimed = f.store.list<ModelCall>('model-call')[0]!;
+    const claimed = f.store.list<ModelCall>('model-call').find(row => row.value.execution?.phase === 'claimed')!;
     assert.equal(claimed.value.execution!.phase, 'claimed'); assert.equal(claimed.value.execution!.provider, null);
     assert.equal(claimed.value.providerProcess, undefined); assert.equal(f.sent().length, 0);
     refusesLiveRecovery(f.store, f.project, reference(claimed));
@@ -977,8 +1031,8 @@ test('E4 owner loss after spawn but before authorization proves no request trans
 test('E4 failed dispatch authorization preserves a terminal physical outcome without transmitting for both transports', async t => {
   for (const purpose of ['fact', 'stop-analysis'] as const) await t.test(purpose, async nested => {
     const product = purpose === 'fact';
-    const f = product ? e4Fixture(nested) : e4AnalysisFixture(nested, 'stop-analysis');
-    const writeMany = f.store.writeMany.bind(f.store);
+    const f = product ? e4Fixture(nested, 'fact', 100_000, 0, 1000, true) : await e4ManagedAnalysisFixture(nested, 'stop-analysis');
+    const exchangeCount = f.store.list('om-model-exchange').length, writeMany = f.store.writeMany.bind(f.store);
     f.store.writeMany = ((writes, guards) => {
       if (writes.some(write => write.kind === 'model-call'
         && (write.value as unknown as ModelCall).execution?.phase === 'authorized'))
@@ -995,9 +1049,12 @@ test('E4 failed dispatch authorization preserves a terminal physical outcome wit
     assert.equal(finished.record.value.error, 'model_call_identity_missing');
     assert.equal(finished.record.value.execution?.phase, 'claimed');
     assert.equal(finished.record.value.usage, null); assert.equal(f.sent().length, 0);
-    assert.equal(f.store.list('om-model-exchange').length, 1);
+    assert.equal(f.store.list('om-model-exchange').length, exchangeCount + 1);
     if (product) {
       assert.equal((finished.record.value as OmModelCall).om.application, 'applied');
+      // LG07: the managed attempt stays open; the explicit G7 derives 'interrupted'.
+      assert.equal(f.store.get<{attempts:{outcome:{reason:string}|null}[]}>(f.series.id)!.value.attempts[0]!.outcome, null);
+      e4ManagedClose(f as ReturnType<typeof e4Fixture>);
       assert.equal(f.store.get<{attempts:{outcome:{reason:string}|null}[]}>(f.series.id)!.value.attempts[0]!.outcome?.reason, 'interrupted');
     }
     const snapshot = f.store.list(); f.restart();
@@ -1686,7 +1743,7 @@ test('MP3 №3171: a literal read of a captured file is carried into the next at
 
 
 test('MP3 row 21 (delivery): an addressed read whose source changed after E3 keeps the prior freshness refusal of delivery and writes nothing', async t => {
-  const m = mp3Cycle(t), { f } = m;
+  const m = mp3Cycle(t, 'fact', 100_000, true), { f } = m;
   f.steps([{ research: m.need([m.range(0, 9)]), usage }]);
   const first = valueOf(await runModelCall(f.store, f.request));
   assert.equal(first.outcome?.kind, 'need-source');
