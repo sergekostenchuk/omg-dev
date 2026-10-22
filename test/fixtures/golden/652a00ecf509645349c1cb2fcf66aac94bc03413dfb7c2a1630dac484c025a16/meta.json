@@ -1,5 +1,5 @@
 {
-  "producerDigest": "e6cb6ce9caf85fe4181c9741a811c4962c0d64617320170c9b338bfc7ef4d38f",
+  "producerDigest": "a07a4d8504c02440f213a562ca1274e3757fdba59f0ec6937bb367ba4af6b308",
   "inputs": [
     {
       "path": "package-lock.json",
@@ -142,12 +142,16 @@
       "sha256": "aaca1370c99a5a8f3fca69b2137c23cd291984fd43cf0cbbb23baad8ef05fc30"
     },
     {
+      "path": "src/discovery/discovery-index.ts",
+      "sha256": "704f759f1760d91c56a327c4699a678eb87f9a5de00c843ab4097a5015f41226"
+    },
+    {
       "path": "src/discovery/discovery-manifest.ts",
       "sha256": "a4ccaf463a5238a3ec4291b0d4d91cc6438fdfd0ecc784c8344bc8ec3d439522"
     },
     {
       "path": "src/discovery/discovery-outcome.ts",
-      "sha256": "c792c8143ac61dd2ddc0ced1d1e59c4556ace9284d586ca4f13ba71846d9aeb2"
+      "sha256": "c75cc85b52fd6753b84b50b00d301f7f45c120f656ba91001a3c5182ed83db58"
     },
     {
       "path": "src/discovery/discovery-variants.ts",
@@ -919,7 +923,7 @@
     },
     {
       "path": "src/storage/schema.ts",
-      "sha256": "0a48c7f7c5366c0f009d6760d6c270549ffdbf504e1425ee73138fd0594026ff"
+      "sha256": "9a92b240d168253556fa373ff6d2f4360286f2afd54f6335c0ab4b4452016799"
     },
     {
       "path": "src/storage/snapshots.ts",
@@ -931,7 +935,7 @@
     },
     {
       "path": "src/storage/store.ts",
-      "sha256": "1246f49d6ff7f651974af2c75f7609d2dd8e94136f029a2ccb10f64d76f196e0"
+      "sha256": "1eade5c0f461c45ea4c8773fc28c0968c1678ce904a868d6981b3866d6ef9128"
     },
     {
       "path": "test/golden-sample-adapter.mjs",
@@ -971,48 +975,48 @@
     "discovery": {
       "id": "stage:golden:discovery",
       "revision": 2,
-      "hash": "5adabcc1f63f9d3b02180932d6cc9b51519da0f9d7f3b29064b8769df832e7a1"
+      "hash": "9abec0409feb2ea7ec3fb1d5ae3630fbeb8e17b1c31e6395d88f2ecdbbd22fbd"
     },
     "concept": {
       "id": "stage:golden:concept",
       "revision": 2,
-      "hash": "0adff8d5f3145151b9e4cc6882a9a20c44f26c7227111bb143b60db8e416e965"
+      "hash": "b9d02efaefd135a43f087f492f6f2255f4a628e3e4cd32a8e40f376fd7af84e4"
     },
     "operation-map": {
       "id": "stage:golden:operation-map",
       "revision": 2,
-      "hash": "555d7e68d4247fffde4b206212c24487f09ef1f1d22428dd5293d1d3872bc62f"
+      "hash": "ee4a989b5cdf978040bccca73bb2a19f8592ff22e47dbefd7fdafb9ecf3ddffe"
     },
     "specification": {
       "id": "stage:golden:specification",
       "revision": 2,
-      "hash": "7385dc6078b68935d961eaadfe59954ddeb4b10f8299950bb2d98b19d080edbd"
+      "hash": "db101846bc3b0e97faa28c07865bb33f1b2a5cd07026f23806dc4acfe6d49ce0"
     },
     "features": {
       "id": "stage:golden:features",
       "revision": 2,
-      "hash": "7813d0f223a202524ae4f7a3d631bed125f11ab49bb9837ee7acd8d934d2b109"
+      "hash": "730726dd29afc7ac173876878c70a2c8ab8fcdb18f9c7ad0a60645ac646b5255"
     },
     "om-g2": {
       "id": "stage:golden:om-g2",
       "revision": 1,
-      "hash": "087aacd07dabc0d2dcf545a1a9b065f85d357da13737c21a2ed8e4f76858d9cb"
+      "hash": "f57819c0e95246392e0a6a2b4b49b15a07b24b93a0995fd6cc9f5e37b127f672"
     },
     "compilation": {
       "id": "stage:golden:compilation",
       "revision": 2,
-      "hash": "cc08ba33e4c66d324ef61d7bbf017fac7e6780a16f4ce008cbfb1b888f388dee"
+      "hash": "1b61766534e8cd9954b75c5d1e5dc7ab29ae83a385a75b23755fc480bf216f4c"
     },
     "execution": {
       "id": "stage:golden:execution",
       "revision": 1,
-      "hash": "d38293e5bddb77cb3d44f3f6f63c7294e21da4b85391d0ff81b9a3431d29456b"
+      "hash": "94671e33a96ca52446afdf4dcd079bdd76a30920f4585eccbe98b49d564feeb1"
     }
   },
   "databaseId": "089133aa-dc16-4529-a3b9-be5ba223092f",
   "proofCache": "empty",
-  "externalRoot": "/Users/kostenchuksergey/omg-wt/omg-int-s3b/.golden-build-OOusCp/",
+  "externalRoot": "/Users/kostenchuksergey/omg-wt/omg-int-s5/.golden-build-QYcLsb/",
   "format": "golden-sample/v1",
-  "sqliteFileSha256": "12648956a0af9011c75c839013019149b299123a459718fc11c4c05089d56b73",
-  "sqliteBytes": 14565376
+  "sqliteFileSha256": "882da4f148d5604550987076a8c91d518a26117d31b6de8bc6b25fac92b827fd",
+  "sqliteBytes": 14581760
 }

@@ -1,6 +1,6 @@
 import { execFileSync } from 'node:child_process';
 import { hashJson } from '../src/canonical.js';
-import { DISCOVERY_CLAIMS_CONTRACT } from '../src/discovery/v7-contracts.js';
+import { DISCOVERY_CLAIMS_CONTRACT, discoveryAcceptanceActId, type DiscoveryAcceptanceAct } from '../src/discovery/v7-contracts.js';
 import { assessAttempts, assessAttemptsWithRequirements } from '../src/discovery/research-assessment.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -329,4 +329,76 @@ test('DRS2.1 a structural covered flag and a forged paid-looking P are not promo
   f.store.write({id:'forged-covered-cell',kind:'discovery-coverage-cell',expected:0,value:malformed});
   assert.throws(()=>buildDiscoveryIndexAt(f.store,'p',second.planAnswer,discoveryIndexCursor(f.store)),
     (e:unknown)=>e instanceof EngineError&&e.code==='discovery_coverage_invalid');
+});
+
+test('DRS2.1 a cold C1 projection stays identical after the same index advances to C2', t=>{
+  const f=fixture(t),v=acceptPlan(f,'p',[planQuestion('original','industry')]);
+  const c1=discoveryIndexCursor(f.store),first=buildDiscoveryIndexAt(f.store,'p',v.planAnswer,c1);
+  f.store.write({id:'later-unrelated',kind:'test',expected:0,value:{projectId:'p'}});
+  const c2=discoveryIndexCursor(f.store),later=buildDiscoveryIndexAt(f.store,'p',v.planAnswer,c2);
+  assert.equal(later.indexedThrough,c2.sequence);
+  const before=snapshot(f.store),again=buildDiscoveryIndexAt(f.open(),'p',v.planAnswer,c1);
+  assert.deepEqual(again,first);assert.equal(again.indexedThrough,c1.sequence);
+  assert.deepEqual(snapshot(f.store),before);
+});
+
+test('DRS2.1 two genuine editions of one draft/Question isolate exact sources and provenance in full and cold incremental builds',async t=>{
+  const f=await setup(t),firstPlan=f.v.planAnswer;
+  const e1=await produce(f,hypothesis(f,'Edition one basis')),a1=await assess(f,[e1],{accept:true});
+  const p1=applyDiscoveryAssessment(f.store,'p',reference(a1.paid));
+  const firstCursor=discoveryIndexCursor(f.store),firstAtC1=buildDiscoveryIndexAt(f.store,'p',firstPlan,firstCursor);
+  const firstAct=f.store.get<DiscoveryAcceptanceAct>(
+    discoveryAcceptanceActId('p',f.v.draft.id,'plan',firstPlan))!;
+  const frameAct=f.store.get<DiscoveryAcceptanceAct>(
+    discoveryAcceptanceActId('p',f.v.draft.id,'frame',f.v.frameRef))!;
+  const source=f.discovery.evidence.document('p','edition:2','Another accepted edition of this plan','text/plain',0);
+  const question=f.store.get<Question>(f.v.plan.id)!;
+  f.discovery.reopen(question.id,question.revision);
+  answerDiscoveryFixture(f.engine,'p',f.store.get<DiscoveryDraft>(f.v.draft.id)!,f.store.get<Question>(question.id)!,
+    validPlan(f.v.frameRef,[planQuestion('q-industry','industry','blocking'),planQuestion('q-market','market'),
+      planQuestion('q-new','outcome')],2,firstPlan),source);
+  const nextQuestion=f.store.get<Question>(question.id)!,nextPlan=nextQuestion.value.answer!;
+  const nextAct=f.store.get<DiscoveryAcceptanceAct>(
+    discoveryAcceptanceActId('p',f.v.draft.id,'plan',nextPlan))!;
+  assert.equal(nextQuestion.id,firstAct.value.questionAfter.id);
+  assert.equal(nextAct.value.draftId,firstAct.value.draftId);
+  assert.ok(nextQuestion.revision>firstAct.value.questionAfter.revision);
+  f.v.planAnswer=nextPlan;
+  const e2=await produce(f,hypothesis(f,'Edition two basis')),a2=await assess(f,[e2],{accept:true});
+  const p2=applyDiscoveryAssessment(f.store,'p',reference(a2.paid)),cursor=discoveryIndexCursor(f.store);
+  const before=snapshot(f.store),wires=f.wires();
+  const old=buildDiscoveryIndexAt(f.store,'p',firstPlan,cursor),next=buildDiscoveryIndexAt(f.store,'p',nextPlan,cursor);
+  const has=(index:typeof old,ref:Ref)=>index.sources.some(s=>canonical(reference(s.record))===canonical(ref));
+  for(const ref of [firstPlan,reference(firstAct),firstAct.value.questionAfter,firstAct.value.draftAfter,
+    f.v.frameRef,reference(frameAct),frameAct.value.questionAfter,frameAct.value.draftAfter])
+    assert.equal(has(old,ref),true,'own exact acceptance and shared frame are retained');
+  for(const ref of [nextPlan,reference(nextAct),nextAct.value.questionBefore,nextAct.value.questionAfter,nextAct.value.draftAfter]) {
+    assert.equal(has(old,ref),false,'a later edition is no source of the older scope');
+    assert.equal(old.provenance.some(link=>canonical(link.from)===canonical(ref)||canonical(link.to)===canonical(ref)),false,
+      'a later edition is no provenance of the older scope');
+  }
+  for(const ref of [nextPlan,reference(nextAct),nextAct.value.questionBefore,nextAct.value.questionAfter,
+    nextAct.value.draftAfter,firstPlan,reference(firstAct),f.v.frameRef,reference(frameAct)])
+    assert.equal(has(next,ref),true,'new scope keeps its exact acceptance and explicitly named previous/frame');
+  assert.deepEqual(old.progress.map(p=>p.state),[reference(p1.state)]);
+  assert.deepEqual(next.progress.map(p=>p.state),[reference(p2.state)]);
+  assert.equal(has(old,e1.attempt),true);assert.equal(has(old,reference(a1.paid)),true);
+  assert.equal(has(old,e2.attempt),false);assert.equal(has(old,reference(a2.paid)),false);
+  assert.equal(has(next,e2.attempt),true);assert.equal(has(next,reference(a2.paid)),true);
+  assert.equal(has(next,e1.attempt),false);assert.equal(has(next,reference(a1.paid)),false);
+  assert.deepEqual(buildDiscoveryIndexAt(f.open(),'p',firstPlan,firstCursor),firstAtC1);
+  // Discard only derived rows, then reconstruct both scopes in bounded batches after reopen.
+  const db=new DatabaseSync(f.path);db.exec('BEGIN IMMEDIATE');
+  for(const plan of [firstPlan,nextPlan]) {
+    const key=digest(canonical(scopeOf(f.store,plan)));
+    db.prepare('DELETE FROM event_index_rows WHERE scope_key=?').run(key);
+    db.prepare('DELETE FROM event_index_scopes WHERE key=?').run(key);
+  }
+  db.exec('COMMIT');db.close();
+  for(const [plan,full] of [[firstPlan,old],[nextPlan,next]] as const) {
+    let batch=buildDiscoveryIndexAt(f.store,'p',plan,cursor,{maxEvents:11});assert.equal(batch.rangeComplete,false);
+    const cold=f.open();while(!batch.rangeComplete)batch=buildDiscoveryIndexAt(cold,'p',plan,cursor,{maxEvents:17});
+    assert.deepEqual(batch,full);assert.deepEqual(buildDiscoveryIndexAt(f.open(),'p',plan,cursor),full);
+  }
+  assert.deepEqual(snapshot(f.store),before);assert.deepEqual(f.wires(),wires);
 });

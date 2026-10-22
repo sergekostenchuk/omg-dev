@@ -4,8 +4,9 @@ import { isRef, reference, type Ref } from '../pipeline/contracts.js';
 import type { IdentityMethod, Revision, Store } from '../storage/store.js';
 import type { DiscoveryDraft, Question } from './discovery.js';
 import { DISCOVERY_ACCEPTANCE_ACT_KIND, DISCOVERY_CLAIMS_CONTRACT, discoveryAcceptanceActId,
-  type DiscoveryAcceptanceAct } from './v7-contracts.js';
+  provenAcceptance, type DiscoveryAcceptanceAct } from './v7-contracts.js';
 import { provePlanQuestions, type V7PlanQuestion } from './v7-plan-questions.js';
+import { issuedAnswerSchemaHolds, proveIssuedAnswer, savedAcceptanceAct } from './projection-reader.js';
 import { resolveClaimAddress, type ClaimAddress } from './claim-address.js';
 import { readV7ProgressStateAt } from './v7-progress.js';
 import type { V7ProgressState } from './research-model.js';
@@ -74,30 +75,60 @@ function exact<T>(view: Store, at: Ref, kind?: string): Revision<T> {
     invalid('source', 'The exact source is missing, substituted or later than the committed cursor');
   return row;
 }
-function planAt(view: Store, project: string, plan: Ref): {draft: Revision<DiscoveryDraft>; questions: V7PlanQuestion[]} {
-  const answer = exact<Record<string, any>>(view, plan, 'research-answer');
-  if (!object(answer.value) || answer.value.projectId !== project || typeof answer.value.question !== 'string')
-    invalid('plan', 'The plan answer must belong to this project');
-  const q = view.get<Question>(answer.value.question, 1);
-  if (!q || q.kind !== 'question' || q.value.projectId !== project || q.value.spec.field !== 'plan')
-    invalid('plan', 'The plan needs its own issued plan question');
-  const act = view.get<DiscoveryAcceptanceAct>(discoveryAcceptanceActId(project, q.value.draftId, 'plan', plan));
-  if (!act || act.kind !== DISCOVERY_ACCEPTANCE_ACT_KIND || !isRef(act.value.draftAfter))
-    invalid('plan', 'The plan needs its saved exact acceptance');
-  const draft = exact<DiscoveryDraft>(view, act.value.draftAfter, 'discovery-draft');
-  return {draft, questions: provePlanQuestions(view, draft, plan)};
+interface PlanBasis { draft: Revision<DiscoveryDraft>; questions: V7PlanQuestion[]; records: Set<string> }
+function planAt(view: Store, project: string, plan: Ref): PlanBasis {
+  const records = new Set<string>(), proven = new Map<string, PlanBasis>();
+  // An edition's exact acceptance and the frame/previous editions it actually names.
+  // Shared draft ids never authorize later draft/question/answer revisions.
+  const acceptance = (field: 'frame' | 'plan', at: Ref): PlanBasis => {
+    const key = canonical(at), cached = proven.get(key);
+    if (cached) return cached;
+    const answer = exact<Record<string, any>>(view, at, 'research-answer');
+    if (!object(answer.value) || answer.value.projectId !== project || typeof answer.value.question !== 'string')
+      invalid('plan', 'The accepted answer must belong to this project');
+    const q = view.get<Question>(answer.value.question, 1);
+    if (!q || q.kind !== 'question' || q.value.projectId !== project || q.value.spec.field !== field)
+      invalid('plan', 'The answer needs its own issued question');
+    const act = view.get<DiscoveryAcceptanceAct>(discoveryAcceptanceActId(project, q.value.draftId, field, at), 1);
+    if (!act || act.kind !== DISCOVERY_ACCEPTANCE_ACT_KIND || !isRef(act.value.draftAfter))
+      invalid('plan', 'The answer needs its saved exact acceptance');
+    const draft = exact<DiscoveryDraft>(view, act.value.draftAfter, 'discovery-draft');
+    const question = exact<Question>(view, act.value.questionAfter, 'question');
+    const questions = field === 'plan' ? provePlanQuestions(view, draft, at) : [];
+    if (field === 'frame') {
+      const issued = proveIssuedAnswer(view, draft,
+        {question, foreign: false, answered: true, answerRef: at, field}, answer, {verifyIssuedQuestion: true});
+      if (!issued.ok || !provenAcceptance(issued.proof.provenance)
+        || !issuedAnswerSchemaHolds(question, answer.value.value)
+        || !savedAcceptanceAct(view, draft, question, field, at, answer.value.value))
+        invalid('plan', 'The shared frame needs its own historical proof');
+    }
+    for (const row of [q, answer, act, draft, question,
+      exact<DiscoveryDraft>(view, act.value.draftBefore, 'discovery-draft'),
+      exact<Question>(view, act.value.questionBefore, 'question')]) records.add(canonical(reference(row)));
+    const result = {draft, questions, records};
+    proven.set(key, result);
+    if (field === 'plan') {
+      acceptance('frame', answer.value.value.frame);
+      if (answer.value.value.previous !== null) acceptance('plan', answer.value.value.previous);
+    }
+    return result;
+  };
+  return acceptance('plan', plan);
 }
 const KINDS = new Set(['question', 'discovery-draft', 'research-answer', 'research-attempt',
   'discovery-assessment', 'v7-progress-application', 'v7-progress-state', 'v7-attempt-account',
   'research-progress-event', 'discovery-coverage-cell', DISCOVERY_ACCEPTANCE_ACT_KIND]);
-function selected(row: Revision, scope: DiscoveryIndexScope, draft: Revision<DiscoveryDraft>): boolean {
+function selected(row: Revision, scope: DiscoveryIndexScope, basis: PlanBasis): boolean {
   if (!KINDS.has(row.kind) || !object(row.value)) return false;
   const v = row.value as Record<string, any>;
   if ((v.projectId ?? v.project ?? v.subject?.project ?? null) !== scope.project) return false;
-  if (row.kind === 'discovery-draft') return row.id === draft.id;
-  if (row.kind === 'question') return v.draftId === draft.id && draft.value.questions.includes(row.id);
-  if (row.kind === 'research-answer') return draft.value.questions.includes(v.question);
-  if (row.kind === DISCOVERY_ACCEPTANCE_ACT_KIND) return v.draftId === draft.id;
+  if (row.kind === 'discovery-draft' || row.kind === 'question' || row.kind === DISCOVERY_ACCEPTANCE_ACT_KIND)
+    return basis.records.has(canonical(reference(row)));
+  if (row.kind === 'research-answer') return basis.records.has(canonical(reference(row)))
+    || v.contract === DISCOVERY_CLAIMS_CONTRACT && basis.draft.value.questions.includes(v.question)
+      && Array.isArray(v.value?.claims) && v.value.claims.some((claim: Record<string, any>) =>
+        Array.isArray(claim?.planQuestions) && claim.planQuestions.some((q: Record<string, any>) => same(q?.planAnswer ?? null, scope.plan)));
   if (row.kind === 'research-attempt') return same(v.planAnswer ?? null, scope.plan);
   if (row.kind === 'discovery-coverage-cell') return same(v.subject?.planAnswer ?? v.subject?.packet?.planAnswer ?? null, scope.plan);
   // Assessment packets and the P application/state/account/event all carry the exact subject.
@@ -132,12 +163,12 @@ export function buildDiscoveryIndexAt(store: Store, project: string, plan: Ref, 
       if (!KINDS.has(event.kind)) return [];
       const row = view.get(event.id, event.revision);
       if (!row || row.kind !== event.kind || hashJson(row.value) !== row.hash) invalid('source', 'A committed source disappeared or changed');
-      return selected(row, scope, provenPlan.draft) ? [{sequence: event.sequence, value: {sequence: event.sequence, record: row}}] : [];
+      return selected(row, scope, provenPlan) ? [{sequence: event.sequence, value: {sequence: event.sequence, record: row}}] : [];
     });
     store.eventIndexWrite(scope, from, through, rows);
     saved = store.eventIndexRead(key, cursor.sequence, false)!;
   }
-  const result: DiscoveryIndex = {scope, cursor: structuredClone(cursor), indexedThrough: saved?.cursor ?? 0,
+  const result: DiscoveryIndex = {scope, cursor: structuredClone(cursor), indexedThrough: Math.min(saved?.cursor ?? 0, cursor.sequence),
     rangeComplete: (saved?.cursor ?? 0) >= cursor.sequence, questions: [], claims: [], progress: [],
     coverage: {complete: false, reason: 'deep-coverage-unavailable', cells: []}, sources: [], provenance: []};
   // A partial scan never masquerades as an empty complete projection.
@@ -148,7 +179,7 @@ export function buildDiscoveryIndexAt(store: Store, project: string, plan: Ref, 
     const source = JSON.parse(stored.body) as DiscoveryIndexSource;
     if (!object(source) || source.sequence !== stored.sequence || !object(source.record)) invalid('row', 'Malformed index row');
     const event = store.eventAt(stored.sequence), row = exact<Json>(view, reference(source.record), source.record.kind);
-    if (!event || !same(event, reference(row)) || !same(row, source.record) || !selected(row, scope, provenPlan.draft))
+    if (!event || !same(event, reference(row)) || !same(row, source.record) || !selected(row, scope, provenPlan))
       invalid('row', 'Index row does not match its exact scoped primary event');
     result.sources.push(source);
     for (const {path, ref} of references(row.value)) {
