@@ -3,16 +3,16 @@ import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Revision, Store, Write } from "../src/storage/store.js";
-import { canonical, hashJson, type Json } from "../src/canonical.js";
+import { hashJson, type Json } from "../src/canonical.js";
 import { reference, type Ref } from "../src/pipeline/contracts.js";
 import type { OmResult } from "../src/om/refusal.js";
 import { UPSTREAM_STAGES, type UpstreamStage } from "../src/discovery/requirements.js";
 import type { Graph } from "../src/graph/model.js";
 import { projectGraph } from "../src/graph/project.js";
 import { ProductEngine } from "../src/product/engine.js";
-import { fillObligations, prepareFrame, readFrame, type FrameRequest, type FrameScope } from "../src/om/frame-obligations.js";
-import type { LayerProposal, ProposalRequest } from "../src/om/frame-proposals.js";
-import { writeCandidate, type FrameCandidateRecord } from "../src/om/frame-candidate.js";
+import { fillObligations, prepareFrame, type FrameRequest, type FrameScope } from "../src/om/frame-obligations.js";
+import type { LayerProposal } from "../src/om/frame-proposals.js";
+import { writeCandidate } from "../src/om/frame-candidate.js";
 import { settleCandidate } from "../src/om/frame-accept.js";
 import { writeOmInput } from "../src/om/input.js";
 import { writeHorizon } from "../src/om/horizon.js";
@@ -24,7 +24,6 @@ import { assessFact } from "../src/om/assessment.js";
 import { runModelCall } from "../src/om/model-call.js";
 import { writeQuestionPacket } from "../src/om/question-packet.js";
 import { writeRoutes, type RoutesRecord } from "../src/om/routes.js";
-import { recordRefusal, unitRefusalNamespace, UNIT_REFUSAL_KIND, type OriginSource } from "../src/om/refusal-journal.js";
 import { seriesId, type AttemptGoal, type BeginAttemptRequest, type ClaimedRefusal, type RepairSeries, type SeriesRequest } from "../src/om/series.js";
 import { closeAttempt, openAttempt, prepareManagedClaim, type GateOutcome, type RepeatOutcome } from "../src/om/repeat-gate.js";
 import { gardenGraph } from "./om-fixture.js";
@@ -34,25 +33,32 @@ import { preparedField } from "./preparation-fixture.js";
 /**
  * LG07: one block of one project whose attempts open and close only as the managed contract allows. The exact M6 plan
  * opens an attempt, its real E2 packet pays E1+E4 through the scenario adapter, the independent E5 verdict ends every
- * fact of the batch, and G7 derives the outcome from that composition. Nothing here writes an owner, an assignment, a
- * close or an achievement by hand; a refusal is a row the A2 journal really took from a gate's record.
+ * fact of the batch, and G7 derives the outcome from that composition. Owners, assignments, closes, achievements and refusal rows
+ * come only from their producers (G7, E5, E4); a refusal row is one an attempt's own paid work left in the A2 journal.
+ * The test's own inputs are written as om-stop-report writes them: the layer proposal the accepted frame stands on and
+ * the dispatch adapter record; the brief, the notes and the stages come from the product and evidence producers.
  */
-export const MANAGED_SUBJECT = "artifact:cart";
+const MANAGED_SUBJECT = "artifact:cart";
 export const managedUsage = { inputTokens: 120, outputTokens: 30, cachedInputTokens: 20, reasoningOutputTokens: 10 };
 const adapterFixture = fileURLToPath(new URL("../../test/om-adapter-fixture.mjs", import.meta.url));
 const UNKNOWNS = ["cart-price", "price-1", "price-2", "price-3", "price-4", "price-5", "price-6", "price-7", "price-8"];
 const targetOf = (unknown: number): string => `discovery:${UNKNOWNS[unknown]!}`;
+/** The target of the first unknown: the question the first plan of every managed block asks. */
+export const MANAGED_FIRST_TARGET = targetOf(0);
 
 /** How the paid work of one attempt ends: the E5 verdict on every fact, or the implementer's own request for the owner. */
 export type ManagedEnding = "supported" | "insufficient" | "off-form" | "interrupted" | "need-owner";
+type FactEnding = Exclude<ManagedEnding, "need-owner">;
+/** One ending for the whole batch, one for each fact in batch order, or one chosen by the target of each fact. */
+export type ManagedEndings = ManagedEnding | readonly FactEnding[] | ((target: string) => FactEnding);
 type Batch = RoutesRecord["batches"][number];
-interface Plan { input: Ref; routes: Revision<RoutesRecord>; batch: Batch; unknown: number; spent: boolean }
-interface Definition { first: FrameRequest; accepted: FrameRequest; upper: Graph; source: Revision<{ content: string }>;
-  graph: Ref; layer: Ref; frame: Ref }
+interface Addressed { input: Ref; sources: GapRequest; unknown: number }
+interface Plan extends Addressed { routes: Revision<RoutesRecord>; batch: Batch; spent: boolean }
+interface Definition { graph: Ref; layer: Ref; frame: Ref }
+// The owner's notes every answer cites: a source of the facts only, which no upstream stage stands on.
+const NOTES = (project: string): string => `source:${project}:cart-notes`;
 interface Opened { plan: Plan; routes: Revision<RoutesRecord>; batch: Batch; series: Ref }
 
-let unique = 0;
-const next = (): number => (unique += 1);
 function take<T>(result: OmResult<T>): T {
   if (!result.ok) assert.fail(`unexpected refusal ${result.refusal.code}: ${result.refusal.message}`);
   return result.value;
@@ -73,6 +79,8 @@ function definition(store: Store, project: string, block: string): Definition {
       resolution: "Resolve the addressed question during OM" }));
     return value;
   });
+  new ProductEngine(store).discovery.evidence.document(project, "cart-notes",
+    "Cart notes: the pricing operation produces the price of a cart line.", "text/plain", 0);
   const base = take(writeOmInput(store, { project, expected: 0,
     stages: Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(store.get(`stage:${project}:${stage}`)!)])) as Record<UpstreamStage, Ref> }));
   const graphRef = reference(store.get<Graph>(`graph:${project}`)!);
@@ -96,12 +104,7 @@ function definition(store: Store, project: string, block: string): Definition {
   const ref = reference(candidate.record);
   const applied = take(settleCandidate(store, { project, level: 2, candidate: ref,
     outcome: { gate: "G3", candidate: ref, graphHash: candidate.record.value.graphHash, passed: true, codes: [] } }));
-  const acceptedHorizon = take(writeHorizon(store, { project, input: reference(base), graph: reference(applied.graph!),
-    refinement: reference(applied.layer!), choice: { choiceVersion: "managed-accepted", features: [{ outcome: `${project}-result` }], excluded: [] }, available: {} }));
-  const accepted: FrameRequest = { ...first, graph: reference(applied.graph!), horizon: reference(acceptedHorizon.gate),
-    layer: reference(applied.layer!), frame: reference(applied.frame!) };
-  return { first, accepted, upper: upper as Graph, source: store.get<{ content: string }>(`source:${project}:brief`)!,
-    graph: reference(applied.graph!), layer: reference(applied.layer!), frame: reference(applied.frame!) };
+  return { graph: reference(applied.graph!), layer: reference(applied.layer!), frame: reference(applied.frame!) };
 }
 
 /**
@@ -123,26 +126,35 @@ function advance(store: Store, project: string, block: string, f: Definition, pl
     operations: { proposals: [], frame: { project, level: 2, graph: f.graph, horizon: reference(horizon.gate), layer: f.layer, frame: f.frame, upper: null } },
     works: { proposals: [], frame: { project, level: 3, graph: f.graph, horizon: reference(horizon.gate),
       layer: null, frame: null, upper: { horizon: reference(horizon.gate), frame: f.frame } } } };
-  const gaps = take(writeGaps(store, sources));
+  return route(store, project, block, { input: reference(input), sources, unknown }, plan?.routes ?? null);
+}
+
+/**
+ * The routes over the exact gap sources of the addressed unknowns: the task of every fact gap, and the MC1 batch of
+ * this consumer, which holds what no applicable accepted answer closes — the open work, and work whose answer was lost.
+ */
+function route(store: Store, project: string, block: string, at: Addressed, previous: Revision<RoutesRecord> | null): Plan {
+  const gaps = take(writeGaps(store, at.sources));
   const gapRead: GapReadRequest = { sources: structuredClone(gaps.sources) as GapRequest, records: gaps.records.map(reference) };
   const tasks = gaps.records.filter(row => row.value.gap.kind === "repository-fact" && row.value.gap.code !== "inventory_missing" && !row.value.gap.deferral)
-    .map(row => take(prepareAnswerTask(store, { project, input: reference(input), gaps: gapRead,
+    .map(row => take(prepareAnswerTask(store, { project, input: at.input, gaps: gapRead,
       gap: reference(row), requirements: [{ pointer: "/contracts/0" }], resultForm: { type: "string" } })))
     .map(task => task.writes.length ? { pending: structuredClone(task.writes[0]!) as Write } : { record: reference(task.record) });
   const routes = take(writeRoutes(store, { project, gaps: gapRead, tasks, catalog: { paths: [], records: [] },
-    previous: plan === null ? null : reference(plan.routes) })) as Revision<RoutesRecord>;
+    previous: previous === null ? null : reference(previous) })) as Revision<RoutesRecord>;
   const batch = routes.value.batches.find(item => item.model === "MC1" && item.items.some(row => row.consumers.includes(block)));
-  if (!batch) assert.fail(`No MC1 batch of ${block} stands on the routes of unknown ${unknown}`);
-  return { input: reference(input), routes, batch, unknown, spent: false };
+  if (!batch) assert.fail(`No MC1 batch of ${block} stands on the routes of unknown ${at.unknown}`);
+  return { input: at.input, sources: at.sources, unknown: at.unknown, routes, batch, spent: false };
 }
 
-const IMPLEMENTER_STEP = (f: Definition, batch: Batch) => ({ research: { protocol: "$answerProtocol", requestId: "$requestId", action: "answer",
-  results: batch.items.map(item => ({ questionId: item.gap, value: f.source.value.content.slice(0, 8),
-    citations: [{ source: reference(f.source), selector: { kind: "text-range", start: 0, end: f.source.value.content.length } }] })) },
+// Every answer cites the notes as they stand now, and its value is their first words, which a revision keeps.
+const IMPLEMENTER_STEP = (brief: Revision<{ content: string }>, batch: Batch) => ({ research: { protocol: "$answerProtocol", requestId: "$requestId",
+  action: "answer", results: batch.items.map(item => ({ questionId: item.gap, value: brief.value.content.slice(0, 8),
+    citations: [{ source: reference(brief), selector: { kind: "text-range", start: 0, end: brief.value.content.length } }] })) },
 usage: managedUsage });
 const OWNER_STEP = (batch: Batch) => ({ research: { protocol: "$answerProtocol", requestId: "$requestId", questionIds: batch.items.map(item => item.gap),
   action: "need_owner", reason: "Only the owner knows which node prices a cart line", decision: "Name the producer of the price" }, usage: managedUsage });
-const ASSESSOR_STEPS: Record<Exclude<ManagedEnding, "need-owner">, unknown> = {
+const ASSESSOR_STEPS: Record<FactEnding, unknown> = {
   supported: { research: { verdict: "supported", reasons: [] }, usage: managedUsage },
   insufficient: { research: { verdict: "insufficient", reasons: ["The cited brief does not name the producer of the price"] }, usage: managedUsage },
   "off-form": { research: { answer: "untyped reviewer reply" }, usage: managedUsage },
@@ -159,15 +171,20 @@ export interface ManagedSteps {
   opening(attempt: number, key?: string, line?: number): BeginAttemptRequest;
   /** Opens the attempt through G7; `reshape` changes the complete request first, as a caller naming it otherwise would. */
   open(attempt: number, key?: string, line?: number, reshape?: (request: BeginAttemptRequest) => BeginAttemptRequest): Revision<RepairSeries>;
-  /** The paid work of an opened attempt: its E2 packet, the E1+E4 call and the E5 verdict of each fact. */
-  pay(attempt: number, ending: ManagedEnding, line?: number): Promise<void>;
+  /** The paid work of an opened attempt: its E2 packet, the E1+E4 call and the E5 verdict of each fact, one for all or one each. */
+  pay(attempt: number, ending: ManagedEndings, line?: number): Promise<void>;
   /** The full claim G7 derives for the attempt: what its registry requires, and these independent refusal rows. */
   claim(attempt: number, refusals?: readonly ClaimedRefusal[], line?: number): GateOutcome;
   close(attempt: number, outcome: GateOutcome, line?: number): RepeatOutcome;
   /** The exact claim the attempt was closed with here — what a late delivery of its close repeats. */
   claimed(attempt: number, line?: number): GateOutcome;
   /** One completed cycle: opened, paid, claimed and closed at the gate. */
-  cycle(key: string, ending: ManagedEnding, refusals?: readonly ClaimedRefusal[], line?: number): Promise<RepeatOutcome>;
+  cycle(key: string, ending: ManagedEndings, refusals?: readonly ClaimedRefusal[], line?: number): Promise<RepeatOutcome>;
+  /**
+   * The owner revises the notes every answer cites, through the evidence producer. An accepted answer grounded on the
+   * earlier revision no longer applies, so the routes of the same addressed unknowns hold its question again.
+   */
+  revise(): void;
 }
 export interface ManagedBlock extends ManagedSteps {
   readonly project: string;
@@ -175,8 +192,6 @@ export interface ManagedBlock extends ManagedSteps {
   address(line?: number): SeriesRequest;
   /** The same block worked on through another Store over the same database: a rival, or the process after a restart. */
   on(store: Store): ManagedSteps;
-  /** A refusal of the rules' own example, journalled through A2 with an origin G7 can weigh, in one of its three shapes. */
-  refusal(shape: "proposal" | "derivation" | "input", over?: { code?: string; goal?: string }): ClaimedRefusal;
   /** The keys the accepted answers of this attempt carry, derived by their producer. */
   achieved(attempt: number, line?: number): string[];
 }
@@ -232,9 +247,14 @@ export function managedBlock(store: Store, workspace: { root: string; path: stri
       async pay(attempt, ending, line = 1) {
         const at = opened.get(slot(line, attempt));
         if (!at) assert.fail(`Attempt ${attempt} of line ${line} was not opened through this block`);
+        const endings = typeof ending === "string" ? at.batch.items.map(() => ending)
+          : typeof ending === "function" ? at.batch.items.map(item => ending(item.target)) : [...ending];
+        assert.equal(endings.length, at.batch.items.length, "One ending for each fact of the batch");
         const packet = take(writeQuestionPacket(s, { project, routes: reference(at.routes), batch: at.batch.id, environment: config,
           attempt: { series: at.series, ordinal: attempt }, previous: [] })).record;
-        steps.push(...(ending === "need-owner" ? [OWNER_STEP(at.batch)] : [IMPLEMENTER_STEP(f, at.batch), ...at.batch.items.map(() => ASSESSOR_STEPS[ending])]));
+        steps.push(...(ending === "need-owner" ? [OWNER_STEP(at.batch)]
+          : [IMPLEMENTER_STEP(s.get<{ content: string }>(NOTES(project))!, at.batch),
+            ...endings.map(item => ASSESSOR_STEPS[item as FactEnding])]));
         writeFileSync(scenario, JSON.stringify({ database: workspace.path, steps }));
         const call = take(await runModelCall(s, { project, packet: reference(packet), dispatch, role: "implementer" }));
         if (ending === "need-owner") return;
@@ -264,6 +284,11 @@ export function managedBlock(store: Store, workspace: { root: string; path: stri
         await api.pay(attempt, ending, line);
         return api.close(attempt, api.claim(attempt, refusals, line), line);
       },
+      revise() {
+        const notes = s.get<{ content: string }>(NOTES(project))!;
+        new ProductEngine(s).discovery.evidence.document(project, "cart-notes", `${notes.value.content} Revised.`, "text/plain", notes.revision);
+        plan = route(s, project, block, plan, plan.routes);
+      },
     };
     return api;
   };
@@ -272,53 +297,9 @@ export function managedBlock(store: Store, workspace: { root: string; path: stri
   return {
     ...own, project, block, address,
     on: bound,
-    refusal(shape, over = {}) {
-      const sources = shape === "proposal" ? assembly(store, project, f, { proposals: [["artifact:tax"]], bases: [false], derived: [["artifact:tax"]] })
-        : shape === "derivation" ? assembly(store, project, f, { proposals: [[MANAGED_SUBJECT]], bases: [false], derived: [["artifact:order"]] })
-        : assembly(store, project, f, { bases: [true], derived: [[MANAGED_SUBJECT]] });
-      return journalled(store, project, { sources }, over);
-    },
     achieved(attempt, line = 1) {
       const held = store.get<RepairSeries>(seriesId(project, block, line))!.value;
       return [...held.inherited, ...held.attempts].find(item => item.ordinal === attempt)!.outcome!.achieved.map(item => item.key);
     },
   };
-}
-
-/** One explicitly linked assembly of definitions; no journal or gate helper repairs the sources it names. */
-function assembly(store: Store, project: string, f: Definition, shape: {
-  proposals?: readonly (readonly string[])[]; bases?: readonly boolean[]; derived?: readonly (readonly string[])[];
-}): OriginSource[] {
-  const frame = shape.bases?.some(Boolean) ? f.accepted : f.first;
-  const artifacts = (definitions: readonly string[]) => definitions.map(id => ({ ...structuredClone(f.upper.artifacts[0]!), id }));
-  const proposals = (shape.proposals ?? []).map(definitions => reference(store.write({ id: `om-proposal:${project}:managed-${next()}`,
-    kind: "layer-proposal", expected: 0, value: { base: { graph: frame.graph, frame: frame.frame }, level: frame.level,
-      source: "decision", status: "proposed", nodes: [], fills: [], localConnectors: [], artifacts: artifacts(definitions), contracts: [],
-      joins: [], tests: [], edges: [], journeys: [], packets: [], transfers: [], anchors: [], removes: [], replaces: [], redefines: [] } })));
-  const request: ProposalRequest = { frame, proposals: [...proposals].sort((a, b) => canonical(a) < canonical(b) ? -1 : 1) };
-  const absentBase = shape.bases?.some(holds => !holds) ? take(readFrame(store, frame)).upperRef : null;
-  return [
-    ...proposals.map(ref => ({ role: "proposal", ref, context: { kind: "proposal", request } }) as OriginSource),
-    ...(shape.bases ?? []).map(holds => ({ role: "base", ref: holds ? frame.graph : absentBase!, context: { kind: "frame", request: frame } }) as OriginSource),
-    ...(shape.derived ?? []).map(definitions => {
-      const graph = structuredClone(f.upper);
-      graph.artifacts = [...graph.artifacts.filter(item => !definitions.includes(item.id)), ...artifacts(definitions)];
-      const value: FrameCandidateRecord = { project, level: 2, graph, graphHash: hashJson(graph), layerHash: hashJson(projectGraph(graph, 2)),
-        upperHash: hashJson(projectGraph(f.upper, 1)), base: { graph: frame.graph, frame: frame.frame }, proposals: request.proposals,
-        fills: [], request };
-      const id = `om-candidate:${project}:${hashJson([value.graphHash, value.base, value.proposals])}`;
-      return { role: "derived", ref: reference(store.get(id) ?? store.write({ id, kind: "frame-candidate", expected: 0, value })) } as OriginSource;
-    }),
-  ];
-}
-
-/** A refusal a gate really wrote, journalled through the accepted API of A2. */
-function journalled(store: Store, project: string, origin: Record<string, unknown>, over: { code?: string; goal?: string }): ClaimedRefusal {
-  const name = over.code ?? `graph_invalid:${next()}`;
-  const goal = over.goal ?? "every artifact an operation consumes is produced somewhere in the layer";
-  const record = store.write({ id: `${unitRefusalNamespace(project)}managed:${next()}`, kind: UNIT_REFUSAL_KIND, expected: 0,
-    value: { gate: "G3", refusals: [{ code: name, goal, remedy: "add the producer of the artifact to the proposal",
-      origin: { name: "artifact_missing", stage: "layer-check", subject: MANAGED_SUBJECT, sources: [], ...origin } }] } as Json });
-  const journal = take(recordRefusal(store, { project, source: reference(record) }));
-  return { name, goal, row: journal.value.rows[journal.value.rows.length - 1]!.id };
 }

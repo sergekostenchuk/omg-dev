@@ -28,7 +28,7 @@ import {
 } from "../src/om/series.js";
 import { closeAttempt, openAttempt, prepareCloseAttempt, prepareManagedClaim, prepareOpenAttempt } from "../src/om/repeat-gate.js";
 import { acceptedAnswerNamespace, readAcceptedAnswer } from "../src/om/accepted-answer.js";
-import { managedBlock, MANAGED_SUBJECT, type ManagedBlock } from "./om-managed-block.js";
+import { managedBlock, MANAGED_FIRST_TARGET, type ManagedBlock, type ManagedSteps } from "./om-managed-block.js";
 
 const UNIT = "store-repairs";
 const PROJECT = "alpha";
@@ -818,22 +818,24 @@ test("every change names the state it comes from, so a late delivery finds its o
 });
 
 test("the order of an unordered set does not change what an outcome is (T5, T6)", async t => {
-  // One batch of two facts: one attempt asks two questions and two accepted answers name its results.
-  const { store, m } = managedFixture(t, PROJECT, { facts: 2 });
+  // One batch of four facts: the assessor accepts two and refuses two, so one attempt names two results and two
+  // refusals, each a row its own assessment left in the journal.
+  const { store, m } = managedFixture(t, PROJECT, { facts: 4 });
   opened(store);
-  const first = m.refusal("proposal");
-  const second = m.refusal("input", { code: "layer_port_unbound", goal: "every port of an operation is bound" });
-
   const attempt = m.ordinal();
   const opening = m.opening(attempt);
-  assert.equal(opening.goal.questions.length, 2);
+  assert.equal(opening.goal.questions.length, 4);
   const questions = [...opening.goal.questions].reverse();
   m.open(attempt, opening.goal.key, 1, request => ({ ...request, goal: { ...request.goal, questions } }));
   // Written canonically whichever order it arrived in, and the package of questions with it.
   assert.deepEqual(held(store)!.value.attempts[0]!.goal.questions, [...questions].sort());
-  await m.pay(attempt, "supported");
+  const accepted = new Set([MANAGED_FIRST_TARGET, "discovery:price-1"]);
+  await m.pay(attempt, target => (accepted.has(target) ? "supported" : "insufficient"));
+  const [first, second] = m.claim(attempt).refusals;
+  assert.ok(first && second && first.row !== second.row);
   const claim = m.claim(attempt, [first, second, first]);
   assert.equal(claim.accepting.length, 2);
+  assert.equal(claim.reason, "result");
   m.close(attempt, claim);
   const closed = held(store)!;
   const outcome = closed.value.attempts[0]!.outcome!;
@@ -865,6 +867,7 @@ test("the order of an unordered set does not change what an outcome is (T5, T6)"
   m.open(later);
   await m.pay(later, "interrupted");
   const ended = m.claim(later);
+  assert.equal(ended.reason, "interrupted");
   const running = held(store)!;
   for (const order of [[...claim.accepting], [...claim.accepting].reverse()]) {
     const refused = refusalOf(closeAttempt(store, { ...address(PROJECT), attempt: later, outcome: { ...ended, cancelling: order } }));
@@ -881,73 +884,84 @@ test("the order of an unordered set does not change what an outcome is (T5, T6)"
 test("a refusal keeps the link that tells it from another of the same name and goal", async t => {
   const { store, root, path, m } = managedFixture(t);
   opened(store);
-  // Two legitimate events of A2 with the SAME name and goal, from different origins: the proposal's own error, and
-  // a definition lost on the way from the proposals to the candidate. G7 classifies them differently, and the series
-  // must keep them apart.
-  const same = { code: "graph_invalid", goal: "every artifact an operation consumes is produced somewhere in the layer" };
-  const fromProposal = m.refusal("proposal", same);
-  const fromAssembly = m.refusal("derivation", same);
-  assert.equal(fromProposal.name, fromAssembly.name);
-  assert.equal(fromProposal.goal, fromAssembly.goal);
-  assert.notEqual(fromProposal.row, fromAssembly.row);
-
-  const one = await m.cycle("gap:cart:price", "off-form", [fromProposal]);
-  const two = await m.cycle("gap:cart:price", "off-form", [fromAssembly]);
+  // Two legitimate events of A2 with the SAME name and goal: the independent assessor refused the same fact in two
+  // attempts. They are two rows, each linked to its own assessment, and the series must keep them apart.
+  const one = await m.cycle("gap:cart:price", FRUITLESS);
+  const two = await m.cycle("gap:cart:price", FRUITLESS);
   const series = held(store)!;
+  assert.deepEqual(series.value.attempts.map(item => item.outcome!.refusals.length), [1, 1]);
   const rows = series.value.attempts.map(item => item.outcome!.refusals[0]!.row);
-  assert.deepEqual(rows, [fromProposal.row, fromAssembly.row]);
-  assert.notEqual(rows[0], rows[1]);
   assert.deepEqual(series.value.attempts.map(item => item.outcome!.reason), ["refused", "refused"]);
+  const journal = deliveredOf(readJournal(store, { project: PROJECT }));
+  const [first, second] = rows.map(row => journal.value.rows.find(item => item.id === row)!);
+  assert.equal(first!.gate, "E5");
+  assert.equal(first!.code, second!.code);
+  assert.equal(first!.goal, second!.goal);
+  assert.notEqual(first!.id, second!.id);
+  assert.notDeepEqual(first!.source, second!.source);
 
   // From the series alone the addressee of each attempt is found, because the link resolves to one row and one class.
-  const journal = deliveredOf(readJournal(store, { project: PROJECT }));
   const classOf = (row: string) => journal.value.classifications.find(item => item.row === row)!;
-  assert.deepEqual(rows.map(row => classOf(row).class), ["proposal", "derivation"]);
-  assert.equal(classOf(rows[0]!).addressee, `node:${MANAGED_SUBJECT}`);
-  assert.ok(classOf(rows[1]!).addressee.startsWith(`code:om-candidate:${PROJECT}:`));
+  assert.deepEqual(rows.map(row => classOf(row).class), ["proposal", "proposal"]);
+  assert.deepEqual(rows.map(row => classOf(row).addressee), [`node:${MANAGED_FIRST_TARGET}`, `node:${MANAGED_FIRST_TARGET}`]);
   assert.deepEqual([...one.routed, ...two.routed].map(item => [item.row, item.class, item.addressee]),
     rows.map(row => [row, classOf(row).class, classOf(row).addressee]));
 
   // A link is weighed against the journal of THIS project when the cycle is closed: a row that stands nowhere, a row
   // of another project, and a row whose refusal is not the one the cycle reports are all refused — whether the claim
   // is derived by G7 or handed to the close directly.
+  const linked = m.claimed(1).refusals[0]!;
+  // A row of another project: a negative mutation, written by hand only to be refused.
   const elsewhere = journalled(store, "beta");
   const attempt = m.ordinal();
   m.open(attempt);
-  await m.pay(attempt, "off-form");
-  const unlinkedRow = (refusal: Refusal, project = PROJECT): void => {
+  await m.pay(attempt, FRUITLESS);
+  // A row the journal holds under another name, or of another project, fails the check of its journal row at the
+  // series; a row that is not in this attempt's own assessed set fails the check of its exact registry first.
+  const unlinkedRow = (refusal: Refusal, at: "series" | "registry", project = PROJECT): void => {
     assert.equal(refusal.code, "completion_invalid");
-    assert.equal(refusal.at.target, seriesId(project, blockOf(project), 1));
     assert.equal(refusal.at.field, "refusals");
+    if (at === "series") assert.equal(refusal.at.target, seriesId(project, blockOf(project), 1));
+    else assert.ok(refusal.at.target.startsWith(`om-completion-work:${project}:`));
   };
-  for (const broken of [
-    { ...fromProposal, row: "om-refusal:invented" },
-    { ...elsewhere },
-    { ...fromProposal, name: "work_not_atomic" },
-    { ...fromProposal, goal: "a goal the row does not hold" },
-  ]) {
-    unlinkedRow(refusalOf(prepareManagedClaimOf(store, attempt, [broken])));
-    unlinkedRow(refusalOf(closeAttempt(store, { ...address(PROJECT), attempt,
-      outcome: { reason: "refused", accepting: [], cancelling: [], refusals: [broken] } })));
+  // The close handed directly: the attempt's own complete claim, and the broken row beside it.
+  const direct = (broken: ClaimedRefusal, steps = m as ManagedSteps, project = PROJECT, at = attempt) => {
+    const own = steps.claim(at);
+    return closeAttempt(store, { ...address(project), attempt: at, outcome: { ...own, refusals: [...own.refusals, broken] } });
+  };
+  for (const [broken, at] of [
+    [{ ...linked, row: "om-refusal:invented" }, "registry"],
+    [{ ...elsewhere }, "series"],
+    [{ ...linked, name: "work_not_atomic" }, "series"],
+    [{ ...linked, goal: "a goal the row does not hold" }, "registry"],
+  ] as const) {
+    unlinkedRow(refusalOf(prepareManagedClaimOf(store, attempt, [broken])), at);
+    unlinkedRow(refusalOf(direct(broken)), at);
   }
   assert.equal(held(store)!.value.attempts[2]!.outcome, null);
 
-  // A project with no journal at all has no refusal a cycle could stand on, even after its attempt was paid for.
+  // A project with no journal at all has no refusal a cycle could stand on, even after its attempt was paid for: the
+  // derived claim and the close are both refused, and the open attempt is left as it was.
   const silent = managedBlock(store, { root, path }, "silent");
   opened(store, "silent");
   silent.open(1);
   await silent.pay(1, "off-form");
   assert.equal(refusalOf(readJournal(store, { project: "silent" })).code, "journal_missing");
-  unlinkedRow(refusalOf(prepareManagedClaimOf(store, 1, [fromProposal], "silent")), "silent");
+  const waiting = held(store, "silent")!;
+  unlinkedRow(refusalOf(prepareManagedClaimOf(store, 1, [linked], "silent")), "registry", "silent");
+  unlinkedRow(refusalOf(direct(linked, silent, "silent", 1)), "registry", "silent");
+  assert.deepEqual(reference(held(store, "silent")!), reference(waiting));
   assert.equal(held(store, "silent")!.value.attempts[0]!.outcome, null);
 
-  // The classification is not required before the cycle closes: G7 derives it at the close, and the link finds it then.
-  const unclassified = m.refusal("input", { code: "work_not_atomic", goal: "each work owns one artifact" });
-  assert.equal(deliveredOf(readJournal(store, { project: PROJECT })).value.classifications.some(item => item.row === unclassified.row), false);
-  m.close(attempt, m.claim(attempt, [unclassified]));
-  assert.equal(held(store)!.value.attempts[2]!.outcome!.refusals[0]!.row, unclassified.row);
-  const derived = deliveredOf(readJournal(store, { project: PROJECT })).value.classifications.find(item => item.row === unclassified.row)!;
-  assert.deepEqual([derived.class, derived.addressee], ["input", `producer:graph:${PROJECT}`]);
+  // The classification is not required before the cycle closes: the attempt's own row stands unclassified until G7
+  // derives its class at the close, and the link finds it then.
+  const [fresh] = m.claim(attempt).refusals;
+  assert.ok(fresh && !rows.includes(fresh.row));
+  assert.equal(deliveredOf(readJournal(store, { project: PROJECT })).value.classifications.some(item => item.row === fresh.row), false);
+  m.close(attempt, m.claim(attempt));
+  assert.equal(held(store)!.value.attempts[2]!.outcome!.refusals[0]!.row, fresh.row);
+  const derived = deliveredOf(readJournal(store, { project: PROJECT })).value.classifications.find(item => item.row === fresh.row)!;
+  assert.deepEqual([derived.class, derived.addressee], ["proposal", `node:${MANAGED_FIRST_TARGET}`]);
 });
 
 test("prepared changes of several series are applied by one transaction, or by none of them", async t => {
@@ -1025,30 +1039,41 @@ test("prepared changes of several series are applied by one transaction, or by n
     outcome: { reason: "result", accepting: [], cancelling: [], refusals: [] } })), "attempt_unknown", PROJECT, 2);
 });
 
-test("alternation A → B → A is no progress, and neither is re-taking a result that was lost", t => {
-  const { store } = fixture(t);
+test("alternation A → B → A is no progress, and neither is re-taking a result that was lost", async t => {
+  const { store, m } = managedFixture(t);
   opened(store);
-  const one = cycle(store, PROJECT, goal(), outcome({ achieved: [win(store, "line:A")] }));
-  assert.equal(one.value.attempts[0]!.verdict, "progress");
-  const two = cycle(store, PROJECT, goal(), outcome({ achieved: [win(store, "line:B")] }));
-  assert.equal(two.value.attempts[1]!.verdict, "progress");
-  assert.equal(two.value.withoutProgress, 0);
+  const bases = (ordinal: number): string[] => held(store)!.value.attempts[ordinal - 1]!.outcome!.achieved.map(item => item.basis.id);
+  const one = await m.cycle("gap:cart:price", "supported");
+  assert.equal(one.verdict, "progress");
+  const [a] = m.achieved(1);
+  const two = await m.cycle("gap:cart:price", "supported");
+  assert.equal(two.verdict, "progress");
+  assert.equal(two.withoutProgress, 0);
+  const [b] = m.achieved(2);
+  assert.notEqual(a, b);
 
-  // Back to A. The record is new, the reference is new, the key is not: the history of this goal already holds it.
-  const three = cycle(store, PROJECT, goal(), outcome({ achieved: [win(store, "line:A")] }));
-  assert.equal(three.value.attempts[2]!.verdict, "none");
-  assert.equal(three.value.withoutProgress, 1);
+  // The owner revises the notes both answers cite: neither applies any more, and their questions are open again.
+  m.revise();
+  // Back to A (and B). The answers are new records under new references; their keys are not: the history of this
+  // goal already holds them.
+  const three = await m.cycle("gap:cart:price", "supported");
+  assert.deepEqual([...m.achieved(3)].sort(), [a!, b!].sort());
+  assert.ok(bases(3).every(id => !bases(1).includes(id) && !bases(2).includes(id)));
+  assert.equal(three.verdict, "none");
+  assert.equal(three.withoutProgress, 1);
 
-  // A candidate changed and an answer delivered are not results: a cycle that accepted nothing moved nothing.
-  const four = cycle(store, PROJECT, goal(), fruitless());
-  assert.equal(four.value.attempts[3]!.verdict, "none");
-  assert.equal(four.value.withoutProgress, 2);
+  // A candidate delivered and not accepted is no result: a cycle that accepted nothing moved nothing.
+  const four = await m.cycle("gap:cart:price", FRUITLESS);
+  assert.equal(four.verdict, "none");
+  assert.equal(four.withoutProgress, 2);
 
   // The same key accepted for ANOTHER goal is that goal's first result: the history is kept per goal.
-  const other = cycle(store, PROJECT, goal({ key: "gap:cart:tax" }), outcome({ achieved: [win(store, "line:A")] }));
-  assert.equal(other.value.attempts[4]!.verdict, "progress");
-  assert.equal(other.value.withoutProgress, 0);
-  assert.deepEqual(verdicts(other.value), ["progress", "progress", "none", "none", "progress"]);
+  m.revise();
+  const other = await m.cycle("gap:cart:tax", "supported");
+  assert.ok(m.achieved(5).includes(a!));
+  assert.equal(other.verdict, "progress");
+  assert.equal(other.withoutProgress, 0);
+  assert.deepEqual(verdicts(held(store)!.value), ["progress", "progress", "none", "none", "progress"]);
 });
 
 test("a fix that cancelled another result is a conflict, not a success, and the lost result stays in the history", t => {
@@ -1082,43 +1107,46 @@ test("a fix that cancelled another result is a conflict, not a success, and the 
   assert.equal(held(store)!.value.attempts[4]!.outcome, null);
 });
 
-test("a package of questions is one cycle: the count of the series is not multiplied by the questions", t => {
-  const { store } = fixture(t);
+test("a package of questions is one cycle: the count of the series is not multiplied by the questions", async t => {
+  // Every plan of this block addresses three questions to it, and one attempt asks the whole package.
+  const { store, m } = managedFixture(t, PROJECT, { facts: 3 });
   opened(store);
-  const package_ = goal({
-    key: "gap:cart:addressing",
-    questions: ["address question one", "address question two", "address question three"],
-    result: "a checked answer for each of the three",
-  });
+  assert.equal(m.goal().questions.length, 3);
 
   // Three questions answered and accepted in ONE cycle: one attempt, one clearing of the count.
-  const won = cycle(store, PROJECT, package_, outcome({ achieved: [win(store, "q:1"), win(store, "q:2"), win(store, "q:3")] }));
-  assert.equal(won.value.attempts.length, 1);
-  assert.equal(won.value.attempts[0]!.verdict, "progress");
-  assert.equal(won.value.withoutProgress, 0);
+  const won = await m.cycle("gap:cart:addressing", "supported");
+  assert.equal(held(store)!.value.attempts.length, 1);
+  assert.equal(m.achieved(1).length, 3);
+  assert.equal(won.verdict, "progress");
+  assert.equal(won.withoutProgress, 0);
 
   // Three questions and nothing accepted: one attempt without progress, so the count is one, not three.
-  const lost = cycle(store, PROJECT, package_, refusedBy(store, PROJECT));
-  assert.equal(lost.value.attempts.length, 2);
-  assert.equal(lost.value.withoutProgress, 1);
-  const again = cycle(store, PROJECT, package_, refusedBy(store, PROJECT, { code: "work_not_atomic" }));
-  assert.equal(again.value.withoutProgress, 2);
-  assert.equal(again.value.stop, null);
+  const lost = await m.cycle("gap:cart:addressing", FRUITLESS);
+  assert.equal(held(store)!.value.attempts.length, 2);
+  assert.equal(held(store)!.value.attempts[1]!.outcome!.refusals.length, 3);
+  assert.equal(lost.withoutProgress, 1);
+  const again = await m.cycle("gap:cart:addressing", FRUITLESS);
+  assert.equal(again.withoutProgress, 2);
+  assert.equal(again.stop, null);
   // A package is one cycle on the way to a stop as well: the third attempt is the third, not the ninth.
-  const stopped = cycle(store, PROJECT, package_, refusedBy(store, PROJECT));
-  assert.equal(stopped.value.withoutProgress, 3);
-  assert.deepEqual(stopped.value.stop!.attempts, [2, 3, 4]);
+  const stopped = await m.cycle("gap:cart:addressing", FRUITLESS);
+  assert.equal(stopped.withoutProgress, 3);
+  assert.deepEqual(stopped.stop!.attempts, [2, 3, 4]);
 });
 
-test("the same outcome delivered again is a repeat, not a new attempt, and it is counted once", t => {
-  const { store } = fixture(t);
+test("the same outcome delivered again is a repeat, not a new attempt, and it is counted once", async t => {
+  const { store, m } = managedFixture(t);
   opened(store);
-  const refusal = refusedBy(store, PROJECT);
-  deliveredOf(beginAttempt(store, { ...address(PROJECT), attempt: 1, goal: goal() }));
-  const first = deliveredOf(completeAttempt(store, { ...address(PROJECT), attempt: 1, outcome: refusal }));
+  m.open(1);
+  await m.pay(1, FRUITLESS);
+  const claim = m.claim(1);
+  assert.equal(claim.refusals.length, 1);
+  m.close(1, claim);
+  const first = held(store)!;
   assert.equal(first.value.withoutProgress, 1);
 
-  const again = deliveredOf(completeAttempt(store, { ...address(PROJECT), attempt: 1, outcome: refusal }));
+  m.close(1, claim);
+  const again = held(store)!;
   assert.equal(again.revision, first.revision);
   assert.deepEqual(again.value, first.value);
   assert.equal(again.value.attempts.length, 1);
@@ -1126,100 +1154,118 @@ test("the same outcome delivered again is a repeat, not a new attempt, and it is
   assert.equal(store.history(seriesId(PROJECT, BLOCK, 1)).length, first.revision);
 
   // A different outcome for a cycle already closed does not replace the one it ended with (T5).
-  addressed(refusalOf(completeAttempt(store, {
-    ...address(PROJECT), attempt: 1, outcome: outcome({ achieved: [win(store, "line:A")] }),
-  })), "outcome_conflict");
+  const other = refusalOf(closeAttempt(store, { ...address(PROJECT), attempt: 1, outcome: { ...claim, refusals: [] } }));
+  assert.equal(other.code, "outcome_conflict");
   assert.equal(held(store)!.value.withoutProgress, 1);
+  assert.equal(held(store)!.revision, first.revision);
 
-  // Naming the next ordinal begins a NEW cycle; naming the running one again is that cycle.
-  const running = deliveredOf(beginAttempt(store, { ...address(PROJECT), attempt: 2, goal: goal() }));
+  // Naming the next ordinal opens a NEW cycle; naming the running one again is that cycle.
+  const running = m.open(2);
   assert.equal(running.value.attempts.length, 2);
-  const repeat = deliveredOf(beginAttempt(store, { ...address(PROJECT), attempt: 2, goal: goal() }));
+  const repeat = deliveredOf(openAttempt(store, m.opening(2)));
   assert.equal(repeat.revision, running.revision);
   assert.equal(repeat.value.attempts.length, 2);
 });
 
-test("an interrupted attempt keeps its own outcome across a restart, and the count follows the results it left", t => {
-  const { path, store } = fixture(t);
+test("an interrupted attempt keeps its own outcome across a restart, and the count follows the results it left", async t => {
+  const { path, root, store, m } = managedFixture(t, PROJECT, { facts: 2 });
   opened(store);
-  cycle(store, PROJECT, goal(), fruitless());
-  deliveredOf(beginAttempt(store, { ...address(PROJECT), attempt: 2, goal: goal({ questions: ["one", "two"] }) }));
-  const basis = win(store, "q:one");
+  await m.cycle("gap:cart:price", FRUITLESS);
+  m.open(2);
+  // One question is accepted before the assessor of the other fails: the paid work of the attempt is all saved.
+  await m.pay(2, ["supported", "interrupted"]);
   store.close();
 
   // The process restarts. The cycle that was open is still open, and it is THE SAME attempt that is closed.
   const back = new Store(path);
   t.after(() => back.close());
+  const r = m.on(back);
   const found = deliveredOf(readSeries(back, address(PROJECT)));
   assert.equal(found.value.attempts.length, 2);
   assert.equal(found.value.attempts[1]!.outcome, null);
   assert.equal(found.value.withoutProgress, 1);
   // Naming that attempt again after the restart re-reaches it instead of opening a second one.
-  const same = deliveredOf(beginAttempt(back, { ...address(PROJECT), attempt: 2, goal: goal({ questions: ["one", "two"] }) }));
+  const same = deliveredOf(openAttempt(back, r.opening(2)));
   assert.equal(same.value.attempts.length, 2);
   assert.equal(same.revision, found.revision);
 
-  // "Interrupted" is why the cycle ended, not a verdict about progress: one question was accepted before the failure.
-  const closed = deliveredOf(completeAttempt(back, {
-    ...address(PROJECT), attempt: 2, outcome: outcome({ reason: "interrupted", achieved: [basis] }),
-  }));
-  assert.equal(closed.value.attempts[1]!.verdict, "progress");
-  assert.equal(closed.value.withoutProgress, 0);
-  // A re-delivered notification of the same interrupted outcome opens no new attempt.
-  const echo = deliveredOf(completeAttempt(back, {
-    ...address(PROJECT), attempt: 2, outcome: outcome({ reason: "interrupted", achieved: [basis] }),
-  }));
-  assert.equal(echo.revision, closed.revision);
-  assert.equal(echo.value.attempts.length, 2);
+  // The interruption is not a verdict about progress: the question accepted before it is a result, and G7 closes the
+  // attempt with it — a confirmed result is the reason it ended with.
+  const claim = r.claim(2);
+  assert.equal(claim.reason, "result");
+  const closed = r.close(2, claim);
+  assert.equal(closed.verdict, "progress");
+  assert.equal(closed.withoutProgress, 0);
+  assert.equal(held(back)!.value.attempts[1]!.outcome!.achieved.length, 1);
+  // A re-delivered notification of the same close opens no new attempt.
+  const before = held(back)!;
+  r.close(2, claim);
+  assert.equal(held(back)!.revision, before.revision);
+  assert.equal(held(back)!.value.attempts.length, 2);
 
   // The other variant: an interruption that left no accepted result is a completed attempt without progress.
+  const barren = managedBlock(back, { root, path }, "barren");
   opened(back, "barren");
-  deliveredOf(beginAttempt(back, { ...address("barren"), attempt: 1, goal: goal() }));
-  const barren = deliveredOf(completeAttempt(back, { ...address("barren"), attempt: 1, outcome: outcome({ reason: "interrupted" }) }));
-  assert.equal(barren.value.attempts[0]!.verdict, "none");
-  assert.equal(barren.value.withoutProgress, 1);
+  barren.open(1);
+  await barren.pay(1, "interrupted");
+  assert.equal(barren.claim(1).reason, "interrupted");
+  const ended = barren.close(1, barren.claim(1));
+  assert.equal(ended.verdict, "none");
+  assert.equal(ended.withoutProgress, 1);
 });
 
-test("\"awaiting owner\" neither raises the count nor clears it", t => {
-  const { store } = fixture(t);
+test("\"awaiting owner\" neither raises the count nor clears it", async t => {
+  const { store, root, path, m } = managedFixture(t);
   opened(store);
-  cycle(store, PROJECT, goal(), fruitless());
-  cycle(store, PROJECT, goal(), fruitless());
+  await m.cycle("gap:cart:price", FRUITLESS);
+  await m.cycle("gap:cart:price", FRUITLESS);
   assert.equal(held(store)!.value.withoutProgress, 2);
 
-  const waiting = cycle(store, PROJECT, goal(), outcome({ reason: "awaiting-owner" }));
-  assert.equal(waiting.value.attempts[2]!.verdict, "neutral");
-  assert.equal(waiting.value.withoutProgress, 2);
-  assert.equal(waiting.value.stop, null);
+  // The implementer asks the owner instead of answering: the attempt waits for the owner.
+  const waiting = await m.cycle("gap:cart:price", "need-owner");
+  assert.equal(held(store)!.value.attempts[2]!.outcome!.reason, "awaiting-owner");
+  assert.equal(waiting.verdict, "neutral");
+  assert.equal(waiting.withoutProgress, 2);
+  assert.equal(waiting.stop, null);
   // Waiting is a completed cycle all the same: it stands in the history and is counted once.
-  assert.equal(waiting.value.attempts.length, 3);
+  assert.equal(held(store)!.value.attempts.length, 3);
 
   // It neither clears the count: the next attempt without progress is the third, and it stops the series.
-  const stopped = cycle(store, PROJECT, goal(), fruitless());
-  assert.equal(stopped.value.withoutProgress, 3);
-  assert.deepEqual(stopped.value.stop!.attempts, [1, 2, 4]);
+  const stopped = await m.cycle("gap:cart:price", FRUITLESS);
+  assert.equal(stopped.withoutProgress, 3);
+  assert.deepEqual(stopped.stop!.attempts, [1, 2, 4]);
 
-  // A cycle that only waits claims no achievement and cancels nothing: it reached no result to claim or lose.
+  // A cycle that only waits claims no achievement and cancels nothing: the call that asked the owner accepted no
+  // result to claim, and no provider confirms a loss.
+  const waits = managedBlock(store, { root, path }, "waits");
   opened(store, "waits");
-  deliveredOf(beginAttempt(store, { ...address("waits"), attempt: 1, goal: goal() }));
-  for (const over of [{ achieved: [win(store, "line:A")] }, { cancelled: ["line:A"] }]) {
-    addressed(refusalOf(completeAttempt(store, {
-      ...address("waits"), attempt: 1, outcome: outcome({ reason: "awaiting-owner", ...over }),
-    })), "outcome_invalid", "waits");
-  }
-  // An answer that came off-form ends the attempt without a result for the same reason, and is still counted.
-  const off = deliveredOf(completeAttempt(store, { ...address("waits"), attempt: 1, outcome: outcome({ reason: "off-form" }) }));
-  assert.equal(off.value.attempts[0]!.verdict, "none");
-  assert.equal(off.value.withoutProgress, 1);
+  waits.open(1);
+  await waits.pay(1, "need-owner");
+  const asked = reference(store.list("model-call").find(record => record.id.startsWith("model-call:waits:"))!);
+  const claim = waits.claim(1);
+  assert.equal(claim.reason, "awaiting-owner");
+  // Its registry names no E4 that filled an input field, so naming the call as a result is refused by G7 itself.
+  const claimed = refusalOf(closeAttempt(store, { ...address("waits"), attempt: 1, outcome: { ...claim, accepting: [asked] } }));
+  assert.deepEqual([claimed.code, claimed.at.field], ["completion_invalid", "accepting"]);
+  const lost = refusalOf(closeAttempt(store, { ...address("waits"), attempt: 1, outcome: { ...claim, cancelling: [asked] } }));
+  assert.deepEqual([lost.code, lost.at.field], ["cancellation_unconfirmed", "outcome.cancelling.0.kind"]);
+  assert.equal(held(store, "waits")!.value.attempts[0]!.outcome, null);
+  assert.equal(waits.close(1, claim).verdict, "neutral");
+  // An answer that came off-form ends the attempt without a result, and is still counted.
+  const off = await waits.cycle("gap:cart:price", "off-form");
+  assert.equal(held(store, "waits")!.value.attempts[1]!.outcome!.reason, "off-form");
+  assert.equal(off.verdict, "none");
+  assert.equal(off.withoutProgress, 1);
 });
 
-test("the third attempt without progress saves a stop a restart does not lift, and only a recorded ground continues", t => {
-  const { path, store } = fixture(t);
+test("the third attempt without progress saves a stop a restart does not lift, and only a recorded ground continues", async t => {
+  const { path, store, m } = managedFixture(t);
   opened(store);
-  cycle(store, PROJECT, goal(), refusedBy(store, PROJECT));
-  cycle(store, PROJECT, goal(), refusedBy(store, PROJECT, { code: "work_not_atomic" }));
+  await m.cycle("gap:cart:price", FRUITLESS);
+  await m.cycle("gap:cart:price", FRUITLESS);
   assert.equal(held(store)!.value.stop, null);
-  const stopped = cycle(store, PROJECT, goal({ key: "gap:cart:tax" }), refusedBy(store, PROJECT));
+  await m.cycle("gap:cart:tax", FRUITLESS);
+  const stopped = held(store)!;
 
   const stop = stopped.value.stop!;
   assert.equal(stopped.value.withoutProgress, 3);
@@ -1229,16 +1275,17 @@ test("the third attempt without progress saves a stop a restart does not lift, a
   assert.deepEqual(stop.goals, ["gap:cart:price", "gap:cart:tax"]);
   assert.ok(stop.reason.includes("3 consecutive attempts"));
   assert.ok(stop.resume.includes("attempt 4"));
-  addressed(refusalOf(beginAttempt(store, { ...address(PROJECT), attempt: 4, goal: goal() })), "series_stopped");
+  addressed(refusalOf(openAttempt(store, m.opening(4))), "series_stopped");
   store.close();
 
   // A restart does not lift it: the stop is in the record, not in a process.
   const back = new Store(path);
   t.after(() => back.close());
+  const r = m.on(back);
   const read = deliveredOf(readSeries(back, address(PROJECT)));
   assert.deepEqual(read.value.stop, stop);
   assert.equal(read.value.withoutProgress, 3);
-  addressed(refusalOf(beginAttempt(back, { ...address(PROJECT), attempt: 4, goal: goal() })), "series_stopped");
+  addressed(refusalOf(openAttempt(back, r.opening(4))), "series_stopped");
 
   // Only a ground of the rung the ladder stands at continues the work, and it is kept where the owner can read it.
   const ground = byReview(back, PROJECT, 3, stop.goals);
@@ -1254,19 +1301,20 @@ test("the third attempt without progress saves a stop a restart does not lift, a
   assert.deepEqual(resumed.value.ladder.grounds, ["owner-decision"]);
 
   // Two more attempts that move nothing do not stop it; the third of the new window does.
-  for (let round = 0; round < 2; round += 1) assert.equal(cycle(back, PROJECT, goal(), fruitless(), 1).value.stop, null);
-  const sixth = cycle(back, PROJECT, goal(), fruitless(), 1);
-  assert.equal(sixth.value.withoutProgress, 3);
-  assert.equal(sixth.value.stop!.attempt, 6);
-  assert.deepEqual(sixth.value.stop!.attempts, [4, 5, 6]);
-  assert.ok(sixth.value.stop!.resume.includes("owner"));
+  for (let round = 0; round < 2; round += 1) assert.equal((await r.cycle("gap:cart:price", FRUITLESS)).stop, null);
+  const sixth = await r.cycle("gap:cart:price", FRUITLESS);
+  assert.equal(sixth.withoutProgress, 3);
+  assert.equal(sixth.stop!.attempt, 6);
+  assert.deepEqual(sixth.stop!.attempts, [4, 5, 6]);
+  assert.ok(sixth.stop!.resume.includes("owner"));
   // And progress clears the count, the road to the next stop and the ladder.
   deliveredOf(resumeSeries(back, { ...address(PROJECT), stop: 6, ...byOwner(back, PROJECT, 6) }));
-  const won = cycle(back, PROJECT, goal(), outcome({ achieved: [win(back, "line:A")] }), 1);
-  assert.equal(won.value.withoutProgress, 0);
-  assert.equal(won.value.stop, null);
-  assert.deepEqual(won.value.ladder, { rung: 1, goals: [], windows: [], grounds: [...CONTINUATION_GROUNDS] });
-  assert.deepEqual(won.value.continuations.map(item => item.after), [3, 6]);
+  const won = await r.cycle("gap:cart:price", "supported");
+  const after = held(back)!.value;
+  assert.equal(won.withoutProgress, 0);
+  assert.equal(won.stop, null);
+  assert.deepEqual(after.ladder, { rung: 1, goals: [], windows: [], grounds: [...CONTINUATION_GROUNDS] });
+  assert.deepEqual(after.continuations.map(item => item.after), [3, 6]);
 });
 
 test("the identity of a goal survives a change of revisions, of ids and of the series around it", t => {
