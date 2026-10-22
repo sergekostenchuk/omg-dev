@@ -168,12 +168,20 @@ export function buildDiscoveryIndexAt(store: Store, project: string, plan: Ref, 
     store.eventIndexWrite(scope, from, through, rows);
     saved = store.eventIndexRead(key, cursor.sequence, false)!;
   }
+  if ((saved?.cursor ?? 0) >= cursor.sequence) saved = store.eventIndexRead(key, cursor.sequence);
+  return projectIndexRows(store, scope, cursor, saved, view, provenPlan);
+}
+
+type SavedIndex = ReturnType<Store['eventIndexRead']>;
+/** The builder and the read-only consumer share the exact same projection/proof semantics. */
+function projectIndexRows(store: Store, scope: DiscoveryIndexScope, cursor: DiscoveryIndexCursor,
+  saved: SavedIndex, view: Store, provenPlan: PlanBasis): DiscoveryIndex {
+  const {project, plan} = scope;
   const result: DiscoveryIndex = {scope, cursor: structuredClone(cursor), indexedThrough: Math.min(saved?.cursor ?? 0, cursor.sequence),
     rangeComplete: (saved?.cursor ?? 0) >= cursor.sequence, questions: [], claims: [], progress: [],
     coverage: {complete: false, reason: 'deep-coverage-unavailable', cells: []}, sources: [], provenance: []};
   // A partial scan never masquerades as an empty complete projection.
   if (!result.rangeComplete) return result;
-  saved = store.eventIndexRead(key, cursor.sequence);
   result.questions = provenPlan.questions;
   for (const stored of saved?.rows ?? []) {
     const source = JSON.parse(stored.body) as DiscoveryIndexSource;
@@ -209,5 +217,59 @@ export function buildDiscoveryIndexAt(store: Store, project: string, plan: Ref, 
       result.coverage.cells.push({verification: 'structural', source: reference(row), cell});
     }
   }
+  return result;
+}
+
+
+/** A caller declares its exact indexed grounds explicitly, including an explicit empty set.
+ * `indexed` proves only the requested event range and these grounds. It proves no acceptance,
+ * traversal end or absence of blockers; structural/deep coverage retains its own incompleteness. */
+export interface DiscoveryIndexRead {
+  contract: 'discovery-index-read/v1';
+  scope: DiscoveryIndexScope;
+  cursor: DiscoveryIndexCursor;
+  basis: Ref[];
+  indexedThrough: number;
+  status: 'indexed' | 'incomplete';
+  reason: 'index_absent' | 'index_behind' | 'basis_missing' | null;
+  missingBasis: Ref[];
+  projection: DiscoveryIndex | null;
+}
+export function readDiscoveryIndexAt(store: Store, project: string, plan: Ref, cursor: DiscoveryIndexCursor,
+  request: {basis: Ref[]}): DiscoveryIndexRead {
+  cursorHolds(store, cursor);
+  if (typeof project !== 'string' || !project.trim() || !isRef(plan)) invalid('scope', 'Expected project and exact plan');
+  if (!object(request) || !Array.isArray(request.basis)) invalid('basis', 'An explicit exact basis array is required');
+  const basis: Ref[] = [], seen = new Set<string>();
+  for (const at of request.basis) {
+    if (!isRef(at)) invalid('basis', 'Every requested ground must be an exact Ref');
+    const key = canonical(at);
+    if (seen.has(key)) invalid('basis', 'A requested ground may occur only once');
+    seen.add(key); basis.push(structuredClone(at));
+  }
+  const scope: DiscoveryIndexScope = {contract: 'discovery-index/v1', databaseId: store.databaseId, project, plan};
+  const view = historicalView(store, cursor.sequence), provenPlan = planAt(view, project, plan);
+  for (const at of basis) {
+    const row = exact<Json>(view, at);
+    if (!selected(row, scope, provenPlan)) invalid('basis', 'The requested source is outside this exact project/plan projection');
+  }
+  // This is a read, never a disguised builder. No journal range, global list, catch-up write,
+  // current plan selection or R.3 traversal is used to substitute the requested historical basis.
+  const saved = store.eventIndexRead(digest(canonical(scope)), cursor.sequence);
+  if (saved && (saved.scope !== canonical(scope) || !Number.isSafeInteger(saved.cursor) || saved.cursor < 0
+    || saved.cursor !== 0 && store.eventAt(saved.cursor) === null))
+    invalid('scope', 'The saved scope/cursor does not name this committed projection');
+  const result: DiscoveryIndexRead = {contract: 'discovery-index-read/v1', scope, cursor: structuredClone(cursor), basis,
+    indexedThrough: Math.min(saved?.cursor ?? 0, cursor.sequence), status: 'incomplete',
+    reason: saved === null ? 'index_absent' : 'index_behind', missingBasis: [], projection: null};
+  if (saved === null || saved.cursor < cursor.sequence) return result;
+  const projection = projectIndexRows(store, scope, cursor, saved, view, provenPlan);
+  const indexed = new Set(projection.sources.map(source => canonical(reference(source.record))));
+  // An empty/mutilated derived table with an advanced cursor cannot stand for an empty complete result:
+  // the exact acceptance grounds of the plan are required even when the caller explicitly asks for [].
+  const required = new Set([...provenPlan.records, ...basis.map(at => canonical(at))]);
+  result.missingBasis = [...required].filter(key => !indexed.has(key)).map(key => JSON.parse(key) as Ref);
+  if (result.missingBasis.length) { result.reason = 'basis_missing'; return result; }
+  result.status = 'indexed'; result.reason = null; result.projection = projection;
   return result;
 }

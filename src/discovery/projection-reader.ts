@@ -48,6 +48,11 @@ import type { ResearchAnswer, ResearchAssessment, ResearchRun } from "./research
 import { discoveryOutcome, discoveryTraversal, type DiscoveryConditionDecision, type DiscoveryOutcome,
   type V7Traversal } from "./discovery-outcome.js";
 
+// DRS2.2: the exact committed index read is exposed through the common consumer boundary.
+// R.3 traversal semantics and outcomeSummary remain with their accepted producers.
+export { readDiscoveryIndexAt, type DiscoveryIndexRead, type DiscoveryIndexCursor,
+  type DiscoveryIndexScope, type DiscoveryIndex } from "./discovery-index.js";
+
 // Потребителям вне модуля внутренние читатели доступны только через эту границу.
 export {
   type Decision, type DiscoveryDraft, type Fact, type FieldSpec, type Question,
