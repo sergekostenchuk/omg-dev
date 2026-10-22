@@ -1,11 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { Discovery, type DiscoveryDraft, type Question } from "../src/discovery/discovery.js";
-import { createPartialV7Draft, V7_AXES, V7_STAGE_TOKEN_CEILING,
-  DISCOVERY_CLAIMS_CONTRACT } from "../src/discovery/v7-contracts.js";
+import { type DiscoveryDraft, type Question } from "../src/discovery/discovery.js";
+import { createPartialV7Draft, DISCOVERY_CLAIMS_CONTRACT } from "../src/discovery/v7-contracts.js";
 import { type V7AttemptEnd } from "../src/discovery/v7-plan-questions.js";
 import { recordV7Attempt } from "../src/discovery/v7-attempts.js";
 import { completeResearchAttemptTurn, prepareResearchAttemptCompletion, readResearchAttemptBinding,
@@ -21,12 +17,12 @@ import type { ResearchRun } from "../src/discovery/research-model.js";
 import { EngineError } from "../src/errors.js";
 import { canonical, hashJson, type Json } from "../src/canonical.js";
 import { reference, type Ref } from "../src/pipeline/contracts.js";
-import { ProductEngine } from "../src/product/engine.js";
 import { Store, type Revision, type Write } from "../src/storage/store.js";
 import { checkStoreIntegrity } from "../src/storage/fsck.js";
 import { referenceSites } from "../src/storage/reference-sites.js";
 import { uniqueTransactionGuards } from "../src/runtime/environment.js";
 import { answerDiscoveryFixture } from "./product-fixture.js";
+import { discoveryFixture, rand, validFrame, planQuestion, validPlan, questionOf, type PlanQuestion } from "./discovery-v7-fixture.js";
 
 // DR3a3-K (codex-omg №7475): the attempt binding of a managed v7 analyst turn.
 // The ordinary call path (DR3a3-C) and the runner (DR3a3-R) are not connected
@@ -35,14 +31,7 @@ import { answerDiscoveryFixture } from "./product-fixture.js";
 // the real projectPaidTurnAdmission, and the model-call carries the plan answer
 // C will write. The door, the binding, the completion and every reader are real.
 
-function fixture(t: { after(fn: () => void): void }) {
-  const root = mkdtempSync(join(tmpdir(), "omg-dr3a3k-"));
-  const path = join(root, "state.sqlite"), stores: Store[] = [];
-  const open = () => { const db = new Store(path); stores.push(db); return db; };
-  const store = open(), engine = new ProductEngine(store), discovery = new Discovery(store);
-  t.after(() => { for (const db of stores) db.close(); rmSync(root, { recursive: true, force: true }); });
-  return { root, path, store, engine, discovery, open };
-}
+const fixture = (t: { after(fn: () => void): void }) => discoveryFixture(t, "omg-dr3a3k-");
 type Fixture = ReturnType<typeof fixture>;
 
 const code = (fn: () => unknown): string => {
@@ -62,31 +51,8 @@ const failure = (fn: () => unknown): string => {
   }
   return "no-error";
 };
-const rand = () => Math.random().toString(16).slice(2);
 const asJson = <T>(value: T): Json => value as unknown as Json;
-const allAxes = (depth: string) => Object.fromEntries(V7_AXES.map(axis => [axis, { depth }]));
 
-function validFrame(): Json {
-  return { productType: "internal", scale: "30 users across 10 sites",
-    industries: ["construction"], domains: ["materials supply", "equipment accounting"],
-    axes: allAxes("deep"),
-    budget: { ceiling: V7_STAGE_TOKEN_CEILING, axisHints: { industry: 4_000_000 }, completionReserve: 2_000_000 } };
-}
-type PlanQuestion = { id: string; axis: string; domain: string; text: string; class: string;
-  criterion: string; requiredDepth: string; roles: string[]; searchPlaces: string[] };
-function planQuestion(id: string, axis: string, cls = "supporting"): PlanQuestion {
-  return { id, axis, domain: "construction", text: `What covers ${id}?`,
-    class: cls, criterion: `Named basis answering ${id}`, requiredDepth: "deep",
-    roles: ["domain expert"], searchPlaces: ["domain documents"] };
-}
-function validPlan(frameRef: Ref, questions: PlanQuestion[], edition = 1, previous: Ref | null = null): Json {
-  return { edition, frame: frameRef, previous, questions } as unknown as Json;
-}
-function questionOf(store: Store, draft: Revision<DiscoveryDraft>, field: string): Revision<Question> {
-  const question = draft.value.questions.map(id => store.get<Question>(id)!).find(q => q.value.spec.field === field);
-  assert.ok(question, `question for ${field}`);
-  return question;
-}
 /** The real plan acceptance chain (frame and plan through #answer). */
 function acceptPlan(f: Fixture, project: string, questions: PlanQuestion[]) {
   const base = createPartialV7Draft(f.discovery, project, "concept");

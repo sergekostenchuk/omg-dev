@@ -1,10 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { Discovery, type DiscoveryDraft, type Question } from "../src/discovery/discovery.js";
-import { createPartialV7Draft, V7_AXES, V7_STAGE_TOKEN_CEILING } from "../src/discovery/v7-contracts.js";
+import { type DiscoveryDraft, type Question } from "../src/discovery/discovery.js";
+import { createPartialV7Draft, V7_STAGE_TOKEN_CEILING } from "../src/discovery/v7-contracts.js";
 import { proveSynthesisSessionSubject } from "../src/discovery/synthesis-session.js";
 import { projectSynthesisSessionV3Initial, synthesisSessionV3Address, synthesisSessionSubject, synthesisStepSubject,
   parseSynthesisSessionV3, projectCheckpointValue, projectCheckpointValueV2, proveCheckpointRecord,
@@ -22,9 +19,9 @@ import { referenceSites } from "../src/storage/reference-sites.js";
 import { EngineError } from "../src/errors.js";
 import { canonical, hashJson, type Json } from "../src/canonical.js";
 import { reference, type Ref } from "../src/pipeline/contracts.js";
-import { ProductEngine } from "../src/product/engine.js";
 import { Store, type Revision } from "../src/storage/store.js";
 import { answerDiscoveryFixture } from "./product-fixture.js";
+import { discoveryFixture, rand, allAxes, questionOf } from "./discovery-v7-fixture.js";
 
 // DR3a3-S1 (codex-omg №7690 решения 2, 3, 5, 8; §3 S1): the subject forms of
 // v7 planner/synthesis — the v3 session, the v2 partial note, the v2 saved-only
@@ -34,14 +31,7 @@ import { answerDiscoveryFixture } from "./product-fixture.js";
 // execution. Every first record comes from the producer's own projector; the
 // plan acceptance chain and the step-intent producer are the real ones.
 
-function fixture(t: { after(fn: () => void): void }) {
-  const root = mkdtempSync(join(tmpdir(), "omg-dr3a3s1-"));
-  const path = join(root, "state.sqlite"), stores: Store[] = [];
-  const open = () => { const db = new Store(path); stores.push(db); return db; };
-  const store = open(), engine = new ProductEngine(store), discovery = new Discovery(store);
-  t.after(() => { for (const db of stores) db.close(); rmSync(root, { recursive: true, force: true }); });
-  return { root, store, engine, discovery, open };
-}
+const fixture = (t: { after(fn: () => void): void }) => discoveryFixture(t, "omg-dr3a3s1-");
 type Fixture = ReturnType<typeof fixture>;
 
 const failure = (fn: () => unknown): string => {
@@ -51,8 +41,6 @@ const failure = (fn: () => unknown): string => {
   }
   return "no-error";
 };
-const rand = () => Math.random().toString(16).slice(2);
-const allAxes = (depth: string) => Object.fromEntries(V7_AXES.map(axis => [axis, { depth }]));
 const validFrame = (): Json => ({ productType: "internal", scale: "30 users across 10 sites",
   industries: ["construction"], domains: ["materials supply", "equipment accounting"], axes: allAxes("deep"),
   budget: { ceiling: V7_STAGE_TOKEN_CEILING, axisHints: { industry: 4_000_000 }, completionReserve: 2_000_000 } });
@@ -61,11 +49,6 @@ const planQuestion = (id: string, axis: string, cls = "supporting") => ({ id, ax
   roles: ["domain expert"], searchPlaces: ["domain documents"] });
 const validPlan = (frame: Ref, ids: string[], edition = 1, previous: Ref | null = null): Json =>
   ({ edition, frame, previous, questions: ids.map((id, i) => planQuestion(id, i ? "market" : "industry", i ? "supporting" : "blocking")) }) as unknown as Json;
-function questionOf(store: Store, draft: Revision<DiscoveryDraft>, field: string): Revision<Question> {
-  const question = draft.value.questions.map(id => store.get<Question>(id)!).find(q => q.value.spec.field === field);
-  assert.ok(question, `question for ${field}`);
-  return question;
-}
 const subjectOf = (planAnswer: Ref, planQuestionId: string): V7PlanSubject =>
   ({ contract: V7_PLAN_SUBJECT_CONTRACT, planAnswer, planQuestionId });
 
