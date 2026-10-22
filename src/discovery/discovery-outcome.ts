@@ -484,6 +484,8 @@ export interface V7Traversal {
   /** Diagnostic only: the saved budget pause of the run, as it was written. It is never a ground of an end, of a
    * limit or of a permission to pay. */
   pause: V7TraversalBudgetPause | null;
+  /** The exact references this read stood on, historical revisions of a P-state chain among them (one id may occur
+   * at several revisions). They are grounds of the reading, not head guards for a write: a writer selects its own. */
   guards: Ref[];
 }
 
