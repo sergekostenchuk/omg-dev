@@ -22,7 +22,7 @@ import { questionDispatchId } from "../src/discovery/v7-managed-attempt.js";
 import type { Write } from "../src/storage/store.js";
 import { Researcher } from "../src/discovery/research-runner.js";
 import { prepareResearchConsumerIntent, prepareResearchConsumerApplication, readResearchConsumerExecution,
-  recoverResearchResponse, subjectContextRecordHolds, contextRecordValue,
+  readResearchConsumerIntent, recoverResearchResponse, subjectContextRecordHolds, contextRecordValue,
   prepareResearchConsumerReservation } from "../src/discovery/response-recovery.js";
 import { REQUEST_MANIFEST_CONTRACT, prepareRequestPartsAndManifest } from "../src/discovery/request-parts.js";
 import { workingContext } from "../src/discovery/working-context.js";
@@ -36,7 +36,7 @@ import { uniqueTransactionGuards } from "../src/runtime/environment.js";
 import type { ModelCall } from "../src/runtime/model-usage.js";
 import { EngineError } from "../src/errors.js";
 import type { Json } from "../src/canonical.js";
-import { reference, type Ref } from "../src/pipeline/contracts.js";
+import { isRef, reference, type Ref } from "../src/pipeline/contracts.js";
 import { ProductEngine } from "../src/product/engine.js";
 import { Store, type Revision } from "../src/storage/store.js";
 import { answerDiscoveryFixture } from "./product-fixture.js";
@@ -185,7 +185,7 @@ test("S5 subject isolation: A and B keep separate sessions and unfinished lookup
 /** One v7 project whose adapter answers from a queue of replies, with both the
  * analyst and the reading-planner purposes calibrated by real calls (a4). */
 async function paidPlanned(t: { after(fn: () => void): void }, project: string, ids = ["q-supply", "q-market"],
-  options: { calibrationTokens?: number; conclusionShare?: number } = {}) {
+  options: { calibrationTokens?: number; conclusionShare?: number; planning?: boolean } = {}) {
   const f = fixture(t);
   const wire = join(f.root, "wire.ndjson"), replies = join(f.root, "replies.json"), adapter = join(f.root, "adapter.mjs");
   const tokensFile = join(f.root, "tokens.json");
@@ -216,6 +216,7 @@ console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,u
   f.engine.execute({ type: "configure-reader-pilot", project, expected: 0, settings: { experimental: true, active: true,
     stopAfter: "L2", reader: { actor: "reader", model: "fixture", effort: "high", speed: "inherited", command }, agentCommand: command,
     maxRequestChars: 200000, maxReadChars: 20000, maxReplyChars: 200000, maxCalls: 50, maxReportedTokens: 100000000,
+    ...(options.planning ? { v7Planning: { contract: "v7-plan-planning/v1", maxRequestChars: 200000, maxRounds: 5 } } : {}),
     ...(options.conclusionShare ? { conclusionShare: options.conclusionShare } : {}) } });
   // Real calibration calls of both purposes on a field-path draft (no plan subject, no stage budget).
   const calibration = f.discovery.create(project, "discovery", "R0", "concept",
@@ -703,7 +704,7 @@ test("S5-03 writer ≡ reader on the inherited runner prefix: A's session inheri
   assert.deepEqual(readSynthesisSessionV3(f.open(), reference(head)), head, "the chain reader proves the same prefix and reservation");
 });
 
-test("S5-03 runner-prefix packet contract: a delivered packet without its research-delivery/v1 contract — missing or foreign — is refused before any record or call; a packet-free paid turn and a lawful real packet inherit", async t => {
+test("S5-03 runner-prefix packet contract: a delivered packet without its research-delivery/v1 contract — missing or foreign — is refused before any record or call; a packet-null turn, an empty delivered set and a lawful real packet inherit", async t => {
   // The positive prefix is the real runner path itself — the same Researcher
   // preparation as the first S5-03 test: the adapter answers every call, the
   // paid machinery writes every intent/claim/dispatch/response/manifest/turn
@@ -715,10 +716,16 @@ test("S5-03 runner-prefix packet contract: a delivered packet without its resear
   };
   const wires = (f: Paid) => readFileSync(join(f.root, "wire.ndjson"), "utf8")
     .trim().split("\n").filter(Boolean).map(line => JSON.parse(line) as Record<string, any>);
-  // The packet gate mirrors runnerWorkspaceAt exactly: any saved delivered
-  // set — even an empty one — is the packet boundary it records.
+  // The packet gate mirrors runnerWorkspaceAt (synthesis-session.ts:416-447)
+  // exactly: no origin Ref or a non-analyst/planner origin means packet ===
+  // null regardless of the wire, and any saved delivered set — even an empty
+  // one — is the packet boundary it records.
   const packetFor = (f: Paid, row: Revision<any>): Record<string, any> | null => {
-    const paid = readResearchConsumerExecution(f.store, f.p.project, row.value.consumerIntent);
+    const origin = (row.value as { consumerIntent?: unknown }).consumerIntent;
+    if (!isRef(origin)) return null;
+    const intent = readResearchConsumerIntent(f.store, origin);
+    if (!["analyst", "reading-planner"].includes(intent.value.kind)) return null;
+    const paid = readResearchConsumerExecution(f.store, f.p.project, origin);
     return paid.kind === "response" && Array.isArray((paid.subject as any)?.contextWorkspace)
       ? paid.subject as Record<string, any> : null;
   };
@@ -737,19 +744,17 @@ test("S5-03 runner-prefix packet contract: a delivered packet without its resear
       { ...contextOf(subjectOf(f.p.planAnswer, "q-supply")), workingSelections: [] },
       "Synthesize the exact plan-question", undefined, { delivery, reserve: reserve(), initialWorkspace: own });
   };
-  // Positive: a packet-free real prefix inherits — a one-turn real run; the
-  // session's first record carries exactly the folded runner workspace.
+  // Positive: an empty delivered set is still a packet boundary — the real
+  // one-turn run's wire carries contextWorkspace: [], so runnerWorkspaceAt
+  // records the packet and folds nothing; the session inherits the prefix.
   {
-    const f = await paidPlanned(t, "s5r2-packet-free");
+    const f = await paidPlanned(t, "s5r2-packet-empty");
     const run = await realRun(f, [{ action: "read_context", record: reference(f.p.draft), pointer: "/fields/plan" }], 1);
     const own = prefix(f, run);
     assert.equal(own.entries.length, 1, "the read_context turn folds its entry");
-    assert.ok(!(own.deliveryCoverage ?? []).length, "no packet delivered any material");
-    assert.ok(!wires(f).some(w => Array.isArray(w.subject?.contextWorkspace) && w.subject.contextWorkspace.length),
-      "the adapter trace carries no delivered packet");
-    const freeResult = await code(async () => { try { await enter(f, run, own); } catch (e) {
-      console.log("DBG packet-free:", (e as EngineError).code, (e as EngineError).message); throw e; } });
-    assert.equal(freeResult, "no-error", "the packet-free prefix inherits");
+    assert.ok(!(own.deliveryCoverage ?? []).length, "the empty packet delivered nothing");
+    assert.equal(await code(() => enter(f, run, own)), "no-error",
+      "the empty-delivery prefix inherits");
     const session = sessionOf(f.store, "q-supply");
     assert.deepEqual(f.store.get<any>(session.id, 1)!.value.workspace, own);
     const head = f.store.get<any>(session.id)!;
@@ -778,12 +783,38 @@ test("S5-03 runner-prefix packet contract: a delivered packet without its resear
     const session = sessionOf(f.store, "q-supply");
     assert.deepEqual(f.store.get<any>(session.id, 1)!.value.workspace, own);
   }
-  // Negative packet only — CORRUPTION. A real paid call on the corruption
-  // fixture's run first saves a lawful packet (the same researchCall path as
-  // the positives); the corrupted turn rebuilds exactly that saved packet with
-  // working.deliveryContract absent or foreign, and only here are the
-  // dependent records — manifest, parts, claim, dispatch, response — rewritten
-  // by hand over the corrupted bytes (input hash/bytes stay consistent).
+  // Positive: counted turns whose saved wire carries no delivered packet at
+  // all — the planning-enabled real run's read_plan turn (reading-planner,
+  // its own lawful v1 packet) queues a managed child that is completed by
+  // the engine and never receives a consumerIntent, so the origin gate at
+  // synthesis-session.ts:441-446 yields packet === null for it.
+  {
+    const f = await paidPlanned(t, "s5r2-packet-null", undefined, { planning: true });
+    const run = await realRun(f, [
+      { action: "read_plan", question: "$q",
+        reads: [{ action: "read_context", record: reference(f.p.draft), pointer: "/fields/plan" }] },
+      { action: "pause", reason: "hold" }]);
+    const turns = f.store.list<any>("research-turn").filter(row => row.value.run === run.id)
+      .sort((a, b) => a.value.number - b.value.number);
+    const child = turns.find(row => isRef(row.value.plannedBy) && row.value.status === "completed"
+      && !row.value.error);
+    assert.ok(child, "the real run completed a planned child turn");
+    assert.ok(!isRef(child.value.consumerIntent), "the planned child carries no paid origin");
+    assert.equal(packetFor(f, child), null,
+      "runnerWorkspaceAt reads packet === null for the counted child turn");
+    const own = prefix(f, run);
+    assert.ok(own.entries.length >= 1, "the child read_context folds its entry");
+    assert.equal(await code(() => enter(f, run, own)), "no-error",
+      "a lawful packet-free prefix inherits — no delivery door was required");
+    const session = sessionOf(f.store, "q-supply");
+    assert.deepEqual(f.store.get<any>(session.id, 1)!.value.workspace, own);
+    const head = f.store.get<any>(session.id)!;
+    assert.deepEqual(readSynthesisSessionV3(f.open(), reference(head)), head, "a new Store reads the same session chain");
+  }
+  // Corruption-zone helpers — manual record rewriting is allowed only as
+  // negative mutation: produce() dispatches through the real paid path
+  // (adapter → researchCall), corrupt() rewrites the dependent records by
+  // hand over the corrupted bytes.
   const startRun = (f: Paid) => f.store.write<ResearchRun>({ id: `research-run:${hashJson([f.p.project, f.p.draft.id, "packet-contract"])}`,
     kind: "research-run", expected: 0,
     value: { projectId: f.p.project, draftId: f.p.draft.id, environment: reference(f.p.environment), turns: 0, limit: 100,
