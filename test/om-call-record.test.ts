@@ -687,6 +687,7 @@ test("an origin-analysis call binds to its standing hold after close and rejects
   assert.equal(f.store.get<RepairSeries>(series.id)!.value.attempts.length, 1);
   assert.equal(f.store.get<OriginHold>(hold.id)!.value.lift, null);
 
+  const negatives = fullSnapshot(f.store);
   addressed(recordCall(f.store, GARDEN, {
     ...input, call: "ordinary-after-hold", purpose: "model-research", basis: null,
   }), "call_series_unresolved");
@@ -700,20 +701,25 @@ test("an origin-analysis call binds to its standing hold after close and rejects
     ...input, call: "forged-origin-hold",
     basis: { kind: "origin-hold", hold: { ...reference(hold), hash: "f".repeat(64) } },
   }), "call_basis_unresolved");
+  assert.deepEqual(fullSnapshot(f.store), negatives);
 
   const lifted = liftByOwner(f.store, GARDEN, reference(hold));
+  const liftedStore = fullSnapshot(f.store);
   addressed(recordCall(f.store, GARDEN, { ...input, call: "old-origin-hold" }), "call_basis_unresolved");
   addressed(recordCall(f.store, GARDEN, {
     ...input, call: "lifted-origin-hold",
     basis: { kind: "origin-hold", hold: lifted },
     gaps: analysisGaps(lifted.id, reviewGoal, "origin"),
   }), "call_basis_unresolved");
+  assert.deepEqual(fullSnapshot(f.store), liftedStore);
 
+  const beforeRepeat = fullSnapshot(f.store);
   const late = deliveredOf(recordCall(f.store, GARDEN, input));
   assert.equal(late.repeated, true);
   assert.deepEqual(reference(late.call), reference(recorded.call));
   assert.equal(f.store.history(recorded.call.id).length, 1);
   assert.equal(f.store.get<CallLedger>(callLedgerId(GARDEN))!.value.calls.length, paid + 1);
+  assert.deepEqual(fullSnapshot(f.store), beforeRepeat);
 });
 
 test("every refusal introduced by E1 is produced with an address and route", t => {
@@ -998,11 +1004,13 @@ test("a dispatch or ledger head changed in the check/write window refuses the wh
   const racing = regated.f.store as RacingStore;
   racing.target = regated.hold.id;
   racing.remaining = 1;
-  racing.run = other => { liftByOwner(other, GARDEN, reference(regated.hold)); };
+  let winner: Ref[] = [];
+  racing.run = other => { liftByOwner(other, GARDEN, reference(regated.hold)); winner = fullSnapshot(other); };
   const staleHold = addressed(recordCall(racing, GARDEN, originRequest(regated.f, regated.hold, {
     call: "race-origin-analysis",
   })), "input_stale");
   assert.deepEqual(staleHold.at.ref, reference(regated.hold));
+  assert.deepEqual(fullSnapshot(racing), winner);
   assert.equal(racing.get(callRecordId(GARDEN, "race-origin-analysis")), null);
   assert.ok(racing.get<CallLedger>(callLedgerId(GARDEN))!.value.calls.every(
     row => row.call.id !== callRecordId(GARDEN, "race-origin-analysis")));
@@ -1731,18 +1739,24 @@ test("block origin analysis follows its inherited current hold and rejects a lif
   const successor = deliveredOf(openSeries(f.store, { project: GARDEN, block: hold.value.block, line: 2,
     slice: "slice:garden-consume-block@2", predecessor: reference(series),
     basis: { ground: "inputs-changed", text: "The inherited origin remains unresolved" } }));
+  const staleDispatch = fullSnapshot(f.store);
   addressed(prepareCallDispatch(f.store, GARDEN, reference(old.call)), "call_series_unresolved");
+  assert.deepEqual(fullSnapshot(f.store), staleDispatch);
   const inherited = deliveredOf(recordCall(f.store, GARDEN, { ...input, call: "block-origin-inherited", series: reference(successor) }));
   const proof = deliveredOf(prepareCallDispatch(f.store, GARDEN, reference(inherited.call)));
   assert.ok(proof.guards.some(ref => ref.id === hold.id));
   liftByOwner(f.store, GARDEN, reference(hold));
+  const liftedStore = fullSnapshot(f.store);
   addressed(prepareCallDispatch(f.store, GARDEN, reference(inherited.call)), "call_basis_unresolved");
+  assert.deepEqual(fullSnapshot(f.store), liftedStore);
   const restarted = new Store(f.database);
   try {
     assert.deepEqual(deliveredOf(readCall(restarted, GARDEN, reference(old.call))), old.call);
     assert.deepEqual(deliveredOf(readCall(restarted, GARDEN, reference(inherited.call))), inherited.call);
     assert.equal(deliveredOf(settleCall(restarted, reference(inherited.call), usage, "succeeded")).settled, true);
+    const cold = fullSnapshot(restarted);
     assert.equal(deliveredOf(recordCall(restarted, GARDEN, input)).repeated, true);
+    assert.deepEqual(fullSnapshot(restarted), cold);
   } finally { restarted.close(); }
 });
 
