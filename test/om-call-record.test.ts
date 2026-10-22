@@ -6,7 +6,7 @@ import { spawn } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { hashJson, type Json } from "../src/canonical.js";
+import { canonical, hashJson, type Json } from "../src/canonical.js";
 import { EngineError } from "../src/errors.js";
 import { isRef, reference, type Ref } from "../src/pipeline/contracts.js";
 import { Store, type Revision, type Write, type ReadGuard } from "../src/storage/store.js";
@@ -412,8 +412,10 @@ test("recordCall writes the call and the one project-ledger row before dispatch,
   assert.equal(recorded.call.value.usage, null);
   assert.equal(recorded.call.value.settledAt, null);
   assert.equal(recorded.call.value.packet.hash, hashJson(packet));
-  assert.ok(recorded.call.value.packet.chars > 0);
-  assert.ok(recorded.call.value.packet.bytes >= recorded.call.value.packet.chars);
+  // A packet with no declared text contract is sent as its canonical text: these are its exact sizes.
+  const text = canonical(packet);
+  assert.equal(recorded.call.value.packet.chars, text.length);
+  assert.equal(recorded.call.value.packet.bytes, Buffer.byteLength(text, "utf8"));
   assert.equal(hashJson(recorded.call.value), recorded.call.hash);
   assert.equal(recorded.ledger.id, callLedgerId(PROJECT));
   assert.equal(recorded.ledger.kind, CALL_LEDGER_KIND);
@@ -448,11 +450,13 @@ test("recordCall writes the call and the one project-ledger row before dispatch,
 test("a normalized late repeat after settlement and restart adds no revision or row", async t => {
   const s = await managedStop(t, "repeat");
   const base = stopRequest(s);
+  // The same three questions, one of them twice, in two different orders: [B, A, A] first, [A, B, A] at the repeat.
   const gaps = [...base.gaps, { ...base.gaps[0]! }];
   const firstRequest = stopRequest(s, {
-    gaps: [...gaps].reverse(),
+    gaps: [{ ...base.gaps[1]! }, { ...base.gaps[0]! }, { ...base.gaps[0]! }],
     goal: { ...base.goal, questions: [...base.goal.questions].reverse() },
   });
+  assert.notDeepEqual(firstRequest.gaps, gaps);
   const first = deliveredOf(recordCall(s.store, PROJECT, firstRequest));
   const settled = deliveredOf(settleCall(s.store, reference(first.call), usage, "succeeded"));
   // Later events move the series and the current dispatch on: an independent review resumes the stop, and the
