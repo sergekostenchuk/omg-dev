@@ -29,7 +29,7 @@ import { inputDecisionWrite, writeAddressing, writeApplyAnswer } from "../src/om
 import { writeGaps, type GapReadRequest, type GapRequest } from "../src/om/gaps.js";
 import { gapLineKey, gapLineExpectedResult, writeGapLines, prepareGapLines } from "../src/om/gap-lines.js";
 import { writeRoutes, type RoutedBatch, type RoutesRecord } from "../src/om/routes.js";
-import { prepareQuestionTasks, writeQuestionPacket } from "../src/om/question-packet.js";
+import { prepareQuestionTasks, writeQuestionPacket, type QuestionPacketRecord } from "../src/om/question-packet.js";
 import { runModelCall } from "../src/om/model-call.js";
 import { assessAnswer } from "../src/discovery/research-assessment.js";
 import type { Question } from "../src/discovery/discovery.js";
@@ -59,7 +59,8 @@ import {
 } from "../src/om/repeat-gate.js";
 import { readRun, regateRun, startRun, type RunStep } from "../src/om/run.js";
 import { managedBlock, MANAGED_FIRST_TARGET } from "./om-managed-block.js";
-import { defectedWork, gardenPass, project, regatedHold, runFixture, usage } from "./om-run-fixture.js";
+import { defectedWork, gardenPass, project, regatedHold, runFixture, usage,
+  advanceRun, assessor, nodeAnswer, worksFixture, OWN1_DECISION } from "./om-run-fixture.js";
 
 const UNIT = "gate-repeat";
 const PROJECT = "alpha";
@@ -639,6 +640,116 @@ test("a mixed set gives every refusal its own class and route, and none of them 
   assert.equal(own.has(readiness.row), false);
   assert.deepEqual([...new Set(result.refusals.map(item => item.code))].sort(),
     ["beyond_block", "handed_to_producer", "origin_unestablished"]);
+});
+
+test("a refusal of the proposal from a real first pass reaches the gate with its class, its addressee and its route: the producer's own G5 row names the exact candidate, base, environment and proposal", async t => {
+  // LG07 rg-rest-proposal (codex-omg2 №11790): the proposal branch of the rules' own example on real producers.
+  // A first pass of genuinely new L3 work, absent from the accepted base: its own managed M6 batch pays a real E2/E4
+  // works cycle for the consuming block, the model's proposal becomes the works candidate, and the candidate's own
+  // G5 refuses the work — a real G5 row the settle writes with the exact candidate, base, environment and proposal
+  // sources — then the attempt's own G7 close classifies it. The refused work stands in the proposal and in what was
+  // assembled, and in NO accepted base: the proposal is what is corrected, so the question goes back to the model —
+  // the same class the rows above establish, reached through the producers' own records. The accepted regatedHold is
+  // no substitute here: its base already holds the subject and yields unknown.
+  const work = "garden-consume-work", block = "garden-consume-block";
+  const f = worksFixture(t);
+  deliveredOf(startRun(f.store, { project }));
+  const answered = new Set<string>();
+  const worksAnswer = (saved: Ref, defected: boolean) => {
+    const packet = f.store.get<QuestionPacketRecord>(saved.id, saved.revision)!;
+    const routed = f.store.get<RoutesRecord>(packet.value.request.routes.id, packet.value.request.routes.revision)!.value;
+    const batch = routed.batches.find(row => row.id === packet.value.request.batch)!;
+    const payload = packet.value.packet as unknown as { expansion: { assigned: string[];
+      obligations: { id: string; kind: string; upper: { port?: string } }[] } };
+    const node = structuredClone(f.desired.nodes.find(item => item.kind === "work" && item.parent === batch.node)!);
+    // The work the model offers declares no file it may write: its own candidate's G5 refuses exactly it.
+    if (defected) node.code = node.code.map(item => ({ ...item, access: "read" as const }));
+    const tests = structuredClone(f.desired.tests.filter(item => node.tests.includes(item.id)));
+    const body = { nodes: [node], tests, fills: payload.expansion.obligations.filter(item => payload.expansion.assigned.includes(item.id))
+      .map(item => ({ obligation: item.id, node: node.id,
+        ...(item.kind === "connection-end" ? { port: item.upper.port!, codeRef: node.code[0]! } : {}) })),
+      localConnectors: [], artifacts: [], contracts: [], joins: [], edges: [], journeys: [], packets: [], transfers: [], anchors: [],
+      removes: [], replaces: [], redefines: [] };
+    f.push({ research: { protocol: "$answerProtocol", requestId: "$requestId", action: "answer", proposal: body, bindings: [] }, usage });
+  };
+  for (let index = 0; index < 400; index++) {
+    const advanced = deliveredOf(await advanceRun(f.store, f.request));
+    const state = advanced.record.value.state as { phase: string; step?: { action: string; request: { packet?: Ref } } };
+    const key = state.phase === "step" ? JSON.stringify(state.step!.request) : "";
+    if (state.phase === "step" && state.step!.action === "cycle" && state.step!.request.packet && !answered.has(key)) {
+      answered.add(key);
+      const saved = state.step!.request.packet, packet = f.store.get<QuestionPacketRecord>(saved.id, saved.revision)!;
+      const routed = f.store.get<RoutesRecord>(packet.value.request.routes.id, packet.value.request.routes.revision)!.value;
+      const batch = routed.batches.find(row => row.id === packet.value.request.batch)!;
+      if (batch.model === "MC1") {
+        const source = f.store.get<{ content: string }>(`source:${project}:brief`)!;
+        f.push({ research: { protocol: "$answerProtocol", requestId: "$requestId", action: "answer",
+          results: batch.items.map(item => ({ questionId: item.gap, value: { answer: "UTF-8" }, citations: [{ source: reference(source),
+            selector: { kind: "text-range", start: 0, end: source.value.content.length } }] })) }, usage });
+      } else if (batch.task === "input-field") {
+        f.push({ research: { protocol: "$answerProtocol", requestId: "$requestId", action: "answer",
+          results: batch.items.map(item => ({ target: item.target, field: item.field, basis: item.record,
+            value: item.field === "address" ? { consumer: block, kind: "repository-fact" } : OWN1_DECISION })) }, usage });
+      } else if (batch.task === "node-expansion" && batch.level === 3) worksAnswer(saved, batch.node === "garden-consume-operation");
+      else f.push(nodeAnswer(f as never, { request: { packet: saved } }));
+    } else if (state.phase === "step" && state.step!.action === "assess" && !answered.has(key)) {
+      answered.add(key);
+      f.push(assessor("supported"));
+    }
+    // The attempt's own G7 close classifies the refusal the settle journalled: the same guarded transaction.
+    if (f.store.get<RefusalJournal>(journalId(project))?.value.classifications.length) break;
+    if (["waiting", "complete", "unable"].includes(state.phase))
+      assert.fail(`The pass stood (${state.phase}) before the producer's G5 row was classified: ${JSON.stringify(state).slice(0, 400)}`);
+  }
+
+  // The producer's own G5 row: written by the settle of the works candidate, beside the unit refusal its gate derives.
+  const journal = f.store.get<RefusalJournal>(journalId(project))!.value;
+  const row = journal.rows.find(item => item.origin.subject === work)!;
+  assert.equal(row.code, "work_write_scope_unbounded");
+  const source = f.store.get<{ gate: string }>(row.source.id)!;
+  assert.equal(source.kind, UNIT_REFUSAL_KIND);
+  assert.equal(source.value.gate, "G5");
+  // The origin names the exact candidate, base, environment and proposal the refusal was weighed on — no more, no less.
+  const roles = new Map(row.origin.sources.map(item => [item.role, item.ref] as const));
+  assert.deepEqual([...roles.keys()].sort(), ["base", "derived", "environment", "proposal"]);
+  assert.equal(f.store.get(roles.get("derived")!.id)!.kind, "frame-candidate");
+  assert.equal(f.store.get(roles.get("base")!.id)!.kind, "graph");
+  assert.equal(f.store.get(roles.get("environment")!.id)!.kind, "environment");
+  assert.equal(f.store.get(roles.get("proposal")!.id)!.kind, "layer-proposal");
+
+  // The classification G7's own close derived and wrote with the row, in the journal it stands at.
+  const stored = journal.classifications.find(item => item.row === row.id)!;
+  assert.equal(stored.class, "proposal");
+  assert.equal(stored.addressee, `${ADDRESSEE_KINDS.proposal}:${work}`);
+
+  // The attempt that paid for the work closed refused on this exact claim; the neighbour's unpaid work stays open.
+  const series = f.store.get<RepairSeries>(seriesId(project, block, 1))!;
+  const attempt = series.value.attempts.find(item => item.outcome !== null)!.ordinal;
+  const binding = deliveredOf(readCompletionBinding(f.store, project, reference(series), attempt))!;
+  const close = f.store.get<CompletionCloseRecord>(completionCloseId(project, binding.id))!;
+  assert.ok(close.value.claim.refusals.some(item => item.row === row.id), "The close's claim names the real row");
+  assert.equal(f.store.get<RepairSeries>(seriesId(project, "garden-produce-block", 1))!.value.attempts
+    .every(item => item.outcome === null), true, "The other block's unpaid work is not closed");
+
+  // An exact repeat of that close derives the same decision on the exact historical sources: class, addressee,
+  // the model-bound flag and the question — and writes nothing and sends nothing, hot or after a restart.
+  const request = { project, block, line: series.value.line, attempt, outcome: close.value.claim };
+  const first = deliveredOf(closeAttempt(f.store, request));
+  const routed = routeOf(first, row.id);
+  assert.equal(routed.class, "proposal");
+  assert.equal(routed.addressee, `${ADDRESSEE_KINDS.proposal}:${work}`);
+  assert.equal(routed.toModel, true);
+  assert.deepEqual(first.question, [work]);
+  assert.equal(first.holds.length, 0, "An established origin raises no hold");
+  assert.deepEqual(routed.basis.map(item => item.role), [...row.origin.sources.map(item => item.role)].sort());
+  const before = f.store.list().map(reference), sent = f.sent().length;
+  assert.deepEqual(deliveredOf(closeAttempt(f.store, request)), first);
+  assert.deepEqual(f.store.list().map(reference), before);
+  f.restart();
+  assert.deepEqual(deliveredOf(closeAttempt(f.store, request)), first);
+  assert.deepEqual(f.store.list().map(reference), before);
+  assert.equal(f.sent().length, sent);
+  assert.deepEqual(f.store.get<RefusalJournal>(journalId(project))!.value.classifications, journal.classifications);
 });
 
 test("an origin that cannot be placed raises a hold AT ONCE, and no project question is raised for it", t => {
@@ -5875,4 +5986,5 @@ test("G7CTX first managed close retains prior classifications from its exact jou
   f.restart();
   repeat();
 });
+
 
