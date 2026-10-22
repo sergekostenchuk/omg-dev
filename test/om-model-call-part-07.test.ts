@@ -71,7 +71,8 @@ test('E4 retains terminal evidence when environment or captured file changes dur
       return get(id, revision);
     }) as Store['get'];
     const actual = await runModelCall(f.store, f.request); f.store.get = get;
-    assert.ok(injected); assert.equal(f.sent().length, 1); assert.equal(f.store.list('om-model-exchange').length, 1);
+    assert.ok(injected); assert.equal(f.sent().length, 1);
+    const exchanges = f.store.list('om-model-exchange'); assert.equal(exchanges.length, 1);
     assert.equal(f.store.list('part-response').length, 0);
     // Under the managed carrier either mid-call change ends in a typed refusal: an incompatible environment
     // ceases the assignment (its proved cessation is written); a changed captured file makes the answer
@@ -83,12 +84,28 @@ test('E4 retains terminal evidence when environment or captured file changes dur
       if (change === 'file') assert.deepEqual([actual.refusal.at.unit, actual.refusal.at.target, actual.refusal.at.field], ['D5', file.id, 'source']);
     }
     if (change === 'environment') assert.equal(f.store.list('om-completion-cessation').length, 1);
+    // The refused application leaves the paid receipt untouched in its received state: a successful
+    // transport, application still pending, no rejection, and response/exchange linked to the one
+    // saved exchange — a mistakenly written failed/application-refused record cannot pass as this.
     const record = f.store.list<OmModelCall>('model-call')[0]!;
+    assert.equal(record.value.status, 'succeeded');
+    assert.equal(record.value.om.application, 'received');
+    assert.equal(record.value.om.rejection, null);
+    assert.deepEqual(record.value.om.exchange, reference(exchanges[0]!));
+    assert.deepEqual(record.value.response?.record, reference(exchanges[0]!));
     assert.deepEqual(record.value.usage, usage);
     writeFileSync(join(f.root, 'e4-source.txt'), 'Still later file content must not reinterpret the refused window.');
     const before = f.store.list().map(reference); f.restart();
     const repeat = await runModelCall(f.store, f.request);
-    assert.equal(repeat.ok, false); if (!repeat.ok) assert.equal(repeat.refusal.code, expected);
+    assert.equal(repeat.ok, false);
+    // On the repeat the same proved cessation refuses earlier — at the disposition check rather than
+    // the application check — so field/message legitimately differ; the code and the address
+    // (unit, target and the cessation record itself) must stay identical.
+    if (!repeat.ok && !actual.ok) {
+      assert.equal(repeat.refusal.code, actual.refusal.code);
+      assert.deepEqual([repeat.refusal.at.unit, repeat.refusal.at.target, repeat.refusal.at.ref],
+        [actual.refusal.at.unit, actual.refusal.at.target, actual.refusal.at.ref]);
+    }
     assert.deepEqual(f.store.list().map(reference), before); assert.equal(f.sent().length, 1);
     assert.deepEqual(f.store.get(record.id), record, 'The refused receipt keeps its exact received state');
   }
@@ -170,7 +187,7 @@ test('C49 H1.0b ordinary E1 compatibility does not authorize a changed reviewer 
 
 test('C31 H1.0b selected MC2 E2 without E1 keeps every still compatible role', async t => {
   const { prepareCompletionCause, writeCompletionCessation, readCompletionCause, readCompletionCessationAt } = await import('../src/om/model-call.js');
-  const measured = e4Fixture(t, 'node', 100_000, 0, 5000);
+  const measured = e4Fixture(t, 'node', 100_000, 0, 5000, true);
   for (const changed of ['implementer', 'reviewer', 'both', 'common', 'none'] as const) await t.test(changed, async child => {
     const f = e4Fixture(child, 'node', currentPacketWire(measured.packet.value.packet) - 1, 0, 5000, true);
     const firstBody = e4Node(f); f.steps([{ research: firstBody, usage }]);
