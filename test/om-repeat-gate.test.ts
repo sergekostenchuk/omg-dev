@@ -1541,8 +1541,10 @@ test("the classes of the gate are re-derived at every reading, and a stored deci
   assert.equal(heldSeries(store)!.value.attempts[2]!.outcome, null);
 });
 
-test("the class G7 gave a real G5 refusal is read as stored: a moved basis neither re-derives nor undoes it on an exact repeat (T5)", async t => {
-  // LG07 c4 (codex-omg2 №10870 п.3): the integration half of T5 on a real G5 hold, whose class is unknown. The layer-check
+test("the class G7 gave a real G5 refusal is unchanged on an exact repeat: on its exact historical sources a moved basis changes neither the result nor the decision (T5)", async t => {
+  // LG07 c4 (codex-omg2 №10870 п.3, №11121 P3): the integration half of T5 on a real G5 hold, whose class is unknown. The
+  // exact repeat derives the close again; what is proven is that its result on the exact historical sources the origin
+  // names does not change when the head of the base moves, hot and after a restart. The layer-check
   // input class of the standalone test above has no producer: that positive leaves with the src part (variant A).
   const { f, hold, row } = await realHold(t);
   const journal = f.store.get<RefusalJournal>(journalId(project))!;
@@ -2084,29 +2086,56 @@ async function realHold(t: test.TestContext) {
 }
 
 test("grounds the table of decision cannot place lift nothing: an absent role and several holders are both 'unknown'", async t => {
-  // LG07 c4 (№10870 п.2): on a real G5 hold. The grounds are the producer's own linked sources: the candidate alone, the
-  // whole set of the row (several holders — the origin G7 itself could not place) and the environment with no record of
-  // the map. Ground sets the producer never links — two accepted records holding the subject, a proposal lacking it with
-  // no accepted record, two assemblies of which one lost it — are tallies of the pure table (SUBJECT_DECISIONS, :1903):
-  // forged here they would fail the link checks before the table, so they are not claimed by this test.
+  // LG07 c4 (№10870 п.2, №11121): on a real G5 hold. The grounds of an analysis are its own record.basis, weighed by
+  // placeOrigin; compatibleSources checks the contexts within that set, not that they belong to the row's origin. So
+  // beside the producer's own linked sources (the candidate alone, every source of the row, the environment alone) the
+  // forged sets stand here as well: the full base twice, a proposal lacking the subject in its own context, and two
+  // assemblies of which one lost it reach the table and stay unknown. The lacking proposal offered under the context
+  // the row observed is refused earlier, at that context.
   const { f, hold, row } = await realHold(t);
   const sources = row.origin.sources as unknown as Record<string, unknown>[];
   const ofRole = (role: string) => sources.filter(item => item.role === role);
+  const [base, derived, proposal] = ["base", "derived", "proposal"].map(role => ofRole(role)[0]!);
+  const subject = row.origin.subject;
+  const offered = proposal as { ref: Ref; context: { kind: string; request: Record<string, unknown> } };
+  const shown = f.store.get<{ nodes: { id: string }[] }>(offered.ref.id, offered.ref.revision)!;
+  const lacking = reference(f.store.write({ id: `${shown.id}-lacking`, kind: shown.kind, expected: 0,
+    value: { ...shown.value, nodes: shown.value.nodes.filter(node => node.id !== subject), fills: [] } as unknown as Json }));
+  // A second assembly of the same inputs whose graph lost the subject, at the address an assembly of its level has.
+  const own = derived as { ref: Ref };
+  const assembled = f.store.get<FrameCandidateRecord>(own.ref.id, own.ref.revision)!;
+  assert.ok(assembled.value.graph.nodes.some(node => node.id === subject));
+  const graph = { ...assembled.value.graph, nodes: assembled.value.graph.nodes.filter(node => node.id !== subject) };
+  const value = { ...assembled.value, graph, graphHash: hashJson(graph as unknown as Json),
+    layerHash: hashJson(projectGraph(graph, assembled.value.level) as unknown as Json) };
+  const lost = reference(f.store.write({ id: `om-candidate:${project}:${hashJson([value.level, value.joinAssembly, value.graphHash,
+    value.base, value.proposals, value.works] as unknown as Json)}`, kind: assembled.kind, expected: 0, value: value as unknown as Json }));
   const cases: [string, string, readonly unknown[]][] = [
-    ["proposal", "only what the code assembled, holding the subject", ofRole("derived")],
+    ["proposal", "only what the code assembled, holding the subject", [derived]],
     ["proposal", "every source of the row: several holders and no single responsible", sources],
     ["conditions", "the environment alone, no record of the map to weigh the subject against", ofRole("environment")],
+    ["input", "the full accepted base twice: two holders of the subject", [base, base]],
+    ["proposal", "a proposal that lacks it, in its own context, and no accepted record looked in",
+      [{ role: "proposal", ref: lacking, context: { kind: offered.context.kind, request: { ...offered.context.request, proposals: [lacking] } } }]],
+    ["derivation", "proposed, and two assemblies of which one lost it", [proposal, derived, { ...derived, ref: lost }]],
   ];
   const at = { project, hold: reference(hold) };
-  for (const [claim, note, basis] of cases)
+  for (const [claim, note, basis] of cases) {
+    // A bare record.basis on a non-empty well-formed set is the table's own unknown, not an earlier link check.
+    const pending = { id: `${originAnalysisNamespace(project)}${next()}`, kind: ORIGIN_ANALYSIS_KIND, value: analysisOf(hold.value, { class: claim, basis }) as Json };
+    assert.match(refusalOf(prepareLiftOriginHold(f.store, liftBy(project, at.hold, "origin-analysis", { pending }))).message,
+      /do not suffice to establish a class of this gate's/, note);
     liftRefused(f.store, at.project, at.hold, analysisOf(hold.value, { class: claim, basis }), "record.basis", note);
+  }
+  liftRefused(f.store, at.project, at.hold, analysisOf(hold.value, { class: "proposal", basis: [{ role: "proposal", ref: lacking, context: offered.context }] }),
+    "record.basis.0.request", "a proposal offered outside the project context it occurs in");
   // Negative mutation: a record of the map among the grounds whose kind does not name the definitions it carries.
   const silent = reference(f.store.write({ id: `om-base:${project}:${next()}`, kind: "om-base", expected: 0, value: { rows: [row.origin.subject] } }));
   liftRefused(f.store, at.project, at.hold, analysisOf(hold.value, { class: "input", basis: [source("base", silent)] }),
     "record.basis.0.kind", "an unsupported kind cannot witness map definitions");
   // Nothing lifted it: the hold stands, only the refused stored analyses exist, and the line opens no next attempt.
   assert.equal(f.store.get<OriginHold>(hold.id)!.value.lift, null);
-  assert.equal(f.store.list(ORIGIN_ANALYSIS_KIND).filter(record => record.id.startsWith(originAnalysisNamespace(project))).length, 4);
+  assert.equal(f.store.list(ORIGIN_ANALYSIS_KIND).filter(record => record.id.startsWith(originAnalysisNamespace(project))).length, 8);
   const series = f.store.get<RepairSeries>(hold.value.series.id)!;
   const attempt = series.value.attempts.find(item => item.ordinal === hold.value.attempt)!;
   const binding = deliveredOf(readCompletionBinding(f.store, project, reference(series), hold.value.attempt))!;
@@ -5848,30 +5877,3 @@ test("G7CTX first managed close retains prior classifications from its exact jou
   repeat();
 });
 
-
-test("PROBE c4 forged grounds", async t => {
-  const { f, hold, row } = await realHold(t);
-  const sources = row.origin.sources as unknown as Record<string, any>[];
-  const base = sources.find(s => s.role === "base")!, derived = sources.find(s => s.role === "derived")!, proposal = sources.find(s => s.role === "proposal")!;
-  const subject = row.origin.subject;
-  const try1 = (label: string, claim: string, basis: unknown[]) => {
-    const r = prepareLiftOriginHold(f.store, liftBy(project, reference(hold), "origin-analysis", { pending: { id: `${originAnalysisNamespace(project)}probe-${label}`, kind: ORIGIN_ANALYSIS_KIND, value: analysisOf(hold.value, { class: claim, basis }) as Json } }));
-    console.log("PROBE", label, JSON.stringify(r.ok ? "OK" : [r.refusal.code, r.refusal.at.field, r.refusal.message.slice(0, 160)]));
-  };
-  try1("base-base", "input", [base, base]);
-  const prop = f.store.get<any>(proposal.ref.id, proposal.ref.revision)!;
-  console.log("PROBE proposal keys", JSON.stringify(Object.keys(prop.value)), JSON.stringify((prop.value.nodes ?? []).map((n: any) => n.id)), JSON.stringify(Object.keys(proposal.context ?? {})), JSON.stringify(Object.keys(proposal.context?.request ?? {})));
-  const lacking = f.store.write({ id: `${prop.id}-lacking`, kind: prop.kind, expected: 0, value: { ...prop.value, nodes: (prop.value.nodes ?? []).filter((n: any) => n.id !== subject), fills: [] } });
-  const lackRef = reference(lacking);
-  try1("proposal-lacking-ownctx", "proposal", [{ role: "proposal", ref: lackRef, context: { kind: "proposal", request: { ...proposal.context.request, proposals: [lackRef] } } }]);
-  try1("proposal-lacking-rowctx", "proposal", [{ role: "proposal", ref: lackRef, context: proposal.context }]);
-  const cand = f.store.get<any>(derived.ref.id, derived.ref.revision)!;
-  console.log("PROBE cand keys", JSON.stringify(Object.keys(cand.value)), JSON.stringify((cand.value.graph?.nodes ?? []).some((n: any) => n.id === subject)));
-  const lostGraph = { ...cand.value.graph, nodes: (cand.value.graph?.nodes ?? []).filter((n: any) => n.id !== subject) };
-  const lostValue = { ...cand.value, graph: lostGraph, graphHash: hashJson(lostGraph), layerHash: hashJson(projectGraph(lostGraph as Graph, cand.value.level)) };
-  const lost = f.store.write({ id: `om-candidate:${project}:${hashJson([lostValue.level, lostValue.joinAssembly, lostValue.graphHash, lostValue.base, lostValue.proposals, lostValue.works])}`, kind: cand.kind, expected: 0, value: lostValue });
-  try1("two-assemblies", "derivation", [derived, { role: "derived", ref: reference(lost) }]);
-  try1("two-assemblies-ctx", "derivation", [derived, { ...derived, ref: reference(lost) }]);
-  try1("derived-proposal", "proposal", [derived, proposal]);
-  try1("base-proposal", "proposal", [base, proposal]);
-});
