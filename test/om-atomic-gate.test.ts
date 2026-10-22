@@ -8,7 +8,7 @@ import { types } from 'node:util';
 import { join } from 'node:path';
 import { canonical, digest, hashJson, type Json } from '../src/canonical.js';
 import { loadTaskSpecification, preplanTaskContext } from '../src/compiler/context.js';
-import { BASIS_TASK_CONTEXT_CONTRACT } from '../src/compiler/model.js';
+import { BASIS_TASK_CONTEXT_CONTRACT, TASK_CONTEXT_CONTRACT } from '../src/compiler/model.js';
 import { resolveArtifact, resolveExternalSource } from '../src/compiler/inputs.js';
 import { Evidence, type Source } from '../src/evidence/evidence.js';
 import { git, type RepositoryState } from '../src/runtime/environment.js';
@@ -42,8 +42,11 @@ import { beginAttempt, openSeries, readSeries, readSeriesAt, readStopHistory } f
 import { prepareWorksFrame, writeWorksFrame } from '../src/om/works-frame.js';
 import { confirmResults } from '../src/om/achievements.js';
 import { readResultIdentity } from '../src/om/result-identity.js';
-import { closeAttempt, prepareCloseAttempt, readStopContext } from '../src/om/repeat-gate.js';
+import { closeAttempt, prepareCloseAttempt, readStopContext, openAttempt } from '../src/om/repeat-gate.js';
+import { writeRoutes } from '../src/om/routes.js';
 import { checkStanding, stopReport } from '../src/om/stop-report.js';
+import { readAcceptedAnswer } from '../src/om/accepted-answer.js';
+import { managedBlock } from './om-managed-block.js';
 import { gardenGraph } from './om-fixture.js';
 import { preparedFeatures } from './product-fixture.js';
 import { preparedField } from './preparation-fixture.js';
@@ -96,11 +99,9 @@ function measuredContexts(store: Store, gate: AtomicGateRecord) {
 
 
 let atomicSeed: ReturnType<typeof produceAtomicSeed> | undefined;
-let eraSeed: ReturnType<typeof produceAtomicSeed> | undefined;
 let foreignSeed: ReturnType<typeof produceAtomicSeed> | undefined;
-async function atomicFixture(t: TestContext, era = false, foreign = false) {
-  const seed = await (era ? eraSeed ??= produceAtomicSeed(seedResources, true, true)
-    : (foreign ? foreignSeed ??= produceAtomicSeed(seedResources, false, true) : atomicSeed ??= produceAtomicSeed(seedResources)));
+async function atomicFixture(t: TestContext, foreign = false) {
+  const seed = await (foreign ? foreignSeed ??= produceAtomicSeed(seedResources, true) : atomicSeed ??= produceAtomicSeed(seedResources));
   const root = mkdtempSync(join(tmpdir(), 'omg-f5-atomic-')), database = join(root, 'state.sqlite');
   copyFileSync(seed.database, database);
   copyFileSync(seed.trace, join(root, 'trace.jsonl')); copyFileSync(seed.scenario, join(root, 'scenario.json'));
@@ -271,29 +272,8 @@ test('F5 accepts real E2.1 and E4 work results with two distinct consumers, reba
   assert.deepEqual(repeat.acceptance, accepted.acceptance); assert.deepEqual(heads(f.store), snapshot); assert.equal(f.sent().length, sent);
 });
 
-// G5 (№3820, №3822): the prep answer was issued and assembled on the ledger the older D7 rule derived (73d95d93), the
-// others on today's ledger of the same exact request: one original handoff. Each source's bindings are transferred from
-// its own ledger onto the final handoff, losslessly; nothing is paid again.
-test('G5 two D7 of one exact request (the older rule and today\'s) are one original handoff: each source\'s bindings are transferred from its own ledger and the works are accepted without a model call', async t => {
-  const f = await atomicFixture(t, true), sent = f.sent().length;
-  assert.ok(f.older);
-  const sources = f.request.results.map(result => ok(readPartAssembly(f.store, { project: f.project, record: result.record })).record.value.works!);
-  assert.deepEqual([...new Set(sources.map(works => works.ledger.id))].sort(), [f.older.ledger.id, f.ledger.record.id].sort(), 'Two ledgers among the sources');
-  const older = sources.find(works => works.ledger.id === f.older!.ledger.id)!;
-  assert.deepEqual(older.bindings, [], 'The older answer binds nothing, as n-research in omg-live');
-  const accepted = ok(writeWorksAcceptance(f.store, f.request));
-  assert.equal(accepted.state, 'accepted', JSON.stringify(gateWrite(accepted as never).value?.result?.findings ?? null));
-  const historical = ok(readAcceptedFrame(f.store, { ...accepted.acceptance!, level: 3 as const }));
-  const candidate = ok(readCandidate(f.store, { project: f.project, candidate: historical.frame!.value.acceptance.candidate }));
-  const handoff = ok(readOmObligations(f.store, { project: f.project, producer: candidate.value.works!.producer }));
-  assert.deepEqual(candidate.value.works!.bindings.map(binding => binding.consumers).map(canonical).sort(),
-    sources.flatMap(works => works.bindings).map(binding => binding.consumers).map(canonical).sort(), 'Every consumer of every source survives');
-  assert.ok(candidate.value.works!.bindings.every(binding => binding.scope.id === handoff.record.id), 'All on the final handoff');
-  assert.equal(f.sent().length, sent, 'No model call');
-});
-
 test('G5 a D7 of another request among the sources is refused: all final proposals belong to one original handoff', async t => {
-  const f = await atomicFixture(t, false, true), before = heads(f.store);
+  const f = await atomicFixture(t, true), before = heads(f.store);
   assert.ok(f.foreign);
   const produce = f.request.results.find(result => {
     const works = ok(readPartAssembly(f.store, { project: f.project, record: result.record })).record.value.works!;
@@ -386,36 +366,61 @@ test('F5 declared work goal closes accepted L3 gaps and confirms progress throug
   assert.deepEqual(ok(readSeriesAt(f.store, f.project, reference(completed))), completed);
   for (const [index, target] of targets.entries()) assert.deepEqual(ok(readResultIdentity(f.store, { acceptance, obligation: target.target })), identities[index]);
   assert.deepEqual(heads(f.store), completedSnapshot); assert.equal(f.sent().length, beforeSend);
-  for (let offset = 1; offset <= 3; offset++) {
-    const next = ok(beginAttempt(f.store, { ...address, attempt: declared.ordinal + offset, goal: declared.goal }));
-    assert.equal(next.value.attempts.at(-1)!.outcome, null);
-    const repeated = ok(closeAttempt(f.store, { ...completion, attempt: declared.ordinal + offset }));
+  // LG08 (codex-omg2 №10244 (в)): a repeat of this exact goal cannot be declared in this fixture state — the accepted
+  // frame resolved every consume obligation and D2 closed its lines, so the current M6 holds no consume batch for it.
+  const fresh = ok(writeRoutes(f.store, { project: f.project, gaps,
+    tasks: [], catalog: { paths: [], records: [] }, previous: reference(f.routes) }));
+  const boundary = heads(f.store);
+  assert.ok(!fresh.value.batches.some(batch => batch.level === 3 && batch.task === 'node-expansion'
+    && f.desired.nodes.some(node => node.id === batch.node && node.parent === declared.block)));
+  denied(openAttempt(f.store, { ...address, attempt: declared.ordinal + 1, goal: declared.goal,
+    completion: { routes: reference(fresh), batches: [] } }), 'completion_request_invalid');
+  assert.deepEqual(heads(f.store), boundary); assert.equal(f.sent().length, beforeSend);
+});
+
+test('F5 a stopped series keeps the accepted result of its earlier progress in every read', async t => {
+  // LG08 (codex-omg2 №10244 (в)): the stop history stands on the managed block — one supported cycle, then three paid
+  // insufficient ends of the same goal key; each next attempt asks for what the current M6 still owes.
+  const root = mkdtempSync(join(tmpdir(), 'omg-atomic-stop-'));
+  const path = join(root, 'managed.sqlite');
+  const store = new Store(path);
+  t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
+  const m = managedBlock(store, { root, path }, 'alpha'), address = m.address(), key = 'gap:cart:price';
+  ok(openSeries(store, { ...address, slice: 'managed-stop', predecessor: null, basis: null }));
+  m.open(1, key);
+  await m.pay(1, 'supported');
+  const firstClaim = m.claim(1);
+  const first = m.close(1, firstClaim);
+  assert.equal(first.verdict, 'progress'); assert.equal(first.withoutProgress, 0);
+  for (const offset of [1, 2, 3]) {
+    const repeated = await m.cycle(key, 'insufficient');
     assert.equal(repeated.verdict, 'none'); assert.equal(repeated.withoutProgress, offset);
     assert.equal(repeated.stop === null, offset < 3);
   }
-  const stopped = ok(readSeries(f.store, address)), context = ok(readStopContext(f.store, address));
-  const history = ok(readStopHistory(f.store, address)), report = ok(stopReport(f.store, address));
-  assert.equal(stopped.value.stop!.attempt, declared.ordinal + 3);
-  assert.equal(history.standing, declared.ordinal + 3); assert.equal(history.stops.length, 1);
-  assert.deepEqual(history.stops[0]!.attempts, [1, 2, 3].map(offset => declared.ordinal + offset));
-  assert.deepEqual(history.stops[0]!.goals, [declared.goal.key]);
-  assert.deepEqual([...context.context.accepted].sort(), confirmed.achieved.map(item => item.key).sort());
+  const stopped = ok(readSeries(store, address)), context = ok(readStopContext(store, address));
+  const history = ok(readStopHistory(store, address)), report = ok(stopReport(store, address));
+  assert.equal(stopped.value.stop!.attempt, 4);
+  assert.equal(history.standing, 4); assert.equal(history.stops.length, 1);
+  assert.deepEqual(history.stops[0]!.attempts, [2, 3, 4]);
+  assert.deepEqual(history.stops[0]!.goals, [key]);
+  const accepted = firstClaim.accepting.map(ref => ok(readAcceptedAnswer(store, { project: m.project, record: ref })).key);
+  assert.deepEqual([...context.context.accepted].sort(), [...new Set(accepted)].sort());
   assert.deepEqual(report.context, context.context); assert.equal(report.audience, 'reviewer'); assert.equal(report.rung, 1);
-  assert.equal(report.finding.facts.accepted, confirmed.achieved.length);
+  assert.equal(report.finding.facts.accepted, accepted.length);
   assert.ok(report.guards.some(ref => canonical(ref) === canonical(reference(stopped))));
-  assert.deepEqual(ok(checkStanding(f.store, report)), report);
-  const latest = heads(f.store); f.restart();
-  assert.deepEqual(ok(readGapLines(f.store, { project: f.project, record: reference(saved) })), saved);
-  assert.deepEqual(ok(confirmResults(f.store, resultRequest)), confirmed);
-  assert.deepEqual(ok(readSeries(f.store, address)), stopped);
-  assert.deepEqual(ok(readSeriesAt(f.store, f.project, reference(completed))), completed);
-  assert.deepEqual(ok(readStopContext(f.store, address)), context);
-  assert.deepEqual(ok(readStopHistory(f.store, address)), history);
-  assert.deepEqual(ok(stopReport(f.store, address)), report); assert.deepEqual(ok(checkStanding(f.store, report)), report);
-  const late = ok(closeAttempt(f.store, completion));
-  assert.equal(late.verdict, 'progress'); assert.deepEqual(late.stop, stopped.value.stop);
-  assert.deepEqual(ok(readSeries(f.store, address)), stopped, 'A late technical repeat cannot overwrite the later stopped series');
-  assert.deepEqual(heads(f.store), latest); assert.equal(f.sent().length, beforeSend);
+  assert.deepEqual(ok(checkStanding(store, report)), report);
+  const latest = heads(store), cold = new Store(path);
+  const sends = () => readFileSync(join(root, 'managed-trace-alpha.jsonl'), 'utf8').split('\n').filter(Boolean).length;
+  try {
+    assert.deepEqual(ok(readSeries(cold, address)), stopped);
+    assert.deepEqual(ok(readStopContext(cold, address)), context);
+    assert.deepEqual(ok(readStopHistory(cold, address)), history);
+    assert.deepEqual(ok(stopReport(cold, address)), report); assert.deepEqual(ok(checkStanding(cold, report)), report);
+    const sent = sends(), late = m.on(cold).close(1, firstClaim);
+    assert.equal(late.verdict, 'progress'); assert.deepEqual(late.stop, stopped.value.stop);
+    assert.deepEqual(ok(readSeries(cold, address)), stopped, 'A late technical repeat cannot overwrite the later stopped series');
+    assert.deepEqual(heads(cold), latest); assert.equal(sends(), sent);
+  } finally { cold.close(); }
 });
 
 test('F5 G5 capacity measures the complete current task context at the exact boundary and rejects without changing accepted bases', async t => {
@@ -576,6 +581,23 @@ test('F5 rejects counterfeit G5 outcomes, altered neighbor contents and loss of 
   assert.deepEqual(heads(f.store), snapshot, 'A failed source read is not a negative gate verdict or partial write');
 });
 
+test('F5 required fields: a missing snapshot, a missing binding and a foreign taskContextContract are typed refusals on both public doors', async t => {
+  const f = await atomicFixture(t), prepared = ok(prepareWorksAcceptance(f.store, f.request)), preparedGate = gateWrite(prepared);
+  f.store.writeMany(sourceWrites(prepared), [...prepared.guards]);
+  const request = preparedGate.value.request, before = heads(f.store);
+  const noSnapshot = clone(request) as Partial<AtomicGateRequest>; delete noSnapshot.snapshot;
+  const noBinding = clone(f.request) as Partial<typeof f.request>; delete noBinding.binding;
+  const invalidRequest = (error: unknown) =>
+    error instanceof EngineError && error.code === 'atomic_gate_request_invalid';
+  assert.throws(() => prepareAtomicGate(f.store, noSnapshot as AtomicGateRequest), invalidRequest);
+  assert.throws(() => writeAtomicGate(f.store, noSnapshot as AtomicGateRequest), invalidRequest);
+  assert.throws(() => prepareAtomicGate(f.store, { ...request, taskContextContract: TASK_CONTEXT_CONTRACT }), invalidRequest);
+  assert.throws(() => writeAtomicGate(f.store, { ...request, taskContextContract: TASK_CONTEXT_CONTRACT }), invalidRequest);
+  assert.throws(() => prepareWorksAcceptance(f.store, noBinding as typeof f.request), invalidRequest);
+  assert.throws(() => writeWorksAcceptance(f.store, noBinding as typeof f.request), invalidRequest);
+  assert.deepEqual(heads(f.store), before, 'A missing or foreign required field writes nothing');
+});
+
 test('F5 public gate and acceptance boundaries reject absent inputs before reading the Store', t => {
   const root = mkdtempSync(join(tmpdir(), 'omg-f5-invalid-')), store = new Store(join(root, 'state.sqlite'));
   t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
@@ -674,7 +696,7 @@ function externalCandidate(t: TestContext) {
   const path = join(root, 'input.txt'); writeFileSync(path, 'A captured external input');
   const source = new Evidence(store).file(project, 'garden-data', root, 'input.txt', 'text/plain', 0);
   const request: AtomicGateRequest = { project, candidate: reference(candidate.record), neighbors: reference(neighbors),
-    environment: reference(environment), gaps: gapRead, results: [], sources: [reference(source)] };
+    environment: reference(environment), gaps: gapRead, results: [], sources: [reference(source)], snapshot: null };
   assert.deepEqual(candidate.record.value.graph.horizon, ['garden-consume-work']);
   assert.equal(store.get('execution-root:garden'), null);
   return { root, database, project, path, source, candidate, request,

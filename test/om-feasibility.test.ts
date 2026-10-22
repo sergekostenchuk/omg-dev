@@ -25,6 +25,7 @@ import { ProductEngine } from '../src/product/engine.js';
 import { Store, type Write, type Revision } from '../src/storage/store.js';
 import { inputDecisionWrite, writeAddressing, type InputDecisionProposal } from '../src/om/addressing.js';
 import { writeAtomicGate, writeWorksAcceptance, type AtomicGateRequest } from '../src/om/atomic-gate.js';
+import { resolveSnapshot } from '../src/om/impact.js';
 import { settleCandidate, readAcceptedFrame } from '../src/om/frame-accept.js';
 import { writeCandidate } from '../src/om/frame-candidate.js';
 import { fillObligations, prepareFrame, type FrameRequest, type FrameRead } from '../src/om/frame-obligations.js';
@@ -95,7 +96,7 @@ function acceptedOperationsFixture(t: TestContext, codeStatus: 'planned' | 'exis
     stages: Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(store.get(`stage:${project}:${stage}`)!)])) as Record<UpstreamStage, Ref> }));
   const first = ok(writeHorizon(store, { project, input: reference(input), graph: reference(store.get(`graph:${project}`)!),
     refinement: null, available: {}, choice: { choiceVersion: 'external-upper', features: [{ outcome: 'garden-result' }], excluded: [] } }));
-  function proposal(frame: FrameRead): Ref {
+  function proposal(frame: FrameRead, name = 'external'): Ref {
     const graph = clone(desired), level = frame.request.level;
     if (level === 3) {
       for (const field of ['nodes', 'artifacts', 'contracts', 'anchors', 'joins', 'tests', 'edges', 'journeys', 'packets', 'transfers'] as const) {
@@ -109,17 +110,25 @@ function acceptedOperationsFixture(t: TestContext, codeStatus: 'planned' | 'exis
       graph, reference: { ...frame.request.graph, hash: hashJson(graph) }, frame: null }, frame.upperRef, level));
     const nodes = projected.nodes.filter(node => node.kind === (level === 2 ? 'operation' : 'work')
       && (level === 2 || frame.scope.nodes.includes(node.parent!))), selected = new Set(nodes.map(node => node.id));
-    const value: LayerProposal = { base: { graph: frame.request.graph, frame: null }, level,
+    const fills = mapped.fills.filter(fill => selected.has(fill.node)).map(fill => ({ obligation: fill.obligation, node: fill.node,
+      ...(fill.port === undefined ? {} : { port: fill.port, ...(level === 3 ? { codeRef: clone(nodes.find(node => node.id === fill.node)!.code[0]!) } : {}) }) }));
+    const occupied = frame.result.fills.filter(fill => fill.source === 'accepted');
+    const value: LayerProposal = { base: { graph: frame.request.graph, frame: frame.request.frame ?? null }, level,
       ...(level === 3 ? { worksContract: 'works-frame/v1' as const } : {}), source: 'decision', status: 'proposed', nodes,
-      fills: mapped.fills.filter(fill => selected.has(fill.node)).map(fill => ({ obligation: fill.obligation, node: fill.node,
-        ...(fill.port === undefined ? {} : { port: fill.port, ...(level === 3 ? { codeRef: clone(nodes.find(node => node.id === fill.node)!.code[0]!) } : {}) }) })),
+      fills,
       localConnectors: level === 3 ? [] : projected.connectors.map(connector => ({ ...connector,
         bindings: connector.bindings.filter(binding => binding.level === 2) })).filter(connector => connector.bindings.length),
       artifacts: projected.artifacts, contracts: projected.contracts, joins: projected.joins,
       tests: projected.tests.filter(test => level === 2 || selected.has(test.node)), edges: projected.edges ?? [],
       journeys: projected.journeys ?? [], packets: projected.packets ?? [], transfers: projected.transfers ?? [],
-      anchors: level === 2 ? projected.anchors : [], removes: [], replaces: [], redefines: [] };
-    return reference(store.write({ id: `om-proposal:garden:external-${level}`, kind: 'layer-proposal', expected: 0, value }));
+      anchors: level === 2 ? projected.anchors : [], removes: [],
+      replaces: fills.filter(fill => occupied.some(old => old.obligation === fill.obligation))
+        .map(fill => ({ obligation: fill.obligation,
+          base: { node: occupied.find(old => old.obligation === fill.obligation)!.node, graph: frame.request.graph },
+          with: { node: fill.node, port: fill.port ?? null },
+          basis: 'A regenerated layer re-occupies the accepted obligation' })),
+      redefines: [] };
+    return reference(store.write({ id: `om-proposal:garden:${name}-${level}`, kind: 'layer-proposal', expected: 0, value }));
   }
   const frame2: FrameRequest = { project, level: 2, graph: reference(store.get('graph:garden')!), horizon: reference(first.gate),
     layer: null, frame: null, upper: null };
@@ -143,7 +152,7 @@ function acceptedOperationsFixture(t: TestContext, codeStatus: 'planned' | 'exis
 }
 
 /** Real C3/C4/C5, D1/D2/D7 and F2/F4/G5 sources; no model or adapter is called. */
-function acceptedWorksFixture(t: TestContext, codeStatus: 'planned' | 'existing' = 'planned', snapshot?: 'head' | null) {
+function acceptedWorksFixture(t: TestContext, codeStatus: 'planned' | 'existing' = 'planned', snapshot: 'head' | null = 'head') {
   const base = acceptedOperationsFixture(t, codeStatus);
   const { root, workspace, database, project, basis, frame2, graph, layer, upperFrame, input, horizon, proposal, store, engine } = base;
   const works: ProposalRequest = { frame: clone(basis.request) as FrameRequest, proposals: [proposal(clone(basis) as unknown as FrameRead)] };
@@ -168,7 +177,7 @@ function acceptedWorksFixture(t: TestContext, codeStatus: 'planned' | 'existing'
   git(workspace, ['-c', 'user.name=OMG Test', '-c', 'user.email=test@example.invalid', 'commit', '-qm', 'capture input']);
   const request: AtomicGateRequest = { project, candidate: reference(candidate.record), neighbors: reference(neighbors),
     environment: reference(environment), gaps: gapRead, results: [], sources: [reference(source)],
-    ...(snapshot === undefined ? {} : { snapshot: snapshot === 'head' ? resolveSnapshot(workspace) : null }) };
+    snapshot: snapshot === 'head' ? resolveSnapshot(workspace) : null };
   assert.deepEqual(candidate.record.value.graph.horizon, ['garden-consume-work']);
   assert.equal(store.get('execution-root:garden'), null);
   const gate = ok(writeAtomicGate(store, request));
@@ -180,7 +189,50 @@ function acceptedWorksFixture(t: TestContext, codeStatus: 'planned' | 'existing'
     layer: reference(settled.layer), frame: reference(settled.frame) };
   const acceptedFrame = { ...clone(candidate.record.value.request.frame),
     graph: acceptance.graph, layer: acceptance.layer, frame: acceptance.frame };
-  return { root, workspace, database, project, path, source, candidate, request, gate, acceptance,
+  /** AT1: a second works generation over the same accepted L3 products — the real horizon→frame→works→C5 chain
+   * ending at the admitted candidate, whose gate then names the effective execution root's snapshot — before any
+   * M8 write. nextCandidate stops at C5 for refusal-boundary checks; nextAcceptance completes G5 and settle. */
+  function nextCandidate(choice = 'second-generation') {
+    const store = base.store;
+    const graph = reference(store.get(`graph:${project}`)!);
+    const h2 = ok(writeHorizon(store, { project, input: reference(input), graph, refinement: layer,
+      available: {}, choice: { choiceVersion: choice, features: [{ outcome: 'garden-result' }], excluded: [] } }));
+    const basis2 = ok(prepareFrame(store, { project, level: 3, graph, horizon: reference(h2.gate),
+      layer: acceptance.layer, frame: acceptance.frame,
+      upper: { horizon: reference(h2.gate), frame: upperFrame } }));
+    const works2: ProposalRequest = { frame: clone(basis2.request) as FrameRequest,
+      proposals: [proposal(clone(basis2) as unknown as FrameRead, choice)] };
+    const gaps2 = ok(writeGaps(store, { project, input: reference(input), graph, horizon: reference(h2.gate),
+      operations: { frame: { ...frame2, graph, layer, frame: upperFrame, horizon: reference(h2.gate) }, proposals: [] },
+      works: works2 }));
+    const gapRead2 = { sources: clone(gaps2.sources) as GapRequest, records: gaps2.records.map(reference) };
+    const lines2 = ok(writeGapLines(store, { project, previous: reference(lines), pass: 2, gaps: gapRead2, closures: [] }));
+    const handoff2 = ok(writeOmObligations(store, { project, gaps: gapRead2, lines: reference(lines2), assignments: [] }));
+    assert.deepEqual(handoff2.handoff.obligations, []);
+    const candidate2 = ok(writeWorksFrame(store, { ...works2, works: { contract: 'works-frame/v1',
+      producer: reference(handoff2.producer), ledger: reference(handoff2.record), bindings: [] } }));
+    assert.equal(candidate2.state, 'candidate');
+    if (candidate2.state !== 'candidate') throw new Error('Missing second-generation works candidate');
+    return { candidate: candidate2.record, gapRead: gapRead2 };
+  }
+  function nextAcceptance(choice = 'second-generation') {
+    const store = base.store, engine = base.engine;
+    const partial = nextCandidate(choice);
+    const neighbors2 = ok(writeNeighbors(store, { project, candidate: reference(partial.candidate) }));
+    const gateRequest: AtomicGateRequest = { project, candidate: reference(partial.candidate), neighbors: reference(neighbors2),
+      environment: reference(environment), gaps: partial.gapRead, results: [], sources: clone(request.sources),
+      snapshot: resolveSnapshot(engine.environments.effective(project).root) };
+    const gate2 = ok(writeAtomicGate(store, gateRequest));
+    assert.equal(gate2.value.result.passed, true, canonical(gate2.value.result.findings));
+    const settled2 = ok(settleCandidate(store, { project, level: 3, candidate: reference(partial.candidate),
+      outcome: { ...gate2.value.result, codes: [...gate2.value.result.codes], basis: reference(gate2) } }));
+    assert.equal(settled2.state, 'accepted'); assert.ok(settled2.graph && settled2.layer && settled2.frame);
+    return { request: gateRequest, gate: gate2, settled: settled2,
+      acceptance: { project, level: 3 as const, graph: reference(settled2.graph), layer: reference(settled2.layer),
+        frame: reference(settled2.frame) } };
+  }
+  return { root, workspace, database, project, path, source, candidate, request, gate, acceptance, nextAcceptance,
+    nextCandidate,
     acceptedFrame, handoff, horizon: reference(horizon.gate), gapRead, environment,
     feasibility: { project, graph: acceptance.graph, layer: acceptance.layer, frame: acceptance.frame,
       environment: reference(environment), expected: 0 },
@@ -507,7 +559,7 @@ process.exitCode=readFileSync(condition,'utf8')==='ready'&&!existsSync(marker+'.
   assert.deepEqual(assembly.record.value.works!.bindings, []);
   assert.deepEqual(assembly.record.value.works!.ledger, reference(initialHandoff.record));
   const accepted = ok(writeWorksAcceptance(store, { project, results: [{ kind: 'assembly', record: cycle.assembly }],
-    environment: reference(environment), sources: [reference(source)] }));
+    environment: reference(environment), sources: [reference(source)], binding: null }));
   assert.equal(accepted.state, 'accepted'); assert.ok(accepted.acceptance);
   const settled = ok(readAcceptedFrame(store, accepted.acceptance));
   assert.ok(settled.graph && settled.frame);
@@ -775,7 +827,8 @@ test('G1 historical M8 rejects absent and inconsistent retained confirmation evi
 
 for (const inspection of ['source_missing', 'repository_unavailable'] as const) {
   test(`G1 historical M8 retains the native ${inspection} inspection after physical recovery`, t => {
-    const f = acceptedWorksFixture(t, inspection === 'source_missing' ? 'existing' : 'planned');
+    const f = acceptedWorksFixture(t, inspection === 'source_missing' ? 'existing' : 'planned',
+      inspection === 'repository_unavailable' ? null : 'head');
     const graph = f.store.get<Graph>(f.acceptance.graph.id, f.acceptance.graph.revision)!;
     const gitDirectory = join(f.workspace, '.git'), displacedGit = join(f.root, 'retained-git');
     if (inspection === 'repository_unavailable') renameSync(gitDirectory, displacedGit);
@@ -939,7 +992,6 @@ export async function load(url,context,next){
 `;
 
 // ---- AT1 (№4091 п.5, row 14): the plan is issued only on the tree the works were checked against ----
-import { resolveSnapshot } from '../src/om/impact.js';
 import { ATOMIC_GATE_IMPACT_CONTRACT } from '../src/om/atomic-gate.js';
 test('AT1 row 14 M8 issues a plan only on the tree its works were checked against: the same tree passes; a workspace moved after G5 is stale; a gate of the impact era without its snapshot is not ready', t => {
   const f = acceptedWorksFixture(t, 'planned', 'head');
@@ -955,7 +1007,4 @@ test('AT1 row 14 M8 issues a plan only on the tree its works were checked agains
   const h = acceptedWorksFixture(t, 'planned', null);
   assert.deepEqual([h.gate.value.contract, h.gate.value.impact], [ATOMIC_GATE_IMPACT_CONTRACT, { snapshot: null, works: [] }]);
   denied(prepareFeasibility(h.store, h.feasibility), 'feasibility_not_ready');
-  const old = acceptedWorksFixture(t, 'planned');
-  assert.equal(old.gate.value.contract, 'om-atomic-gate/v1', 'a request of the earlier era keeps its own record and rule');
-  assert.ok(prepareFeasibility(old.store, old.feasibility).ok);
 });

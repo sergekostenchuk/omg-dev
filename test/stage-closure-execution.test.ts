@@ -12,7 +12,12 @@ import { git } from '../src/runtime/environment.js';
 import type { ExecutionResult } from '../src/execution/model.js';
 import { writeFeasibility, type FeasibilityRequest } from '../src/om/feasibility.js';
 import { ProductEngine } from '../src/product/engine.js';
-import { executionFixture as baseExecutionFixture, refreshExecutionPlan } from './execution-fixture.js';
+import { prepareFrame, type FrameRequest } from '../src/om/frame-obligations.js';
+import { writeHorizon } from '../src/om/horizon.js';
+import type { LayerProposal } from '../src/om/frame-proposals.js';
+import type { OmAcceptedFrame } from '../src/om/layer-basis.js';
+import { acceptNativeWorks } from './om-fixture.js';
+import { executionFixture as baseExecutionFixture } from './execution-fixture.js';
 const executionFixture = (t: TestContext) => baseExecutionFixture(t, 'normal', { route: 'om' });
 
 const context = (store: Store, projectId = 'p'): ExternalCheckContext => ({ store, projectId, stage: 'om-g2' });
@@ -20,7 +25,49 @@ const repository = (store: Store, basis: Ref, project = 'p') => REFINEMENT_EXTER
 const environment = (store: Store, basis: Ref, project = 'p') => REFINEMENT_EXTERNAL_CHECKS.environment!({ kind: 'environment', basis }, context(store, project));
 const ancestry = (store: Store, basis: Ref, project = 'p') => EXECUTION_EXTERNAL_CHECKS['git-ancestry']!({ kind: 'git-ancestry', basis }, context(store, project));
 function measured(action: () => void) { const before = storeReads(); action(); return storeReads() - before; }
-function nextPlan(f: ReturnType<typeof executionFixture>) { return refreshExecutionPlan(f.engine); }
+/** A plan after the run: the same frame's gate names the tree its works were checked against, so the next plan needs a
+ * second works generation accepted on the execution root the first generation's commits advanced (AT1). */
+function nextPlan(f: ReturnType<typeof executionFixture>) {
+  const store = f.store, graph = structuredClone(f.plan.value.graphSnapshot);
+  const successors = ["produce", "consume"].map(name => {
+    const node = graph.nodes.find(node => node.id === `p-${name}-work`)!;
+    node.title = name === "produce" ? "Second producer pass" : "Second consumer pass";
+    node.code = node.code.map(ref => ({ ...ref, status: "existing" as const }));
+    const check = graph.tests.find(test => test.node === node.id)!;
+    check.contract!.entrypoint.status = "existing";
+    check.covers = [...new Set([...check.covers, "p-flow"])];
+    check.contract!.counterfactuals.push({ connector: "p-flow", mutation: "substitute", expectedFailure: name === "produce" ? "output_overflow" : "result_overflow",
+      command: { executable: process.execPath, args: ["check.mjs", `overflow-${name}`] } });
+    return node;
+  });
+  const acceptedGraph = reference(store.get("graph:p")!), layer2 = reference(store.get("graph-layer:p:2")!);
+  const frame2 = reference(store.get("om-frame:p:2")!), frame3 = store.get<OmAcceptedFrame>("om-frame:p:3")!;
+  const horizon = writeHorizon(store, { project: "p", input: reference(store.get("om-input:p")!), graph: acceptedGraph,
+    refinement: layer2, available: {}, choice: { choiceVersion: "second-generation", features: [{ outcome: "p-result" }], excluded: [] } });
+  assert.ok(horizon.ok, horizon.ok ? "" : horizon.refusal.message);
+  const request: FrameRequest = { project: "p", level: 3, graph: acceptedGraph, horizon: reference(horizon.value.gate),
+    layer: reference(store.get("graph-layer:p:3")!), frame: reference(frame3), upper: { frame: frame2, horizon: reference(horizon.value.gate) } };
+  const prepared = prepareFrame(store, request);
+  assert.ok(prepared.ok, prepared.ok ? "" : prepared.refusal.message);
+  const oldIds = new Set(["p-produce-work", "p-consume-work"]);
+  const replacements = prepared.value.result.fills.filter(fill => oldIds.has(fill.node));
+  const successor = (old: string) => successors.find(node => node.parent === graph.nodes.find(node => node.id === old)!.parent)!;
+  const proposal: LayerProposal = { base: { graph: request.graph, frame: request.frame }, level: 3, worksContract: "works-frame/v1",
+    source: "decision", status: "proposed", nodes: successors,
+    fills: replacements.map(fill => ({ obligation: fill.obligation, node: successor(fill.node).id,
+      ...(fill.port === undefined ? {} : { port: fill.port, codeRef: successor(fill.node).code[0]! }) })),
+    replaces: replacements.map(fill => ({ obligation: fill.obligation, base: { node: fill.node, graph: request.graph },
+      with: { node: successor(fill.node).id, port: fill.port ?? null }, basis: "A second pass over the committed first generation" })),
+    tests: graph.tests.filter(test => successors.some(node => node.id === test.node)),
+    transfers: graph.transfers!.filter(transfer => successors.some(node => node.id === transfer.to)),
+    edges: graph.edges!.filter(edge => successors.some(node => node.id === edge.source)),
+    localConnectors: [], artifacts: [], contracts: [], joins: [], journeys: [], packets: [], anchors: [],
+    removes: successors.map(node => node.id), redefines: graph.tests.filter(test => successors.some(node => node.id === test.node)).map(test => test.id) };
+  const proposed = store.write({ id: "om-proposal:p:second-generation", kind: "layer-proposal", expected: 0, value: proposal });
+  acceptNativeWorks(f.engine, "p", { frame: { project: "p", level: 2, graph: acceptedGraph, horizon: request.horizon,
+    layer: layer2, frame: frame2, upper: null }, proposals: [] }, { frame: request, proposals: [reference(proposed)] });
+  return f.engine.compiler.compile("p");
+}
 
 test('G2b the real accepted compilation prefix is closed, cold and independent of unrelated history', t => {
   const f = executionFixture(t);

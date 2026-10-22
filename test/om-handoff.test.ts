@@ -176,7 +176,7 @@ async function lateObligationsFixture(t: TestContext) {
   const assembly = ok(readPartAssembly(store, { project, record: cycle.assembly }));
   assert.deepEqual(assembly.record.value.works!.bindings, [...bindings].sort((a, b) => canonical(a) < canonical(b) ? -1 : canonical(a) > canonical(b) ? 1 : 0));
   const accepted = ok(writeWorksAcceptance(store, { project, results: [{ kind: 'assembly', record: cycle.assembly }],
-    environment: reference(environment), sources: [reference(source)] }));
+    environment: reference(environment), sources: [reference(source)], binding: null }));
   assert.equal(accepted.state, 'accepted'); assert.ok(accepted.acceptance);
   const settled = ok(readAcceptedFrame(store, accepted.acceptance)); assert.ok(settled.graph && settled.frame);
   assert.deepEqual(settled.graph.value.horizon, [work.id]);

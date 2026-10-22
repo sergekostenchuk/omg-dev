@@ -257,7 +257,7 @@ export function taskObligationExecutionFixture(t: TestContext) {
             results.push({ kind: "part", record: reference(part.record) });
           }
           assert.equal(results.length, 2);
-          const accepted = take(writeWorksAcceptance(store, { project, results, environment, sources: [] }));
+          const accepted = take(writeWorksAcceptance(store, { project, results, environment, sources: [], binding: null }));
           assert.equal(accepted.state, "accepted"); assert.ok(accepted.acceptance);
           const settled = take(readAcceptedFrame(store, accepted.acceptance)); assert.ok(settled.frame);
           const candidate = take(readWorksFrame(store, { project, candidate: settled.frame.value.acceptance.candidate }));

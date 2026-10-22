@@ -29,6 +29,7 @@ import { writeWorksFrame } from "../src/om/works-frame.js";
 import { writeNeighbors } from "../src/om/neighbors.js";
 import { writeAtomicGate } from "../src/om/atomic-gate.js";
 import { writeFeasibility } from "../src/om/feasibility.js";
+import { resolveSnapshot } from "../src/om/impact.js";
 import { writeHandoff } from "../src/om/handoff.js";
 import { writeHorizon, prepareHorizonIssuance, writeHorizonIssuance, readHorizonIssuance,
   type HorizonRequest } from "../src/om/horizon.js";
@@ -219,7 +220,7 @@ function nativeExecuted(engine: ProductEngine, desired: Graph, sources: Ref[] = 
   if (candidate3.state !== "candidate") throw new EngineError("om_fixture_invalid", "Native L3 candidate is required");
   const neighbors = ok(writeNeighbors(store, { project, candidate: reference(candidate3.record) }));
   const gate3 = ok(writeAtomicGate(store, { project, candidate: reference(candidate3.record), neighbors: reference(neighbors),
-    environment, gaps: gapRead, results: [], sources }));
+    environment, gaps: gapRead, results: [], sources, snapshot: resolveSnapshot(engine.environments.get(project).value.workspace) }));
   assert.equal(gate3.value.result.passed, true, canonical(gate3.value.result.findings));
   const accepted3 = ok(settleCandidate(store, { project, level: 3, candidate: reference(candidate3.record),
     outcome: { ...gate3.value.result, codes: [...gate3.value.result.codes], basis: reference(gate3) } }));
@@ -1043,7 +1044,7 @@ process.stdout.write(JSON.stringify(response));
   if (candidate3.state !== "candidate") return;
   const neighbors = ok(writeNeighbors(store, { project, candidate: reference(candidate3.record) }));
   const gate3 = ok(writeAtomicGate(store, { project, candidate: reference(candidate3.record), neighbors: reference(neighbors),
-    environment, gaps: gapRead, results: [], sources: [] }));
+    environment, gaps: gapRead, results: [], sources: [], snapshot: null }));
   assert.equal(gate3.value.result.passed, false);
   assert.deepEqual(gate3.value.result.findings.map(finding => [finding.code, finding.target]), [["work_artifact_not_single", supplierWork]],
     "Exactly the supplier's work would produce both garden-data and the external artifact");

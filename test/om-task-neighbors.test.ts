@@ -11,13 +11,18 @@ import { loadTaskContextSources, taskContext, type ContextText, type PlanTaskCon
 import { nodeSignature, type MachinePlan } from '../src/compiler/model.js';
 import { requireCompatibleReceipt } from '../src/compiler/inputs.js';
 import { EngineError } from '../src/errors.js';
-import { writeFeasibility, type FeasibilityRequest } from '../src/om/feasibility.js';
+import { prepareFeasibility, writeFeasibility, type FeasibilityRequest } from '../src/om/feasibility.js';
+import { type AtomicGateRecord, type AtomicGateRequest } from '../src/om/atomic-gate.js';
+import type { FrameCandidateRecord } from '../src/om/frame-candidate.js';
+import type { GapRequest } from '../src/om/gaps.js';
 import { writeHandoff } from '../src/om/handoff.js';
-import { neighborsOf, type NeighborSources } from '../src/om/neighbors.js';
+import { neighborsOf, writeNeighbors, type NeighborSources } from '../src/om/neighbors.js';
+import { selectWriter } from '../src/ownership/owners.js';
+import { readWriterIndex, writerIndexId } from '../src/ownership/writer-index.js';
 import type { OmResult, Sealed } from '../src/om/refusal.js';
-import { reference } from '../src/pipeline/contracts.js';
+import { reference, type Ref } from '../src/pipeline/contracts.js';
 import { ProductEngine } from '../src/product/engine.js';
-import { Environments, type Environment } from '../src/runtime/environment.js';
+import { Environments, type Environment, type ExecutionRoot } from '../src/runtime/environment.js';
 import { Store, type Revision } from '../src/storage/store.js';
 
 const capacity = 200_000;
@@ -30,7 +35,14 @@ function ok<T>(result: OmResult<T>): T {
 function code(expected: string) { return (error: unknown) => error instanceof EngineError && error.code === expected; }
 interface Fixture {
   readonly store: Store; root: string; workspace: string; database: string; project: string;
-  feasibility: FeasibilityRequest; restart(): void;
+  feasibility: FeasibilityRequest;
+  gate: Revision<AtomicGateRecord>;
+  /** The real second-generation works chain ending at settleCandidate — before any M8 (LG08 AT1). */
+  nextAcceptance(choice?: string): { request: AtomicGateRequest; gate: Revision<AtomicGateRecord>;
+    acceptance: { project: string; level: 3; graph: Ref; layer: Ref; frame: Ref } };
+  /** The same chain stopping at the admitted C5 candidate — for refusal-boundary checks (LG08 AT1). */
+  nextCandidate(choice?: string): { candidate: Revision<FrameCandidateRecord>; gapRead: { sources: GapRequest; records: Ref[] } };
+  restart(): void;
 }
 type Mode = 'external' | 'shared' | 'flows';
 const fixtures = new Map<Mode, Promise<{ acceptedWorksFixture(t: TestContext): Fixture }>>();
@@ -150,9 +162,42 @@ test('G3 both consumers reuse V2 and F4 for each native task and preserve histor
   for (const task of f.plan.value.tasks) {
     assert.deepEqual(taskContext(f.plan, fullCheck, task.id, capacity, original), contexts.get(task.id));
     assert.deepEqual(taskContext(f.plan, fullCheck, task.id, capacity, historical), contexts.get(task.id));
-    // Current admission still applies the existing ownership rule; pure history does not re-admit the plan.
-    assert.throws(() => f.engine.compiler.context(f.project, reference(f.plan), task.id, capacity), code('ownership_transfer_required'));
   }
+  // Two distinct boundaries: the old plan's saved G5 snapshot is the pre-run tree, so context issuance is the
+  // public plan_stale boundary while compiler.gate keeps the underlying feasibility_stale finding — and a second
+  // works generation keeps the ownership rule at its real first door, public writeNeighbors.
+  const beforeStale = f.store.list().map(reference);
+  for (const task of f.plan.value.tasks)
+    assert.throws(() => f.engine.compiler.context(f.project, reference(f.plan), task.id, capacity), code('plan_stale'));
+  const stale = prepareFeasibility(f.store, { ...f.feasibility, expected: f.m8.revision });
+  assert.ok(!stale.ok); assert.equal(stale.refusal.code, 'feasibility_stale');
+  assert.deepEqual(stale.refusal.at, { unit: 'M8', target: f.gate.id, field: 'snapshot' });
+  const gated = f.engine.compiler.gate(f.project, reference(f.plan));
+  assert.ok(gated.findings.some(finding => finding.code === 'feasibility_stale' && finding.target === f.gate.id),
+    canonical(gated.findings));
+  assert.deepEqual(f.store.list().map(reference), beforeStale, 'The stale-plan refusals write nothing');
+  // Ownership: after the two committed writers the selected owner of shared.txt is garden-consume-work, proven by
+  // the real current execution-root and writer-index. The second-generation candidate keeps both horizon works
+  // writing shared.txt with no transfer to garden-produce-work — writeWorksFrame admits it, then the same
+  // writeGrants rule refuses it at the neighbors boundary before any G5.
+  const nextGeneration = f.nextCandidate();
+  const root = f.store.get<ExecutionRoot>(`execution-root:${f.project}`)!;
+  const index = readWriterIndex(f.store, f.project, 'shared.txt',
+    reference(f.store.get(writerIndexId(f.project, 'shared.txt'))!), reference(root));
+  const owner = selectWriter(f.store, f.project, { root: root.value.path, head: root.value.head },
+    index.value.writers, 'shared.txt');
+  assert.equal(owner?.node, 'garden-consume-work', 'The proven current owner writes shared.txt last');
+  const beforeOwnership = f.store.list().map(reference), sent = f.calls().length;
+  const refusedNeighbors = writeNeighbors(f.store, { project: f.project, candidate: reference(nextGeneration.candidate) });
+  assert.ok(!refusedNeighbors.ok);
+  assert.equal(refusedNeighbors.refusal.code, 'ownership_predecessor_missing');
+  assert.equal(refusedNeighbors.refusal.message, 'The accepted owner of shared.txt needs an explicit transfer');
+  assert.deepEqual(refusedNeighbors.refusal.at, { unit: 'F7.4', target: 'garden-produce-work',
+    field: canonical({ producer: '', block: '', artifact: 'shared.txt' }) });
+  assert.deepEqual(f.store.list().map(reference), beforeOwnership, 'The ownership refusal writes nothing');
+  assert.equal(selectWriter(f.store, f.project, { root: root.value.path, head: root.value.head },
+    index.value.writers, 'shared.txt')?.node, owner?.node, 'The refusal changes no selected owner');
+  assert.equal(f.calls().length, sent, 'The refusal sends nothing');
   // Completed execution and recovery do not acquire new capacity-dependent admission.
   assert.deepEqual((await f.run(1, true)).map(reference), runs.map(reference));
   await f.engine.executor.recover(f.project); assert.equal(f.calls().length, 4);

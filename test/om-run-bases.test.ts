@@ -497,7 +497,7 @@ function externalCandidate(t: test.TestContext, selfInput = false) {
     timeoutMs: 5000, requestCapacityChars: 200_000 }, 0);
   const path = join(root, "input.txt");
   const request: AtomicGateRequest = { project, candidate: reference(candidate.record), neighbors: reference(neighbors),
-    environment: reference(environment), gaps: gapRead, results: [], sources: [] };
+    environment: reference(environment), gaps: gapRead, results: [], sources: [], snapshot: null };
   return { store, root, path, first, candidate, neighbors, request };
 }
 

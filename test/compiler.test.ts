@@ -31,7 +31,7 @@ test("machine tasks, dependencies and required durable checks are derived withou
   engine.environments.configure("garden", { workspace, implementer: { actor: "worker", model: "fixture", effort: "high", command },
     reviewer: { actor: "reviewer", model: "fixture", effort: "high", command }, fullCheck: command, timeoutMs: 1000, requestCapacityChars: 100_000 }, 0);
   assert.throws(() => engine.compiler.compile("garden"), /OM-G2 must be accepted/);
-  prepareNativeLayers(engine, "garden", desired, "executed");
+  prepareNativeLayers(engine, "garden", desired, "executed", { decidePolicies: true });
   const plan = engine.compiler.compile("garden"); const again = engine.compiler.compile("garden");
   assert.deepEqual(again, plan); assert.equal(store.list("plan").length, 1);
   assert.equal(plan.value.tasks.length, 2);

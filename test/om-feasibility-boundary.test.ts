@@ -26,6 +26,8 @@ import { ProductEngine } from '../src/product/engine.js';
 import { Environments, uniqueTransactionGuards, type ExecutionRoot } from '../src/runtime/environment.js';
 import { Store, type Revision } from '../src/storage/store.js';
 import { gateFeasibility, prepareFeasibility, readFeasibility, writeFeasibility, type FeasibilityRequest, type OmFeasibility } from '../src/om/feasibility.js';
+import { type AtomicGateRecord, type AtomicGateRequest } from '../src/om/atomic-gate.js';
+import { resolveSnapshot } from '../src/om/impact.js';
 import { historicalTrace, withHistoricalReads } from '../src/om/input.js';
 import type { OmResult, Sealed } from '../src/om/refusal.js';
 
@@ -34,6 +36,11 @@ interface BoundaryFixture {
   readonly project: string;
   readonly workspace: string;
   readonly feasibility: FeasibilityRequest;
+  readonly request: AtomicGateRequest;
+  readonly gate: Revision<AtomicGateRecord>;
+  /** The real second-generation works chain ending at settleCandidate — before any M8 (LG08 AT1). */
+  nextAcceptance(choice?: string): { request: AtomicGateRequest; gate: Revision<AtomicGateRecord>;
+    acceptance: { project: string; level: 3; graph: Ref; layer: Ref; frame: Ref } };
   restart(): void;
 }
 type FixtureModule = { acceptedWorksFixture(t: TestContext): BoundaryFixture };
@@ -444,12 +451,30 @@ test('G1.1 M8 and its compiled plan survive their own first native execution com
   assert.deepEqual(next.value.writers, [reference(run)]);
   assert.deepEqual(next.value.root, reference(root));
   f.restart();
+  // AT1 split: the saved G5 snapshot is the tree the works were checked against, and the first execution commit
+  // advanced the effective root — so an M8 derived again on the old frame is exactly feasibility_stale at the gate's
+  // snapshot field, and the refusal writes nothing.
+  const snapshot0 = f.request.snapshot;
+  assert.ok(snapshot0, 'The saved gate names the tree its works were checked against');
+  const snapshot1 = resolveSnapshot(new ProductEngine(f.store).environments.effective(f.project).root);
+  assert.notEqual(snapshot0.tree, snapshot1.tree, 'The first execution commit advanced the effective tree');
   const beforePreview = heads(f.store);
-  const preview = ok(prepareFeasibility(f.store, { ...f.feasibility, expected: saved.revision }));
+  const stale = prepareFeasibility(f.store, { ...f.feasibility, expected: saved.revision });
+  assert.ok(!stale.ok);
+  assert.equal(stale.refusal.code, 'feasibility_stale');
+  assert.deepEqual(stale.refusal.at, { unit: 'M8', target: f.gate.id, field: 'snapshot' });
+  assert.deepEqual(heads(f.store), beforePreview, 'The stale-snapshot refusal writes nothing');
+  // A second works generation is genuinely checked by G5 against the new tree and settles before M8; its fresh
+  // preview keeps the exact nonempty writer index for the same path without rewriting the original M8.
+  const second = f.nextAcceptance();
+  assert.equal(second.gate.value.request.snapshot!.tree, snapshot1.tree, 'The second gate names the effective tree');
+  const beforeSecondPreview = heads(f.store);
+  const preview = ok(prepareFeasibility(f.store, { ...f.feasibility, graph: second.acceptance.graph,
+    layer: second.acceptance.layer, frame: second.acceptance.frame, expected: saved.revision }));
   assert.equal(preview.record.value.ready, true);
   assert.deepEqual(preview.record.value.producer.deliveries.ownership!.indexes[path], reference(next));
   assertExplicitEmptyReadinessInputs(preview.record.value);
-  assert.deepEqual(heads(f.store), beforePreview, 'A new preview with a nonempty selected writer does not rewrite the original M8');
+  assert.deepEqual(heads(f.store), beforeSecondPreview, 'A new preview with a nonempty selected writer does not rewrite the original M8');
   const replay = tracedM8(f.store, f.project, reference(saved));
   assert.equal(canonical(replay.saved), savedBytes);
   assert.equal(replay.saved.hash, saved.hash);

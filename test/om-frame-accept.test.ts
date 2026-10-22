@@ -708,7 +708,7 @@ test('G5 result identity traverses a proved rebase to native L3 fills without tr
   const environment = engine.environments.get(project), { projectId: _projectId, ...configuration } = environment.value;
   const capacity = engine.environments.configure(project, { ...configuration, requestCapacityChars: 200_000 }, environment.revision);
   const gate = ok(writeAtomicGate(store, { project, candidate: candidateRef, neighbors: reference(neighbors),
-    environment: reference(capacity), gaps: gapRead, results: [], sources: [] }));
+    environment: reference(capacity), gaps: gapRead, results: [], sources: [], snapshot: null }));
   assert.equal(gate.value.result.passed, true, canonical(gate.value.result.findings));
   const accepted = ok(settleCandidate(store, { project, level: 3, candidate: candidateRef,
     outcome: { ...gate.value.result, codes: [...gate.value.result.codes], basis: reference(gate) } }));
@@ -969,20 +969,19 @@ async function currentF5Fixture(t: TestContext): Promise<CurrentF5Fixture> {
 test('C5.1 current F5 acceptance preserves null and exact work bindings, series guards and restart replay', async t => {
   const f = await currentF5Fixture(t);
   assert.ok(f.obligations.length > 1 && f.foreignObligations.length > 0);
-  for (const explicitFirst of [false, true]) {
-    const path = join(f.root, `unbound-${explicitFirst}.sqlite`); copyFileSync(f.database, path);
-    const unbound = new Store(path);
+  for (const binding of [null, f.request.binding]) {
+    const path = join(f.root, `binding-${binding === null}.sqlite`); copyFileSync(f.database, path);
+    const bound = new Store(path);
     try {
-      const first = explicitFirst ? { ...f.request, binding: null } : f.request;
-      const second = explicitFirst ? f.request : { ...f.request, binding: null };
-      const accepted = ok(writeWorksAcceptance(unbound, first)); assert.ok(accepted.acceptance);
-      const read = ok(readAcceptedFrameLayer(unbound, { project: 'garden', level: 3, frame: accepted.acceptance.frame }));
+      const request = { ...f.request, binding };
+      const accepted = ok(writeWorksAcceptance(bound, request)); assert.ok(accepted.acceptance);
+      const read = ok(readAcceptedFrameLayer(bound, { project: 'garden', level: 3, frame: accepted.acceptance.frame }));
       assert.equal(read.frame.value.acceptance.contract, 'om-frame-acceptance/v1');
-      assert.equal(read.frame.value.acceptance.binding, null);
-      const before = snapshot(unbound), replay = ok(writeWorksAcceptance(unbound, second));
+      assert.deepEqual(read.frame.value.acceptance.binding, binding);
+      const before = snapshot(bound), replay = ok(writeWorksAcceptance(bound, request));
       assert.equal(replay.state, 'unchanged'); assert.deepEqual(replay.record, accepted.record);
-      assert.deepEqual(replay.acceptance, accepted.acceptance); assert.deepEqual(snapshot(unbound), before);
-    } finally { unbound.close(); }
+      assert.deepEqual(replay.acceptance, accepted.acceptance); assert.deepEqual(snapshot(bound), before);
+    } finally { bound.close(); }
   }
   const realizedPath = join(f.root, 'realized-block.sqlite'); copyFileSync(f.database, realizedPath);
   const realized = new Store(realizedPath);
@@ -992,11 +991,13 @@ test('C5.1 current F5 acceptance preserves null and exact work bindings, series 
     const graph = realized.get<Graph>(f.graph.id, f.graph.revision)!.value;
     assert.notEqual(graph.nodes.find(node => node.id === 'garden-produce-operation')!.parent, address.block);
     assert.ok(graph.edges!.some(edge => edge.relation === 'realizes' && edge.source === 'garden-produce-operation' && edge.target === address.block));
-    ok(completeAttempt(realized, { ...address, attempt: f.goal.ordinal,
-      outcome: { reason: 'interrupted', achieved: [], cancelled: [], refusals: [] } }));
-    const ordinal = f.goal.ordinal + 1, attempt = ok(beginAttempt(realized, { ...address, attempt: ordinal,
-      goal: { key: 'shared-operation-result', questions: f.realizedObligations.map(id => gapLineKey('garden', id, 'fill')), result: 'accepted-gap-fill' } }));
-    const binding = { series: reference(attempt), ordinal, obligations: f.realizedObligations };
+    // LG08-03: the produce-operation fills entered this attempt's original completion lawfully — every selected
+    // batch item names this block among its consumers — so the realizes edge binds them to the consume series
+    // whose block differs from the operation's parent.
+    const running = ok(readSeries(realized, address));
+    assert.deepEqual(reference(running), f.goal.series);
+    assert.equal(running.value.attempts.find(item => item.ordinal === f.goal.ordinal)!.outcome, null);
+    const binding = { series: f.goal.series, ordinal: f.goal.ordinal, obligations: f.realizedObligations };
     const accepted = ok(writeWorksAcceptance(realized, { ...f.request, binding })); assert.ok(accepted.acceptance);
     const read = ok(readAcceptedFrameLayer(realized, { project: 'garden', level: 3, frame: accepted.acceptance.frame }));
     assert.deepEqual(read.frame.value.acceptance.binding, binding);

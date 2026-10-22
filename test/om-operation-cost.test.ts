@@ -159,7 +159,7 @@ try {
   const declared = f.openGoal, goal = declared.goal;
   const targets = f.gaps.records.map(row => row.value.gap).filter(gap => gap.code === 'obligation_open'
     && gap.evidence.some(evidence => evidence.origin === 'works') && goal.questions.includes(gapLineKey(f.project, gap.target, gap.field)));
-  assert.equal(targets.length, 4);
+  assert.equal(targets.length, 8);
   const request = { project: f.project, previous: reference(previous), pass: previous.value.request.pass + 1, gaps,
     closures: targets.map(target => ({ id: target.id, reason: 'filled', basis: acceptance.frame, acceptance,
       attempt: { series: declared.series, attempt: declared.ordinal } })) };
@@ -281,7 +281,7 @@ try {
   assert.equal(accepted.state, 'accepted'); assert.ok(accepted.acceptance);
   const freshAcceptance = ok(readAcceptedFrame(store, accepted.acceptance));
   const { contract, binding, layer, ...originalAcceptance } = freshAcceptance.frame.value.acceptance;
-  assert.equal(contract, 'om-frame-acceptance/v1'); assert.equal(binding, null);
+  assert.equal(contract, 'om-frame-acceptance/v1'); assert.deepEqual(binding, f.request.binding);
   assert.deepEqual(layer, { id: freshAcceptance.layer.id, revision: freshAcceptance.layer.revision });
   // FJ1: a new independent C4 belongs to its new assembly era; the exact saved history above remains unchanged.
   const { hashJson } = await imports('canonical');
@@ -350,19 +350,19 @@ try {
   const declared = f.openGoal, goal = declared.goal;
   const targets = f.gaps.records.map(row => row.value.gap).filter(gap => gap.code === 'obligation_open'
     && gap.evidence.some(evidence => evidence.origin === 'works') && goal.questions.includes(gapLineKey(f.project, gap.target, gap.field)));
-  assert.equal(targets.length, 4, 'The unchanged producer supplies four genuine obligations of the declared work goal');
+  assert.equal(targets.length, 8, 'The unchanged producer supplies the genuine obligations of the declared work goal');
   assert.ok(targets.every(target => !current.collection.gaps.some(gap => gap.id === target.id)));
   const afterAcceptance = paths.get(store);
   store.close();
   let preparationFamilies = null, confirmationFamilies = null;
-  for (const size of [1, 2, 4]) {
+  for (const size of [1, 2, targets.length]) {
     const copy = cloneStore(afterAcceptance, 'closures-' + size);
     const request = { project: f.project, previous: reference(previous), pass: previous.value.request.pass + 1, gaps,
       closures: targets.slice(0, size).map(target => ({ id: target.id, reason: 'filled', basis: acceptance.frame, acceptance,
         attempt: { series: declared.series, attempt: declared.ordinal } })) };
     const before = copy.list().map(reference);
     const cold = measured('prepareGapLines.' + size, () => ok(prepareGapLines(copy, request)));
-    if (size === 4) {
+    if (size === targets.length) {
       const oldFrame = checkpoint.accepted.acceptance.frame;
       const expectedLines = checkpoint.prepared.record.lines.map(line => line.basis && canonical(line.basis) === canonical(oldFrame)
         ? { ...line, basis: acceptance.frame } : line);
@@ -401,7 +401,7 @@ try {
     const saved = ok(writeGapLines(copy, request));
     const confirmation = { project: f.project, block: declared.block, target: declared.series.id, goal, accepting: [reference(saved)], cancelling: [] };
     const confirmed = measured('confirmResults.' + size, () => ok(confirmResults(copy, confirmation)));
-    if (size === 4) {
+    if (size === targets.length) {
       assert.deepEqual(confirmed.result.achieved.map(item => item.key), checkpoint.confirmed.achieved.map(item => item.key));
       assert.deepEqual(confirmed.result.cancelled, checkpoint.confirmed.cancelled);
       assert.ok(confirmed.result.achieved.every(item => canonical(item.basis) === canonical(reference(saved))),
@@ -419,7 +419,7 @@ try {
     });
     assert.deepEqual(warmed.result, confirmed.result, 'Warm confirmation preserves all exact achievement keys and bases');
     assert.ok(warmed.sample.proofs.size < confirmed.sample.proofs.size);
-    if (size === 4) {
+    if (size === targets.length) {
       const other = new Store(paths.get(copy)); stores.push(other);
       withHistoricalReads(() => {
         ok(confirmResults(copy, confirmation));

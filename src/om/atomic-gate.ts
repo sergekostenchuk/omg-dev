@@ -22,7 +22,6 @@ import { hasBasisApplications } from './selected-specification.js';
 import { readDeliveries as readDeliveriesOf } from './deliveries.js';
 import { prepareSettleCandidate as prepareSettleCandidateOf, readAcceptedFrame as readAcceptedFrameOf, readRejectedCandidate as readRejectedCandidateOf, type AcceptedFrameRequest } from './frame-accept.js';
 import type { CandidateRequest, FrameCandidateRecord } from './frame-candidate.js';
-import { chosenWakes as chosenWakesOf } from './wake-choice.js';
 import { WORKS_FRAME_CONTRACT } from './frame-obligations.js';
 import { isFrameAttemptBinding, type FrameAttemptBinding } from './layer-basis.js';
 import type { ProposalRequest } from './frame-proposals.js';
@@ -68,7 +67,6 @@ const prepareCurrentGaps = transferring('gaps', prepareCurrentGapsOf);
 const prepareGaps = transferring('gaps', prepareGapsOf);
 const readGaps = transferring('gaps', readGapsOf);
 const readPartAssembly = transferring('model-call', readPartAssemblyOf);
-const chosenWakes = transferring('wake-choice', chosenWakesOf);
 const readReuseResult = transferring('model-call', readReuseResultOf);
 const prepareNeighbors = transferring('neighbors', prepareNeighborsOf);
 const readNeighbors = transferring('neighbors', readNeighborsOf);
@@ -104,9 +102,11 @@ export interface AtomicGateImpact { snapshot: RepositorySnapshot | null; works: 
 export interface WorkProposalSource { kind: 'part' | 'assembly' | 'reuse'; record: Ref }
 export interface AtomicGateRequest {
   project: string; candidate: Ref; neighbors: Ref; environment: Ref; gaps: GapReadRequest; results: WorkProposalSource[]; sources: Ref[];
-  snapshot?: RepositorySnapshot | null;
+  /** AT1: the exact snapshot the originating packets were answered against, or its legal null when they had none. */
+  snapshot: RepositorySnapshot | null;
   taskContextContract?: TaskContextContract;
 }
+export type IssuedGateRequest = AtomicGateRequest & { taskContextContract: TaskContextContract };
 export interface AtomicGateRecord {
   contract: typeof ATOMIC_GATE_CONTRACT | typeof ATOMIC_GATE_IMPACT_CONTRACT; project: string; request: AtomicGateRequest;
   result: { gate: 'G5'; candidate: Ref; graphHash: string; passed: boolean; codes: string[]; findings: Finding[] };
@@ -152,21 +152,20 @@ function requireRequest(store: Store, request: AtomicGateRequest): void {
   if (!(store instanceof Store) || !object(request) || !text(request.project)
     || ![request.candidate, request.neighbors, request.environment].every(isRef) || !object(request.gaps)
     || !sourcesShape(request.results) || !sourcesRefs(request.sources)
-    || Object.hasOwn(request, 'snapshot') && request.snapshot !== null && !validSnapshot(request.snapshot)
+    || request.snapshot !== null && !validSnapshot(request.snapshot)
     || Object.hasOwn(request, 'taskContextContract') && !isTaskContextContract(request.taskContextContract)
     || Object.keys(request).some(key => !['project', 'candidate', 'neighbors', 'environment', 'gaps', 'results', 'sources', 'snapshot', 'taskContextContract'].includes(key))) invalid('request');
 }
 
-const normalizedGateRequest = (request: AtomicGateRequest): AtomicGateRequest =>
+const normalizedGateRequest = <T extends AtomicGateRequest>(request: T): T =>
   ({ ...copy(request), sources: sorted(request.sources), results: sorted(request.results) });
 const gateId = (request: AtomicGateRequest) => `om-atomic-gate:${request.project}:${hashJson(request)}`;
-function issuedRequest(store: Store, request: AtomicGateRequest): AtomicGateRequest {
+function issuedRequest(store: Store, request: AtomicGateRequest): IssuedGateRequest {
   request = normalizedGateRequest(request);
-  // A saved G5 keeps its era. New work derives the contract from its immutable B1 producers, never field presence.
-  if (store.get(gateId(request))) return request;
+  // New work derives the contract from its immutable B1 producers, never field presence.
   const input = take(readOmInput(store, request.project, request.gaps.sources.input)).value.input;
   const contract = hasBasisApplications(input.sources) ? BASIS_TASK_CONTEXT_CONTRACT : TASK_CONTEXT_CONTRACT;
-  if (request.taskContextContract && request.taskContextContract !== contract)
+  if (request.taskContextContract !== undefined && request.taskContextContract !== contract)
     invalid('taskContextContract');
   return { ...request, taskContextContract: contract };
 }
@@ -264,30 +263,20 @@ function modelSources(store: Store, project: string, results: readonly WorkPropo
   }
   if (new Set(outputs.map(output => canonical(reference(output.proposal)))).size !== outputs.length)
     fail('atomic_gate_bindings_unproven', project, 'results', 'A proposal occurs once in the accepted result set');
-  // G5 (№3820, №3822): one original handoff is one exact D7 request. D7 derived from it by a rule of another era (OWN1.2)
-  // is the same handoff; each source keeps its own ledger, and its bindings are transferred from that ledger.
-  const originals = new Map<string, Sealed<OmObligations>>();
+  // G5 (№3820, №3822): the checked answers of the final proposals all belong to the one exact original handoff —
+  // every source's own declared ledger is that same D7 record; its bindings are transferred from it.
+  let original: Sealed<OmObligations> | null = null;
   for (const work of works) {
-    const key = canonical(work.producer as unknown as Json);
-    if (originals.has(key)) continue;
-    const original = take(readOmObligations(store, { project, producer: work.producer }));
-    if (!same(reference(original.record), work.ledger))
+    const found = take(readOmObligations(store, { project, producer: work.producer }));
+    if (!same(reference(found.record), work.ledger))
       fail('atomic_gate_bindings_unproven', work.ledger.id, 'ledger', 'The source ledger must belong to the checked answer');
-    originals.set(key, original);
+    if (original && !same(reference(original.record), reference(found.record)))
+      fail('atomic_gate_bindings_unproven', work.ledger.id, 'works', 'All final proposals belong to one original handoff');
+    original = found;
   }
-  const requests = new Set([...originals.values()].map(original => canonical(original.record.value.request as unknown as Json)));
-  if (requests.size > 1) fail('atomic_gate_bindings_unproven', project, 'works', 'All final proposals belong to one original handoff');
-  const originalOf = (work: WorksPartBindings): Sealed<OmObligations> => originals.get(canonical(work.producer as unknown as Json))!;
-  return { outputs, works, originalOf, references: unique(outputs.flatMap(output => output.references)) };
+  return { outputs, works, original, references: unique(outputs.flatMap(output => output.references)) };
 }
 
-/** G5.1 (№3847): the exact proposal of the one source whose answer defines this producer work, if exactly one does. */
-export function producerProposal(store: Store, project: string, results: readonly WorkProposalSource[], work: string): AtomicGateResult<Sealed<Ref | null>> {
-  return run(() => {
-    const found = modelSources(store, project, results).outputs.filter(output => output.proposal.value.nodes.some(node => node.id === work));
-    return found.length === 1 ? reference(found[0]!.proposal) : null;
-  });
-}
 /** Assignment identity is checked by D7; this key preserves every responsibility and policy field. */
 function assignmentKey(value: CarriedObligation): string {
   const { scope: _scope, original: _original, ...policy } = value;
@@ -335,12 +324,12 @@ function proveBindingTransfer(store: Store, request: AtomicGateRequest, candidat
       fail('atomic_gate_bindings_unproven', candidate.works!.ledger.id, 'results', 'A nonempty handoff needs the checked model results carrying its bindings');
     return current.inputs as Ref[];
   }
-  const original = sources.originalOf(sources.works[0]!);
+  const original = sources.original!;
   const initial = original.record.value.request.gaps.sources.works;
   if ('state' in initial || !same(initial.frame, candidate.request.frame)
     || !same(unique([...initial.proposals, ...sources.outputs.map(output => reference(output.proposal))]), unique(candidate.proposals)))
     fail('atomic_gate_bindings_unproven', request.candidate.id, 'proposals', 'The candidate must contain the initial proposals and exactly the checked final answers');
-  const expected = remapBindings(sources.works.map(work => ({ old: sources.originalOf(work), bindings: work.bindings })), current);
+  const expected = remapBindings(sources.works.map(work => ({ old: original, bindings: work.bindings })), current);
   if (!same(sorted(expected), sorted(candidate.works!.bindings)))
     fail('atomic_gate_bindings_unproven', request.candidate.id, 'bindings', 'Final bindings must be the complete, lossless transfer of the checked answers');
   for (const basis of current.record.value.request.assignments) {
@@ -350,7 +339,7 @@ function proveBindingTransfer(store: Store, request: AtomicGateRequest, candidat
       || !same(transfer.record.value.from.ledger, reference(original.record)))
       fail('atomic_gate_bindings_unproven', basis.record.id, 'from', 'The retained authority must come from this exact answer assignment');
   }
-  return unique([...sources.references, ...sources.works.flatMap(work => sources.originalOf(work).inputs), ...current.inputs]);
+  return unique([...sources.references, ...original.inputs, ...current.inputs]);
 }
 
 /** New G5 rules are layered on native graph checks; C4 remains the authority for assembly and binding. */
@@ -419,7 +408,7 @@ function candidateTasks(store: Store, project: string, target: string, candidate
   return { tasks, obligations };
 }
 /** Measure the exact compiler task DTO plus the complete checked F4 packet, before any MachinePlan exists. */
-function packetCapacity(store: Store, request: AtomicGateRequest, candidate: FrameCandidateRecord,
+function packetCapacity(store: Store, request: IssuedGateRequest, candidate: FrameCandidateRecord,
   neighbors: Revision<NeighborCollection>, limit: number, current: boolean): Finding[] {
   const graph = candidate.graph;
   const external = new Map(request.sources.map(ref => [ref.id, ref])), used = new Set<string>();
@@ -440,8 +429,8 @@ function packetCapacity(store: Store, request: AtomicGateRequest, candidate: Fra
   if (used.size !== external.size) fail('atomic_gate_basis_unproven', request.candidate.id, 'sources', 'A context names exactly its necessary external sources');
   const findings: Finding[] = [...derived.obligations.findings];
   for (const task of derived.tasks) {
-    const selected = request.taskContextContract ? { taskContextContract: request.taskContextContract,
-      specification: loadTaskSpecification(store, request.project, request.gaps.sources.input, graph, task, readTaskSpecification, request.taskContextContract) } : {};
+    const selected = { taskContextContract: request.taskContextContract,
+      specification: loadTaskSpecification(store, request.project, request.gaps.sources.input, graph, task, readTaskSpecification, request.taskContextContract) };
     try { preplanTaskContext({ project: request.project, graph, task, fullCheck: fullCheck!,
       basis: { candidate: request.candidate, environment: request.environment }, neighbors, ...selected }, limit); }
     catch (error) {
@@ -458,7 +447,7 @@ function packetCapacity(store: Store, request: AtomicGateRequest, candidate: Fra
  * producer from Git objects of that tree, and the coverage of each work's inventory by its own decisions.
  */
 function impactOf(store: Store, request: AtomicGateRequest, graph: Graph): { record: AtomicGateImpact; findings: Finding[] } {
-  const snapshot = request.snapshot ?? null;
+  const snapshot = request.snapshot;
   const input = take(readOmInput(store, request.project, request.gaps.sources.input)).value.input as OmInput;
   const policy = gatePolicies(graph, input), policies = policy.rows.length ? { policies: policy.rows } : {};
   if (!snapshot) return { record: { snapshot: null, works: [], ...policies }, findings: [...policy.findings, ...gateIntegrations(graph, null).findings] };
@@ -607,7 +596,7 @@ function resultsSnapshot(store: Store, project: string, results: readonly WorkPr
     fail('atomic_gate_basis_unproven', project, 'snapshot', 'One works chain is checked against one repository snapshot');
   return snapshots[0] ?? null;
 }
-function deriveGate(store: Store, request: AtomicGateRequest, current: boolean): PreparedAtomicGate {
+function deriveGate(store: Store, request: IssuedGateRequest, current: boolean): PreparedAtomicGate {
   requireRequest(store, request); request = normalizedGateRequest(request);
   const candidate = take(readWorksFrame(store, { project: request.project, candidate: request.candidate }));
   const neighbors = take(readNeighbors(store, { project: request.project, neighbors: request.neighbors }));
@@ -625,14 +614,14 @@ function deriveGate(store: Store, request: AtomicGateRequest, current: boolean):
   }
   const references = proveBindingTransfer(store, request, candidate.value as FrameCandidateRecord);
   const capacity = take(readCapacity(store, { project: request.project, environment: request.environment, current }));
-  const impact = Object.hasOwn(request, 'snapshot') ? impactOf(store, request, candidate.value.graph as Graph) : null;
+  const impact = impactOf(store, request, candidate.value.graph as Graph);
   const findings = unique([...take(checkAtomicWorks(candidate.value.graph as Graph, gapSet.collection as GapCollection)),
     ...packetCapacity(store, request, candidate.value as FrameCandidateRecord, neighbors as Revision<NeighborCollection>, capacity.maxRequestChars, current),
-    ...(impact?.findings ?? [])]);
-  const value: AtomicGateRecord = { contract: impact ? ATOMIC_GATE_IMPACT_CONTRACT : ATOMIC_GATE_CONTRACT, project: request.project, request,
+    ...impact.findings]);
+  const value: AtomicGateRecord = { contract: ATOMIC_GATE_IMPACT_CONTRACT, project: request.project, request,
     result: { gate: 'G5', candidate: request.candidate, graphHash: candidate.value.graphHash,
       passed: findings.length === 0, codes: unique(findings.map(finding => finding.code)), findings },
-    ...(impact ? { impact: impact.record } : {}) };
+    impact: impact.record };
   const record: Revision<AtomicGateRecord> = { id: gateId(request),
     kind: 'om-atomic-gate', revision: 1, hash: hashJson(value), value };
   if (current) guards.push(...capacity.guards);
@@ -673,7 +662,9 @@ export function writeAtomicGate(store: Store, request: AtomicGateRequest): Atomi
   });
 }
 
-export interface WorksAcceptanceRequest { project: string; results: WorkProposalSource[]; environment: Ref; sources: Ref[]; binding?: FrameAttemptBinding | null }
+export interface WorksAcceptanceRequest { project: string; results: WorkProposalSource[]; environment: Ref; sources: Ref[];
+  /** C5: the exact accepting attempt and its declared obligations, or the legal null of an unbound acceptance. */
+  binding: FrameAttemptBinding | null }
 export interface WorksAcceptanceRecord {
   contract: 'om-works-acceptance/v1'; request: WorksAcceptanceRequest; gate: Ref;
   acceptance: AcceptedFrameRequest | null;
@@ -686,11 +677,11 @@ function requireAcceptance(store: Store, request: WorksAcceptanceRequest): void 
   if (!(store instanceof Store) || !object(request) || !text(request.project) || !isRef(request.environment)
     || !sourcesShape(request.results) || !request.results.length || !sourcesRefs(request.sources)
     || Object.keys(request).some(key => !['project', 'results', 'environment', 'sources', 'binding'].includes(key))
-    || Object.hasOwn(request, 'binding') && request.binding !== null && !isFrameAttemptBinding(request.binding)) invalid('acceptance');
+    || !Object.hasOwn(request, 'binding') || request.binding !== null && !isFrameAttemptBinding(request.binding)) invalid('acceptance');
 }
 function normalizeAcceptance(request: WorksAcceptanceRequest): WorksAcceptanceRequest {
   return { project: request.project, results: sorted(copy(request.results)), environment: copy(request.environment), sources: sorted(copy(request.sources)),
-    ...(request.binding ? { binding: { ...copy(request.binding), obligations: sorted(request.binding.obligations) } } : {}) };
+    binding: request.binding === null ? null : { ...copy(request.binding), obligations: sorted(request.binding.obligations) } };
 }
 const acceptanceId = (request: WorksAcceptanceRequest) => `om-works-acceptance:${request.project}:${hashJson(request)}`;
 function acceptanceRow(value: WorksAcceptanceRecord): Revision<WorksAcceptanceRecord> {
@@ -734,7 +725,7 @@ export function readWorksAcceptance(store: Store, request: { project: string; re
  * the next D2 snapshot, the D7 transfer, C4 and F3. G5 acceptance and the machine list of its external Sources share it.
  */
 function worksCandidate(store: Store, project: string, results: readonly WorkProposalSource[], target: string) {
-  const checked = modelSources(store, project, results), old = checked.originalOf(checked.works[0]!);
+  const checked = modelSources(store, project, results), old = checked.original!;
   const oldRequest = old.record.value.request, initial = oldRequest.gaps.sources.works;
   if ('state' in initial) fail('atomic_gate_basis_unproven', target, 'works', 'The original assignment requires an accepted operation frame');
   const works: ProposalRequest = { frame: copy(initial.frame) as ProposalRequest['frame'],
@@ -766,11 +757,9 @@ function worksCandidate(store: Store, project: string, results: readonly WorkPro
     tx.add(transfer); assignments.push({ record: reference(transfer.record) });
   }
   const handoff = take(prepareOmObligations(tx.view, { project, ...context, assignments })); tx.add(handoff);
-  const bindings = remapBindings(checked.works.map(work => ({ old: checked.originalOf(work), bindings: work.bindings })), handoff);
-  // G5.1 (№3847): the chosen wake tests of these exact proposals' producer ends travel with the candidate request.
-  const wakes = checked.outputs.flatMap(output => take(chosenWakes(store, project, reference(output.proposal))));
+  const bindings = remapBindings(checked.works.map(work => ({ old, bindings: work.bindings })), handoff);
   const candidateRequest: CandidateRequest = { ...works, works: { contract: WORKS_FRAME_CONTRACT,
-    producer: reference(handoff.producer), ledger: reference(handoff.record), bindings }, ...(wakes.length ? { wakes } : {}) };
+    producer: reference(handoff.producer), ledger: reference(handoff.record), bindings } };
   const candidate = take(prepareWorksFrame(tx.view, candidateRequest));
   if (candidate.state !== 'candidate') fail('work_blocking_gap_open', target, 'candidate', 'The final proposals must fill the complete work frame');
   tx.add(candidate);
@@ -795,7 +784,7 @@ export function prepareWorksAcceptance(store: Store, raw: WorksAcceptanceRequest
     const gate = take(prepareAtomicGate(tx.view, { project: request.project, candidate: candidateRef, neighbors: neighbors.reference,
       environment: request.environment, gaps: gapRead, results: request.results, sources: request.sources,
       snapshot: resultsSnapshot(store, request.project, request.results) })); tx.add(gate);
-    const settlement = take(prepareSettleCandidate(tx.view, { project: request.project, level: 3, candidate: candidateRef, binding: request.binding ?? null,
+    const settlement = take(prepareSettleCandidate(tx.view, { project: request.project, level: 3, candidate: candidateRef, binding: request.binding,
       outcome: { ...gate.record.value.result, codes: [...gate.record.value.result.codes], basis: reference(gate.record) } })); tx.add(settlement);
     const accepted = settlement.result;
     const acceptance: AcceptedFrameRequest | null = gate.record.value.result.passed && accepted.graph && accepted.layer && accepted.frame

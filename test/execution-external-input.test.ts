@@ -22,6 +22,7 @@ import type { Graph } from '../src/graph/model.js';
 import { writeFeasibility, readFeasibility, type FeasibilityRequest } from '../src/om/feasibility.js';
 import { writeHandoff } from '../src/om/handoff.js';
 import { checkAtomicWorks, prepareCandidateSources, writeAtomicGate } from '../src/om/atomic-gate.js';
+import { resolveSnapshot } from '../src/om/impact.js';
 import { inputDecisionWrite, writeAddressing, type InputDecisionProposal } from '../src/om/addressing.js';
 import { writeHorizon } from '../src/om/horizon.js';
 import { fillObligations, prepareFrame, representativeId, type FrameRead, type FrameRequest } from '../src/om/frame-obligations.js';
@@ -197,7 +198,8 @@ function prepareExternalWorks(engine: ProductEngine, desired: Graph, reject = fa
   const candidateRef = reference(candidate.record), neighbors = externalOk(writeNeighbors(store, { project, candidate: candidateRef }));
   const sources = externalOk(prepareCandidateSources(store, { project, candidate: candidateRef, neighbors: reference(neighbors) }));
   const gate = externalOk(writeAtomicGate(store, { project, candidate: candidateRef, neighbors: reference(neighbors),
-    environment: reference(engine.environments.get(project)), gaps: gapRead, results: [], sources: [...sources.sources] }));
+    environment: reference(engine.environments.get(project)), gaps: gapRead, results: [], sources: [...sources.sources],
+    snapshot: resolveSnapshot(engine.environments.get(project).value.workspace) }));
   assert.equal(gate.value.result.passed, !reject, canonical(gate.value.result.findings));
   const accepted = externalOk(settleCandidate(store, { project, level: 3, candidate: candidateRef,
     outcome: { ...gate.value.result, codes: [...gate.value.result.codes], basis: reference(gate) } }));

@@ -229,7 +229,7 @@ process.exitCode=readFileSync(condition,'utf8')==='ready'&&!existsSync(marker+'.
       results.push({ kind: 'part', record: reference(part.record) });
     }
     assert.equal(results.length, nodes.length);
-    const completion = ok(writeWorksAcceptance(store, { project, results, environment: reference(environment), sources: [] }));
+    const completion = ok(writeWorksAcceptance(store, { project, results, environment: reference(environment), sources: [], binding: null }));
     assert.equal(completion.state, 'accepted'); assert.ok(completion.acceptance); accepted = clone(completion.acceptance);
     const settled = ok(readAcceptedFrame(store, accepted)); assert.ok(settled.frame);
     const candidate = ok(readWorksFrame(store, { project, candidate: settled.frame.value.acceptance.candidate }));

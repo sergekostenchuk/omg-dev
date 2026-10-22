@@ -1227,7 +1227,7 @@ function fjProduceHistory(directory: string) {
   const source = new Evidence(f.store).file(project, 'garden-data', f.root, 'input.txt', 'text/plain', 0);
   const gate = delivered(writeAtomicGate(f.store, { project, candidate: ref, neighbors: reference(neighbors),
     environment: reference(environment), gaps: clone(f.ledger.record.value.request.gaps) as import('../src/om/gaps.js').GapReadRequest,
-    results: [], sources: [reference(source)] }));
+    results: [], sources: [reference(source)], snapshot: null }));
   assert.equal(gate.value.result.passed, true, canonical(gate.value.result.findings));
   const settlement = { project, level: 3 as const, candidate: ref,
     outcome: { ...clone(gate.value.result), codes: [...gate.value.result.codes], basis: reference(gate) } };

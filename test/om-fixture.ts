@@ -15,8 +15,8 @@ import type { TaskRun } from "../src/execution/model.js";
 import { git, inspectRepository, type ExecutionRoot, type RepositoryState } from "../src/runtime/environment.js";
 import type { Revision } from "../src/storage/store.js";
 import { Store, type Write } from "../src/storage/store.js";
-import { inputDecisionWrite, writeAddressing, type InputDecisionProposal } from "../src/om/addressing.js";
-import { writeOmInput } from "../src/om/input.js";
+import { inputDecisionWrite, writeAddressing, type InputDecisionProposal, type ModelDecision } from "../src/om/addressing.js";
+import { writeOmInput, writeReadinessInput } from "../src/om/input.js";
 import { writeHorizon } from "../src/om/horizon.js";
 import { fillObligations, prepareFrame, type FrameRead, type FrameRequest } from "../src/om/frame-obligations.js";
 import { gateCandidate, writeCandidate } from "../src/om/frame-candidate.js";
@@ -28,6 +28,7 @@ import { writeOmObligations, type ObligationContext, type OwnerAssignmentBasis, 
 import { writeWorksFrame } from "../src/om/works-frame.js";
 import { writeNeighbors } from "../src/om/neighbors.js";
 import { writeAtomicGate } from "../src/om/atomic-gate.js";
+import { resolveSnapshot } from "../src/om/impact.js";
 import { writeFeasibility } from "../src/om/feasibility.js";
 import { writeHandoff } from "../src/om/handoff.js";
 import { UPSTREAM_STAGES, type UpstreamStage } from "../src/discovery/requirements.js";
@@ -245,6 +246,8 @@ export interface NativeObligationOptions {
 export interface NativeLayerOptions {
   addresses?: InputDecisionProposal["decision"][];
   obligations?: NativeObligationOptions;
+  /** OWN1: an undecided works policy is answered the way the pass would — one exact decision per open policy question. */
+  decidePolicies?: boolean;
 }
 
 /** Build each accepted layer through the current OM producers, without Refinement phases. */
@@ -282,7 +285,8 @@ export function prepareNativeLayers(engine: ProductEngine, project: string, desi
       tests: projected.tests.filter(test => level === 2 || selected.has(test.node)), edges: projected.edges ?? [],
       journeys: projected.journeys ?? [], packets: projected.packets ?? [], transfers: projected.transfers ?? [],
       anchors: level === 2 ? projected.anchors : [], removes: [], replaces: [], redefines: [] };
-    return reference(store.write({ id: `om-proposal:${project}:fixture-${level}`, kind: "layer-proposal", expected: 0, value }));
+    const id = `om-proposal:${project}:fixture-${level}`;
+    return reference(store.write({ id, kind: "layer-proposal", expected: store.get(id)?.revision ?? 0, value }));
   };
   const frame2: FrameRequest = { project, level: 2, graph: graphRef, horizon: reference(first.gate), layer: null, frame: null, upper: null };
   const candidate2 = take(writeCandidate(store, { frame: frame2, proposals: [proposal(structuredClone(take(prepareFrame(store, frame2))) as unknown as FrameRead)] }));
@@ -302,17 +306,33 @@ export function prepareNativeLayers(engine: ProductEngine, project: string, desi
   ];
   input = take(writeAddressing(store, { project, input: reference(input), graph,
     decisions: decisions.map(decision => ({ pending: inputDecisionWrite({ project, input: reference(input), graph, layers: decision.field === "address" ? [layer] : [], decision }) as Write })) }));
-  const horizon = take(writeHorizon(store, { project, input: reference(input), graph, refinement: layer, available: {},
-    choice: { choiceVersion: "fixture-works", features: [{ outcome: `${project}-result` }], excluded: [] } }));
-  const frame3: FrameRequest = { project, level: 3, graph, horizon: reference(horizon.gate), layer: null, frame: null,
-    upper: { horizon: reference(horizon.gate), frame: upperFrame }, workZoneContract: "accepted-l2-v1" };
-  const works: ProposalRequest = { frame: frame3, proposals: [proposal(structuredClone(take(prepareFrame(store, frame3))) as unknown as FrameRead)] };
-  acceptNativeWorks(engine, project,
-    { frame: { ...frame2, graph, layer, frame: upperFrame, horizon: reference(horizon.gate) }, proposals: [] }, works, options.obligations);
+  const attempt = (choiceVersion = "fixture-works") => {
+    const horizon = take(writeHorizon(store, { project, input: reference(store.get(`om-input:${project}`)!), graph, refinement: layer, available: {},
+      choice: { choiceVersion, features: [{ outcome: `${project}-result` }], excluded: [] } }));
+    const frame3: FrameRequest = { project, level: 3, graph, horizon: reference(horizon.gate), layer: null, frame: null,
+      upper: { horizon: reference(horizon.gate), frame: upperFrame }, workZoneContract: "accepted-l2-v1" };
+    const works: ProposalRequest = { frame: frame3, proposals: [proposal(structuredClone(take(prepareFrame(store, frame3))) as unknown as FrameRead)] };
+    return acceptNativeWorks(engine, project,
+      { frame: { ...frame2, graph, layer, frame: upperFrame, horizon: reference(horizon.gate) }, proposals: [] }, works,
+      options.obligations, options.decidePolicies);
+  };
+  // OWN1: a policy the first gate leaves open is decided on B1; the works cycle is then retried once on the decided input.
+  if (attempt()) assert.equal(attempt("fixture-works-decided"), false, "The works gate passes once its open policies are decided");
 }
 
+/** The bypass decision a works policy question gets when a fixture decides it the way the pass would (OWN1). */
+const POLICY_DECISION: ModelDecision = {
+  decision: "The producer creates the durable state on its first run and treats a missing one later as a loss",
+  rationale: "One contract needs one appearance policy at its producer, and every work of it refers to that decision",
+  alternatives: [
+    { option: "Each consumer creates its own state", consequences: "Copies diverge and the contract loses its single writer" },
+    { option: "The state is seeded before any run", consequences: "A first run cannot be told from a recovered loss" },
+  ],
+};
+
 /** Accept a fresh works proposal (including an explicit replacement) and publish its M8/M9. */
-export function acceptNativeWorks(engine: ProductEngine, project: string, operations: ProposalRequest, works: ProposalRequest, obligations?: NativeObligationOptions): void {
+export function acceptNativeWorks(engine: ProductEngine, project: string, operations: ProposalRequest, works: ProposalRequest,
+  obligations?: NativeObligationOptions, decidePolicies = false): boolean {
   const store = engine.store;
   const gaps = take(writeGaps(store, { project, input: reference(store.get(`om-input:${project}`)!),
     graph: works.frame.graph, horizon: works.frame.horizon, operations, works: obligations ? { ...works, proposals: [] } : works }));
@@ -333,7 +353,7 @@ export function acceptNativeWorks(engine: ProductEngine, project: string, operat
     const ref = works.proposals[0]!, proposal = store.get<LayerProposal>(ref.id, ref.revision)!;
     assert.deepEqual(reference(proposal), ref);
     const accepted = obligations.accept(gapRead, structuredClone(handoff) as unknown as OmObligations, proposal.value);
-    finish({ graph: accepted.graph, layer: accepted.layer, frame: accepted.frame }, reference(engine.environments.get(project))); return;
+    finish({ graph: accepted.graph, layer: accepted.layer, frame: accepted.frame }, reference(engine.environments.get(project))); return false;
   }
   assert.deepEqual(handoff.handoff.obligations, []);
   const candidate3 = take(writeWorksFrame(store, { ...works, works: { contract: "works-frame/v1",
@@ -342,13 +362,26 @@ export function acceptNativeWorks(engine: ProductEngine, project: string, operat
   if (candidate3.state !== "candidate") throw new EngineError(OM_FIXTURE_ERROR, "Native L3 candidate is required");
   const neighbors = take(writeNeighbors(store, { project, candidate: reference(candidate3.record) }));
   const environment = reference(engine.environments.get(project));
-  const gate3 = take(writeAtomicGate(store, { project, candidate: reference(candidate3.record), neighbors: reference(neighbors),
-    environment, gaps: gapRead, results: [], sources: [] }));
+  const gateRequest = (gapRead: GapReadRequest) => ({ project, candidate: reference(candidate3.record), neighbors: reference(neighbors),
+    environment, gaps: gapRead, results: [], sources: [] as Ref[], snapshot: resolveSnapshot(engine.environments.effective(project).root) });
+  const gate3 = take(writeAtomicGate(store, gateRequest(gapRead)));
+  if (decidePolicies && !gate3.value.result.passed) {
+    // OWN1: a works policy the gate leaves open is asked on B1 and decided as the pass would; the caller retries the works
+    // cycle — its horizon, gaps and gate derive again on the decided input.
+    assert.ok(gate3.value.result.findings.every(finding => finding.code === "work_policy_open"), canonical(gate3.value.result.findings));
+    const asked = take(writeReadinessInput(store, { project, input: reference(store.get(`om-input:${project}`)!), gate: reference(gate3) }));
+    take(writeAddressing(store, { project, input: reference(asked), graph: works.frame.graph,
+      decisions: asked.value.input.questions.filter(question => question.readiness?.cause === "policy")
+        .map(question => ({ pending: inputDecisionWrite({ project, input: reference(asked), graph: works.frame.graph, layers: [],
+          decision: { target: question.id, field: "answer", value: POLICY_DECISION as unknown as Json } }) })) }));
+    return true;
+  }
   assert.equal(gate3.value.result.passed, true, canonical(gate3.value.result.findings));
   const accepted3 = take(settleCandidate(store, { project, level: 3, candidate: reference(candidate3.record),
     outcome: { ...gate3.value.result, codes: [...gate3.value.result.codes], basis: reference(gate3) } }));
   assert.equal(accepted3.state, "accepted"); assert.ok(accepted3.graph && accepted3.layer && accepted3.frame);
   finish({ graph: reference(accepted3.graph), layer: reference(accepted3.layer), frame: reference(accepted3.frame) }, environment);
+  return false;
 }
 
 export function createOmFixture(t: TestContext, variant: GardenVariant, project: string, options: { mode: "executed" }): Promise<OmFixture>;
