@@ -1,6 +1,6 @@
 import test, { type TestContext } from "node:test";
 import assert from "node:assert/strict";
-import { copyFileSync, mkdtempSync, rmSync } from "node:fs";
+import { copyFileSync, mkdtempSync, rmSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { canonical, hashJson } from "../src/canonical.js";
@@ -115,6 +115,25 @@ function firstPass(t: TestContext, variant: "standard" | "cross" = "standard") {
     request: { frame: frameRequest, proposals: [proposalRef] } satisfies ProposalRequest };
 }
 
+
+/** NR1 (№3600): eras differ only in `references` (a checked trail before, the records read since); the rest is equal and the
+ * trusted references are a subset of the trail. Local, because FJ1 runs this file's declarations under an old revision. */
+function sameButReferences(actual: unknown, expected: string, message?: string): void {
+  const sortedRef = (ref: unknown) => JSON.stringify(Object.fromEntries(Object.entries(ref as Record<string, unknown>).sort(([a], [b]) => a < b ? -1 : 1)));
+  const collect = (value: unknown, into: Set<string>): unknown => {
+    if (Array.isArray(value)) return value.map(item => collect(item, into));
+    if (value === null || typeof value !== "object") return value;
+    const result: Record<string, unknown> = {};
+    for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+      if (key === "references" && Array.isArray(item)) { for (const ref of item) into.add(sortedRef(ref)); continue; }
+      result[key] = collect(item, into);
+    }
+    return result;
+  };
+  const mine = new Set<string>(), theirs = new Set<string>();
+  assert.deepEqual(collect(JSON.parse(JSON.stringify(actual)), mine), collect(JSON.parse(expected), theirs), message);
+  assert.deepEqual([...mine].filter(ref => !theirs.has(ref)), [], `${message ?? "references"}: only records of the checked trail`);
+}
 
 
 test('candidate observation reads a self-consistent failed assembly without accepting its lost definition', { todo: "NR1 №3646: согласованная перезапись цепочки до новейшей записи — om-fsck её не видит; решение позже" }, t => {
@@ -955,14 +974,21 @@ test("L3 outcome and connector dependencies remain protected while unrelated typ
   assert.deepEqual(revisions(f.store).filter(item => item.head.id !== written.record.id), before);
 });
 
+import { execFileSync } from 'node:child_process';
+import { createRequire } from 'node:module';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import type { Write } from '../src/storage/store.js';
-import { settleCandidate } from '../src/om/frame-accept.js';
+import { settleCandidate, readAcceptedFrame, rebaseFrame } from '../src/om/frame-accept.js';
 import { writeGaps, type GapRequest } from '../src/om/gaps.js';
 import { writeGapLines } from '../src/om/gap-lines.js';
 import { writeOmObligations } from '../src/om/obligations.js';
 import { inputDecisionWrite, writeAddressing } from '../src/om/addressing.js';
 import { prepareWorksFrame, writeWorksFrame, readWorksFrame } from '../src/om/works-frame.js';
 import { preparedField } from './preparation-fixture.js';
+import { Evidence } from '../src/evidence/evidence.js';
+import { writeNeighbors } from '../src/om/neighbors.js';
+import { writeAtomicGate, readAtomicGate } from '../src/om/atomic-gate.js';
+import { readFrameProposals } from '../src/om/frame-proposals.js';
 
 function fjPut(store: Store, id: string, proposal: LayerProposal) { return reference(store.write({ id: `om-proposal:garden:${id}`, kind: 'layer-proposal', expected: 0, value: proposal })); }
 function fjProposalFor(frame: FrameRead, graph: Graph): LayerProposal {
