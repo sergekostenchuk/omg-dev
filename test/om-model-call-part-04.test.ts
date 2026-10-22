@@ -214,7 +214,9 @@ test('E4 analysis transport sends both real E1 purposes, preserves opaque A6 dat
     if (sent.result.kind === 'answered') assert.deepEqual(JSON.parse(sent.result.raw), { cause: 'fixture observation', hypothesis: true });
     assert.deepEqual(sent.record.value.usage, usage); assert.equal(f.sent().length, 1);
     assert.deepEqual(reference(f.store.get(f.series.id)!), before); assert.deepEqual(f.store.list('question-packet').map(reference), packets);
-    assert.deepEqual(f.store.list('model-call').map(reference).filter(ref => !calls.some(own => own.id === ref.id)), [reference(sent.record)]);
+    // The whole set of exact Refs: the paid preparation stays as it was, revisions included, and the analysis adds exactly its own call.
+    const byId = (a: Ref, b: Ref) => a.id.localeCompare(b.id);
+    assert.deepEqual(f.store.list('model-call').map(reference).sort(byId), [...calls, reference(sent.record)].sort(byId));
     assert.equal(f.store.get<{status:string}>(sent.call.id)!.value.status, 'succeeded');
     const expected = valueOf(readModelTransport(f.store, { project: f.project, record: reference(sent.record) }));
     f.store.write({ id: f.environment.id, kind: f.environment.kind, expected: f.environment.revision, value: f.environment.value });
