@@ -709,13 +709,38 @@ test("a refusal of the proposal from a real first pass reaches the gate with its
   const source = f.store.get<{ gate: string }>(row.source.id)!;
   assert.equal(source.kind, UNIT_REFUSAL_KIND);
   assert.equal(source.value.gate, "G5");
-  // The origin names the exact candidate, base, environment and proposal the refusal was weighed on — no more, no less.
-  const roles = new Map(row.origin.sources.map(item => [item.role, item.ref] as const));
-  assert.deepEqual([...roles.keys()].sort(), ["base", "derived", "environment", "proposal"]);
-  assert.equal(f.store.get(roles.get("derived")!.id)!.kind, "frame-candidate");
-  assert.equal(f.store.get(roles.get("base")!.id)!.kind, "graph");
-  assert.equal(f.store.get(roles.get("environment")!.id)!.kind, "environment");
-  assert.equal(f.store.get(roles.get("proposal")!.id)!.kind, "layer-proposal");
+  // The origin names the exact candidate, base, environment and proposal the refusal was weighed on: one of each
+  // role, and every record standing at the exact reference the row was written with — never merely at today's head.
+  assert.equal(new Set(row.origin.sources.map(item => item.role)).size, row.origin.sources.length,
+    "Every source role is named exactly once");
+  const sources = new Map(row.origin.sources.map(item => [item.role, item] as const));
+  assert.deepEqual([...sources.keys()].sort(), ["base", "derived", "environment", "proposal"]);
+  const exact = (role: string) => {
+    const source = sources.get(role)!;
+    const record = f.store.get(source.ref.id, source.ref.revision)!;
+    assert.equal(record.hash, source.ref.hash, `${role} stands at the exact reference the row names`);
+    return { source, record };
+  };
+  const candidate = exact("derived"), base = exact("base"), environment = exact("environment"), proposal = exact("proposal");
+  assert.equal(candidate.record.kind, "frame-candidate");
+  assert.equal(base.record.kind, "graph");
+  assert.equal(environment.record.kind, "environment");
+  assert.equal(proposal.record.kind, "layer-proposal");
+  // The named base and proposal are the candidate's own, and the environment is the one its G5 request declared.
+  const candidateValue = candidate.record.value as unknown as FrameCandidateRecord;
+  assert.deepEqual(base.source.ref, candidateValue.base.graph);
+  assert.ok(candidateValue.proposals.some(item => canonical(item) === canonical(proposal.source.ref)),
+    "The named proposal is one of the candidate's own");
+  const gate = f.store.list<{ request: { candidate: Ref; environment: Ref } }>("om-atomic-gate")
+    .find(item => item.value.request.candidate.id === candidate.source.ref.id)!;
+  assert.deepEqual(environment.source.ref, gate.value.request.environment);
+  // And the tally the class came from is itself proven: the subject stands in the proposal and in what was
+  // assembled, and in no accepted base — read through the producers' own definition readers, not by name.
+  const definitions = (role: string) => deliveredOf(readDefinitions(f.store,
+    { project, source: sources.get(role)! })).definitions;
+  assert.ok(definitions("proposal").includes(work), "The proposal holds the refused work");
+  assert.ok(definitions("derived").includes(work), "The assembled candidate holds the refused work");
+  assert.ok(!definitions("base").includes(work), "No accepted base holds the refused work");
 
   // The classification G7's own close derived and wrote with the row, in the journal it stands at.
   const stored = journal.classifications.find(item => item.row === row.id)!;
@@ -741,7 +766,10 @@ test("a refusal of the proposal from a real first pass reaches the gate with its
   assert.equal(routed.toModel, true);
   assert.deepEqual(first.question, [work]);
   assert.equal(first.holds.length, 0, "An established origin raises no hold");
-  assert.deepEqual(routed.basis.map(item => item.role), [...row.origin.sources.map(item => item.role)].sort());
+  const orderBySource = (left: OriginSource, right: OriginSource) =>
+    originSourceKey(left) < originSourceKey(right) ? -1 : originSourceKey(left) > originSourceKey(right) ? 1 : 0;
+  assert.deepEqual([...routed.basis].map(normalizeOriginSource).sort(orderBySource),
+    [...row.origin.sources].map(normalizeOriginSource).sort(orderBySource));
   const before = f.store.list().map(reference), sent = f.sent().length;
   assert.deepEqual(deliveredOf(closeAttempt(f.store, request)), first);
   assert.deepEqual(f.store.list().map(reference), before);
