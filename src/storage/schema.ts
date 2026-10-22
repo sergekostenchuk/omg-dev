@@ -59,6 +59,25 @@ function proofCacheState(db: DatabaseSync): 'absent' | 'present' | 'mismatch' {
     ? 'present' : 'mismatch';
 }
 
+/** DRS2.1: a disposable projection, separate from primary revisions and the PF4 cache.
+ * Its cursor and rows always commit together; an incomplete extension is never repaired silently. */
+const EVENT_INDEX_SCHEMA = `
+CREATE TABLE event_index_scopes(key TEXT PRIMARY KEY, scope TEXT NOT NULL, cursor INTEGER NOT NULL CHECK(cursor>=0)) STRICT;
+CREATE TABLE event_index_rows(scope_key TEXT NOT NULL, sequence INTEGER NOT NULL, body TEXT NOT NULL CHECK(json_valid(body)),
+ PRIMARY KEY(scope_key, sequence), FOREIGN KEY(scope_key) REFERENCES event_index_scopes(key),
+ FOREIGN KEY(sequence) REFERENCES events(sequence)) STRICT, WITHOUT ROWID;
+CREATE TABLE event_index_schema(version INTEGER PRIMARY KEY, sha256 TEXT NOT NULL) STRICT;
+`;
+function eventIndexState(db: DatabaseSync): 'absent' | 'present' | 'mismatch' {
+  const names = ['event_index_scopes', 'event_index_rows', 'event_index_schema'];
+  const found = db.prepare("SELECT name,type FROM sqlite_master WHERE name IN (?,?,?)").all(...names);
+  if (!found.length) return 'absent';
+  if (found.length !== names.length || found.some(row => row['type'] !== 'table')) return 'mismatch';
+  const records = db.prepare("SELECT version,sha256 FROM event_index_schema").all();
+  return records.length === 1 && records[0]!['version'] === 1 && records[0]!['sha256'] === digest(EVENT_INDEX_SCHEMA)
+    ? 'present' : 'mismatch';
+}
+
 export function migrate(db: DatabaseSync): void {
   db.exec("PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000; BEGIN IMMEDIATE");
   try {
@@ -75,6 +94,10 @@ export function migrate(db: DatabaseSync): void {
       db.exec(PROOF_CACHE_SCHEMA);
       db.prepare("INSERT INTO proof_cache_schema VALUES(?, ?)").run(PROOF_CACHE_VERSION, digest(PROOF_CACHE_SCHEMA));
     }
+    if (eventIndexState(db) === 'absent') {
+      db.exec(EVENT_INDEX_SCHEMA);
+      db.prepare("INSERT INTO event_index_schema VALUES(1, ?)").run(digest(EVENT_INDEX_SCHEMA));
+    }
     db.exec("COMMIT");
   } catch (error) { db.exec("ROLLBACK"); throw error; }
   db.exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL");
@@ -88,6 +111,7 @@ export function assertSchema(db: DatabaseSync): void {
   const migrations = db.prepare("SELECT version, sha256 FROM migrations ORDER BY version").all();
   requireCondition(migrations.length === 1 && migrations[0]!['sha256'] === digest(SCHEMA),
     "migration_mismatch", "Database migration identity does not match this engine");
+  requireCondition(eventIndexState(db) !== 'mismatch', "migration_mismatch", "The event index extension is incomplete or of another version");
   requireCondition(proofCacheState(db) !== 'mismatch', "migration_mismatch", "The proof cache extension is incomplete or of another version");
 }
 
@@ -106,6 +130,23 @@ export function removeProofCache(path: string): void {
         "foreign_database", "This is not an OMG database");
       for (const [name, type] of PROOF_CACHE_OBJECTS)
         if (db.prepare("SELECT 1 FROM sqlite_master WHERE name = ? AND type = ?").get(name, type)) db.exec(`DROP ${type.toUpperCase()} ${name}`);
+      assertSchema(db);
+      db.exec("COMMIT");
+    } catch (error) { db.exec("ROLLBACK"); throw error; }
+  } finally { db.close(); }
+}
+
+/** DRS2.1 recovery: discard only the derived index, including an interrupted extension.
+ * The next Store open rebuilds it from committed events. No primary row or PF4 cache is removed. */
+export function removeEventIndex(path: string): void {
+  const db = new DatabaseSync(path);
+  try {
+    db.exec("PRAGMA busy_timeout=5000; BEGIN IMMEDIATE");
+    try {
+      requireCondition(Number(db.prepare("PRAGMA application_id").get()!['application_id']) === APPLICATION_ID,
+        "foreign_database", "This is not an OMG database");
+      for (const name of ['event_index_rows', 'event_index_scopes', 'event_index_schema'])
+        if (db.prepare("SELECT 1 FROM sqlite_master WHERE name=? AND type='table'").get(name)) db.exec(`DROP TABLE ${name}`);
       assertSchema(db);
       db.exec("COMMIT");
     } catch (error) { db.exec("ROLLBACK"); throw error; }

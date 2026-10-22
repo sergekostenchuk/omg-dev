@@ -415,6 +415,86 @@ export class Store {
     eventCounters.rangeEvents += rows.length;
     return rows.map(row => ({ sequence: Number(row['sequence']), id: String(row['entity_id']), revision: Number(row['revision']), kind: String(row['kind']) }));
   }
+  /** Bounded incremental journal scan; the old events() contract stays unchanged. */
+  eventsPage(from: number, to: number, limit: number): StoreEvent[] {
+    this.#eventBoundary(to);
+    requireCondition(Number.isSafeInteger(from) && from >= 0 && from <= to && Number.isSafeInteger(limit) && limit > 0,
+      "event_cursor_invalid", "Expected a forward range and a positive event page limit");
+    eventCounters.ranges++;
+    const rows = this.#statement(`SELECT e.sequence,e.entity_id,e.revision,r.kind FROM events e JOIN revisions r USING(entity_id,revision)
+      WHERE e.sequence>? AND e.sequence<=? ORDER BY e.sequence LIMIT ?`).all(from,to,limit);
+    eventCounters.rangeEvents += rows.length;
+    return rows.map(row => ({sequence: Number(row['sequence']),id: String(row['entity_id']),revision: Number(row['revision']),kind: String(row['kind'])}));
+  }
+  /** DRS2.1: an exact revision (or the last revision of an id) committed no later than
+   * this event boundary. Unlike get(), a current head can never enter this read. */
+  getAtEvent<T = Json>(sequence: number, id: string, revision?: number): Revision<T> | null {
+    this.#eventBoundary(sequence);
+    physicalReads++;
+    const token = observer?.begin(this);
+    const row = this.#statement(`SELECT ${IDENTITY_COLUMNS} FROM revisions r JOIN events e USING(entity_id,revision)
+      WHERE e.sequence<=? AND r.entity_id=? ${revision === undefined ? '' : 'AND r.revision=?'}
+      ORDER BY e.sequence DESC LIMIT 1`).get(...(revision === undefined ? [sequence, id] : [sequence, id, revision]));
+    this.#current();
+    const found = row ? this.#materialize<T>(row) : null;
+    if (token) observer!.end(token, this, 'get', 'get', id, revision, found ? [found] : []);
+    return found;
+  }
+  /** Historical heads/history, selected by event sequence, never by today's heads table. */
+  identitiesAtEvent(sequence: number, kind?: string, id?: string, history = false): RevisionIdentity[] {
+    this.#eventBoundary(sequence);
+    physicalReads++;
+    const token = observer?.begin(this);
+    const rows = this.#statement(`SELECT ${IDENTITY_COLUMNS} FROM revisions r JOIN events e USING(entity_id,revision)
+      WHERE e.sequence<=? ${kind === undefined ? '' : 'AND r.kind=?'} ${id === undefined ? '' : 'AND r.entity_id=?'}
+      ${history ? '' : `AND NOT EXISTS (SELECT 1 FROM events later WHERE later.entity_id=e.entity_id
+        AND later.sequence>e.sequence AND later.sequence<=?)`} ORDER BY r.entity_id,r.revision`)
+      .all(sequence, ...(kind === undefined ? [] : [kind]), ...(id === undefined ? [] : [id]), ...(history ? [] : [sequence]));
+    const found = rows.map(row => ({id: String(row['entity_id']), revision: Number(row['revision']),
+      kind: String(row['kind']), hash: String(row['sha256'])}));
+    if (token) observer!.end(token, this, 'identities', history ? 'history' : 'list', id ?? kind, undefined, found);
+    return found;
+  }
+  #eventBoundary(sequence: number): void {
+    requireCondition(!this.#closed && !this.#busy, "store_busy", "Store is closed or creating a snapshot");
+    requireCondition(Number.isSafeInteger(sequence) && sequence >= 0 && (sequence === 0 || this.eventAt(sequence) !== null),
+      "event_cursor_invalid", "The cursor must name a committed event (or the empty journal)");
+  }
+  /** Technical projection reads are not product proof reads. Metadata and rows come from one snapshot. */
+  eventIndexRead(key: string, through: number, includeRows = true): {scope: string; cursor: number; rows: {sequence: number; body: string}[]} | null {
+    this.#eventBoundary(through);
+    this.#db.exec("BEGIN DEFERRED");
+    try {
+      const scope = this.#db.prepare("SELECT scope,cursor FROM event_index_scopes WHERE key=?").get(key);
+      if (!scope) return null;
+      const rows = !includeRows ? [] : this.#db.prepare("SELECT sequence,body FROM event_index_rows WHERE scope_key=? AND sequence<=? ORDER BY sequence")
+        .all(key, through).map(row => ({sequence: Number(row['sequence']), body: String(row['body'])}));
+      return {scope: String(scope['scope']), cursor: Number(scope['cursor']), rows};
+    } finally { this.#db.exec("COMMIT"); }
+  }
+  /** Publish a scanned event range and its selected rows in the SAME transaction. A lost
+   * cursor CAS or any failed row rolls the whole range back; primary records/events stay untouched. */
+  eventIndexWrite(scope: unknown, from: number, through: number, rows: readonly {sequence: number; value: unknown}[]): void {
+    this.#eventBoundary(through);
+    requireCondition(Number.isSafeInteger(from) && from >= 0 && from <= through,
+      "event_cursor_invalid", "An index range must move forward");
+    const body = canonical(scope), key = digest(body), seen = new Set<number>();
+    const prepared = rows.map(row => {
+      requireCondition(Number.isSafeInteger(row.sequence) && row.sequence > from && row.sequence <= through && !seen.has(row.sequence),
+        "event_cursor_invalid", "Every selected event occurs once inside the published range");
+      seen.add(row.sequence); return {sequence: row.sequence, body: canonical(row.value)};
+    });
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      const previous = this.#db.prepare("SELECT scope,cursor FROM event_index_scopes WHERE key=?").get(key);
+      requireCondition(previous ? previous['scope'] === body && previous['cursor'] === from : from === 0,
+        "event_index_conflict", "Another builder advanced this projection; reload its cursor");
+      if (!previous) this.#db.prepare("INSERT INTO event_index_scopes VALUES(?,?,?)").run(key, body, through);
+      else this.#db.prepare("UPDATE event_index_scopes SET cursor=? WHERE key=?").run(through, key);
+      for (const row of prepared) this.#db.prepare("INSERT INTO event_index_rows VALUES(?,?,?)").run(key, row.sequence, row.body);
+      this.#db.exec("COMMIT");
+    } catch (error) { this.#db.exec("ROLLBACK"); throw error; }
+  }
   /** NR1 (№3633): every stored revision as written — its body text and the sha256 stored with it — in id and revision
    * order, for the integrity check (om-fsck) alone; no product read uses it. */
   *integrityRevisions(): Generator<{ id: string; revision: number; kind: string; body: string; sha256: string }> {
