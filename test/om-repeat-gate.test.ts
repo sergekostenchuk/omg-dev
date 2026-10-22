@@ -54,12 +54,12 @@ import {
   originAnalysisNamespace, originDecisionNamespace, originHoldId, originHoldNamespace,
   ADDRESSEE_KINDS, GATE_REFUSAL_CODES, LIFT_GROUNDS, ORIGIN_ANALYSIS_KIND, ORIGIN_DECISION_KIND, ORIGIN_HOLD_KIND,
   ORIGIN_ROLES, REFUSAL_CLASSES, REFUSAL_STAGES, REPEAT_GATE_CODES, SUBJECT_DECISIONS,
-  type CloseAttemptRequest, type GateOutcome, type LiftOriginHoldRequest, type OriginHold, type RefusalClass,
+  type CloseAttemptRequest, type CompletionCloseRecord, type GateOutcome, type LiftOriginHoldRequest, type OriginHold, type RefusalClass,
   type OriginTally, type RepeatOutcome, type RoutedRefusal,
 } from "../src/om/repeat-gate.js";
-import { readRun, regateRun, type RunStep } from "../src/om/run.js";
+import { readRun, regateRun, startRun, type RunStep } from "../src/om/run.js";
 import { managedBlock, MANAGED_FIRST_TARGET } from "./om-managed-block.js";
-import { gardenPass, project, usage } from "./om-run-fixture.js";
+import { defectedWork, gardenPass, project, regatedHold, runFixture, usage } from "./om-run-fixture.js";
 
 const UNIT = "gate-repeat";
 const PROJECT = "alpha";
@@ -1541,6 +1541,32 @@ test("the classes of the gate are re-derived at every reading, and a stored deci
   assert.equal(heldSeries(store)!.value.attempts[2]!.outcome, null);
 });
 
+test("the class G7 gave a real G5 refusal is read as stored: a moved basis neither re-derives nor undoes it on an exact repeat (T5)", async t => {
+  // LG07 c4 (codex-omg2 №10870 п.3): the integration half of T5 on a real G5 hold, whose class is unknown. The layer-check
+  // input class of the standalone test above has no producer: that positive leaves with the src part (variant A).
+  const { f, hold, row } = await realHold(t);
+  const journal = f.store.get<RefusalJournal>(journalId(project))!;
+  assert.equal(journal.value.classifications.find(item => item.row === row.id)!.class, "unknown");
+  const series = f.store.get<RepairSeries>(hold.value.series.id)!;
+  const binding = deliveredOf(readCompletionBinding(f.store, project, reference(series), hold.value.attempt))!;
+  const close = f.store.get<CompletionCloseRecord>(completionCloseId(project, binding.id))!;
+  const request = { project, block: hold.value.block, line: series.value.line, attempt: hold.value.attempt, outcome: close.value.claim };
+  const first = deliveredOf(closeAttempt(f.store, request));
+  assert.equal(routeOf(first, row.id).class, "unknown");
+  // Negative mutation: the accepted base the origin names moves on; the origin names its exact revision.
+  const base = (row.origin.sources as unknown as { role: string; ref: Ref }[]).find(item => item.role === "base")!.ref;
+  const head = f.store.get<Graph>(base.id)!;
+  assert.equal(head.revision, base.revision);
+  f.store.write({ id: head.id, kind: head.kind, expected: head.revision, value: { ...head.value, title: "Later unaccepted graph" } as unknown as Json });
+  const before = f.store.list().map(reference), sent = f.sent().length;
+  assert.deepEqual(deliveredOf(closeAttempt(f.store, request)), first);
+  f.restart();
+  assert.deepEqual(deliveredOf(closeAttempt(f.store, request)), first);
+  assert.deepEqual(f.store.get<RefusalJournal>(journalId(project)), journal);
+  assert.deepEqual(f.store.list().map(reference), before);
+  assert.equal(f.sent().length, sent);
+});
+
 test("a result is never taken on the caller's word: five invented keys on one real record move nothing (P1)", async t => {
   const f = fixture(t), m = managedBlock(f.store, f, PROJECT), path = f.path;
   let store = f.store;
@@ -2041,32 +2067,51 @@ test("the reviewer's reproduction: an analysis whose grounds establish ANOTHER c
   }))).code, "lift_unusable");
 });
 
-test("grounds the table of decision cannot place lift nothing: an absent role and several holders are both 'unknown'", t => {
-  const { store } = fixture(t);
-  const cases: [string, string, (project: string) => readonly unknown[]][] = [
-    ["proposal", "only what the code assembled, holding the subject",
-      project => [source("derived", carries(store, project, "candidate", [SUBJECT]))]],
-    ["input", "two accepted records both holding the subject",
-      project => [source("base", carries(store, project, "base", [SUBJECT])), source("base", carries(store, project, "base", [SUBJECT]))]],
-    ["proposal", "a proposal that lacks it, and no accepted record looked in",
-      project => [source("proposal", carries(store, project, "proposal", []))]],
-    ["derivation", "two assemblies, one of which lost it",
-      project => assembly(store, project, { proposals: [[SUBJECT]], derived: [[SUBJECT], []] })],
+/**
+ * LG07 c4 (codex-omg2 №10870 п.2): a real standing origin hold — the regated works answer is defected, its G5 row
+ * carries its candidate, base, environment and holding proposal, G7 cannot place it, and the pass pauses on its
+ * analysis with the hold unpaid (as the accepted oh-a in om-call-record).
+ */
+async function realHold(t: test.TestContext) {
+  const f = runFixture(t, [], "executed");
+  deliveredOf(startRun(f.store, { project }));
+  const held = await regatedHold(f, { cycle: (packet, batch) => batch.task === "node-expansion" && batch.level === 3
+    ? defectedWork(f, reference(packet)) : null, pause: { step: "analyze" } });
+  const step = held.second!.step!.request as { hold: Ref };
+  const hold = f.store.get<OriginHold>(step.hold.id, step.hold.revision)!;
+  const row = f.store.get<RefusalJournal>(journalId(project))!.value.rows.find(item => item.id === hold.value.row)!;
+  return { f, hold, row };
+}
+
+test("grounds the table of decision cannot place lift nothing: an absent role and several holders are both 'unknown'", async t => {
+  // LG07 c4 (№10870 п.2): on a real G5 hold. The grounds are the producer's own linked sources: the candidate alone, the
+  // whole set of the row (several holders — the origin G7 itself could not place) and the environment with no record of
+  // the map. Ground sets the producer never links — two accepted records holding the subject, a proposal lacking it with
+  // no accepted record, two assemblies of which one lost it — are tallies of the pure table (SUBJECT_DECISIONS, :1903):
+  // forged here they would fail the link checks before the table, so they are not claimed by this test.
+  const { f, hold, row } = await realHold(t);
+  const sources = row.origin.sources as unknown as Record<string, unknown>[];
+  const ofRole = (role: string) => sources.filter(item => item.role === role);
+  const cases: [string, string, readonly unknown[]][] = [
+    ["proposal", "only what the code assembled, holding the subject", ofRole("derived")],
+    ["proposal", "every source of the row: several holders and no single responsible", sources],
+    ["conditions", "the environment alone, no record of the map to weigh the subject against", ofRole("environment")],
   ];
-  cases.forEach(([claim, note, build], index) => {
-    const project = `unplaced${index}`;
-    opened(store, project);
-    const held = heldOn(store, project, { sources: [] });
-    liftRefused(store, project, held.hold, analysisOf(held.standing, { class: claim, basis: build(project) }), "record.basis", note);
-    addressed(refusalOf(openAttempt(store, { ...address(project), attempt: 2, goal: goal() })), "origin_held", at(project));
-    assert.equal(store.list(ORIGIN_ANALYSIS_KIND).filter(record => record.id.startsWith(originAnalysisNamespace(project))).length, 1, note);
-  });
-  // A source of the map among the grounds that does not name the definitions it carries answers nothing here either.
-  opened(store, "mute");
-  const mute = heldOn(store, "mute", { sources: [] });
-  const silent = reference(store.write({ id: `om-base:mute:${next()}`, kind: "om-base", expected: 0, value: { rows: [SUBJECT] } }));
-  liftRefused(store, "mute", mute.hold, analysisOf(mute.standing, { class: "input", basis: [source("base", silent)] }),
+  const at = { project, hold: reference(hold) };
+  for (const [claim, note, basis] of cases)
+    liftRefused(f.store, at.project, at.hold, analysisOf(hold.value, { class: claim, basis }), "record.basis", note);
+  // Negative mutation: a record of the map among the grounds whose kind does not name the definitions it carries.
+  const silent = reference(f.store.write({ id: `om-base:${project}:${next()}`, kind: "om-base", expected: 0, value: { rows: [row.origin.subject] } }));
+  liftRefused(f.store, at.project, at.hold, analysisOf(hold.value, { class: "input", basis: [source("base", silent)] }),
     "record.basis.0.kind", "an unsupported kind cannot witness map definitions");
+  // Nothing lifted it: the hold stands, only the refused stored analyses exist, and the line opens no next attempt.
+  assert.equal(f.store.get<OriginHold>(hold.id)!.value.lift, null);
+  assert.equal(f.store.list(ORIGIN_ANALYSIS_KIND).filter(record => record.id.startsWith(originAnalysisNamespace(project))).length, 4);
+  const series = f.store.get<RepairSeries>(hold.value.series.id)!;
+  const attempt = series.value.attempts.find(item => item.ordinal === hold.value.attempt)!;
+  const binding = deliveredOf(readCompletionBinding(f.store, project, reference(series), hold.value.attempt))!;
+  addressed(refusalOf(openAttempt(f.store, { project, block: hold.value.block, line: series.value.line, attempt: hold.value.attempt + 1,
+    goal: attempt.goal, completion: binding.value.plan } as BeginAttemptRequest)), "origin_held", series.id);
 });
 
 test("an analysis whose grounds establish the class it claims lifts the hold, and says exactly what the table said", t => {
@@ -5802,3 +5847,4 @@ test("G7CTX first managed close retains prior classifications from its exact jou
   f.restart();
   repeat();
 });
+
