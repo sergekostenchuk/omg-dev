@@ -301,13 +301,3 @@ function reopenedDraftFloor(store: Store, original: Revision<Question>): number 
   }
   return floor;
 }
-
-/** Compatibility for the saved pre-fix authority answer: append a replay, never
- * rewrite its history or reinterpret a semantic rejection as transport failure. */
-export function recoverableAnswer(turns: Revision<ResearchTurn>[], question: Revision<Question>) {
-  const latest = [...turns].reverse().find(turn => (turn.value.action as { question?: string })?.question === question.id
-    && ["answer", "answer_delta"].includes(String((turn.value.action as { action?: string })?.action)));
-  return latest?.value.status === "completed" && latest.value.error === "An input changed before the transaction could commit"
-    && latest.value.assessment === null && latest.value.observation === null && latest.value.question
-    && canonical(latest.value.question) === canonical(reference(question)) ? latest : null;
-}

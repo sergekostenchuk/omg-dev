@@ -54,12 +54,10 @@ import { assertPilotBoundary, readerPilot, pilotEnvironment, type ReaderPilot } 
 import { pilotContext, retainPilotRead } from "./pilot-context.js";
 import { readBundle, readSavedReaderBundleResult, readReaderResultAt, resumeReadBundleIntent } from "./reader.js";
 import { expandLayerDelta, layerDeltaCandidate, layerDeltaView, type LayerDelta } from "./layer-delta.js";
-import { checkpoint, latestFocus, latestProposal, recoverableAnswer, workingSelections, repeatedContextRead,
+import { checkpoint, latestFocus, latestProposal, workingSelections, repeatedContextRead,
   addressedWorkspace, findAcceptedPaidAnswerChain } from "./research-continuation.js";
 import { addContextLookup, contextWorkspace, requireCompleteContextPacket } from './context-workspace.js';
 import { dispatchMode, v7DispatchMode, projectReadingQueue, queueReadingPlan, queuedChildReached, splitPlannedContextRead, PLANNING_INSTRUCTION, SYNTHESIS_INSTRUCTION } from "./reading-plan.js";
-import { recoverableReadingPlan } from "./planning-recovery.js";
-import { replayableLegacyCall } from "./response-replay.js";
 import { pendingSynthesis, synthesisSession, findUnfinishedSynthesisSession, synthesisOutcomeDelivery,
   synthesisDeliveryMarks, findUnfinishedSynthesisSessionV3, readSynthesisSessionV3,
   type UnfinishedSynthesisOperation } from "./synthesis-session.js";
@@ -736,30 +734,6 @@ export class Researcher {
           Object.assign(context, { researchMissing: unknown.missing,
             previousUnknown: { turn: reference(lastTurn), missing: unknown.missing, newMaterial: fresh } });
         }
-        const recoveredPlan = !savedMaterials && !pendingTurn && planning ? recoverableReadingPlan(this.store, turns, draft, pending[0]!) : null;
-        if (recoveredPlan) {
-          const number = run.value.turns + 1;
-          const { contract: _contract, consumerIntent: _consumerIntent, ...originalPlan } = recoveredPlan.original.value as
-            ResearchTurn & { contract?: string; consumerIntent?: Ref };
-          const saved = this.store.writeMany<ResearchRun | ResearchTurn>([{ id: run.id, kind: run.kind, expected: run.revision,
-            value: { ...run.value, turns: number } },
-          { id: `research-turn:${hashJson([id, number])}`, kind: "research-turn", expected: 0,
-            value: { ...originalPlan, number, action: recoveredPlan.action, status: "pending", error: null,
-              observation: null, question: reference(pending[0]!), replayedFrom: reference(recoveredPlan.original),
-              recoveredRequest: recoveredPlan.request } }],
-          [...recoveredPlan.guards, reference(draft), reference(pending[0]!), reference(environment), ...draft.value.inputs]);
-          run = saved[0]! as Revision<ResearchRun>;
-          pendingTurn = saved[1]! as Revision<ResearchTurn>;
-        }
-        const recover = !pendingTurn && pilot ? recoverableAnswer(turns, pending[0]!) : null;
-        if (recover) {
-          run = this.save(run, { turns: run.value.turns + 1 });
-          const { contract: _contract, consumerIntent: _consumerIntent, ...originalAnswer } = recover.value as
-            ResearchTurn & { contract?: string; consumerIntent?: Ref };
-          pendingTurn = this.store.writeMany<ResearchTurn>([{ id: `research-turn:${hashJson([id, run.value.turns])}`, kind: "research-turn", expected: 0,
-            value: { ...originalAnswer, number: run.value.turns, status: "pending", error: null, observation: null, replayedFrom: reference(recover) } }],
-            [reference(recover), reference(pending[0]!), reference(draft), reference(environment), ...draft.value.inputs])[0]!;
-        }
         let action: ResearchAction;
         let sent:Record<string,any>|undefined = resumedSent;
         resumedSent = undefined;
@@ -833,26 +807,6 @@ export class Researcher {
           } else {
             const kind = mode === "planning" ? "reading-planner" as const : "analyst" as const;
             const number = run.value.turns + 1;
-            // C51: a matching pre-intent pilot_reply_limit call already paid for
-            // this exact logical step — deliver it as a previous-era turn
-            // before a managed intent could claim another physical send.
-            const legacyReplay = pilot ? replayableLegacyCall(this.store, pilot,
-              dispatch.implementer, draft.id, pending[0]!.id, kind, id) : null;
-            if (legacyReplay) {
-              const replayed = this.store.writeMany<ResearchRun | ResearchTurn>([
-                { id: run.id, kind: run.kind, expected: run.revision,
-                  value: { ...run.value, turns: number } },
-                { id: `research-turn:${hashJson([id, number])}`, kind: "research-turn", expected: 0,
-                  value: { run: id, number, action: legacyReplay.research as ResearchAction,
-                    assessment: null, observation: null, error: null,
-                    status: "pending" as const, question: reference(pending[0]!),
-                    ...(mode ? { dispatchMode: mode } : {}), recoveredRequest: legacyReplay.call } }],
-                uniqueTransactionGuards([reference(run), legacyReplay.call, legacyReplay.response,
-                  reference(draft), reference(pending[0]!), reference(environment), ...draft.value.inputs]));
-              run = replayed[0]! as Revision<ResearchRun>;
-              pendingTurn = replayed[1]! as Revision<ResearchTurn>;
-              action = admittedResearchAction(pendingTurn.value.action);
-            } else {
             const basis = uniqueRefs([...draft.value.inputs, ...currentContextHeads, ...(conceptMaterial?.guards ?? []), ...effective.guards,
               ...(outcome?.guards ?? []), ...related.guards, ...turns.map(reference),
               ...sources.list().map(reference)]);
@@ -876,7 +830,6 @@ export class Researcher {
             const applied = await this.applyActionIntent(intent, run, dispatch, pilot, owner, limit, signal);
             run = applied.run; pendingTurn = applied.turn; sent = applied.sent;
             action = admittedResearchAction(pendingTurn.value.action);
-            }
           }
         }
         let observation: unknown = null; let assessment: Ref | null = null; let error: string | null = null;

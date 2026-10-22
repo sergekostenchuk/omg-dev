@@ -11,7 +11,6 @@ import { prepareResearchConsumerIntent, readResearchConsumerTurn } from "../src/
 import { managedTurnId, projectPaidTurnAdmission } from "../src/discovery/research-consumer-transition.js";
 import { dispatchMode, PLANNING_INSTRUCTION, projectPlannedRetry, projectReadingQueue, projectSplitParts,
   queueOriginOf, queueReadingPlan, queuedChildReached, v7DispatchMode, v7PlannerRounds } from "../src/discovery/reading-plan.js";
-import { recoverableReadingPlan } from "../src/discovery/planning-recovery.js";
 import { ATTEMPT_BINDING_CONTRACT, V7_PLAN_SUBJECT_CONTRACT, type V7PlanSubject } from "../src/discovery/v7-managed-attempt.js";
 import type { V7PlanningSettings } from "../src/discovery/reader-pilot.js";
 import type { ResearchAction, ResearchRun, ResearchTurn } from "../src/discovery/research-model.js";
@@ -302,10 +301,6 @@ test("S3 mode isolation: A never inherits B's plan, mode or failed child; the fi
     observation: { nextMode: "synthesis" } });
   assert.equal(dispatchMode([...turns, doneB], p.plan, B), "synthesis");
   assert.equal(code(() => dispatchMode([...turns, doneB], p.plan, A)), "reading_plan_blocked", "B's mode is not A's");
-  // The v6 transcription repair never adopts a v7 planner turn.
-  const failedPlanner = memo<ResearchTurn>(parentA.id, "research-turn", 2,
-    { ...parentA.value, status: "completed", error: "Reading plan must target this question" });
-  assert.equal(recoverableReadingPlan(f.store, [failedPlanner], p.draft, p.plan), null);
 });
 
 test("S3 rounds: planner rounds count per project+subject from saved planner turns only; the limit stops new planning and damaged settings refuse", t => {

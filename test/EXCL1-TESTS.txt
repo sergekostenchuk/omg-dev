@@ -76,8 +76,6 @@ om-series-current.test.ts :: B3 whole e1e87e9 producer retains applied series po
 om-task-context.test.ts :: V2 unchanged legacy bytes and hashes match the complete aa8eb1d source graph in a fresh process # вид 1: эра aa8eb1d, aa8eb1d4
 om-task-neighbors.test.ts :: G3 complete base producer retains legacy plan and node hashes, context bytes, receipt compatibility and completed execution after reopen # вид 1: эра 6eb61d9, 6eb61d9e
 preparation.test.ts :: B1.1 real version 3 producer preserves schemas, accepted stage history and mapDesign validation after restart # вид 1: эра 1189043f
-research-call-resume.test.ts :: a real pre-intent Git producer remains readable as paid, reused and combined history # вид 1: эра a4b6f57
-research-call-resume.test.ts :: D8.4e R16: records of the previous producer (479b307) are read and restored by the old contract without a retroactive K; an old un-accepted pending turn is accepted by new code with K # вид 1: эра 479b307
 research.test.ts :: RS2 exact Git ecd00625 producer keeps history and packet bytes and recovers its paid pending read # вид 1: эра ecd00625
 research.test.ts :: RS3 №4414 era: the base engine 8b665772 (from Git, its own process) saved the codex-stdio envelope failure as its terminal research_provider_failed; the new code reads it in its era and DS1 requires upgrade before a new paid generation # вид 1: эра 8b665772
 runtime-absence-r3.test.ts :: D8.1 reads unchanged feasibility milestones stages and MachinePlan produced by the complete 3d8dcfd engine after restart # вид 1: эра 3d8dcfd
