@@ -93,7 +93,7 @@ test('4T.4: real snapshot -> managed intent/call/output; cold repeated publicati
   assert.deepEqual(origin.value.cursor.resultCapacity.forms.map((form:any)=>form.kind),['variants','no_variants']);
   assert.deepEqual(origin.value.cursor.resultCapacity.bindings.variantSubject,f.input.variantSubject);
   const execution=readResearchConsumerExecution(f.store,'p',reference(origin));assert.equal(execution.kind,'response');
-  assert.equal(execution.intent.value.state,'applied');assert.deepEqual(execution.intent.value.outputs,[reference(result)]);
+  assert.equal(execution.intent.value.state,'applied');assert.deepEqual(execution.intent.value.outputs![0],reference(result)); // 4B.1: the receipt leads its product publication
   const before=snapshot(f.store),cold=f.open();
   assert.deepEqual(readVariantExecutionSession(cold,'p',reference(result)),result);
   assert.deepEqual(await runVariantSession(cold,f.input),result);assert.deepEqual(snapshot(f.store),before);assert.equal(f.wires().length,calls+1);
@@ -190,8 +190,10 @@ for(const changed of ['mode','actor'] as const)
     assert.equal(f.wires().length,calls+1);
     const result=await runVariantSession(f.open(),f.input);
     assert.deepEqual(inspect(f.open()),history);assert.equal(f.wires().length,calls+1);
-    const otherInput=changed==='actor'?{...f.input,role:f.environment.value.reviewer}:
-      {...f.input,variantSubject:{...f.input.variantSubject,mode:reference(f.store.write({id:f.mode.id,kind:f.mode.kind,
+    // 4B.1: the first publication wrote the current selection; a new legal send names it (4T.2-T selection guard).
+    const current=reference(f.store.get(variantStateId('p',v.draft.id))!);
+    const otherInput=changed==='actor'?{...f.input,role:f.environment.value.reviewer,variantSubject:{...f.input.variantSubject,expectedSelection:current}}:
+      {...f.input,variantSubject:{...f.input.variantSubject,expectedSelection:current,mode:reference(f.store.write({id:f.mode.id,kind:f.mode.kind,
         expected:f.mode.revision,value:{projectId:'p',mode:'another-legal-transport-mode'}}))}};
     const other=prepareVariantSession(f.store,otherInput),o=other.intent.value;
     const otherState=continuationState(f.store,'p',o.draft.id,o.question.id,o.kind,o.role.actor,null,null,o.cursor.variantSubject);
@@ -267,7 +269,9 @@ test('4T.4: actual overrun retains one paid response for free publication and cl
   assert.equal(f.wires().length,calls+1);assert.deepEqual(f.store.list('research-budget-ledger'),ledger);
   assert.deepEqual(f.store.list('model-call'),allCalls);
   const newer=f.store.write({id:f.mode.id,kind:f.mode.kind,expected:f.mode.revision,value:{projectId:'p',mode:'questions'}});
-  await assert.rejects(runVariantSession(f.open(),{...f.input,variantSubject:{...f.input.variantSubject,mode:reference(newer)}}),code('discovery_budget_overrun'));
+  // 4B.1: the publication wrote the current selection; the new send names it, so the overrun alone refuses it.
+  const current=reference(f.store.get(variantStateId('p',result.value.draft.id))!);
+  await assert.rejects(runVariantSession(f.open(),{...f.input,variantSubject:{...f.input.variantSubject,mode:reference(newer),expectedSelection:current}}),code('discovery_budget_overrun'));
   assert.equal(f.wires().length,calls+1);assert.deepEqual(f.store.list('research-budget-ledger'),ledger);
   assert.deepEqual(f.store.list('model-call'),allCalls);
 });

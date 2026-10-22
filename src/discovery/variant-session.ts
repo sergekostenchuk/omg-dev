@@ -7,6 +7,7 @@ import type { DiscoveryDraft, Question } from './discovery.js';
 import { decodeVariantExecutionSession, decodeVariantSubject, readVariantNoneStructural, readVariantSetStructural, VARIANT_SESSION_CONTRACT,
   type VariantExecutionSession, type VariantPublication, type VariantSubject } from './discovery-variants.js';
 import { variantPublicationWrites } from './variant-decision.js';
+import { PROJECT_MODE_RECORD_KIND, readProjectMode } from '../product/project-mode.js';
 import { variantTransportFields, variantTransportGuards } from './continuation-packet.js';
 import { readVariantSnapshot } from './variant-snapshot.js';
 import { researchCall } from './research-protocol.js';
@@ -52,15 +53,16 @@ export function readVariantExecutionSession(store:Store,project:string,ref:Ref):
     // A 4T.4 execution-only receipt keeps its own contract and is no product set; a 4B.1 receipt carries the whole
     // publication its paid generation projects, in the exact order and revisions it was written with.
     if(outputs!.length>1) {
-      const expected=variantPublicationWrites(store,v,paid.payload).writes.map(write=>({id:write.id,revision:write.expected+1,hash:hashJson(write.value as never)}));
-      if(!same(outputs!.slice(1),expected)) invalid('The execution receipt names another publication than its paid generation projects');
+      const refs=(admit:boolean)=>variantPublicationWrites(store,v,paid.payload,admit).writes.map(write=>({id:write.id,revision:write.expected+1,hash:hashJson(write.value as never)}));
+      if(!same(outputs!.slice(1),refs(true)) && !same(outputs!.slice(1),refs(false)))
+        invalid('The execution receipt names another publication than its paid generation projects');
     }
   }
   return row;
 }
 
 export interface ProvenVariantGeneration {
-  verification:'proven'; session:Revision<VariantExecutionSession>; publication:VariantPublication; state:Ref;
+  verification:'proven'; session:Revision<VariantExecutionSession>; publication:VariantPublication; state:Ref|null;
 }
 /** 4B.1: the proven reader of a published generation result — a set or no_variants. The structural record leads to the
  * running intent it names, the applied revision right after it, and that application's receipt; the whole publication is
@@ -78,10 +80,11 @@ export function readVariantGeneration(store:Store,project:string,ref:Ref):Proven
   if(!same(session.value.result,origin)) invalid('The generation result names another execution receipt');
   const paid=readResearchConsumerExecution(store,project,reference(running));
   if(paid.kind!=='response') invalid('The generation result lost its paid response');
-  const {publication,writes}=variantPublicationWrites(store,session.value,paid.payload);
+  const {publication,state}=variantPublicationWrites(store,session.value,paid.payload,true);
   if(!same(publication.result.ref,ref)) invalid('The generation result is not the one its paid answer projects');
-  const state=writes.at(-1)!;
-  return {verification:'proven',session,publication,state:{id:state.id,revision:state.expected+1,hash:hashJson(state.value as never)}};
+  // The state is part of this result only when its application wrote it; a newer choice had made it inadmissible otherwise.
+  const stateRef={id:state.id,revision:state.expected+1,hash:hashJson(state.value as never)};
+  return {verification:'proven',session,publication,state:applied.value.outputs.some(output=>same(output,stateRef))?stateRef:null};
 }
 
 export interface VariantSessionInput {
@@ -106,7 +109,10 @@ export function prepareVariantSession(store:Store,input:VariantSessionInput):{
     draft:snapshot.value.draft,question,variantSubject:subject,purpose:'variant-proposal',actor:input.role.actor,cursor:0,result:null};
   decodeVariantExecutionSession(initial);
   const mode=store.get<Record<string,unknown>>(subject.mode.id,subject.mode.revision);
-  if(!mode || !same(reference(mode),subject.mode) || mode.value.projectId!==input.projectId) invalid('The variant mode basis is missing or foreign');
+  // A real project mode (project-mode/v1, written by setProjectMode) is proved by its own reader at the exact Ref; the
+  // explicit control rows the variant checks use keep their former check (codex-worker №11516). Mode authority is 4O's.
+  if(mode?.kind===PROJECT_MODE_RECORD_KIND) readProjectMode(store,input.projectId,subject.mode);
+  else if(!mode || !same(reference(mode),subject.mode) || mode.value.projectId!==input.projectId) invalid('The variant mode basis is missing or foreign');
   const id=variantExecutionSessionId(initial),existing=store.get<VariantExecutionSession>(id);
   let session=existing?readVariantExecutionSession(store,input.projectId,reference(existing)):null;
   const previous=session?findResearchConsumerIntent(store,input.projectId,initial.purpose,id,initial.draft.id):null;

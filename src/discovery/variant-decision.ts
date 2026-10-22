@@ -1,5 +1,5 @@
 import { hashJson } from '../canonical.js';
-import type { Ref } from '../pipeline/contracts.js';
+import { reference, type Ref } from '../pipeline/contracts.js';
 import { VARIANT_SCOPE_CONTRACT, readVariantNoneStructural, readVariantSetStructural, readVariantSnapshotStructural,
   readVariantStructure, variantBasis, variantInvalid, variantNullableRef, variantOrigin, variantReason,
   variantRecordId, variantRef, variantSame, variantShape, variantText,
@@ -197,11 +197,14 @@ export function readVariantHandoffStructural(view: VariantRecordView, project: s
 export { variantRecordId };
 
 export interface VariantPublicationWrite { id: string; kind: string; expected: number; value: unknown }
-/** 4B.1: the whole product batch of one paid generation — members, the set or no_variants, and the next current state —
- * as the producer writes it and the historical reader recomputes it. The previous state is the exact expected selection
- * the execution was dispatched with (absent when none); the state names the subject's exact mode and no decision yet. */
-export function variantPublicationWrites(view: VariantRecordView, session: VariantExecutionSession, payload: unknown):
-  { publication: VariantPublication; writes: VariantPublicationWrite[]; guards: Ref[] } {
+/** 4B.1: the whole product batch of one paid generation — members, the set or no_variants, and, when admissible, the next
+ * current state — as the producer writes it and the historical reader recomputes it. The previous state is the exact
+ * expected selection the execution was dispatched with (absent when none); the state names the subject's exact mode and
+ * no decision yet. It is admissible only while the current selection and mode are still exactly the subject's; otherwise
+ * the paid result is published under its original subject without the state, and a newer choice is never overwritten.
+ * `admit` fixes the form when a saved application is reread; omitted, it is judged on today's heads (producer, validator). */
+export function variantPublicationWrites(view: VariantRecordView, session: VariantExecutionSession, payload: unknown, admit?: boolean):
+  { publication: VariantPublication; writes: VariantPublicationWrite[]; guards: Ref[]; state: VariantPublicationWrite; admitted: boolean } {
   const publication = projectVariantPublication(session, payload), subject = session.variantSubject;
   const stateId = variantStateId(session.projectId, session.draft.id), expected = subject.expectedSelection;
   let previous: Ref | null = null, revision = 0;
@@ -212,9 +215,16 @@ export function variantPublicationWrites(view: VariantRecordView, session: Varia
   const isSet = publication.result.kind === 'discovery-variant-set';
   const state = decodeVariantState({ contract: VARIANT_STATE_CONTRACT, projectId: session.projectId, draft: session.draft,
     mode: subject.mode, result: publication.result.ref, set: isSet ? publication.result.ref : null, decision: null, previous });
+  const stateWrite: VariantPublicationWrite = { id: stateId, kind: 'discovery-variant-state', expected: revision, value: state };
+  let admitted = admit;
+  if (admitted === undefined) {
+    const head = view.get(stateId), mode = view.get(subject.mode.id);
+    admitted = (expected ? !!head && variantSame(reference(head), expected) : !head) && !!mode && variantSame(reference(mode), subject.mode);
+  }
   const writes: VariantPublicationWrite[] = [
     ...publication.members.map(member => ({ id: member.id, kind: member.kind, expected: 0, value: member.value })),
     { id: publication.result.id, kind: publication.result.kind, expected: 0, value: publication.result.value },
-    { id: stateId, kind: 'discovery-variant-state', expected: revision, value: state }];
-  return { publication, writes, guards: [subject.mode, ...(subject.kind === 'proposal' ? [subject.snapshot] : [])] };
+    ...(admitted ? [stateWrite] : [])];
+  const basis = subject.kind === 'proposal' ? [subject.snapshot] : [];
+  return { publication, writes, guards: admitted ? [subject.mode, ...basis] : basis, state: stateWrite, admitted };
 }

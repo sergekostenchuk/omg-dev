@@ -164,25 +164,31 @@ test('4B.1: a break after payment publishes later in a new Store without another
 });
 
 for (const conflict of ['another current selection', 'a moved mode'] as const) {
-  test(`4B.1: ${conflict} refuses the whole batch without overwriting it; the paid answer stays saved under its original subject`, async t => {
+  test(`4B.1: ${conflict} keeps the newer choice: the paid result is published under its original subject without a current state`, async t => {
     const f = await setup(t);
     f.reply(generation(2));
     const running = await f.pay(), sent = f.wires().length;
     const draft = prepareVariantSession(f.store, f.input).session.value.draft;
+    const stateId = variantStateId(f.project, draft.id);
     let moved: Ref;
     if (conflict === 'another current selection') {
       // A concurrent writer published a state for this draft after the dispatch, which expected none.
-      moved = reference(f.store.write({ id: variantStateId(f.project, draft.id), kind: 'discovery-variant-state', expected: 0, value: { fixture: 'concurrent state' } }));
+      moved = reference(f.store.write({ id: stateId, kind: 'discovery-variant-state', expected: 0, value: { fixture: 'concurrent state' } }));
     } else moved = reference(f.store.write({ id: f.mode.id, kind: f.mode.kind, expected: f.mode.revision, value: { projectId: f.project, mode: 'bypass' } }));
-    const before = history(f.store);
-    assert.throws(() => applyVariantSession(f.store, f.project, reference(running)),
-      (error: unknown) => error instanceof EngineError && ['input_stale', 'revision_conflict'].includes(error.code));
-    assert.deepEqual(history(f.store), before, 'no member, set, state or receipt is written');
-    assert.deepEqual(f.store.get(moved.id), f.store.get(moved.id, moved.revision), 'the newer selection or mode stays as it was');
-    const paid = readResearchConsumerExecution(f.store, f.project, reference(running));
-    assert.equal(paid.kind, 'response');
-    assert.equal(f.store.get<ResearchConsumerIntent>(running.id)!.value.state, 'running');
+    const stateBefore = f.store.get(stateId);
+    const receipt = applyVariantSession(f.store, f.project, reference(running));
+    assert.deepEqual(reference(f.store.get(moved.id)!), moved, 'the newer selection or mode stays as it was');
+    assert.deepEqual(f.store.get(stateId), stateBefore, 'no current state is written over it');
+    const set = f.store.list<VariantSet>('discovery-variant-set').find(row => row.value.projectId === f.project)!;
+    const applied = f.store.get<ResearchConsumerIntent>(running.id)!;
+    assert.deepEqual(applied.value.outputs, [reference(receipt), ...set.value.members, reference(set)]);
+    const proven = readVariantGeneration(f.store, f.project, reference(set));
+    assert.deepEqual([proven.verification, proven.state], ['proven', null]);
+    assert.deepEqual(proven.session.value.variantSubject, f.input.variantSubject, 'under its original subject');
     assert.equal(f.wires().length, sent);
+    const cold = f.open(), snapshot = history(cold);
+    assert.deepEqual(readVariantExecutionSession(cold, f.project, reference(receipt)), receipt);
+    assert.deepEqual(history(cold), snapshot);
   });
 }
 
@@ -221,4 +227,14 @@ test('4B.1: a forged member, recommendation or origin proves no set, and the lif
     assert.throws(() => readVariantGeneration(f.store, f.project, ref), (error: unknown) => error instanceof EngineError, note);
   assert.equal(readVariantGeneration(f.store, f.project, reference(set)).verification, 'proven');
   assert.ok(canonical(set.value.recommendation.member) === canonical(reference(second!)));
+});
+
+
+test('4B.1: a real project-mode record is proved by its own reader; a forged one of that kind is refused before any intent', async t => {
+  const f = await setup(t);
+  const forged = f.store.write({ id: 'project-mode:p', kind: 'project-mode', expected: 0, value: { projectId: f.project, mode: 'questions' } });
+  const before = history(f.store);
+  assert.throws(() => prepareVariantSession(f.store, { ...f.input, variantSubject: { ...f.input.variantSubject, mode: reference(forged) } }),
+    (error: unknown) => error instanceof EngineError && error.code.startsWith('project_mode_'));
+  assert.deepEqual(history(f.store), before);
 });
