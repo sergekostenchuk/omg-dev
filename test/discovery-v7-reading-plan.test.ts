@@ -282,7 +282,7 @@ test("S3-02/03 queue origin: only the writers' own chain — original child, com
   }
 });
 
-test("S3 mode isolation: A never inherits B's plan, mode or failed child; the field path and old planning recovery ignore subject turns", t => {
+test("S3 mode isolation: A never inherits B's plan, mode or failed child; the field path ignores subject turns", t => {
   const f = fixture(t), p = planned(f, "s3-mode"), run = runOf(p);
   const A = subjectOf(p.planAnswer, "q-supply"), B = subjectOf(p.planAnswer, "q-market");
   const parentA = plannerTurn(p, run, intentRef, A, readPlan("q-supply"));

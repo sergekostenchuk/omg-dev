@@ -406,7 +406,7 @@ test("intermediate checkpoints preserve exact evidence and never accept a questi
   assert.throws(() => checkpoint(store, draft, question, action), { code: "source_stale" });
 });
 
-test('a fabricated managed completed turn cannot use legacy transport replay without its producer proof', async t => {
+test('a fabricated managed completed turn is refused without its producer proof', async t => {
   const { engine, store, settings, pilot, draft, question } = fixture(t);
   configureReaderPilot(store, engine.environments, 'p', { ...settings, maxCalls: 3 }, pilot.revision);
   await engine.researcher.run('p', draft.id, 2);

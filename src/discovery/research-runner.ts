@@ -161,11 +161,7 @@ export class Researcher {
     // the addressed pause of the run; a missing K in the binding era with a
     // research answer on the question is a refusal, never a scan.
     if (forcedPendingTurn && forcedPendingTurn.id.startsWith("research-turn:v1:")
-      // The era is the turn's own field; a legacy-era turn is consulted here
-      // only when an acceptance record exists at its address (an old pending
-      // turn accepted by new code) — such a K is checked, never silenced.
-      && (acceptanceEraOf(forcedPendingTurn.value as ManagedResearchTurn) === 'binding'
-        || this.store.get(acceptanceBindingId(project, forcedPendingTurn.id)) !== null)) {
+      && acceptanceEraOf(forcedPendingTurn.value as ManagedResearchTurn) === 'binding') {
       const paid = admittedResearchAction(forcedPendingTurn.value.action);
       if (paid.action === 'answer' || paid.action === 'answer_delta') {
         const pendingRun = this.store.get<ResearchRun>(id);
