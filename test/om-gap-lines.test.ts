@@ -1,6 +1,6 @@
-import test, { type TestContext } from "node:test";
+import test, { after, type TestContext } from "node:test";
 import assert from "node:assert/strict";
-import { copyFileSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { createRequire } from "node:module";
 import { DatabaseSync } from "node:sqlite";
@@ -33,6 +33,8 @@ import { writeRoutes } from "../src/om/routes.js";
 import { readResultIdentity } from "../src/om/result-identity.js";
 import { gardenGraph, refusedWith, sameButReferences } from "./om-fixture.js";
 import { preparedFeatures } from "./product-fixture.js";
+import { produceAtomicSeed, type AtomicSeedResources } from "./om-atomic-seed.js";
+import { writeWorksAcceptance, type AtomicGateRecord } from "../src/om/atomic-gate.js";
 
 const clone = structuredClone;
 const fakeRef = (id: string, revision = 1): Ref => ({ id, revision, hash: hashJson({ id, revision }) });
@@ -639,49 +641,95 @@ function openAttempt(store: Store, address: SeriesRequest, goal: AttemptGoal) {
   return ok(beginAttempt(store, { ...address, attempt: 1, goal }));
 }
 
-test("D2 verifies the exact earlier attempt goal and retains that historical link after completion and restart", t => {
-  const f = firstPassFixture(t), first = ok(writeGapLines(f.store, f.request));
-  const oldGap = f.gaps.collection.gaps.find(item => item.field === "fill" && item.evidence.some(evidence => evidence.origin === "operations"))!;
-  const obligation = ok(prepareFrame(f.store, f.frame)).result.obligations.find(item => item.id === oldGap.target)!;
-  const address: SeriesRequest = { project: "garden", block: obligation.upper.node, line: 1 };
-  const initialGoal = goalFor(oldGap), goal = { ...initialGoal, questions: [...initialGoal.questions, "additional-goal-question"] };
-  const attempt = openAttempt(f.store, address, goal), next = acceptOperations(f);
-  assert.equal(next.line.id, oldGap.id);
-  const request: GapLinesRequest = { ...f.request, previous: reference(first), pass: 2, gaps: next.gaps,
-    closures: [{ ...next.closure, attempt: { series: reference(attempt), attempt: 1 } }] };
-  const prepared = ok(prepareGapLines(f.store, request));
-  assert.ok(prepared.guards.some(ref => canonical(ref) === canonical(reference(attempt))));
-  const saved = ok(writeGapLines(f.store, request));
-  const resultRequest = { project: "garden", block: address.block, target: attempt.id, goal, accepting: [reference(saved)], cancelling: [] };
-  const confirmed = ok(confirmResults(f.store, resultRequest));
-  const identity = ok(readResultIdentity(f.store, { acceptance: next.acceptance, obligation: oldGap.target }));
-  assert.deepEqual(confirmed, { achieved: [{ key: identity.key, basis: reference(saved) }], cancelled: [] });
-  assert.deepEqual(ok(confirmResults(f.store, { ...resultRequest, goal: { ...goal, questions: [...goal.questions].reverse() } })), confirmed);
-  denied(confirmResults(f.store, { ...resultRequest, accepting: [next.candidate] }), "achievement_unconfirmed");
+/**
+ * LG07 gl-b (№10631): the carrier of the D2 attempt goal is the atomic seed (only imported) — a real open consume attempt
+ * with its full goal and completion, its own paid E2/E4 and assemblies — finished the way F5 of om-atomic-gate does:
+ * the works acceptance, the current D1, D2 with the exact original Ref of the attempt, confirmResults, then G7.
+ */
+const atomicSeedResources: AtomicSeedResources = [];
+after(() => { for (const seed of atomicSeedResources) { seed.store.close(); rmSync(seed.root, { recursive: true, force: true }); } });
+let atomicSeed: ReturnType<typeof produceAtomicSeed> | undefined;
+
+test("D2 verifies the exact earlier attempt goal and retains that historical link after completion and restart", async t => {
+  const seed = await (atomicSeed ??= produceAtomicSeed(atomicSeedResources));
+  const root = mkdtempSync(join(tmpdir(), "omg-gap-lines-d2-goal-")), database = join(root, "state.sqlite");
+  copyFileSync(seed.database, database);
+  let store = new Store(database);
+  t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
+  const sends = () => readFileSync(seed.trace, "utf8"), paid = sends();
+  const f = clone(seed.data), declared = f.openGoal!, project = f.project;
+  const address: SeriesRequest = { project, block: declared.block, line: 1 };
+  const open = ok(readSeries(store, address)), earlier = open.value.attempts.find(item => item.ordinal === declared.ordinal)!;
+  assert.deepEqual(reference(open), declared.series);
+  assert.deepEqual(earlier.goal, declared.goal); assert.equal(earlier.outcome, null);
+  assert.ok(declared.goal.questions.length > 1, "The goal is the full multi-question goal of the attempt's real batches");
+  const accepted = ok(writeWorksAcceptance(store, f.request));
+  assert.equal(accepted.state, "accepted"); assert.ok(accepted.acceptance);
+  const acceptance = accepted.acceptance, gate = accepted.record.value.gate;
+  const candidate = store.get<AtomicGateRecord>(gate.id, gate.revision)!.value.result.candidate;
+  const previous = store.get<GapLinesRecord>(f.lines.id)!;
+  const sources = clone(f.gapRead.sources) as GapRequest;
+  if ("state" in sources.works) throw new Error("A real works frame is required");
+  sources.graph = acceptance.graph; sources.operations.frame.graph = acceptance.graph;
+  sources.works = { frame: { ...sources.works.frame, graph: acceptance.graph, layer: acceptance.layer, frame: acceptance.frame }, proposals: [] };
+  const current = ok(writeGaps(store, sources)), gaps: GapReadRequest = { sources: clone(current.sources) as GapRequest, records: current.records.map(reference) };
+  const targets = f.gaps.records.filter(record => record.value.gap.code === "obligation_open"
+    && record.value.gap.evidence.some(evidence => evidence.origin === "works")
+    && declared.goal.questions.includes(gapLineKey(project, record.value.gap.target, record.value.gap.field))).map(record => record.value.gap);
+  assert.equal(targets.length, declared.goal.questions.length);
+  const request: GapLinesRequest = { project, previous: reference(previous), pass: previous.value.request.pass + 1, gaps,
+    closures: targets.map(target => ({ id: target.id, reason: "filled" as const, basis: acceptance.frame, acceptance,
+      attempt: { series: declared.series, attempt: declared.ordinal } })) };
+  const prepared = ok(prepareGapLines(store, request));
+  assert.ok(prepared.guards.some(ref => canonical(ref) === canonical(declared.series)), "The exact series of the attempt guards D2");
+  const saved = ok(writeGapLines(store, request));
+  const resultRequest = { project, block: declared.block, target: declared.series.id, goal: declared.goal, accepting: [reference(saved)], cancelling: [] };
+  const confirmed = ok(confirmResults(store, resultRequest));
+  const identities = targets.map(target => ok(readResultIdentity(store, { acceptance, obligation: target.target })));
+  assert.deepEqual(confirmed.achieved.map(item => item.key).sort(), [...new Set(identities.map(identity => identity.key))].sort());
+  assert.ok(confirmed.achieved.length > 0 && confirmed.achieved.every(item => canonical(item.basis) === canonical(reference(saved))));
+  assert.deepEqual(confirmed.cancelled, []);
+  assert.deepEqual(ok(confirmResults(store, { ...resultRequest, goal: { ...declared.goal, questions: [...declared.goal.questions].reverse() } })), confirmed);
+  const beforeRefusals = historySnapshot(store);
+  denied(confirmResults(store, { ...resultRequest, accepting: [candidate] }), "achievement_unconfirmed");
   for (const context of [{ ...resultRequest, block: "garden-unrelated-block" },
-    { ...resultRequest, goal: { ...goal, key: "different-full-goal" } },
-    { ...resultRequest, goal: { ...goal, result: "different-result" } }]) {
-    const refused = denied(confirmResults(f.store, context), "achievement_unconfirmed");
+    { ...resultRequest, goal: { ...declared.goal, key: "different-full-goal" } },
+    { ...resultRequest, goal: { ...declared.goal, result: "different-result" } }]) {
+    const refused = denied(confirmResults(store, context), "achievement_unconfirmed");
     assert.match(refused.message, /closure_unconfirmed/);
   }
-  const result = ok(closeAttempt(f.store, { ...address, attempt: 1,
-    outcome: { reason: "result", accepting: [reference(saved)], cancelling: [], refusals: [] } }));
-  assert.equal(result.verdict, "progress"); assert.equal(result.withoutProgress, 0);
-  ok(beginAttempt(f.store, { ...address, attempt: 2, goal }));
-  const repeated = ok(closeAttempt(f.store, { ...address, attempt: 2,
-    outcome: { reason: "result", accepting: [reference(saved)], cancelling: [], refusals: [] } }));
-  assert.equal(repeated.verdict, "none"); assert.equal(repeated.withoutProgress, 1);
-  assert.notDeepEqual(reference(ok(readSeries(f.store, address))), reference(attempt));
-  const reopened = new Store(f.database);
-  try {
-    const before = historySnapshot(reopened);
-    assert.deepEqual(ok(readGapLines(reopened, { project: "garden", record: reference(saved) })), saved);
-    assert.deepEqual(ok(writeGapLines(reopened, request)), saved);
-    assert.deepEqual(ok(confirmResults(reopened, resultRequest)), confirmed);
-    assert.equal(ok(readResultIdentity(reopened, { acceptance: next.acceptance, obligation: oldGap.target })).key, identity.key);
-    denied(confirmResults(reopened, { ...resultRequest, accepting: [], cancelling: [reference(saved)] }), "cancellation_unconfirmed");
-    assert.deepEqual(historySnapshot(reopened), before);
-  } finally { reopened.close(); }
+  assert.deepEqual(historySnapshot(store), beforeRefusals);
+  // The first G7 is the progress of the attempt; its write moves the series on, and the original Ref of the open attempt
+  // stays the historical ground of D2.
+  const completion = { ...address, attempt: declared.ordinal,
+    outcome: { reason: "result" as const, accepting: [reference(saved)], cancelling: [], refusals: [] } };
+  const closed = ok(closeAttempt(store, completion));
+  assert.equal(closed.verdict, "progress"); assert.equal(closed.withoutProgress, 0);
+  const completed = ok(readSeries(store, address));
+  assert.notDeepEqual(reference(completed), declared.series);
+  assert.deepEqual(ok(readSeriesAt(store, project, declared.series)), open);
+  assert.deepEqual(ok(confirmResults(store, resultRequest)), confirmed);
+  store.close(); store = new Store(database);
+  const before = historySnapshot(store);
+  assert.deepEqual(ok(readGapLines(store, { project, record: reference(saved) })), saved);
+  assert.deepEqual(ok(writeGapLines(store, request)), saved);
+  assert.deepEqual(ok(confirmResults(store, resultRequest)), confirmed);
+  for (const [index, target] of targets.entries()) assert.deepEqual(ok(readResultIdentity(store, { acceptance, obligation: target.target })), identities[index]);
+  assert.deepEqual(ok(closeAttempt(store, completion)), closed);
+  denied(confirmResults(store, { ...resultRequest, accepting: [], cancelling: [reference(saved)] }), "cancellation_unconfirmed");
+  assert.deepEqual(historySnapshot(store), before);
+  assert.equal(sends(), paid, "Nothing after the paid preparation dispatched another model call");
+  // The old standalone tail — a new attempt with the same full goal repeating this D2 — has no carrier here: the accepted
+  // frame resolved every consume obligation of the goal and D2 closed its lines, so the fresh M6 holds no consume batch
+  // that serves it, and an opening without one is refused before anything is written.
+  const fresh = ok(writeRoutes(store, { project, gaps, tasks: [], catalog: { paths: [], records: [] }, previous: reference(f.routes) }));
+  assert.ok(!fresh.value.batches.some(batch => batch.items.every(item => item.consumers.includes(declared.block))
+    && batch.items.some(item => declared.goal.questions.includes(gapLineKey(project, item.target, item.field)))));
+  const boundary = historySnapshot(store);
+  denied(managedOpenAttempt(store, { ...address, attempt: declared.ordinal + 1, goal: declared.goal,
+    completion: { routes: reference(fresh), batches: [] } }), "completion_request_invalid");
+  assert.deepEqual(historySnapshot(store), boundary);
+  assert.equal(sends(), paid);
 });
 
 test("D2 unrelated attempts and a shifted series cannot close a line or partially write a neighbor", async t => {
