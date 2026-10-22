@@ -126,6 +126,38 @@ export function requireVariantArchive(store: Store, ref: Ref, projectId: string,
   'continuation_foreign', 'A variant archive body must retain its exact transport identity');
 }
 
+/** A call's first saved packet fixes its transport identity. A later head
+ * cannot move that call to another archive; a valid older edition is separate. */
+export function variantCallMatches(store: Store, call: Revision<ModelCall>, projectId: string,
+  draft: Ref, question: Ref, purpose: string, actor: string, variant: VariantSubject): boolean {
+  const first = store.get<ModelCall>(call.id,1);
+  requireCondition(first?.kind === 'model-call' && first.value.projectId === projectId
+    && first.value.draftId === draft.id && first.value.questionId === question.id
+    && first.value.purpose === purpose && first.value.requested.actor === actor
+    && canonical(packetVariantSubject(first.value)) === canonical(variant)
+    && !Object.hasOwn(first.value,'subject') && !Object.hasOwn(first.value,'assessmentSubject')
+    && first.value.packet && isRef(first.value.packet.archive),
+  'continuation_foreign','A variant call must retain its first saved transport binding');
+  const archiveRef = first.value.packet.archive;
+  const archive = store.get<any>(archiveRef.id,archiveRef.revision);
+  requireCondition(archive?.kind === 'research-context' && archive.hash === archiveRef.hash
+    && isRef(archive.value.draft) && archive.value.draft.id === draft.id
+    && isRef(archive.value.question) && archive.value.question.id === question.id,
+  'continuation_foreign','The first call packet needs its exact draft and Question references');
+  const savedDraft = store.get<DiscoveryDraft>(draft.id,archive.value.draft.revision);
+  const savedQuestion = store.get<Question>(question.id,archive.value.question.revision);
+  requireCondition(savedDraft?.kind === 'discovery-draft' && savedDraft.hash === archive.value.draft.hash
+    && savedDraft.value.projectId === projectId && savedDraft.value.questions.includes(question.id)
+    && savedQuestion?.kind === 'question' && savedQuestion.hash === archive.value.question.hash
+    && savedQuestion.value.projectId === projectId && savedQuestion.value.draftId === draft.id,
+  'continuation_foreign','The saved transport edition must name its actual historical draft and Question');
+  if (canonical(archive.value.draft) !== canonical(draft) || canonical(archive.value.question) !== canonical(question)) return false;
+  requireCondition(call.value.packet && canonical(call.value.packet.archive) === canonical(archiveRef),
+    'continuation_foreign','A call cannot replace its first transport packet');
+  requireVariantArchive(store,archiveRef,projectId,draft,question,purpose,actor,variant);
+  return true;
+}
+
 /** This is the response shape transported by T. The paid producer A proves
  * the verdict and complete novelty against M; the model never sets N or keys. */
 export const ATTEMPTS_ASSESSMENT_RESPONSE = {
@@ -318,12 +350,8 @@ export function continuationState(store: Store, projectId: string, draftId: stri
     && callAddressesSubject(c.value as unknown as Record<string,unknown>, reference(question), subject) && c.value.purpose===purpose && c.value.requested.actor===actor
     && canonical(packetVariantSubject(c.value)) === canonical(variantSubject)
     && (!variantSubject || !Object.hasOwn(c.value,'subject') && !Object.hasOwn(c.value,'assessmentSubject')
-      && c.value.draftId === draftId))
+      && c.value.draftId === draftId && variantCallMatches(store,c,projectId,reference(draft),reference(question),purpose,actor,variantSubject)))
     .sort((a,b)=>a.value.startedAt-b.value.startedAt||a.id.localeCompare(b.id));
-  if (variantSubject) for (const call of calls) {
-    requireCondition(call.value.packet && isRef(call.value.packet.archive),'continuation_foreign','A variant call requires its exact transport archive');
-    requireVariantArchive(store,call.value.packet.archive,projectId,reference(draft),reference(question),purpose,actor,variantSubject);
-  }
   requireCondition(!calls.some(c=>c.value.status==='running'),'continuation_call_active',
     'This question/role has an unfinished invocation; recover its actual outcome before another dispatch');
   if(state) requireCondition((state.value.assessmentKey ?? null) === assessmentKey && state.kind==='continuation-state' && state.value.question===questionId

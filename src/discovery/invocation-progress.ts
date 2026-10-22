@@ -1,5 +1,5 @@
 import type { VariantSubject } from './discovery-variants.js';
-import { variantTransportSubject, requireVariantContext, packetVariantSubject, variantTransportGuards, variantTransportFields, requireVariantArchive, assessmentSubjectKey, type AssessmentTransportSubject } from './continuation-packet.js';
+import { variantTransportSubject, requireVariantContext, packetVariantSubject, variantTransportGuards, variantTransportFields, variantCallMatches, assessmentSubjectKey, type AssessmentTransportSubject } from './continuation-packet.js';
 import { callAddressesSubject, sameSubject, planSubjectOf, type V7PlanSubject } from './v7-managed-attempt.js';
 import { AsyncLocalStorage } from "node:async_hooks";
 import type { Store, ReadGuard, TransactionGuard } from '../storage/store.js';
@@ -51,12 +51,9 @@ export function invocationProgress(store:Store,questionId:string,purpose:string,
     && c.value.purpose===purpose && c.value.progressKey===key
     && (!variantSubject || c.value.draftId===draft!.id
       && !Object.hasOwn(c.value,'subject') && !Object.hasOwn(c.value,'assessmentSubject'))
+    && (!(subject||assessmentSubject||variantSubject) || c.value.projectId===(question.value as any).projectId && c.value.requested.actor===actor)
     && canonical(packetVariantSubject(c.value))===canonical(variantSubject)
-    && (!(subject||assessmentSubject||variantSubject) || c.value.projectId===(question.value as any).projectId && c.value.requested.actor===actor));
-  if(variantSubject) for(const call of calls) {
-    requireCondition(call.value.draftId===draft!.id && !!call.value.packet,'continuation_foreign','Variant progress needs its exact saved archive');
-    requireVariantArchive(store,call.value.packet!.archive,(question.value as any).projectId,reference(draft!),reference(question),purpose,actor!,variantSubject);
-  }
+    && (!variantSubject || variantCallMatches(store,c,(question.value as any).projectId,reference(draft!),reference(question),purpose,actor!,variantSubject)));
   return {key,guards:[...calls.map(reference),...(variantSubject?variantTransportGuards((question.value as any).projectId,draft!.id,variantSubject):[])]};
 }
 

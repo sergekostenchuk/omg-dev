@@ -194,3 +194,52 @@ test('4T.2-T missing identity on saved state/archive and altered exact archive R
   const bad=f.store.write({id:'research-context:transport-fixture-forged',kind:'research-context',expected:0,value:badValue});
   assert.throws(()=>f.pack(v,'a',reference(bad),true),{code:'continuation_foreign'});
 });
+
+
+for(const kind of ['proposal','decision'] as const) {
+  for(const target of ['question','draft'] as const)
+    test(`4T.2-T-01 ${kind} saved calls stay with their exact ${target} edition after cold reopen`,t=>{
+      const f=fixture(t),v=f[kind],packet=f.pack(v),old=f.state(v),oldProgress=f.progress(v);
+      const oldCall=f.call(v,packet),oldDispatch=continuationDispatch(old,oldCall.id);
+      f.store.writeMany(oldDispatch.writes,oldDispatch.guards);
+      const row=f[target];
+      f.store.write({id:row.id,kind:row.kind,expected:row.revision,value:{...row.value,
+        ...(target==='question'?{status:'paused'}:{fields:{topic:'new edition'}})}});
+      const next=f.state(v),progress=f.progress(v);
+      assert.notEqual(next.id,old.id);assert.equal(next.initial,true);assert.equal(next.priorCalls,0);
+      assert.equal(next.state,null);assert.equal(next.basis,null);assert.equal(next.attempts,0);
+      assert.notEqual(progress.key,oldProgress.key);
+      assert.deepEqual(progress.guards.filter(g=>g.id.startsWith('model-call:')),[]);
+      assert.throws(()=>f.pack(v,'a',packet.working.archive,true),{code:'continuation_foreign'});
+      const snapshot=f.store.identities('list'),cold=new Store(f.path);
+      try {
+        assert.deepEqual(continuationState(cold,'p',f.draft.id,f.question.id,f.purpose(v),'a',null,null,v),next);
+        assert.deepEqual(invocationProgress(cold,f.question.id,f.purpose(v),f.body(v),null,'a',null,v),progress);
+        assert.deepEqual(cold.identities('list'),snapshot);
+      } finally {cold.close();}
+      const ownPacket=f.pack(v),ownCall=f.call(v,ownPacket),current=f.state(v);
+      assert.equal(current.priorCalls,1);assert.deepEqual(current.callGuards,[reference(ownCall)]);
+      assert.deepEqual(current.basis,ownPacket.working.archive);
+      // Packet replacement of this edition's own call must still refuse.
+      f.store.write({id:ownCall.id,kind:'model-call',expected:ownCall.revision,value:{...ownCall.value,
+        packet:{...ownCall.value.packet,archive:packet.working.archive}}});
+      const after=f.store.identities('list');
+      assert.throws(()=>f.state(v),{code:'continuation_foreign'});
+      assert.throws(()=>f.progress(v),{code:'continuation_foreign'});
+      assert.deepEqual(f.store.identities('list'),after);
+    });
+  for(const owner of ['actor','project'] as const)
+    test(`4T.2-T-02 ${kind} excludes malformed foreign ${owner} before decoding; its own corruption refuses`,t=>{
+      const f=fixture(t),v=f[kind],packet=f.pack(v),own=f.call(v,packet),progress=f.progress(v),state=f.state(v);
+      f.call(v,packet,'a',{...(owner==='actor'?{requested:{actor:'foreign'}}:{projectId:'foreign'}),
+        variantSubject:{...v,contract:'unknown'}});
+      const before=f.store.identities('list');
+      assert.deepEqual(f.progress(v),progress);assert.deepEqual(f.state(v),state);
+      assert.deepEqual(f.store.identities('list'),before);
+      f.store.write({id:own.id,kind:'model-call',expected:own.revision,value:{...own.value,variantSubject:{...v,contract:'unknown'}}});
+      const corrupt=f.store.identities('list');
+      assert.throws(()=>f.progress(v),{code:'discovery_variant_subject_invalid'});
+      assert.throws(()=>f.state(v),{code:'discovery_variant_subject_invalid'});
+      assert.deepEqual(f.store.identities('list'),corrupt);
+    });
+}
