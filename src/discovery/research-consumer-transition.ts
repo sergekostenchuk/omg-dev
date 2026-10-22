@@ -1,3 +1,4 @@
+import { decodeVariantExecutionSession, decodeVariantGeneration, type VariantExecutionSession } from './discovery-variants.js';
 import type { AssessmentTransportSubject } from './continuation-packet.js';
 import { DISCOVERY_ASSESSMENT_CONTRACT_V2, DISCOVERY_ASSESSMENT_CONTRACT_V3, type DiscoveryAttemptsAssessmentV2, type DiscoveryAttemptsAssessmentV3, type PaidDiscoveryAttemptsAssessment } from './research-model.js';
 import { earlyResearchFailure, deliveredConceptSections, EARLY_RESEARCH_OUTCOME, researchResultFailure, requireAttemptsAssessmentReply,
@@ -2339,3 +2340,29 @@ export function projectPaidAttemptsAssessment(input: { subject: AssessmentTransp
 }
 export const discoveryAssessmentId = (value: Pick<PaidDiscoveryAttemptsAssessment, 'contract'|'projectId'|'session'|'application'>) =>
   `discovery-assessment:${value.contract === DISCOVERY_ASSESSMENT_CONTRACT_V3 ? 'v3' : 'v2'}:${hashJson({ projectId: value.projectId, session: value.session, application: value.application })}`;
+
+/* 4T.4: execution owns a logical variant dispatch, independently of D3 and of the
+ * product set/state published by 4B. The receipt pins the running intent, never
+ * its simultaneously-created terminal revision. No current mode is read here. */
+export function variantExecutionSessionId(value: Pick<VariantExecutionSession,
+  'projectId' | 'draft' | 'question' | 'variantSubject' | 'purpose' | 'actor'>): string {
+  return `discovery-variant-session:${hashJson({projectId:value.projectId,draft:value.draft,
+    question:value.question,variantSubject:value.variantSubject,purpose:value.purpose,actor:value.actor})}`;
+}
+export function projectPaidVariantSession(session: Revision<VariantExecutionSession>,
+  intent: Revision<ResearchConsumerIntent>, paid: {call:Ref;response:Ref;payload:unknown}): VariantExecutionSession {
+  const before=decodeVariantExecutionSession(session.value), v=intent.value;
+  requireCondition(session.kind==='discovery-variant-session' && session.revision===1 && before.cursor===0
+    && session.hash===hashJson(before) && session.id===variantExecutionSessionId(before)
+    && intent.kind==='research-consumer-intent' && intent.hash===hashJson(v) && v.state==='running'
+    && canonical(v.owner)===canonical(reference(session)) && v.projectId===before.projectId
+    && canonical(v.draft)===canonical(before.draft) && canonical(v.question)===canonical(before.question)
+    && v.kind===before.purpose && v.role.actor===before.actor
+    && canonical(v.cursor.variantSubject)===canonical(before.variantSubject) && v.cursor.sessionId===session.id
+    && v.cursor.offset===0 && isRef(paid.call) && isRef(paid.response),
+  'discovery_variant_session_invalid','The variant receipt needs its exact initial session and paid running intent');
+  const capacityFailure=researchResultFailure(v.cursor.resultCapacity,paid.payload);
+  if(capacityFailure) throw capacityFailure;
+  if(before.variantSubject.kind==='proposal') decodeVariantGeneration(paid.payload);
+  return {...before,cursor:1,result:{intent:reference(intent),call:paid.call,response:paid.response}};
+}

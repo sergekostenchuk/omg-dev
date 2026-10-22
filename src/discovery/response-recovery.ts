@@ -1,3 +1,7 @@
+import { decodeVariantExecutionSession, decodeVariantSubject, type VariantExecutionSession } from './discovery-variants.js';
+import { readVariantSnapshot } from './variant-snapshot.js';
+import { variantExecutionSessionId, projectPaidVariantSession } from './research-consumer-transition.js';
+import { requireVariantArchive, variantTransportFields, variantTransportGuards } from './continuation-packet.js';
 import { packetAssessmentSubject, proveAssessmentTransportSubject, assessmentQuestionContract, assessmentTransportPrompt, continuationPrompt, planQuestionContract } from './continuation-packet.js';
 import { prepareResearchEnvelope } from './research-protocol.js';
 import { readRequestWire, readArchiveBody, prepareContextPreparation, readPreparationRecord, readPreparedContext,
@@ -168,7 +172,7 @@ function responseSessionBinding(session: Revision<RecoverableContextSession>) {
 
 const object = (value: unknown): value is Record<string, any> => value !== null && typeof value === 'object' && !Array.isArray(value);
 
-export type ResearchConsumerKind = 'synthesis' | 'consolidation' | 'reader' | 'analyst' | 'reading-planner' | 'escalation-assessor';
+export type ResearchConsumerKind = 'variant-proposal' | 'variant-decision' | 'synthesis' | 'consolidation' | 'reader' | 'analyst' | 'reading-planner' | 'escalation-assessor';
 /** DRS1a2: v2 keeps the analyst call context once in an immutable
  * context-preparation/v1 (request parts) and names it by exact Ref; its cursor
  * carries no context. v1 keeps cursor.context. The saved contract decides. */
@@ -188,7 +192,7 @@ export interface ResearchConsumerIntent {
 }
 export type ResearchConsumerIntentInput = Omit<ResearchConsumerIntent,
   'contract' | 'rootKey' | 'generation' | 'previous' | 'state' | 'call' | 'request' | 'archive' | 'outputs' | 'refusal' | 'preparation'>;
-const consumerKinds: ResearchConsumerKind[] = ['synthesis', 'consolidation', 'reader', 'analyst', 'reading-planner', 'escalation-assessor'];
+const consumerKinds: ResearchConsumerKind[] = ['variant-proposal', 'variant-decision', 'synthesis', 'consolidation', 'reader', 'analyst', 'reading-planner', 'escalation-assessor'];
 function sameLogicalConsumerStep(a: ResearchConsumerIntent, b: ResearchConsumerIntent): boolean {
   if (a.projectId !== b.projectId || a.kind !== b.kind || a.rootKey !== b.rootKey
     || a.owner.id !== b.owner.id || a.draft.id !== b.draft.id || a.question.id !== b.question.id)
@@ -293,6 +297,11 @@ function consumerShape(value: unknown, id: string): asserts value is ResearchCon
       || !Object.hasOwn(value.cursor, 'materialEncoding')
       || !(value.cursor.materialEncoding === null || typeof value.cursor.materialEncoding === 'string'))
       consumerInvalid(id, 'The synthesis intent lost its exact session cursor');
+  } else if (isVariantConsumer(value as ResearchConsumerIntent)) {
+    if(value.cursor.sessionId!==value.owner.id || value.cursor.offset!==0 || !isRef(value.owner)
+      || !Object.hasOwn(value.cursor.context,'variantSubject')
+      || canonical(decodeVariantSubject(value.cursor.variantSubject))!==canonical(value.cursor.context.variantSubject))
+      consumerInvalid(id,'The variant intent lost its complete execution session cursor');
   } else if (typeof value.cursor.run !== 'string' || value.cursor.run !== value.owner.id
     || !Number.isSafeInteger(value.cursor.turn) || value.cursor.turn <= 0)
     consumerInvalid(id, 'The runner intent lost its exact run and turn');
@@ -351,6 +360,7 @@ export function readResearchConsumerIntent(store: Store, ref: Ref): Revision<Res
   // step — the record and its binding, without re-reading history or parts.
   if (saved.value.contract === CONSUMER_INTENT_V2)
     readPreparationRecord(store, saved.value.preparation!, preparationBinding(saved.value, saved.id));
+  if(isVariantConsumer(saved.value)) requireVariantConsumerBinding(store,saved.value,saved.id);
   return saved;
 }
 /** DRS1a2: the step a v2 preparation must be bound to — from the intent's own
@@ -1499,11 +1509,13 @@ export function consumerResultCapacity(store: Store, intent: ResearchConsumerInt
     && (!intent.profile || profile && canonical(reference(profile)) === canonical(intent.profile)),
   'research_capacity_invalid', 'Result capacity needs the exact draft, question and profile');
   const cursor = intent.cursor, context = pendingContext ?? consumerIntentContext(store, intent);
-  return researchCapacityInput({ operation: intent.key, generation: intent.generation,
+  const capacity = researchCapacityInput({ operation: intent.key, generation: intent.generation,
     bindings: { projectId: intent.projectId, draft: intent.draft, question: intent.question,
       inputsHash: hashJson(draft.value.inputs), basis: intent.basis, owner: intent.owner,
       // DR3a3-K: two plan-questions of one plan Question never share a declaration.
-      ...(cursorSubject(intent) ? { subject: cursorSubject(intent) } : {}) },
+      ...(cursorSubject(intent) ? { subject: cursorSubject(intent) } : {}),
+      ...(isVariantConsumer(intent) ? { variantSubject:decodeVariantSubject(cursor.variantSubject),
+        purpose:intent.kind,actor:intent.role.actor } : {}) },
     role: ['synthesis', 'consolidation'].includes(intent.kind) ? 'synthesizer'
       : intent.kind === 'escalation-assessor' ? 'assessor' : 'analyst',
     purpose: intent.kind, actionMode: intent.kind === 'consolidation' ? 'consolidation'
@@ -1514,6 +1526,9 @@ export function consumerResultCapacity(store: Store, intent: ResearchConsumerInt
     question: { id: question.id, value: question.value }, context,
     cursor: Object.fromEntries(['sessionId', 'offset', 'materialOffset', 'run', 'turn', 'pendingTurn', 'delivery',
       'previousProposalRef', 'contextContract'].filter(key => Object.hasOwn(cursor, key)).map(key => [key, cursor[key]])) });
+  // The common result bound measures the complete generation reply, not legacy analyst actions.
+  return intent.kind==='variant-proposal'
+    ? {...capacity,forms:[{kind:'variants'},{kind:'no_variants'}]} : capacity;
 }
 export function consumerCapacityFailure(_store: Store, intent: Revision<ResearchConsumerIntent>, payload: unknown) {
   const cursor = intent.value.cursor;
@@ -1543,7 +1558,39 @@ export function consumerCapacityCorrection(store: Store, intent: Revision<Resear
  * discovery draft at the exact revision answered by the subject's plan answer,
  * and the plan-question belongs to that proven plan edition. Readers trust the
  * saved subject afterwards (its form is checked with the intent shape). */
+export function isVariantConsumer(value: Pick<ResearchConsumerIntent,'kind'>): boolean {
+  return value.kind==='variant-proposal' || value.kind==='variant-decision';
+}
+function requireVariantConsumerBinding(store: Store, value: ResearchConsumerIntent, id: string): void {
+  if(!isRef(value.owner) || !isRef(value.draft) || !isRef(value.question) || !object(value.role)
+    || !object(value.cursor) || !object(value.cursor.context) || !Array.isArray(value.guards))
+    consumerInvalid(id,'The variant intent needs its complete owner, role, context and guards');
+  const owner=store.get<VariantExecutionSession>(value.owner.id,value.owner.revision);
+  if(!owner || owner.kind!=='discovery-variant-session' || canonical(reference(owner))!==canonical(value.owner))
+    consumerInvalid(id,'A variant intent must be owned by its exact execution session');
+  const v=decodeVariantExecutionSession(owner.value);
+  if(owner.revision!==1 || v.cursor!==0 || owner.id!==variantExecutionSessionId(v) || value.key!==owner.id
+    || v.projectId!==value.projectId || canonical(v.draft)!==canonical(value.draft)
+    || canonical(v.question)!==canonical(value.question) || v.purpose!==value.kind || v.actor!==value.role.actor
+    || canonical(v.variantSubject)!==canonical(value.cursor.variantSubject))
+    consumerInvalid(id,'The variant intent differs from its session identity');
+  const fields=variantTransportFields(v.projectId,v.draft,v.question,v.purpose,v.actor,v.variantSubject);
+  if(!Object.entries(fields).every(([key,field])=>Object.hasOwn(value.cursor.context,key)
+    && canonical(value.cursor.context[key])===canonical(field))
+    || Object.hasOwn(value.cursor.context,'subject') || Object.hasOwn(value.cursor.context,'assessmentSubject'))
+    consumerInvalid(id,'The variant context lost or mixed its exact transport binding');
+  if(v.variantSubject.kind==='proposal') {
+    const snapshot=readVariantSnapshot(store,v.projectId,v.variantSubject.snapshot);
+    if(canonical(snapshot.value.draft)!==canonical(v.draft)
+      || !snapshot.value.questions.some(question=>canonical(question.question)===canonical(v.question)))
+      consumerInvalid(id,'The variant session does not name its proven snapshot draft/Question');
+  }
+  if(!variantTransportGuards(v.projectId,v.draft.id,v.variantSubject).every(guard=>
+    value.guards.some(saved=>canonical(saved)===canonical(guard))))
+    consumerInvalid(id,'The variant intent omitted an exact or absent dispatch dependency');
+}
 function requireIntentSubject(store: Store, value: ResearchConsumerIntent, id: string): void {
+  if(isVariantConsumer(value)) { requireVariantConsumerBinding(store,value,id); return; }
   const subject = cursorSubject(value, id);
   if (!subject) return;
   if (!SUBJECT_KINDS.includes(value.kind))
@@ -1696,6 +1743,9 @@ export function prepareResearchConsumerIntent(store: Store, input: ResearchConsu
 export function prepareResearchConsumerReservation(store: Store, intentRef: Ref, call: Write,
   request: Ref, archive: Ref): { writes: Write[]; guards: TransactionGuard[] } {
   const intent = readResearchConsumerIntent(store, intentRef);
+  // This is a NEW physical claim only. Paid returns and historical decision readers stay available.
+  if(intent.value.kind==='variant-decision') throw new EngineError('discovery_variant_set_not_ready',
+    'A new managed decision reservation requires the proven set producer of 4B.1');
   if (intent.value.state !== 'prepared' || !object(call.value) || call.kind !== 'model-call' || call.expected !== 0
     || !isRef(request) || !isRef(archive) || !object(call.value.request) || !object(call.value.packet)
     || !isRef(call.value.request.record) || canonical(call.value.request.record) !== canonical(request)
@@ -1705,6 +1755,7 @@ export function prepareResearchConsumerReservation(store: Store, intentRef: Ref,
     || !callAddressesSubject(call.value, intent.value.question, cursorSubject(intent.value, intent.id))
     || canonical(call.value.requested) !== canonical(intent.value.role)
     || canonical(call.value.profile ?? null) !== canonical(intent.value.profile)
+    || isVariantConsumer(intent.value) && canonical(call.value.variantSubject)!==canonical(intent.value.cursor.variantSubject)
     || call.value.purpose !== (intent.value.kind === 'synthesis' || intent.value.kind === 'consolidation'
       ? 'analyst' : intent.value.kind))
     consumerInvalid(intent.id, 'The pending physical claim is not the exact admitted consumer call');
@@ -2447,6 +2498,8 @@ function readResearchConsumerExecutionFromIntent(store: Store, projectId: string
     || canonical(call.value.requested) !== canonical(intent.value.role)
     || canonical(call.value.profile ?? null) !== canonical(intent.value.profile))
     consumerInvalid(intent.id, 'The terminal model call is missing or belongs to another consumer');
+  if(isVariantConsumer(intent.value) && canonical(call.value.variantSubject)!==canonical(intent.value.cursor.variantSubject))
+    consumerInvalid(intent.id,'The paid call lost its exact variant subject');
   const purpose = intent.value.kind === 'synthesis' || intent.value.kind === 'consolidation' ? 'analyst' : intent.value.kind;
   if (call.value.purpose !== purpose) consumerInvalid(intent.id, 'The paid purpose does not match its consumer variant');
   if (call.value.status === 'running')
@@ -2577,6 +2630,8 @@ function readResearchConsumerExecutionFromIntent(store: Store, projectId: string
     throw error;
   }
   const archiveBody = archived.body;
+  if(isVariantConsumer(intent.value)) requireVariantArchive(store,archiveRef!,projectId,intent.value.draft,
+    intent.value.question,intent.value.kind,intent.value.role.actor,decodeVariantSubject(intent.value.cursor.variantSubject));
   if (digest(requestText) !== call.value.request.hash || requestText.length !== call.value.request.chars
     || Buffer.byteLength(requestText) !== call.value.request.bytes
     || response.value.text.length !== call.value.response!.chars || Buffer.byteLength(response.value.text) !== call.value.response!.bytes)
@@ -2606,7 +2661,11 @@ function readResearchConsumerExecutionFromIntent(store: Store, projectId: string
       || canonical(envelope.subject.resultCapacity) !== canonical(intent.value.cursor.resultCapacity)
       || canonical(archiveBody.resultCapacity) !== canonical(intent.value.cursor.resultCapacity)))
     consumerInvalid(intent.id, 'The paid request or archive lost its exact result declaration');
-  if (intent.value.kind === 'synthesis' || intent.value.kind === 'consolidation') {
+  if(isVariantConsumer(intent.value)) {
+    if(canonical(envelope.subject.variantSubject)!==canonical(intent.value.cursor.variantSubject)
+      || canonical(requestRef)!==canonical(intent.value.request) || canonical(archiveRef)!==canonical(intent.value.archive))
+      consumerInvalid(intent.id,'The paid variant request differs from the original managed reservation');
+  } else if (intent.value.kind === 'synthesis' || intent.value.kind === 'consolidation') {
     if (archiveBody.synthesisSession !== intent.value.owner.id
       || archiveBody.dispatchMode !== (intent.value.kind === 'consolidation' ? 'consolidation' : 'synthesis')
       || canonical(envelope.subject.synthesisState) !== canonical(archiveBody.synthesisState))
@@ -3137,6 +3196,18 @@ export function subjectRecordFormHolds(record: Revision<Record<string, any>>, su
  * marker existed is the earlier era, never rewritten. */
 function validateConsumerApplicationWrites(store: Store, intent: Revision<ResearchConsumerIntent>, writes: Write[],
   physical?: ResearchConsumerExecution, mode: 'application' | 'historical' = 'historical'): void {
+  if(isVariantConsumer(intent.value)) {
+    const paid=physical??readResearchConsumerExecutionFromIntent(store,intent.value.projectId,intent);
+    if(paid.kind!=='response') consumerInvalid(intent.id,'A variant application needs its paid response');
+    const owner=store.get<VariantExecutionSession>(intent.value.owner.id,intent.value.owner.revision);
+    const running=intent.value.state==='running'?intent:store.get<ResearchConsumerIntent>(intent.id,intent.revision-1);
+    if(!owner || !running) consumerInvalid(intent.id,'The variant application lost its original execution cursor');
+    const value=projectPaidVariantSession(owner,running,{call:reference(paid.call),response:paid.response,payload:paid.payload});
+    if(writes.length!==1 || writes[0]!.id!==owner.id || writes[0]!.kind!==owner.kind
+      || writes[0]!.expected!==owner.revision || canonical(writes[0]!.value)!==canonical(value))
+      consumerInvalid(intent.id,'Only the exact paid variant execution receipt can be applied');
+    return;
+  }
   if (intent.value.kind === 'synthesis' || intent.value.kind === 'consolidation') {
     const paid = physical ?? readResearchConsumerExecutionFromIntent(store, intent.value.projectId, intent);
     if (paid.kind !== 'response') consumerInvalid(intent.id, 'An applied synthesis step needs the paid response');
@@ -3320,7 +3391,10 @@ export function prepareResearchConsumerApplication(store: Store, intentRef: Ref,
   // The dispatch-time basis stays immutable inside the intent, but the
   // application transaction takes today's admission heads for the same ids.
   for (const guard of guards) if (!('absent' in guard)) refreshed.add(guard.id);
-  const original = intent.value.guards.filter(guard => guard.id !== intent.value.owner.id && !refreshed.has(guard.id));
+  // A variant receipt is an immutable historical result. Current mode/selection admit a NEW dispatch,
+  // not free application of an already paid answer; product publication supplies its own CAS in 4B.
+  const original = isVariantConsumer(intent.value) ? []
+    : intent.value.guards.filter(guard => guard.id !== intent.value.owner.id && !refreshed.has(guard.id));
   const required = uniqueTransactionGuards([...original, ...currentReaderGuards, ...guards, reference(intent), reference(paid.call),
     paid.request, paid.response, paid.archive]);
   const outputs = writes.map(pendingRef);
