@@ -974,8 +974,17 @@ test("D2 real C5→D1→D2→G7 A→B→A keeps a closed line and counts only ne
   assert.equal(ok(readResultIdentity(reopened, { acceptance: restored.acceptance, obligation: line.target })).key, keyA);
   assert.deepEqual(ok(confirmResults(reopened, { ...address, target: carrier.attempt.id, goal,
     accepting: [reference(restoredLine)], cancelling: [] })).achieved.map(item => item.key), [keyA]);
+  // The joint confirmation of all three D2 records is the managed semantic dedup itself (№11113): exactly the two
+  // distinct keys, the repeated A confirmed again without becoming a second key.
+  const joint = ok(confirmResults(reopened, { ...address, target: carrier.attempt.id, goal,
+    accepting: [reference(closedA), reference(closedB), reference(restoredLine)], cancelling: [] }));
+  assert.deepEqual(joint.achieved.map(item => item.key).sort(), [keyA, keyB].sort());
+  assert.deepEqual(joint.cancelled, []);
   const returned = closeCarrier(reopened, carrier, [reference(closedA), reference(closedB), reference(restoredLine)]);
   assert.equal(returned.verdict, "progress"); assert.equal(returned.withoutProgress, 0);
+  const storedOutcome = ok(readSeries(reopened, address)).value.attempts.find(item => item.ordinal === 1)!.outcome!;
+  assert.deepEqual(storedOutcome.achieved.map(item => item.key).sort(), [keyA, keyB].sort(),
+    "The saved attempt outcome carries exactly the two semantic results, the repeated key deduplicated");
   // The pinned boundary of M6/open: after the close the fresh M6 holds no batch that could carry this goal again —
   // a repeated managed attempt has no carrier and its opening is refused before anything is written (№10753 п.5).
   const fresh = ok(writeRoutes(reopened, { project: "garden", gaps: restored.gaps, tasks: [], catalog: { paths: [], records: [] },
@@ -992,6 +1001,14 @@ test("D2 real C5→D1→D2→G7 A→B→A keeps a closed line and counts only ne
   assert.deepEqual(ok(writeGapLines(reopened, requestA)), closedA);
   assert.deepEqual(ok(readGapLines(reopened, { project: "garden", record: reference(closedB) })), closedB);
   assert.deepEqual(historySnapshot(reopened), beforeRefusal);
+  // The cold read proves the saved outcome again and writes nothing (№11113).
+  const cold = new Store(f.database);
+  try {
+    const beforeCold = historySnapshot(cold);
+    assert.deepEqual(ok(readSeries(cold, address)).value.attempts.find(item => item.ordinal === 1)!.outcome!.achieved
+      .map(item => item.key).sort(), [keyA, keyB].sort());
+    assert.deepEqual(historySnapshot(cold), beforeCold);
+  } finally { cold.close(); }
 });
 
 test("D2 historical closure stays bound to its saved D1 context on replay, confirmation and restart", t => {
