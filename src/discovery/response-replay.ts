@@ -153,6 +153,16 @@ export function replayAssessmentApplication(store: Store, session: Revision<Reco
   return paid.kind==='response'?paid:null;
 }
 
+/** Every call of exactly this saved variant transport identity, direct or managed (its first packet fixes the identity). */
+export function variantIdentityCalls(store: Store, projectId: string, draftId: string, questionId: string, purpose: string,
+  actor: string, variant: VariantSubject): Revision<ModelCall>[] {
+  const draft = store.get<DiscoveryDraft>(draftId), question = store.get<Question>(questionId);
+  if (draft?.kind !== 'discovery-draft' || question?.kind !== 'question') return [];
+  return store.list<ModelCall>('model-call').filter(call => call.value.projectId === projectId && call.value.purpose === purpose
+    && call.value.requested?.actor === actor && canonical(packetVariantSubject(call.value)) === canonical(variant)
+    && variantCallMatches(store, call, projectId, reference(draft), reference(question), purpose, actor, variant));
+}
+
 /** 4T.3: the paid answer of exactly this saved variant transport identity — project, the draft and Question edition of
  * its first packet, purpose, actor and the complete variantSubject — returns again without another payment. Only the
  * saved identity is compared: today's mode or state heads never select or replace it, and another identity never
@@ -161,9 +171,10 @@ export function replayVariantResponse(store: Store, projectId: string, draftId: 
   purpose: string, actor: string, variant: VariantSubject): { research: unknown; subject: Record<string, any>; call: Ref; request: Ref; response: Ref } | null {
   const draft = store.get<DiscoveryDraft>(draftId), question = store.get<Question>(questionId);
   if (draft?.kind !== 'discovery-draft' || question?.kind !== 'question') return null;
-  const own = store.list<ModelCall>('model-call').filter(call => call.value.projectId === projectId && call.value.purpose === purpose
-    && call.value.requested?.actor === actor && canonical(packetVariantSubject(call.value)) === canonical(variant)
-    && variantCallMatches(store, call, projectId, reference(draft), reference(question), purpose, actor, variant));
+  const own = variantIdentityCalls(store, projectId, draftId, questionId, purpose, actor, variant);
+  // 4T.4: a managed call of this identity is read through its own intent, never returned or paid beside it here.
+  requireCondition(!own.some(call => isRef((call.value as { consumerIntent?: unknown }).consumerIntent)), 'discovery_variant_managed',
+    'This variant identity is carried by its managed intent; its result is read through that intent');
   requireCondition(!own.some(call => call.value.status === 'running'), 'continuation_call_active',
     'This variant identity has an unfinished invocation; recover its actual outcome before another dispatch');
   const paid = own.filter(call => call.value.status === 'succeeded');

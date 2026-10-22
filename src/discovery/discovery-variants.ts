@@ -123,6 +123,37 @@ export function decodeVariantSubject(value: unknown): VariantSubject {
   }
   return structuredClone(value) as VariantSubject;
 }
+export const VARIANT_SESSION_CONTRACT = 'discovery-variant-session/v1' as const;
+export const VARIANT_SESSION_KIND = 'discovery-variant-session' as const;
+/** 4T.4 (codex-worker №11290): the minimal execution session that owns a variant intent, written by the common preparer
+ * before the first intent. Cursor 0 with no result at the start; cursor 1 with the applied receipt of the single
+ * generation or decision step of this exact identity. No ready or proven flag; members, set and state are not published
+ * by it. The address of a session and its historical proof belong to its producer, not to this structural decoder. */
+export interface VariantExecutionSession {
+  contract: typeof VARIANT_SESSION_CONTRACT; projectId: string; draft: Ref; question: Ref; variantSubject: VariantSubject;
+  purpose: 'variant-proposal' | 'variant-decision'; actor: string; cursor: 0 | 1; result: VariantOrigin | null;
+}
+export function decodeVariantExecutionSession(value: unknown): VariantExecutionSession {
+  const code = 'discovery_variant_session_invalid';
+  try {
+    variantShape(value, ['contract', 'projectId', 'draft', 'question', 'variantSubject', 'purpose', 'actor', 'cursor', 'result'],
+      'variantSession', code);
+    if (value.contract !== VARIANT_SESSION_CONTRACT) variantInvalid('variantSession.contract', 'Unknown variant session contract', code);
+    variantText(value.projectId, 'variantSession.projectId');
+    variantRef(value.draft, 'variantSession.draft'); variantRef(value.question, 'variantSession.question');
+    const subject = decodeVariantSubject(value.variantSubject);
+    if (value.purpose !== `variant-${subject.kind}`) variantInvalid('variantSession.purpose', 'The purpose names the kind of its subject', code);
+    variantText(value.actor, 'variantSession.actor');
+    if (!(value.cursor === 0 && value.result === null || value.cursor === 1 && value.result !== null))
+      variantInvalid('variantSession.cursor', 'Cursor 0 has no result; cursor 1 has the applied receipt of its step', code);
+    if (value.result !== null) variantOrigin(value.result, 'variantSession.result');
+  } catch (error) {
+    if (!(error instanceof EngineError) || error.code === code) throw error;
+    throw new EngineError(code, error.message, error.details);
+  }
+  return structuredClone(value) as unknown as VariantExecutionSession;
+}
+
 export function decodeVariantSnapshot(value: unknown): VariantSnapshot {
   variantShape(value, ['contract', 'projectId', 'draft', 'frame', 'plan', 'questions'], 'snapshot');
   variantBasis(value, VARIANT_SNAPSHOT_CONTRACT); variantRef(value.frame, 'frame'); variantRef(value.plan, 'plan');

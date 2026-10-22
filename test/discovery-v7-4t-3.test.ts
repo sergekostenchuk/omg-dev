@@ -11,7 +11,8 @@ import { ProductEngine } from '../src/product/engine.js';
 import { reference, type Ref } from '../src/pipeline/contracts.js';
 import { answerDiscoveryFixture } from './product-fixture.js';
 import { researchCall } from '../src/discovery/research-protocol.js';
-import { VARIANT_CRITERIA, VARIANT_SUBJECT_CONTRACT, decodeVariantGeneration, type VariantSubject } from '../src/discovery/discovery-variants.js';
+import { VARIANT_CRITERIA, VARIANT_SUBJECT_CONTRACT, VARIANT_SESSION_CONTRACT, VARIANT_SESSION_KIND, decodeVariantGeneration,
+  decodeVariantExecutionSession, type VariantSubject } from '../src/discovery/discovery-variants.js';
 import { stageBudgetSegmentId } from '../src/discovery/stage-token-budget.js';
 import type { ModelCall } from '../src/runtime/model-usage.js';
 import { EngineError } from '../src/errors.js';
@@ -373,6 +374,85 @@ test('4T3-02: no early paid return crosses branches — a paid analyst intent ne
   // Each branch keeps its own free replay by its historical identity.
   assert.deepEqual(await managed('analyst', context), paid);
   assert.deepEqual(decodeVariantGeneration(await f.call(v, f.v.draft.id, f.v.plan)).action, 'variants');
+  assert.deepEqual(f.snapshot(f.store), before);
+  assert.equal(f.wires().length, sent);
+});
+
+
+// ---- 4T.3 × 4T.4 junction (codex-worker №11290): the leaf form of the variant execution session and the narrow trusted
+// admission of a managed variant intent. The session and intent rows below are FORGED INPUTS for refusals only: their
+// producer and the managed lifecycle are 4T.4 (variant-session.ts, response-recovery.ts), checked there jointly.
+test('4T.3×4T.4: the variant execution session is one closed form — cursor 0 without a result, cursor 1 with its receipt', () => {
+  const ref = (label: string) => ({ id: `transport-fixture:${label}`, revision: 1, hash: 'a'.repeat(64) });
+  const subject: VariantSubject = { contract: VARIANT_SUBJECT_CONTRACT, kind: 'proposal', snapshot: ref('snapshot'), mode: ref('mode'), expectedSelection: null };
+  const start = { contract: VARIANT_SESSION_CONTRACT, projectId: 'p', draft: ref('draft'), question: ref('question'), variantSubject: subject,
+    purpose: 'variant-proposal', actor: 'author', cursor: 0, result: null };
+  const applied = { ...start, cursor: 1, result: { intent: ref('intent'), call: ref('call'), response: ref('response') } };
+  assert.deepEqual(decodeVariantExecutionSession(start), start);
+  assert.deepEqual(decodeVariantExecutionSession(applied), applied);
+  const { actor: _actor, ...missing } = start;
+  const bad: [string, unknown][] = [
+    ['no actor', missing], ['an extra ready flag', { ...start, ready: true }], ['another contract', { ...start, contract: 'unknown' }],
+    ['a purpose of the other kind', { ...start, purpose: 'variant-decision' }], ['an empty project', { ...start, projectId: ' ' }],
+    ['an inexact draft', { ...start, draft: { id: 'd' } }], ['a forged subject', { ...start, variantSubject: { ...subject, ready: true } }],
+    ['cursor 0 with a result', { ...applied, cursor: 0 }], ['cursor 1 without a result', { ...start, cursor: 1 }],
+    ['another cursor', { ...start, cursor: 2 }], ['a partial receipt', { ...applied, result: { intent: ref('intent') } }],
+    ['an empty actor', { ...start, actor: '' }], ['not an object', [start]],
+  ];
+  for (const [note, value] of bad) assert.throws(() => decodeVariantExecutionSession(value), errorCode('discovery_variant_session_invalid'), note);
+});
+
+test('4T.3×4T.4: only an intent of its own kind, owned by the exact session of this very identity, passes the variant admission — before payment', async t => {
+  const f = await setup(t), v = f.subject('proposal', f.transport('snapshot'), f.transport('mode'));
+  const draft = f.store.get<DiscoveryDraft>(f.v.draft.id)!, plan = f.store.get<Question>(f.v.plan.id)!;
+  let serial = 0;
+  const session = (value: Record<string, unknown>) => reference(f.store.write({ id: `discovery-variant-session:forged:${serial++}`,
+    kind: VARIANT_SESSION_KIND, expected: 0, value: value as Json }));
+  const sessionValue = { contract: VARIANT_SESSION_CONTRACT, projectId: 'p', draft: reference(draft), question: reference(plan), variantSubject: v,
+    purpose: 'variant-proposal', actor: 'author', cursor: 0, result: null };
+  const intent = (owner: Ref, overrides: Record<string, unknown> = {}, cursor: Record<string, unknown> = {}) =>
+    reference(f.store.write({ id: `research-consumer-intent:forged:${serial++}`, kind: 'research-consumer-intent', expected: 0,
+      value: { projectId: 'p', kind: 'variant-proposal', owner, draft: reference(draft), question: reference(plan),
+        cursor: { variantSubject: v, sessionId: owner.id, offset: 0, ...cursor }, ...overrides } as unknown as Json }));
+  const good = session(sessionValue);
+  const managed = (ref: Ref, purpose = 'variant-proposal', subject: VariantSubject = v) => researchCall(f.environment.value.implementer,
+    f.environment.value, 'Propose the variants of the saved snapshot', f.body(subject, f.v.plan), undefined,
+    { store: f.store, draftId: f.v.draft.id, questionId: f.v.plan.id, purpose, consumerIntent: ref });
+  const refused: [string, Ref, string][] = [
+    ['an intent of another kind', intent(good, { kind: 'variant-decision' }), 'discovery_variant_subject_invalid'],
+    ['an analyst intent carrying the subject', intent(good, { kind: 'analyst' }), 'discovery_variant_subject_invalid'],
+    ['an intent of another subject', intent(good, {}, { variantSubject: { ...v, mode: f.transport('other-mode') } }), 'discovery_variant_subject_invalid'],
+    ['an intent beside its session step', intent(good, {}, { offset: 1 }), 'discovery_variant_subject_invalid'],
+    ['an intent naming another session', intent(good, {}, { sessionId: 'discovery-variant-session:other' }), 'discovery_variant_subject_invalid'],
+    ['an intent owned by no session', intent(f.transport('owner')), 'discovery_variant_subject_invalid'],
+    ['a session of another actor', intent(session({ ...sessionValue, actor: 'reviewer' })), 'discovery_variant_subject_invalid'],
+    ['a session of another subject', intent(session({ ...sessionValue, variantSubject: { ...v, snapshot: f.transport('other-snapshot') } })), 'discovery_variant_subject_invalid'],
+    ['a session of another draft edition', intent(session({ ...sessionValue, draft: { ...reference(draft), revision: draft.revision + 1 } })), 'discovery_variant_subject_invalid'],
+    ['a damaged session', intent(session({ ...sessionValue, cursor: 1 })), 'discovery_variant_session_invalid'],
+    ['an inexact intent reference', { ...intent(good), hash: 'f'.repeat(64) }, 'discovery_variant_subject_invalid'],
+  ];
+  const before = f.snapshot(f.store), sent = f.wires().length;
+  for (const [note, ref, code] of refused) await assert.rejects(() => managed(ref), errorCode(code), note);
+  // A complete forged pair passes this narrow admission only: the ordinary reader of the intent refuses it next, since the
+  // managed variant kinds and their lifecycle are 4T.4's.
+  const complete = intent(good), afterForgery = f.snapshot(f.store);
+  await assert.rejects(() => managed(complete), (error: unknown) => error instanceof EngineError && error.code !== 'discovery_variant_subject_invalid'
+    && error.code !== 'discovery_variant_session_invalid');
+  assert.deepEqual(f.snapshot(f.store), afterForgery);
+  assert.equal(f.wires().length, sent);
+  assert.ok(before.length < afterForgery.length, 'only the forged inputs were written');
+});
+
+test('4T.3×4T.4: the direct replay never returns or pays beside a managed call of the same identity', async t => {
+  const f = await setup(t), v = f.subject('proposal', f.transport('snapshot'), f.transport('mode'));
+  await f.call(v, f.v.draft.id, f.v.plan);
+  const [call] = variantCalls(f);
+  // Negative mutation: a managed call of the very same identity stands beside the direct one.
+  f.store.write({ id: `model-call:consumer:v1:${call!.value.requestId}-managed`, kind: 'model-call', expected: 0,
+    value: { ...call!.value, consumerIntent: f.transport('intent') } as unknown as Json });
+  const before = f.snapshot(f.store), sent = f.wires().length;
+  for (const store of [f.store, f.open()])
+    await assert.rejects(() => f.call(v, f.v.draft.id, f.v.plan, f.environment.value.implementer, store), errorCode('discovery_variant_managed'));
   assert.deepEqual(f.snapshot(f.store), before);
   assert.equal(f.wires().length, sent);
 });

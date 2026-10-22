@@ -54,8 +54,8 @@ import { isRef, reference, type Ref } from "../pipeline/contracts.js";
 import { pilotDispatch } from "./pilot-budget.js";
 import type { ReaderPilot } from "./reader-pilot.js";
 import { workingContext } from "./working-context.js";
-import { replayAssessmentApplication, replayVariantResponse } from "./response-replay.js";
-import { decodeVariantGeneration } from "./discovery-variants.js";
+import { replayAssessmentApplication, replayVariantResponse, variantIdentityCalls } from "./response-replay.js";
+import { decodeVariantGeneration, decodeVariantExecutionSession, VARIANT_SESSION_KIND, type VariantSubject } from "./discovery-variants.js";
 import { recoveryDispatchBoundary, operatorReplayedResponse, assessmentSessionEra, isResponseRecovery,
   readResearchConsumerIntent, resumeResearchConsumerExecution,
   refuseResearchConsumerIntent, prepareResearchConsumerReservation, consumerIntentContext, CONSUMER_INTENT_V2,
@@ -296,6 +296,30 @@ export function prepareResearchEnvelope(role: RoleBinding, environment: Environm
   return { packetState, subject, envelope, input, requestLimit };
 }
 
+/** 4T.4 (codex-worker №11290): the exact saved intent of a managed variant call — its own kind, exactly this subject, its
+ * single step of its owner session — and that owner: the exact variant execution session naming this project, draft,
+ * Question, purpose, actor and subject. Read raw by the exact Ref, before any other reader of the intent. */
+function requireVariantIntent(store: Store, ref: Ref, projectId: string, draftId: string, questionId: string | undefined,
+  purpose: string, actor: string, variant: VariantSubject): void {
+  const fail = (condition: unknown, message: string) => requireCondition(condition, 'discovery_variant_subject_invalid', message);
+  const intent = isRef(ref) ? store.get<Record<string, any>>(ref.id, ref.revision) : null;
+  fail(intent?.kind === 'research-consumer-intent' && intent.hash === ref.hash && intent.hash === hashJson(intent.value),
+    'A managed variant call needs its exact saved intent');
+  const value = intent!.value;
+  fail(value.kind === purpose && value.projectId === projectId && isRef(value.owner) && isRef(value.draft) && isRef(value.question)
+    && value.draft.id === draftId && value.question.id === questionId,
+    'Only a variant intent of the same kind, project, draft and Question admits a variant call');
+  fail(canonical(value.cursor?.variantSubject ?? null) === canonical(variant) && value.cursor?.sessionId === value.owner.id
+    && value.cursor?.offset === 0, 'The intent carries exactly this subject at the single step of its owner session');
+  const owner = store.get<Record<string, unknown>>(value.owner.id, value.owner.revision);
+  fail(owner?.kind === VARIANT_SESSION_KIND && owner.hash === value.owner.hash, 'The intent is owned by an exact variant execution session');
+  const session = decodeVariantExecutionSession(owner!.value);
+  fail(session.projectId === projectId && session.purpose === purpose && session.actor === actor
+    && canonical(session.variantSubject) === canonical(variant)
+    && canonical(session.draft) === canonical(value.draft) && canonical(session.question) === canonical(value.question),
+    'The owner session names another project, draft, Question, purpose, actor or subject');
+}
+
 /** 4T.3: a variant generation answer — new or replayed — leaves the transport only in its closed form. The paid call is
  * saved before the check, so an off-form answer is a typed refusal on every reading and never a second payment. */
 export async function researchCall(role: RoleBinding, environment: Environment, prompt: string, context: unknown, signal?: AbortSignal,
@@ -318,9 +342,15 @@ async function dispatchResearchCall(role: RoleBinding, environment: Environment,
   // historical identity needs no head of today's mode or state.
   const contextVariant = packetVariantSubject(context);
   if (contextVariant || audit?.purpose === 'variant-proposal' || audit?.purpose === 'variant-decision') {
-    requireCondition(audit && !audit.consumerIntent && !audit.previewIntent && !audit.application && !audit.prepareCall,
-      'discovery_variant_subject_invalid', 'A variant call travels on its own branch, without a consumer intent or an assessment reservation');
-    requireVariantContext(context, variantTransportSubject(audit.purpose, role.actor, contextVariant, null, null));
+    requireCondition(audit && !audit.previewIntent && !audit.application && !audit.prepareCall,
+      'discovery_variant_subject_invalid', 'A variant call travels on its own branch, without an assessment reservation');
+    const variant = variantTransportSubject(audit.purpose, role.actor, contextVariant, null, null)!;
+    requireVariantContext(context, variant);
+    // 4T.4 (№11290): a managed variant call is admitted only by an intent of exactly its own kind, owned by the exact
+    // execution session of this very identity; the saved session decides, not the caller's context. Any other intent
+    // carrying a variant subject stays refused here, before every early return.
+    if (audit.consumerIntent) requireVariantIntent(audit.store, audit.consumerIntent, environment.projectId, audit.draftId,
+      audit.questionId, audit.purpose, role.actor, variant);
   }
   let consumerIntent: Revision<ResearchConsumerIntent> | null = null;
   let planSubject: V7PlanSubject | null = null;
@@ -437,11 +467,19 @@ async function dispatchResearchCall(role: RoleBinding, environment: Environment,
   // attempt, progress or assessor. Its paid answer of exactly this saved identity returns before packing or payment.
   const variantSubject = packetVariantSubject(context);
   if (variantSubject) {
-    requireCondition(audit && draft && audit.questionId && !consumerIntent && !assessment && !assessmentSubject && !planSubject,
-      'discovery_variant_subject_invalid', 'A variant call needs its saved draft and Question, without an intent, assessment or plan subject');
-    const paid = replayVariantResponse(audit.store, environment.projectId, audit.draftId, audit.questionId, audit.purpose,
-      role.actor, variantSubject);
-    if (paid) { audit.onContext?.(paid.subject); return paid.research; }
+    requireCondition(audit && draft && audit.questionId && (!consumerIntent || consumerIntent.value.kind as string === audit.purpose)
+      && !assessment && !assessmentSubject && !planSubject,
+      'discovery_variant_subject_invalid', 'A variant call needs its saved draft and Question, without another intent, assessment or plan subject');
+    // The managed and the direct path of one identity never mix: a managed send never stands beside a direct call of this
+    // identity, and the direct replay never returns or pays beside a managed one (replayVariantResponse).
+    if (consumerIntent) requireCondition(!variantIdentityCalls(audit.store, environment.projectId, audit.draftId, audit.questionId,
+      audit.purpose, role.actor, variantSubject).some(call => !isRef((call.value as { consumerIntent?: unknown }).consumerIntent)),
+    'discovery_variant_managed', 'This variant identity already has a direct call; a managed send would pay it twice');
+    else {
+      const paid = replayVariantResponse(audit.store, environment.projectId, audit.draftId, audit.questionId, audit.purpose,
+        role.actor, variantSubject);
+      if (paid) { audit.onContext?.(paid.subject); return paid.research; }
+    }
   }
   const requestId = randomUUID();
   const callId = consumerIntent ? `model-call:consumer:v1:${requestId}` : `model-call:${requestId}`;
