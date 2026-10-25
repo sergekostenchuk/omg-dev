@@ -27,7 +27,7 @@ import { writeHorizon } from '../src/om/horizon.js';
 import { type GapRequest, writeGaps } from '../src/om/gaps.js';
 import { prepareQuestionTasks, writeQuestionPacket, type QuestionPacketRequest, type QuestionPacketRecord, prepareQuestionPacket, type PartProposalBody, readQuestionPacket } from '../src/om/question-packet.js';
 import { writeRoutes } from '../src/om/routes.js';
-import { openSeries, beginAttempt, completeAttempt, type RepairSeries, readCompletionBinding, completionWorkId, seriesRequestOf, type AnyBeginAttemptRequest, type AnyRepairSeries, type MechanismRepairSeries } from '../src/om/series.js';
+import { openSeries, beginAttempt, type RepairSeries, readCompletionBinding, completionWorkId, seriesRequestOf, type AnyBeginAttemptRequest, type AnyRepairSeries, type MechanismRepairSeries } from '../src/om/series.js';
 import { gapLineKey, gapLineExpectedResult, writeGapLines } from '../src/om/gap-lines.js';
 import { prepareFrameProposals, type LayerProposal } from '../src/om/frame-proposals.js';
 import { type FrameRequest, prepareFrame, type FrameScope } from '../src/om/frame-obligations.js';
