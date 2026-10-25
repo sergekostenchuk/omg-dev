@@ -1,5 +1,7 @@
+import { requireResearchResultCapacity, type ResearchResultCapacity } from './research-delivery.js';
 import { requireDossierAssessmentSubject, requireDossierAssessmentPacket } from './dossier-assessment.js';
-import { DOSSIER_ASSESSMENT_SUBJECT_CONTRACT, type DossierAssessmentSubject } from './research-model.js';
+import { DOSSIER_ASSESSMENT_SUBJECT_CONTRACT, DOSSIER_ASSESSMENT_RESULT_CONTRACT, DOSSIER_QUALITY_DIMENSIONS,
+  type DossierAssessmentSubject, type DossierAssessmentPacket } from './research-model.js';
 import { deepIdentityCalls } from './invocation-progress.js';
 import { ASSESSMENT_METHODOLOGY_CONTRACT, ASSESSMENT_METHODOLOGY_POLICY, ASSESSMENT_METHODOLOGY_POLICY_V2, type MethodologyPolicy } from './assessment-methodology.js';
 import { DISCOVERY_ASSESSMENT_CONTRACT_V2, DISCOVERY_ASSESSMENT_CONTRACT_V3 } from './research-model.js';
@@ -87,11 +89,105 @@ export function sameAssessmentSubject(a: unknown, b: unknown): boolean {
  * the async accepted reader below proves its complete historical material. */
 export const DOSSIER_TRANSPORT_DELIVERY = { contract:'dossier-assessment-transport/v1', dispatch:'unavailable',
   instruction:'Read the complete exact dossier before assessment; managed dossier assessment is not connected.' } as const;
+/** Explicit result-transport era. Markerless preparation/archives retain their read_context-only meaning. */
+export const DOSSIER_RESULT_TRANSPORT = 'dossier-result-transport/v1' as const;
+export const DOSSIER_REPLY_FORMS = Object.freeze(['dossier_supported', 'dossier_return', 'read_context', 'assessment_checkpoint'] as const);
+export function dossierResultTransport(container: unknown): boolean {
+  if (!container || typeof container !== 'object') return false;
+  const body = container as Record<string, unknown>;
+  if (!Object.hasOwn(body, 'dossierResultTransport')) {
+    requireCondition(!Object.hasOwn(body, 'dossierReplyContract'), 'discovery_dossier_transport_invalid',
+      'A dossier reply contract cannot lose its explicit transport era');
+    return false;
+  }
+  requireCondition(body.dossierResultTransport === DOSSIER_RESULT_TRANSPORT,
+    'discovery_dossier_transport_invalid', 'Unknown or null dossier result transport era');
+  return true;
+}
+
+/** Shape delivered to the model. Semantic bases, classifications and blocking are checked only by 6.5. */
+export function dossierReplyContract(packet: DossierAssessmentPacket) {
+  const object = (properties: Record<string, unknown>) => ({ type:'object', additionalProperties:false,
+    required:Object.keys(properties), properties });
+  const text = { type:'string', minLength:1 }, ref = { $ref:'#/$defs/ref' }, claim = { $ref:'#/$defs/claim' };
+  const array = (items: unknown, minimum = 0) => ({ type:'array', items, minItems:minimum, uniqueItems:true });
+  const bases = array({ oneOf:[object({claim}), object({record:ref})] },1);
+  const target = { oneOf:[object({claim}), object({unknown:claim}), object({axis:{enum:Object.keys(packet.manifest.value.axes)}}),
+    object({contradiction:text}), object({partialReason:{type:'integer',minimum:0}})] };
+  const returned = object({targets:array(target,1),reason:text,bases});
+  const terminal = object({contract:{const:DOSSIER_ASSESSMENT_RESULT_CONTRACT}, subject:{const:packet.subject},
+    verdict:{enum:['supported','return']},reasons:array(text,1),
+    quality:object(Object.fromEntries(DOSSIER_QUALITY_DIMENSIONS.map(key => [key,
+      object({judgement:{enum:['adequate','gap']},reason:text,bases})]))),
+    inventory:{const:{materials:packet.materials.map(item=>item.address),unknowns:packet.unknowns.map(item=>item.unknown.claim),
+      contradictions:packet.contradictions.map(item=>({id:item.contradiction.id,sides:item.sides.map(side=>side.address),grounds:item.grounds.map(row=>row.ref)}))}},
+    return:{oneOf:[{type:'null'},returned]}});
+  const read = { ...object({action:{const:'read_context'},record:ref,pointer:{type:'string',pattern:'^(/.*)?$'}}),
+    properties:{action:{const:'read_context'},record:ref,pointer:{type:'string',pattern:'^(/.*)?$'},
+      purpose:text, page:{...object({offset:{type:'integer',minimum:0},limit:{type:'integer',minimum:1}}),
+        properties:{offset:{type:'integer',minimum:0},limit:{type:'integer',minimum:1},encoding:{const:'canonical-json'}}}} };
+  return { contract:DOSSIER_RESULT_TRANSPORT, subject:packet.subject, result:DOSSIER_ASSESSMENT_RESULT_CONTRACT,
+    forms:[...DOSSIER_REPLY_FORMS], schema:{ $defs:{ref:object({id:text,revision:{type:'integer',minimum:1},hash:{type:'string',pattern:'^[a-f0-9]{64}$'}}),
+      claim:object({project:text,container:ref,containerKind:{enum:['research-answer','research-attempt']},pointer:text,claimId:text})},
+    oneOf:[terminal,read,object({action:{const:'assessment_checkpoint'},dossierSubject:{const:packet.subject},notes:array(text,1)})] } };
+}
+
+/** Lower bound only, never a generated judgement: every exact inventory reference is included. */
+function dossierResultMinimum(packet: DossierAssessmentPacket, verdict: 'supported' | 'return', bytes=false): number {
+  // These are transport contents already proven by the common dossier reader.
+  // Pick the shortest available exact basis; no invented reference or semantic judgement is admitted.
+  const records=[packet.root,packet.manifest,...Object.values(packet.basis),...Object.values(packet.route),...packet.grounds,
+    ...packet.materials.flatMap(item=>[item.container,item.assessment]),...packet.contradictions.flatMap(item=>item.grounds)];
+  const candidates=[...records.flatMap(item=>item?[{record:item.ref}]:[]),
+    ...packet.contradictions.flatMap(item=>item.sides.flatMap(side=>side.application?[{record:side.application}]:[])),
+    ...packet.materials.map(item=>({claim:item.address}))];
+  const size=(value:unknown)=>bytes?Buffer.byteLength(JSON.stringify(value),'utf8'):JSON.stringify(value).length;
+  const bases=[candidates.sort((a,b)=>size(a)-size(b))[0]!];
+  const axis = Object.keys(packet.manifest.value.axes).sort((a,b)=>a.length-b.length)[0]!;
+  return size({contract:DOSSIER_ASSESSMENT_RESULT_CONTRACT,subject:packet.subject,verdict,reasons:['x'],
+    quality:Object.fromEntries(DOSSIER_QUALITY_DIMENSIONS.map(key => [key,{judgement:verdict==='supported'?'adequate':'gap',reason:'x',bases}])),
+    inventory:{materials:packet.materials.map(item=>item.address),unknowns:packet.unknowns.map(item=>item.unknown.claim),
+      contradictions:packet.contradictions.map(item=>({id:item.contradiction.id,sides:item.sides.map(side=>side.address),grounds:item.grounds.map(row=>row.ref)}))},
+    return:verdict==='supported'?null:{targets:[{axis}],reason:'x',bases}});
+}
+export function dossierResultCapacityForms(packet: DossierAssessmentPacket, physical: number | null) {
+  return DOSSIER_REPLY_FORMS.map(kind => ({kind, specialLimits:{
+    combinedOutputBytes:4_000_000, ...(physical === null ? {} : {physicalReplyChars:physical}),
+    ...(['dossier_supported','dossier_return'].includes(kind) ? {
+      minimumResultChars:dossierResultMinimum(packet,kind==='dossier_supported'?'supported':'return'),
+      minimumResultBytes:dossierResultMinimum(packet,kind==='dossier_supported'?'supported':'return',true)} : {})
+  }}));
+}
+/** One transport check for live preflight replies and exact archived declarations. */
+export function requireDossierReplyCapacity(packet: DossierAssessmentPacket, saved: ResearchResultCapacity,
+  mandatory: Record<string,any>, resolve?: (record:Ref,pointer:string)=>unknown) {
+  const declaration=dossierReplyContract(packet);
+  requireDossierSubjectBinding(saved.bindings,packet.subject);
+  requireCondition(saved.bindings.projectId===packet.subject.projectId
+    && isRef(saved.bindings.draft) && saved.bindings.draft.id===packet.basis.draft.ref.id
+    && isRef(saved.bindings.question)
+    && dossierResultTransport(saved.bindings) && saved.operation===packet.subject.identity
+    && saved.generation===0 && saved.role==='assessor' && saved.purpose==='dossier-assessor'
+    && saved.actionMode==='dossier-result-preflight'
+    && canonical(mandatory.subject?.dossierSubject)===canonical(packet.subject)
+    && mandatory.subject?.dossierResultTransport===DOSSIER_RESULT_TRANSPORT
+    && canonical(mandatory.subject?.dossierReplyContract)===canonical({contract:declaration.contract,
+      result:declaration.result,subject:declaration.subject,schemaHash:hashJson(declaration.schema)})
+    && canonical(mandatory.subject?.assessmentDelivery)===canonical(DOSSIER_TRANSPORT_DELIVERY),
+    'discovery_dossier_transport_invalid','Reply capacity belongs to this exact versioned dossier contract');
+  const physical=mandatory.subject.responseOutputLimit?.replyChars;
+  requireCondition(physical===null || Number.isSafeInteger(physical) && physical>0,
+    'research_capacity_invalid','The saved physical reply bound is missing or invalid');
+  requireResearchResultCapacity(saved,{operation:saved.operation,generation:saved.generation,bindings:saved.bindings,
+    role:saved.role,purpose:saved.purpose,actionMode:saved.actionMode,envelopeLimitChars:saved.envelopeLimitChars,
+    mandatoryEnvelope:mandatory,forms:dossierResultCapacityForms(packet,physical),
+    ...('archive' in saved.mandatory?{mandatoryArchive:saved.mandatory.archive}:{})},resolve);
+}
 export function packetDossierSubject(container: unknown): DossierAssessmentSubject | null {
   if (!container || typeof container !== 'object') return null;
   const body = container as Record<string, any>;
   if (!Object.hasOwn(body, 'dossierSubject')) {
-    requireCondition(!Object.hasOwn(body, 'dossierPacket'), 'discovery_dossier_transport_invalid',
+    requireCondition(!['dossierPacket','dossierResultTransport','dossierReplyContract'].some(key=>Object.hasOwn(body,key)), 'discovery_dossier_transport_invalid',
       'Dossier material cannot lose its explicit subject');
     return null;
   }
@@ -105,6 +201,7 @@ export function packetDossierSubject(container: unknown): DossierAssessmentSubje
   return subject;
 }
 export function requireDossierTransportContext(container: unknown, required = false) {
+  dossierResultTransport(container);
   const subject = packetDossierSubject(container);
   requireCondition(!required || subject, 'discovery_dossier_transport_invalid', 'The dossier subject is required');
   if (subject) {
@@ -135,6 +232,9 @@ export async function proveDossierTransportContext(store: Store, project: string
     : await requireDossierAssessmentSubject(store, project, subject);
   requireCondition(canonical(packet.subject) === canonical(subject), 'discovery_dossier_transport_invalid',
     'Dossier subject and material must name the same exact snapshot');
+  if (dossierResultTransport(container) && Object.hasOwn(container as object,'dossierReplyContract'))
+    requireCondition(canonical((container as any).dossierReplyContract) === canonical(dossierReplyContract(packet)),
+      'discovery_dossier_transport_invalid', 'Caller cannot substitute the dossier reply schema or subject');
   return packet;
 }
 
@@ -152,6 +252,37 @@ export async function requireDossierTransportArchive(store: Store, project: stri
     && (body.resultCapacity as any)?.purpose === 'dossier-assessor'
     && (body.resultCapacity as any)?.operation === packet.subject.identity,
   'discovery_dossier_transport_invalid', 'The archive and capacity must bind this exact dossier');
+  if (dossierResultTransport(body)) {
+    requireCondition(
+    canonical((body as any).dossierReplyContract) === canonical(dossierReplyContract(packet))
+      && dossierResultTransport((body.resultCapacity as any)?.bindings)
+      && (body.resultCapacity as any)?.actionMode === 'dossier-result-preflight',
+    'discovery_dossier_transport_invalid', 'The exact new-era archive lost its dossier reply contract');
+    const capacity=(body as any).resultCapacity as ResearchResultCapacity;
+    const resolve=(record:Ref,pointer:string) => {
+      requireCondition(isRef(record) && typeof pointer==='string',
+        'research_capacity_invalid','The capacity projection lost its exact address');
+      const saved=store.get<any>(record.id,record.revision);
+      requireCondition(pointer==='/body' && saved?.kind==='research-context' && saved.revision===1
+        && saved.hash===record.hash && hashJson(saved.value)===record.hash && saved.id===`research-context:${saved.hash}`
+        && saved.value.contract==='result-capacity-projection/v1',
+        'research_capacity_invalid','The exact capacity projection is missing');
+      return saved.value.body;
+    };
+    requireCondition(capacity.mandatory && typeof capacity.mandatory==='object' && !Array.isArray(capacity.mandatory)
+      && ('projection' in capacity.mandatory ? capacity.mandatory.projection && typeof capacity.mandatory.projection==='object'
+        && !Array.isArray(capacity.mandatory.projection) : capacity.mandatory.archive
+        && isRef(capacity.mandatory.archive.record) && typeof capacity.mandatory.archive.pointer==='string'),
+      'research_capacity_invalid','The archived dossier lost its result minimum');
+    const mandatory='projection' in capacity.mandatory?capacity.mandatory.projection
+      :resolve(capacity.mandatory.archive.record,capacity.mandatory.archive.pointer);
+    requireDossierReplyCapacity(packet,capacity,mandatory,resolve);
+    requireCondition(canonical((body as any).responseOutputLimit)===canonical((mandatory as any).subject.responseOutputLimit),
+      'discovery_dossier_transport_invalid','The exact archive lost its declared physical output bound');
+  } else requireCondition((body.resultCapacity as any)?.actionMode==='dossier-preflight'
+    && !dossierResultTransport((body.resultCapacity as any)?.bindings)
+    && canonical((body.resultCapacity as any)?.forms?.map((form:any)=>form.kind))===canonical(['read_context']),
+    'discovery_dossier_transport_invalid','A terminal declaration cannot masquerade as a markerless archive');
   return packet;
 }
 

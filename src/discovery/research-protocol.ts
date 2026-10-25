@@ -222,7 +222,7 @@ export function prepareResearchEnvelope(role: RoleBinding, environment: Environm
 /** Callable dossier preflight: accepted async proof, ordinary capacity arithmetic,
  * and the same measured wire builder and addressed material delivery. */
 export async function prepareDossierResearchEnvelope(role: RoleBinding, environment: Environment, prompt: string,
-  context: unknown, audit: Pick<ResearchCallAudit, 'store' | 'draftId' | 'questionId' | 'purpose'>,
+  context: unknown, audit: Pick<ResearchCallAudit, 'store' | 'draftId' | 'questionId' | 'purpose' | 'pilot'>,
   capacity?: Record<string, any>, requestId = '00000000-0000-0000-0000-000000000000') {
   requireCondition(audit?.store && audit.purpose === 'dossier-assessor' && audit.questionId,
     'discovery_dossier_transport_invalid', 'Dossier preflight needs its explicitly separate audited purpose');
@@ -236,7 +236,8 @@ export async function prepareDossierResearchEnvelope(role: RoleBinding, environm
   const input = researchCapacityInput({ operation:prepared.packet.subject.identity, generation:0,
     bindings: { projectId:environment.projectId, draft:reference(draft), question:reference(question),
       dossierSubject:prepared.packet.subject }, role:'assessor', purpose:'dossier-assessor', actionMode:'dossier-preflight',
-    limit:researchResultEnvelopeLimit(environment), prompt, binding:role, draft:draft.value,
+    limit:researchResultEnvelopeLimit(environment), physicalReplyLimit:audit.pilot?.value.physicalLimits?.maxReplyChars ?? null,
+    prompt, binding:role, draft:draft.value,
     question, context:prepared.context });
   const admitted = capacity === undefined ? resultCapacityFrom(input) : requireResultCapacity(capacity, input, audit.store);
   requireCondition(!Object.hasOwn(context as object, 'resultCapacity')

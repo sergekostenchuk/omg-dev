@@ -1,5 +1,7 @@
+import { requireDossierAssessmentSubject } from './dossier-assessment.js';
+import { DOSSIER_ASSESSMENT_RESULT_CONTRACT } from './research-model.js';
 import { assessmentRolePrompt } from './assessment-session.js';
-import { DOSSIER_TRANSPORT_DELIVERY, packetDossierSubject, requireDossierSubjectBinding, requireDossierTransportContext, packetAssessmentSubject, packetPlanSubject, assessmentQuestionContract, assessmentTransportPrompt, assessmentResponseContract, type AssessmentTransportSubject } from './continuation-packet.js';
+import { DOSSIER_TRANSPORT_DELIVERY, DOSSIER_RESULT_TRANSPORT, dossierResultCapacityForms, requireDossierReplyCapacity, dossierResultTransport, dossierReplyContract, packetDossierSubject, requireDossierSubjectBinding, requireDossierTransportContext, packetAssessmentSubject, packetPlanSubject, assessmentQuestionContract, assessmentTransportPrompt, assessmentResponseContract, type AssessmentTransportSubject } from './continuation-packet.js';
 import { buildResearchResultCapacity, requireResearchResultCapacity, measureResearchResult,
   type ResearchResultCapacity, type ResearchResultCapacityInput } from './research-delivery.js';
 import type { Environment, RoleBinding } from '../runtime/environment.js';
@@ -10,7 +12,7 @@ import type { DiscoveryDraft, Question } from './discovery.js';
 import { requireDiscoveryProposal, type DiscoveryBasisCatalogue, type DiscoveryContext } from './discovery-outcome.js';
 import { conceptApplicationFindings, requiresConceptApplications,
   requiresSpecificationApplications, specificationApplicationFindings } from './preparation-validation.js';
-import { researchAction, responseAction } from './research-consumer-transition.js';
+import { projectDossierAssessment, researchAction, responseAction } from './research-consumer-transition.js';
 import { canonical, hashJson, type Json } from '../canonical.js';
 import { isRef, reference, stageId, type Ref, type StageArtifact } from '../pipeline/contracts.js';
 import type { Store } from '../storage/store.js';
@@ -221,14 +223,25 @@ export function researchCapacityInput(input: {
     requireCondition(input.role === 'assessor' && input.purpose === 'dossier-assessor'
       && dossierSubject.projectId === input.draft.projectId,
     'discovery_dossier_transport_invalid', 'Capacity must bind this separate exact dossier subject');
-    return { operation: input.operation, generation: input.generation, bindings: input.bindings,
-      role: input.role, purpose: input.purpose, actionMode: 'dossier-preflight', envelopeLimitChars: input.limit,
+    const resultEra = dossierResultTransport(c);
+    const declaration = resultEra ? dossierReplyContract(c.dossierPacket) : null;
+    const physical = input.physicalReplyLimit ?? null;
+    if (resultEra) requireCondition(!Object.hasOwn(c,'physicalReplyLimit')
+      && (!Object.hasOwn(c,'responseOutputLimit') || canonical(c.responseOutputLimit)===canonical(researchResponseOutputLimit(physical))),
+      'discovery_dossier_transport_invalid','Caller context cannot replace the audited physical reply bound');
+    requireCondition(physical === null || Number.isSafeInteger(physical) && physical > 0,
+      'research_capacity_configuration', 'Dossier reply limit must be a positive physical bound');
+    return { operation: input.operation, generation: input.generation,
+      bindings: {...input.bindings, ...(resultEra ? {dossierResultTransport:DOSSIER_RESULT_TRANSPORT} : {})},
+      role: input.role, purpose: input.purpose, actionMode: resultEra ? 'dossier-result-preflight' : 'dossier-preflight', envelopeLimitChars: input.limit,
       mandatoryEnvelope: { protocol:'omg-agent/v1', mode:'research', model:input.binding.model,
         effort:input.binding.effort, prompt:input.prompt,
         subject: { dossierSubject, purpose:input.purpose,
+          ...(declaration ? {dossierResultTransport:DOSSIER_RESULT_TRANSPORT, dossierReplyContract:{
+            contract:declaration.contract, result:declaration.result, subject:declaration.subject, schemaHash:hashJson(declaration.schema)}} : {}),
           assessmentDelivery: DOSSIER_TRANSPORT_DELIVERY,
           responseOutputLimit: researchResponseOutputLimit(input.physicalReplyLimit ?? null) } },
-      forms: [{kind:'read_context'}] };
+      forms: resultEra ? dossierResultCapacityForms(c.dossierPacket, physical) : [{kind:'read_context'}] };
   }
   requireCondition(!packetDossierSubject(input.bindings), 'discovery_dossier_transport_invalid',
     'Capacity cannot drop its dossier subject');
@@ -301,8 +314,24 @@ export function researchCapacityInput(input: {
       ...(goal ? { specialLimits: { targetChars: goal.targetChars, fullTargetChars: goal.fullTargetChars } } : {}) })) };
 }
 
+function requireDossierResultRoom(capacity: ResearchResultCapacity): void {
+  if (capacity.actionMode !== 'dossier-result-preflight') return;
+  for (const form of capacity.forms) {
+    const floor = form.specialLimits?.minimumResultChars;
+    if (floor === undefined) continue;
+    const limit = Math.min(form.maxResultChars, form.specialLimits?.physicalReplyChars ?? Infinity);
+    if ((form.specialLimits?.minimumResultBytes ?? 0) > (form.specialLimits?.combinedOutputBytes ?? Infinity))
+      throw new EngineError(RESULT_CAPACITY_REFUSAL,'The mandatory complete dossier inventory exceeds its byte bound',
+        {form:form.kind,field:'inventory',pointer:'/inventory',unit:'bytes',limit:form.specialLimits!.combinedOutputBytes,actual:form.specialLimits!.minimumResultBytes});
+    if (floor > limit) throw new EngineError(RESULT_CAPACITY_REFUSAL,
+      'The mandatory complete dossier inventory cannot fit this result form',
+      {form:form.kind,field:'inventory',pointer:'/inventory',limit,actual:floor,deficit:floor-limit});
+  }
+}
 export function resultCapacityFrom(input: ResearchResultCapacityInput): ResearchResultCapacity {
-  return buildResearchResultCapacity(input);
+  const capacity = buildResearchResultCapacity(input);
+  requireDossierResultRoom(capacity);
+  return capacity;
 }
 const CAPACITY_PROJECTION = 'result-capacity-projection/v1' as const;
 function projectionRecord(input: ResearchResultCapacityInput) {
@@ -364,6 +393,7 @@ export function requireResultCapacity(saved: unknown, input: ResearchResultCapac
     input = { ...input, mandatoryArchive: archive.archive };
     requireResearchResultCapacity(saved, input, (record, pointer) => readCapacityProjection(store, record, pointer));
   } else requireResearchResultCapacity(saved, input);
+  requireDossierResultRoom(saved);
   return saved;
 }
 /** The saved marker selects the era. No current profile/head is consulted. */
@@ -376,13 +406,26 @@ export function researchResultFailure(saved: unknown, payload: unknown): EngineE
     && capacity.forms.every(form => form && typeof form.kind === 'string'),
   'research_capacity_invalid', 'The producer lost its declared result forms');
   const response = payload as Record<string, any> | null;
-  const kind = capacity.actionMode === 'consolidation' ? 'summary'
+  const kind = capacity.actionMode === 'dossier-result-preflight'
+    ? response?.contract === DOSSIER_ASSESSMENT_RESULT_CONTRACT && ['supported','return'].includes(response?.verdict)
+      ? `dossier_${response!.verdict}` : response?.action
+    : capacity.actionMode === 'consolidation' ? 'summary'
     : capacity.purpose === 'escalation-assessor' ? 'escalation'
     : capacity.purpose === 'reader' ? 'selections'
     : capacity.purpose === 'assessor' && !response?.action ? 'verdict' : response?.action;
   // Invalid forms remain ordinary schema errors, not a capacity correction.
   if (!capacity.forms.some(form => form.kind === kind)) return null;
   const measured = measureResearchResult(capacity, kind, payload);
+  if (capacity.actionMode === 'dossier-result-preflight') {
+    const limits = capacity.forms.find(form=>form.kind===kind)!.specialLimits!;
+    const chars = JSON.stringify(payload).length, bytes = Buffer.byteLength(JSON.stringify(payload),'utf8');
+    const physical = limits.physicalReplyChars;
+    if (physical !== undefined && chars > physical || bytes > limits.combinedOutputBytes!)
+      return new EngineError(RESULT_CAPACITY_REFUSAL, 'The complete dossier reply exceeds its physical output bound',
+        {form:kind,field:'answer',pointer:'/',unit:physical!==undefined && chars>physical?'utf16':'bytes',
+          limit:physical!==undefined && chars>physical?physical:limits.combinedOutputBytes,
+          actual:physical!==undefined && chars>physical?chars:bytes});
+  }
   if (measured.fits) return null;
   const field = kind === 'verdict' ? 'reasons' : kind === 'escalation' ? 'reason'
     : ['checkpoint', 'need_owner', 'summary'].includes(kind) ? kind
@@ -397,4 +440,24 @@ export function researchResultFailure(saved: unknown, payload: unknown): EngineE
 export function withoutResultCapacity(context: Record<string, any>): Record<string, any> {
   const { resultCapacity: _capacity, resultCapacityContract: _era, resultCapacityPrompt: _prompt, resultCapacityCorrection: _correction, ...original } = context;
   return original;
+}
+
+/** Check one complete normalized reply against the exact proven dossier and saved transport admission.
+ * This does not open a session, dispatch or prove payment. */
+export async function checkDossierResearchReply(store: Store, project: string, subject: unknown,
+  saved: ResearchResultCapacity, response: unknown) {
+  const packet = await requireDossierAssessmentSubject(store, project, subject);
+  const declaration = dossierReplyContract(packet), mandatory = researchCapacityProjection(saved,store);
+  requireDossierReplyCapacity(packet,saved,mandatory,(record,pointer)=>readCapacityProjection(store,record,pointer));
+  requireDossierResultRoom(saved);
+  const validate = new Ajv({strict:true}).compile(declaration.schema);
+  requireCondition(validate(response),'discovery_dossier_result_invalid','Reply does not match the declared dossier terminal or continuation shape');
+  const value = response as Record<string,any>;
+  const terminal = value.contract===DOSSIER_ASSESSMENT_RESULT_CONTRACT;
+  const projection = terminal ? projectDossierAssessment({packet,result:response}) : null;
+  const normalized = projection?.result ?? structuredClone(response);
+  const failure = researchResultFailure(saved,normalized);
+  if (failure) throw failure;
+  const kind = terminal ? `dossier_${value.verdict}` : value.action;
+  return {kind,terminal,normalized,measurement:measureResearchResult(saved,kind,normalized),projection};
 }
