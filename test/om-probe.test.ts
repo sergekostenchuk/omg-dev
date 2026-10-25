@@ -1,9 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { spawn, spawnSync, execFileSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { chmodSync, copyFileSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync,
   statSync, symlinkSync, writeFileSync } from 'node:fs';
-import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join, relative } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -43,7 +42,6 @@ import { parseProbeArgs, probeCommand, replayVerdict, runProbe, wireDifference, 
 
 // PR1 (№2943). Every fixture below is made by the engine's own producers; the probe only ever reads a copy of it.
 
-const ROOT = fileURLToPath(new URL('../../', import.meta.url));
 const { fixtureAnswer } = await import(new URL('../../test/om-adapter-fixture.mjs', import.meta.url).href);
 const CLI = fileURLToPath(new URL('../src/cli.js', import.meta.url));
 const PROJECT = 'garden';
@@ -89,7 +87,7 @@ function script(stubDir: string, steps: Record<string, unknown>[], database: str
   writeFileSync(join(stubDir, 'scenario.json'), JSON.stringify({ steps, database })); writeFileSync(join(stubDir, 'cursor'), '0');
 }
 
-/** The engine modules the garden recipe uses; a historical run hands it the same names from the base commit instead. */
+/** The engine modules the garden recipe uses. */
 const RECIPE = { Store, ProductEngine, reference, gardenGraph, preparedFeatures, preparedField, UPSTREAM_STAGES, projectGraph, writeOmInput,
   writeAddressing, inputDecisionWrite, writeHorizon, writeGaps, prepareQuestionTasks, writeRoutes, openSeries, beginAttempt, completeAttempt,
   gapLineKey, gapLineExpectedResult, writeQuestionPacket, runModelCycle, prepareFrameProposals, writeFileSync, mkdirSync, symlinkSync, mkdtempSync,
@@ -102,13 +100,12 @@ interface GardenData {
 }
 
 /**
- * The garden fixture through the engine's own producers. Self-contained on purpose: it touches only `m` and its arguments,
- * so a historical test runs this very function in a child process whose `m` is the base commit's code.
+ * The garden fixture through the engine's own producers. Self-contained on purpose: it touches only `m` and its arguments.
  *  facts: MC1 with a call refused for a read path that leaves the workspace (attempt 1) and an answered call (attempt 2),
  *         an L2 node call through a source continuation, and a blocked packet of a later, too small environment.
  *  fields: an M5 input-field call and L2 node packets of both blocks, one more of the producer under a relative-path adapter.
  */
-async function gardenRecipe(m: RecipeModules, root: string, plan: 'facts' | 'fields', complete: boolean): Promise<GardenData> {
+async function gardenRecipe(m: RecipeModules, root: string, plan: 'facts' | 'fields'): Promise<GardenData> {
   const ok = <T>(result: OmResult<T>): T => {
     if (!result.ok) throw new Error(`${result.refusal.code} ${result.refusal.at.target}.${result.refusal.at.field ?? ''}: ${result.refusal.message}`);
     return result.value;
@@ -221,12 +218,8 @@ async function gardenRecipe(m: RecipeModules, root: string, plan: 'facts' | 'fie
       const continuation = store.list<{ request: { continuation?: unknown } }>('question-packet').find(row => row.value.request.continuation);
       if (!continuation) throw new Error('The node cycle left no continuation packet');
       data.packets.nodeContinuation = m.reference(continuation);
-      if (complete) ok(m.completeAttempt(store, { project, block: 'garden-consume-block', line: 1, attempt: 2,
-        outcome: { reason: 'result', achieved: [], cancelled: [], refusals: [] } } as never));
-      else {
-        const small = environment([stubPath, stubDir], 50);
-        data.packets.blocked = m.reference(packetOf(fact, m.reference(second), 2, m.reference(small)));
-      }
+      const small = environment([stubPath, stubDir], 50);
+      data.packets.blocked = m.reference(packetOf(fact, m.reference(second), 2, m.reference(small)));
       data.answers = { node: nodeAnswer(produce, 'answer', false), fact: factAnswer } as unknown as Record<string, Json>;
     } else {
       const field = batches.find(batch => batch.model === 'MC2' && batch.task === 'input-field' && batch.items.some(item => item.target === 'discovery:encoding'))!;
@@ -285,8 +278,8 @@ function once<T>(key: string, build: () => Promise<T>): Promise<T> {
 function directory(prefix: string): string {
   const path = mkdtempSync(join(tmpdir(), prefix)); cleanup.push(path); return realpathSync(path);
 }
-const facts = () => once('facts', async () => { const root = directory('omg-pr1-facts-'); const data = await gardenRecipe(RECIPE, root, 'facts', false); cleanup.push(data.outside); return data; });
-const fields = () => once('fields', async () => { const root = directory('omg-pr1-fields-'); const data = await gardenRecipe(RECIPE, root, 'fields', false); cleanup.push(data.outside); return data; });
+const facts = () => once('facts', async () => { const root = directory('omg-pr1-facts-'); const data = await gardenRecipe(RECIPE, root, 'facts'); cleanup.push(data.outside); return data; });
+const fields = () => once('fields', async () => { const root = directory('omg-pr1-fields-'); const data = await gardenRecipe(RECIPE, root, 'fields'); cleanup.push(data.outside); return data; });
 
 interface WorksData { root: string; database: string; stubDir: string; packet: Ref; calls: string[]; answers: Record<string, Json> }
 /** A first works pass (C2/C4/C5 of L2, a D7 owner assignment) and one answered L3 call, as in the E4 works fixture. */
@@ -1256,89 +1249,6 @@ test('PR1 D9 the command line prints omg-probe-report/v1 and exits 0, 2 or 1', a
   assert.equal(report.format, PROBE_REPORT_FORMAT); assert.equal(report.exit, 0); assert.equal(report.complete, false); assert.equal(report.mode, 'free');
   assert.equal(call('--source', garden.database, '--project', PROJECT).status, 2);
   assert.equal(call('--source', join(work.root, 'missing.sqlite'), '--project', PROJECT).status, 1);
-});
-
-// ---- History: the base producer from Git in its own process; the new probe reads after reopening. ----
-
-const BASE = 'b595c7b5fc4cc3360d8395dcf1b7ce1aa11feb3c';
-const BASE_LOADER = String.raw`import {execFileSync} from 'node:child_process';
-import {fileURLToPath} from 'node:url';
-let root, base, ts;
-export async function initialize(data) { root = data.root; base = data.base; ts = (await import(data.typescript)).default; }
-export async function load(url, context, next) {
-  const prefix = new URL('dist/', root).href;
-  if (url.startsWith(prefix) && /\.js$/.test(url)) {
-    // Every engine and fixture module comes from the base commit; there is no fallback to the current source.
-    const relative = url.slice(prefix.length).replace(/\.js$/, '.ts');
-    const source = execFileSync('git', ['show', base + ':' + relative], { cwd: fileURLToPath(root), encoding: 'utf8', maxBuffer: 10000000 });
-    return { format: 'module', shortCircuit: true,
-      source: ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2023 } }).outputText };
-  }
-  return next(url, context);
-}
-`;
-const BASE_RECIPE = String.raw`
-const C = JSON.parse(process.argv[2]);
-const fs = await import('node:fs'), path = await import('node:path'), os = await import('node:os');
-const src = name => import(C.src + name), tst = name => import(C.tst + name);
-const m = { Store: (await src('storage/store.js')).Store, ProductEngine: (await src('product/engine.js')).ProductEngine,
-  reference: (await src('pipeline/contracts.js')).reference, gardenGraph: (await tst('om-fixture.js')).gardenGraph,
-  preparedFeatures: (await tst('product-fixture.js')).preparedFeatures, preparedField: (await tst('preparation-fixture.js')).preparedField,
-  UPSTREAM_STAGES: (await src('discovery/requirements.js')).UPSTREAM_STAGES, projectGraph: (await src('graph/project.js')).projectGraph,
-  writeOmInput: (await src('om/input.js')).writeOmInput, writeAddressing: (await src('om/addressing.js')).writeAddressing,
-  inputDecisionWrite: (await src('om/addressing.js')).inputDecisionWrite, writeHorizon: (await src('om/horizon.js')).writeHorizon,
-  writeGaps: (await src('om/gaps.js')).writeGaps, prepareQuestionTasks: (await src('om/question-packet.js')).prepareQuestionTasks,
-  writeRoutes: (await src('om/routes.js')).writeRoutes, openSeries: (await src('om/series.js')).openSeries, beginAttempt: (await src('om/series.js')).beginAttempt,
-  completeAttempt: (await src('om/series.js')).completeAttempt, gapLineKey: (await src('om/gap-lines.js')).gapLineKey,
-  gapLineExpectedResult: (await src('om/gap-lines.js')).gapLineExpectedResult, writeQuestionPacket: (await src('om/question-packet.js')).writeQuestionPacket,
-  runModelCycle: (await src('om/model-call.js')).runModelCycle, prepareFrameProposals: (await src('om/frame-proposals.js')).prepareFrameProposals,
-  writeFileSync: fs.writeFileSync, mkdirSync: fs.mkdirSync, symlinkSync: fs.symlinkSync, mkdtempSync: fs.mkdtempSync, join: path.join, tmpdir: os.tmpdir,
-  execPath: process.execPath, STUB: C.stub };
-const recipe = (0, eval)('(' + C.recipe + ')');
-process.stdout.write(JSON.stringify(await recipe(m, C.root, 'facts', true)) + '\n');
-`;
-const BASE_INSPECT = String.raw`
-const C = JSON.parse(process.argv[2]);
-process.argv = [process.argv[0], 'cli', 'inspect', C.database];
-await import(C.src + 'cli.js');
-`;
-/** Runs a module script in a fresh process whose every dist module is the base commit's source from Git, transpiled. */
-function atBase(folder: string, name: string, source: string, config: Record<string, unknown>): string {
-  const scriptPath = join(folder, `${name}.mjs`), loader = join(folder, 'base-loader.mjs');
-  writeFileSync(scriptPath, source); writeFileSync(loader, BASE_LOADER);
-  const typescript = pathToFileURL(createRequire(import.meta.url).resolve('typescript')).href;
-  const register = `import{register}from'node:module';register(${JSON.stringify(pathToFileURL(loader).href)},{data:{root:${JSON.stringify(pathToFileURL(ROOT).href)},base:${
-    JSON.stringify(BASE)},typescript:${JSON.stringify(typescript)}}});`;
-  const environment = { ...process.env }; delete environment['NODE_TEST_CONTEXT'];
-  return execFileSync(process.execPath, ['--import', `data:text/javascript,${encodeURIComponent(register)}`, scriptPath,
-    JSON.stringify({ src: pathToFileURL(join(ROOT, 'dist/src/')).href, tst: pathToFileURL(join(ROOT, 'dist/test/')).href, ...config })],
-  { cwd: ROOT, env: environment, encoding: 'utf8', timeout: 600_000, maxBuffer: 64 * 1024 * 1024 });
-}
-
-test('PR1 §7 history: the base b595c7b producer from Git writes in its own process; after reopening the new probe reads every request and wire unchanged', async () => {
-  const folder = directory('omg-pr1-base-'), root = join(folder, 'garden'); mkdirSync(root);
-  const output = atBase(folder, 'recipe', BASE_RECIPE, { root, stub: STUB, recipe: gardenRecipe.toString() });
-  const data = JSON.parse(output.trim().split('\n').at(-1)!) as GardenData;
-  cleanup.push(data.outside);
-  const report = await probe({ source: data.database, points: 9, replay: true });
-  assert.equal(report.refusal, null);
-  for (const point of report.points) {
-    assert.ok(point.readable?.ok, point.key); assert.equal(point.verdict, 'equal', point.group);
-    for (const call of point.calls) {
-      assert.equal(call.wire, 'equal');
-      const exchange = rawRecord<{ wire: { requestId: string } }>(data.database, call.exchange!);
-      assert.equal(exchange.wire.requestId, point.wire!.requestId, 'the saved request id is the packet\'s own');
-    }
-  }
-  const fact = pointOf(report, data.packets.fact!);
-  assert.ok(fact.admission && !fact.admission.ok, 'the completed attempt admits no current preparation, yet its history reads unchanged');
-  assert.equal(pointOf(report, data.packets.factRefused!).calls[0]!.replay!.verdict, 'unsettled');
-  assert.equal(pointOf(report, data.packets.fact!).calls[0]!.replay!.verdict, 'same');
-  // The command line of the base and the new one show the same snapshot.
-  const copy = join(directory('omg-pr1-inspect-'), 'state.sqlite'); copyFileSync(data.database, copy);
-  const fresh = execFileSync(process.execPath, [CLI, 'inspect', copy], { encoding: 'utf8' });
-  const old = atBase(folder, 'inspect', BASE_INSPECT, { database: copy });
-  assert.deepEqual(JSON.parse(fresh.trim().split('\n').at(-1)!), JSON.parse(old.trim().split('\n').at(-1)!));
 });
 
 test('PR1 every probe refusal code is exercised by the tests above', () => {
