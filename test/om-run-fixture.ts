@@ -1436,8 +1436,7 @@ function g51AmbiguousAnswer(f: WorksRun, saved: Ref) {
 }
 
 type Lp6Op = { op: "round"; ordinal: number; answers: { field: "nodes" | "state" | "checkKind" | "expansion"; value?: Json; cannot?: string; owner?: string; exit?: number; unsent?: true }[] }
-  | { op: "replace"; target: string; field: string; value: Json } | { op: "cease"; ordinal: number } | { op: "close"; ordinal: number }
-  | { op: "analyze"; decided: boolean } | { op: "resume"; stop: number };
+  | { op: "cease"; ordinal: number } | { op: "close"; ordinal: number };
 /** The garden block garden-consume-block on a B1 that leaves its contract's nodes and state and its criterion's checkKind open. */
 function lp6Line(t: test.TestContext) {
   const root = mkdtempSync(join(tmpdir(), "omg-lp6-era-")), database = join(root, "state.sqlite");
@@ -1487,6 +1486,8 @@ function lp7Routes(f: ReturnType<typeof lp6Line>) {
 async function lp6CurrentRounds(f: ReturnType<typeof lp6Line>, ops: Lp6Op[]) {
   const steps: unknown[] = [], verdicts: (string | null)[] = [], calls: Sealed<ModelCallOutcome>[] = [];
   for (const item of ops) {
+    // Named before the branches narrow `item`: the last one has nothing left but the refusal.
+    const op = item.op;
     if (item.op === "round") {
       const routes = lp7Routes(f);
       const batches = item.answers.map(answer => routes.value.batches.find(batch => answer.field === "expansion"
@@ -1523,7 +1524,7 @@ async function lp6CurrentRounds(f: ReturnType<typeof lp6Line>, ops: Lp6Op[]) {
     } else if (item.op === "close") {
       const claim = ok(prepareManagedClaim(f.store, { ...f.address, attempt: item.ordinal, outcome: { reason: "result", accepting: [], cancelling: [], refusals: [] } } as never));
       verdicts.push(ok(closeAttempt(f.store, { ...f.address, attempt: item.ordinal, outcome: claim.outcome } as never)).verdict);
-    } else assert.fail(`Unexpected current-round operation ${item.op}`);
+    } else assert.fail(`Unexpected current-round operation ${op}`);
   }
   return { verdicts, calls };
 }
