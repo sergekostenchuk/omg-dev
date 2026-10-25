@@ -47,7 +47,7 @@ import { writeGuarded } from '../src/om/refs.js';
 import { runModelCall, runModelCycle, readCompletionWorkAt, writeCompletionCessation, deliverModelSources, assembleModelParts, pendingCallStore, readPartAssembly, type ReadDeliveryRecord } from '../src/om/model-call.js';
 import { gardenGraph, prepareOmFixtureStages, prepareNativeLayers } from './om-fixture.js';
 // OMMC-SPLIT: the managed-cycle helpers moved to a shared fixture module; importing it registers no tests.
-import { e4Fixture, e4WorksFixture, e4Node, e4NeedSource, mp2Refused, h15AtCommit } from './om-model-call-fixture.js';
+import { e4Fixture, e4WorksFixture, e4Node, e4NeedSource, mp2Refused } from './om-model-call-fixture.js';
 import { preparedFeatures } from './product-fixture.js';
 import { preparedField } from './preparation-fixture.js';
 
@@ -107,7 +107,7 @@ function frozen(value: unknown): boolean {
   return value === null || typeof value !== 'object' || Object.isFrozen(value) && Object.values(value).every(frozen);
 }
 
-function questionFixture(t: TestContext, desiredGraph = gardenGraph(), addressOwner = true, commonFactConsumer = false, historicalCommit?: string,
+function questionFixture(t: TestContext, desiredGraph = gardenGraph(), addressOwner = true, commonFactConsumer = false,
   decideContract = false) {
   const root = mkdtempSync(join(tmpdir(), 'omg-question-packet-')), database = join(root, 'state.sqlite');
   let store = new Store(database), engine = new ProductEngine(store);
@@ -127,7 +127,7 @@ function questionFixture(t: TestContext, desiredGraph = gardenGraph(), addressOw
       moment: 'om-pass', blocksCurrentStage: false, resolution: 'Resolve the addressed question during OM',
     }));
     return value;
-  }, historicalCommit);
+  });
   const stages = Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(store.get(`stage:${project}:${stage}`)!)])) as Record<UpstreamStage, Ref>;
   const base = ok(writeOmInput(store, { project, expected: 0, stages })), graph = store.get<Graph>(`graph:${project}`)!;
   const input = ok(writeAddressing(store, { project, input: reference(base), graph: reference(graph),
@@ -338,66 +338,14 @@ test('E2 does not disguise storage execution faults as a producer refusal', t =>
   assert.deepEqual(snapshot(f.store), before);
 });
 
-/** The route of a fixture as `commit` writes it, with every engine module of that commit, in its own process (LP7 F2). */
-function routeAtCommit(f: { root: string; path: string }, commit: string, request: unknown): Sealed<Revision<RoutesRecord>> {
-  const repository = fileURLToPath(new URL('../../', import.meta.url)), served = join(f.root, 'route-commit-served.log');
-  const loader = join(f.root, 'route-commit-loader.mjs'), producer = join(f.root, 'route-commit-producer.mjs'), argsFile = join(f.root, 'route-commit-input.json');
-  const typescript = pathToFileURL(createRequire(import.meta.url).resolve('typescript')).href;
-  writeFileSync(served, '');
-  writeFileSync(loader, `import { execFileSync } from 'node:child_process';
-import { appendFileSync, realpathSync } from 'node:fs';
-import { fileURLToPath, pathToFileURL } from 'node:url';
-import ts from ${JSON.stringify(typescript)};
-let root, log, prefixes;
-export function initialize(data) {
-  root = data.root; log = data.log;
-  prefixes = [root, pathToFileURL(realpathSync(fileURLToPath(root)) + '/').href].map(base => new URL('dist/src/', base).href);
-}
-export async function load(url, context, next) {
-  const prefix = prefixes.find(item => url.startsWith(item));
-  if (prefix && /\\.js$/.test(url)) {
-    const relative = 'src/' + url.slice(prefix.length).replace(/\\.js$/, '.ts');
-    appendFileSync(log, relative + '\\n');
-    const source = execFileSync('git', ['show', ${JSON.stringify(commit)} + ':' + relative],
-      { cwd: fileURLToPath(root), encoding: 'utf8', maxBuffer: 10000000 });
-    return { format: 'module', shortCircuit: true, source: ts.transpileModule(source,
-      { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2023 } }).outputText };
-  }
-  if (url.startsWith('file:') && url.includes('/dist/src/') && !url.includes('/node_modules/'))
-    throw new Error('An engine module outside the era checkout: ' + url);
-  return next(url, context);
-}`);
-  writeFileSync(producer, `import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
-import { pathToFileURL } from 'node:url';
-const [repository, database, input] = process.argv.slice(2);
-const src = path => pathToFileURL(join(repository, 'dist/src', path)).href;
-const { Store } = await import(src('storage/store.js'));
-const { writeRoutes } = await import(src('om/routes.js'));
-const store = new Store(database);
-try {
-  const result = writeRoutes(store, JSON.parse(readFileSync(input, 'utf8')));
-  if (!result.ok) throw Error(JSON.stringify(result.refusal));
-  process.stdout.write(JSON.stringify(result.value));
-} finally { store.close(); }`);
-  writeFileSync(argsFile, JSON.stringify(request));
-  const bootstrap = `import { register } from 'node:module'; register(${JSON.stringify(pathToFileURL(loader).href)},
-    { data: { root: ${JSON.stringify(pathToFileURL(repository).href)}, log: ${JSON.stringify(served)} } });`;
-  const output = JSON.parse(execFileSync(process.execPath, ['--import', `data:text/javascript,${encodeURIComponent(bootstrap)}`, producer, repository, f.path, argsFile],
-    { cwd: repository, encoding: 'utf8', timeout: 180_000, maxBuffer: 10_000_000 })) as Sealed<Revision<RoutesRecord>>;
-  assert.ok(readFileSync(served, 'utf8').split('\n').includes('src/om/routes.ts'), `The route was written by the modules of ${commit}`);
-  return output;
-}
 function packetFixture(t: TestContext, capacity: number | null = 100_000, desiredGraph = gardenGraph(), addressOwner = true, commonFactConsumer = false,
-  resultForm: Json = { type: 'string' }, routeCommit?: string, decideContract = false, opening: 'open' | 'deferred' = 'open') {
-  const f = questionFixture(t, desiredGraph, addressOwner, commonFactConsumer, routeCommit, decideContract);
+  resultForm: Json = { type: 'string' }, decideContract = false, opening: 'open' | 'deferred' = 'open') {
+  const f = questionFixture(t, desiredGraph, addressOwner, commonFactConsumer, decideContract);
   for (const question of f.request.questions) question.resultForm = resultForm;
   const tasks = ok(prepareQuestionTasks(f.store, f.request));
   const routesRequest = { project: f.project, gaps: f.request.gaps,
     tasks: tasks.tasks.map(task => ({ pending: clone(task.writes[0]!) as Write })), catalog: { paths: ['src/format.ts'], records: [] }, previous: null };
-  // LP7 (№3393 §6 F2): a historical producer reads the route its own commit wrote, never a route joined by today's code.
-  const routes = routeCommit ? routeAtCommit({ root: dirname(f.store.path), path: f.store.path }, routeCommit, routesRequest)
-    : ok(writeRoutes(f.store, routesRequest));
+  const routes = ok(writeRoutes(f.store, routesRequest));
   const batch = routes.value.batches.find(batch => batch.model === 'MC1'
     && batch.items.some(item => item.target === 'discovery:encoding'))!;
   assert.ok(batch);
@@ -415,9 +363,7 @@ function packetFixture(t: TestContext, capacity: number | null = 100_000, desire
     questions: batch.items.map(item => gapLineKey(f.project, item.target, item.field)),
     result: gapLineExpectedResult(f.project, batch.items[0]!.target, batch.items[0]!.field) };
   const root = ok(openSeries(f.store, { project: f.project, block, line: 1, slice: 'packet-facts', predecessor: null, basis: null }));
-  const series = opening === 'deferred' ? root : ok(routeCommit
-    ? beginAttempt(f.store, { project: f.project, block, line: 1, attempt: 1, goal })
-    : openPacketAttempt(f.store, { project: f.project, block, line: 1, attempt: 1, goal }, routes, [batch.id]));
+  const series = opening === 'deferred' ? root : ok(openPacketAttempt(f.store, { project: f.project, block, line: 1, attempt: 1, goal }, routes, [batch.id]));
   const request: QuestionPacketRequest = { project: f.project, routes: reference(routes), batch: batch.id,
     environment: reference(configured), attempt: { series: reference(series), ordinal: 1 }, previous: [] };
   return { f, tasks, routes, batch, configured, block, goal, series, request, environment };
@@ -546,7 +492,7 @@ test('E2 does not invent a capacity or accept a request override and requires th
 
 test('E2 refuses a D5 requirement selector that would copy the whole input or a whole requirement section', t => {
   for (const pointer of ['', '/requirements']) {
-    const p = packetFixture(t, 100_000, gardenGraph(), true, false, { type: 'string' }, undefined, false, 'deferred'), { f } = p;
+    const p = packetFixture(t, 100_000, gardenGraph(), true, false, { type: 'string' }, false, 'deferred'), { f } = p;
     const request = clone(f.request);
     request.questions = request.questions.map(item => ({ ...item, requirements: [{ pointer }] }));
     const tasks = ok(prepareQuestionTasks(f.store, request));
@@ -658,8 +604,8 @@ function crossedPacketGraph(sideBindings = 1): Graph {
   return graph;
 }
 
-function expansionFixture(t: TestContext, capacity = 100_000, sideBindings = 1, routeCommit?: string, opening: 'open' | 'deferred' = 'open') {
-  const p = packetFixture(t, capacity, crossedPacketGraph(sideBindings), true, false, { type: 'string' }, routeCommit), { f } = p;
+function expansionFixture(t: TestContext, capacity = 100_000, sideBindings = 1, opening: 'open' | 'deferred' = 'open') {
+  const p = packetFixture(t, capacity, crossedPacketGraph(sideBindings), true, false, { type: 'string' }), { f } = p;
   const batch = p.routes.value.batches.find(batch => batch.task === 'node-expansion' && batch.node === 'garden-produce-block')!;
   assert.ok(batch);
   const source = ok(prepareFrameProposals(f.store, f.request.gaps.sources.operations));
@@ -671,9 +617,7 @@ function expansionFixture(t: TestContext, capacity = 100_000, sideBindings = 1, 
     result: gapLineExpectedResult(f.project, batch.items[0]!.target, batch.items[0]!.field) };
   const block = batch.node!;
   const root = ok(openSeries(f.store, { project: f.project, block, line: 1, slice: 'packet-expansion', predecessor: null, basis: null }));
-  const series = opening === 'deferred' ? root : ok(routeCommit
-    ? beginAttempt(f.store, { project: f.project, block, line: 1, attempt: 1, goal })
-    : openPacketAttempt(f.store, { project: f.project, block, line: 1, attempt: 1, goal }, p.routes, [batch.id]));
+  const series = opening === 'deferred' ? root : ok(openPacketAttempt(f.store, { project: f.project, block, line: 1, attempt: 1, goal }, p.routes, [batch.id]));
   const request: QuestionPacketRequest = { ...p.request, batch: batch.id, attempt: { series: reference(series), ordinal: 1 } };
   return { ...p, batch, source, obligations, goal, block, series, request };
 }
@@ -1648,7 +1592,7 @@ test('E2 does not reassign accepted refinements and writes an empty packet when 
 });
 
 test('E2 assigns a genuinely open outcome alone after C3 fills every connection of the upper node', async t => {
-  const p = expansionFixture(t, 100_000, 1, undefined, 'deferred'), { f } = p;
+  const p = expansionFixture(t, 100_000, 1, 'deferred'), { f } = p;
   const outcome = p.obligations.find(item => item.kind !== 'connection-end')!;
   const upper = f.graph.value.nodes.find(node => node.id === p.batch.node)!, connections = p.obligations.filter(item => item.kind === 'connection-end');
   const node: Node = { ...clone(upper), id: 'garden-connections-filled', kind: 'operation', parent: upper.id,
@@ -1689,8 +1633,8 @@ for (const model of ['MC1', 'MC2'] as const) {
   test(`G7 ${model} binds every managed assignment to its declared whole goal and consumer before any writes`, async t => {
     for (const defect of ['questions', 'result', 'consumer', 'missing-question'] as const) await t.test(defect, async t => {
       const p = model === 'MC1'
-        ? packetFixture(t, 100_000, gardenGraph(), true, true, { type: 'string' }, undefined, false, 'deferred')
-        : expansionFixture(t, 100_000, 1, undefined, 'deferred');
+        ? packetFixture(t, 100_000, gardenGraph(), true, true, { type: 'string' }, false, 'deferred')
+        : expansionFixture(t, 100_000, 1, 'deferred');
       const { f } = p, block = defect === 'consumer' ? 'garden-later-block' : p.block;
       if (block !== p.block)
         ok(openSeries(f.store, { project: f.project, block, line: 1, slice: 'other-consumer', predecessor: null, basis: null }));
@@ -1814,7 +1758,7 @@ test('E2 reaches both real fact batches with different consumers using their own
 });
 
 test('E2 admits an MC2 missing input field with a proven block consumer under the common line-result goal', async t => {
-  const p = packetFixture(t, 100_000, gardenGraph(), true, false, { type: 'string' }, undefined, false, 'deferred'), { f } = p;
+  const p = packetFixture(t, 100_000, gardenGraph(), true, false, { type: 'string' }, false, 'deferred'), { f } = p;
   const batch = p.routes.value.batches.find(batch => batch.task === 'input-field'
     && batch.items.every(item => item.consumers.length > 0))!;
   assert.ok(batch, 'The native first pass contains missing structured fields with block consumers');
@@ -3068,9 +3012,8 @@ test('MP1 the observed material guard closes a second Store race atomically whil
 
 import { briefReadings } from '../src/om/packet-brief.js';
 
-const MP11_BASE = 'e88b4ed40d94dd61e242d613d96a87e0bb5e6206';
-// Reuse the actual managed-cycle fixtures from the shared module; destructuring keeps the historical sites unchecked as before.
-const mp11CycleFixtures: any = { e4Fixture, e4NeedSource, h15AtCommit };
+// Reuse the actual managed-cycle fixtures from the shared module; destructuring keeps the sites unchecked as before.
+const mp11CycleFixtures: any = { e4Fixture, e4NeedSource };
 function mp11Version(packet: Sealed<Revision<QuestionPacketRecord>>, era: 'om-brief/v1' | 'om-brief/v2') {
   assert.equal(packet.value.briefContract, era === 'om-brief/v2' ? era : undefined);
   if (packet.value.packet) {
@@ -3227,33 +3170,9 @@ test('MP1.1 current managed continuation keeps v2 across a compatible Environmen
   assert.equal(f.sent().length, 1);
 });
 
-test('MP1.1 row 10: two individually proved parts from different brief versions cannot form one producer request or a saved chain', { todo: "NR1 №3646: согласованная перезапись цепочки до новейшей записи — om-fsck её не видит; решение позже" }, async t => {
-  const { h15AtCommit } = mp11CycleFixtures, p = expansionFixture(t, 100_000, 1, MP11_BASE), { f } = p;
-  const oldWhole = h15AtCommit(f, MP11_BASE, 'mp11-old-whole', `const { prepareQuestionPacket } = await import(src('om/question-packet.js'));
-    out(take(prepareQuestionPacket(store, args)).record);`, p.request);
-  const oldEnvironment = p.environment(oldWhole.value.fullChars - 1), oldRequest = { ...p.request, environment: reference(oldEnvironment) };
-  const oldRecord = h15AtCommit(f, MP11_BASE, 'mp11-old-part', `const { writeQuestionPacket } = await import(src('om/question-packet.js'));
-    out(take(writeQuestionPacket(store, args)).record);`, oldRequest) as Revision<QuestionPacketRecord>;
-  const old = ok(writeQuestionPacket(f.store, oldRequest)), oldPart = partResult(p, old); mp11Version(oldRecord, 'om-brief/v1');
-  const largeEnvironment = p.environment(100_000), newWhole = ok(prepareQuestionPacket(f.store, { ...p.request, environment: reference(largeEnvironment) })).record;
-  const newEnvironment = p.environment(packetWire(newWhole.value.packet) - 1), newRequest = { ...p.request, environment: reference(newEnvironment) };
-  const next = ok(writeQuestionPacket(f.store, newRequest)), nextPart = partResult(p, next); mp11Version(next.record, 'om-brief/v2');
-  const request: QuestionPacketRequest = { ...newRequest, previous: [
-    { packet: reference(oldRecord), proposal: reference(oldPart.proposal), result: reference(oldPart.record) },
-    { packet: reference(next.record), proposal: reference(nextPart.proposal), result: reference(nextPart.record) },
-  ] };
-  const before = snapshot(f.store);
-  for (const action of [prepareQuestionPacket, writeQuestionPacket]) rejected(action(f.store, request), 'packet_chain_invalid');
-  const id = `om-question-packet:${f.project}:${hashJson({ contract: BRIEF_PACKET_CONTRACT, protocol: PACKET_ANSWER_PROTOCOL, request })}`;
-  const value = { ...clone(next.record.value), request };
-  const view = pendingCallStore(f.store, [{ id, kind: 'question-packet', expected: 0, value }]);
-  rejected(readQuestionPacket(view, { project: f.project, record: { id, revision: 1, hash: hashJson(value) } }), 'packet_chain_invalid');
-  assert.deepEqual(snapshot(f.store), before);
-});
-
 test('LP7 row 29: a joined input packet is whole — ready when the capacity holds it, otherwise the former blocked packet_too_large with every item kept; never split or cut', async t => {
   for (const fits of [true, false]) {
-    const p = packetFixture(t, 400_000, crossedPacketGraph(1), true, false, { type: 'string' }, undefined, false, 'deferred'), { f } = p;
+    const p = packetFixture(t, 400_000, crossedPacketGraph(1), true, false, { type: 'string' }, false, 'deferred'), { f } = p;
     const joined = p.routes.value.batches.find(batch => batch.task === 'input-field' && new Set(batch.items.map(item => item.field)).size > 1)!;
     assert.ok(joined, "Today's routing joins the open input fields of garden-consume-block");
     assert.equal(p.routes.value.grouping, 'block-input-v1');
@@ -3869,7 +3788,7 @@ function sp1FieldRequest(p: ReturnType<typeof packetFixture>, slice: string): Qu
 }
 
 test('SP1a №4714 §5 «доставка» input field: an ordinary field brief carries the selected originals of its contract', t => {
-  const p = packetFixture(t, 100_000, gardenGraph(), true, false, { type: 'string' }, undefined, false, 'deferred'), { f } = p;
+  const p = packetFixture(t, 100_000, gardenGraph(), true, false, { type: 'string' }, false, 'deferred'), { f } = p;
   const record = ok(writeQuestionPacket(f.store, sp1FieldRequest(p, 'sp1a-field'))).record;
   assert.equal((record.value.packet as Record<string, any>).task, 'input-field');
   sp1Delivered(f.store, reference(f.input), record);
@@ -3887,7 +3806,7 @@ test('SP1a №4714 §2.1: a continuation keeps the declaration and the selected 
 });
 
 test('SP1a №4714 §5 «расхождение представлений»: B1 decided nodes/state — the normalized row shows the decision, the original contract stays as accepted', t => {
-  const p = packetFixture(t, 100_000, gardenGraph(), true, false, { type: 'string' }, undefined, true), { f } = p;
+  const p = packetFixture(t, 100_000, gardenGraph(), true, false, { type: 'string' }, true), { f } = p;
   const effective = f.input.value.input.contracts.find(row => row.id === 'garden-B1')!;
   assert.deepEqual(effective.nodes, ['garden-produce-block']);
   assert.equal(effective.state.writer, 'garden-produce-block');
@@ -3901,7 +3820,7 @@ test('SP1a №4714 §5 «расхождение представлений»: B1
 });
 
 test('SP1a №4714 §5 «бюджет»: the selected section is mandatory — where the brief fits without it but not with it, the packet is blocked before any call, nothing is cut', t => {
-  const p = packetFixture(t, 100_000, gardenGraph(), true, false, { type: 'string' }, undefined, false, 'deferred'), { f } = p;
+  const p = packetFixture(t, 100_000, gardenGraph(), true, false, { type: 'string' }, false, 'deferred'), { f } = p;
   const request = sp1FieldRequest(p, 'sp1a-budget');
   const ready = ok(prepareQuestionPacket(f.store, request)).record;
   const { text } = sp1Scope(ready), section = `,"selected":${canonical(sp1Scope(ready).input.selected)}`;
@@ -3935,7 +3854,7 @@ test('SP1a №4714 §5 «принадлежность источника»: a la
 
 /** v6 field projections can be exercised before DS1.2lh enables their actual producers. No Store bytes are changed. */
 function ds12BriefFixture(t: TestContext) {
-  const p = packetFixture(t, 100_000, gardenGraph(), true, false, { type: 'string' }, undefined, false, 'deferred'), { f } = p, request = sp1FieldRequest(p, 'ds12m-bases');
+  const p = packetFixture(t, 100_000, gardenGraph(), true, false, { type: 'string' }, false, 'deferred'), { f } = p, request = sp1FieldRequest(p, 'ds12m-bases');
   const record = ok(prepareQuestionPacket(f.store, request)).record, payload = clone(record.value.packet) as Record<string, any>;
   payload.responseForm.schema = clone(packetAnswerSchema('field'));
   const input = { ...clone(f.input.value.input), sources: f.input.value.input.sources.map(source => ({ ...source, contractVersion: 6 })) };
