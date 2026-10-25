@@ -35,7 +35,7 @@ import { writeHandoff } from "../src/om/handoff.js";
 import { UPSTREAM_STAGES, type UpstreamStage } from "../src/discovery/requirements.js";
 import { enrichedGraph } from "./enriched-graph-fixture.js";
 import { exampleGraph } from "./graph-fixture.js";
-import { preparedFeatures, refinedLayers } from "./product-fixture.js";
+import { preparedFeatures } from "./product-fixture.js";
 
 export type GardenVariant = "standard" | "cross";
 export const OM_FIXTURE_ERROR = "om_fixture_invalid";
@@ -518,15 +518,14 @@ export function acceptNativeWorks(engine: ProductEngine, project: string, operat
 
 export function createOmFixture(t: TestContext, variant: GardenVariant, project: string, options: { mode: "executed" }): Promise<OmFixture>;
 export function createOmFixture(t: TestContext, variant: GardenVariant, project: string, options: OmFixtureOptions): Promise<OmPreparedFixture>;
-export function createOmFixture(t: TestContext, variant?: GardenVariant, project?: string): Promise<OmFixture>;
-export async function createOmFixture(t: TestContext, variant: GardenVariant = "standard", project = "garden", options?: OmFixtureOptions): Promise<OmPreparedFixture | OmFixture> {
+export async function createOmFixture(t: TestContext, variant: GardenVariant = "standard", project = "garden", options: OmFixtureOptions): Promise<OmPreparedFixture | OmFixture> {
   validateTestContext(t);
   validateGardenArguments(variant, project);
-  if (options !== undefined && (options === null || typeof options !== "object"
-    || !["stages", "n2", "executed"].includes(options.mode)))
+  if (options === undefined || options === null || typeof options !== "object"
+    || !["stages", "n2", "executed"].includes(options.mode))
     throw new EngineError(OM_FIXTURE_ERROR, "Fixture mode must be stages, n2 or executed", { target: "/mode" });
-  const mode = options?.mode;
-  const maxContextChars = mode ? 200_000 : 100_000;
+  const mode = options.mode;
+  const maxContextChars = 200_000;
   const root = mkdtempSync(join(tmpdir(), "omg-om-fixture-"));
   const workspace = join(root, "workspace");
   const database = join(root, "state.sqlite");
@@ -542,8 +541,7 @@ export async function createOmFixture(t: TestContext, variant: GardenVariant = "
   t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
 
   const graph = gardenGraph(variant, project);
-  if (mode) prepareOmFixtureStages(engine, project, graph);
-  else preparedFeatures(engine, project, graph);
+  prepareOmFixtureStages(engine, project, graph);
   const command = { executable: process.execPath, args: [agent] };
   engine.environments.configure(project, {
     workspace,
@@ -551,7 +549,7 @@ export async function createOmFixture(t: TestContext, variant: GardenVariant = "
     reviewer: { actor: "fixture-reviewer", model: "fixture", effort: "high", command },
     fullCheck: { executable: process.execPath, args: ["--version"] },
     timeoutMs: 10_000,
-    ...(mode ? { requestCapacityChars: maxContextChars } : {}),
+    requestCapacityChars: maxContextChars,
   }, 0);
   const read = <T>(id: string): Revision<T> => {
     const record = store.get<T>(id);
@@ -568,15 +566,8 @@ export async function createOmFixture(t: TestContext, variant: GardenVariant = "
     };
   };
   if (mode === "stages") return prepared();
-  if (mode) {
-    prepareNativeLayers(engine, project, graph, mode);
-    if (mode === "n2") return prepared();
-  } else {
-    refinedLayers(engine, project);
-    const feasibility = engine.refinement.assess(project, 0);
-    const om = engine.refinement.publish(project, reference(feasibility), 0);
-    engine.pipeline.accept(project, "om-g2", om.revision);
-  }
+  prepareNativeLayers(engine, project, graph, mode);
+  if (mode === "n2") return prepared();
   const plan = engine.compiler.compile(project);
   const compilation = engine.compiler.publish(project, reference(plan), 0);
   engine.pipeline.accept(project, "compilation", compilation.revision);
@@ -611,9 +602,9 @@ export async function createOmFixture(t: TestContext, variant: GardenVariant = "
 
 export function createCrossOmFixture(t: TestContext, project: string, options: { mode: "executed" }): Promise<OmFixture>;
 export function createCrossOmFixture(t: TestContext, project: string, options: OmFixtureOptions): Promise<OmPreparedFixture>;
-export function createCrossOmFixture(t: TestContext, project?: string): Promise<OmFixture>;
-export async function createCrossOmFixture(t: TestContext, project = "garden", options?: OmFixtureOptions): Promise<OmPreparedFixture> {
-  return options === undefined ? createOmFixture(t, "cross", project) : createOmFixture(t, "cross", project, options);
+export function createCrossOmFixture(t: TestContext, project: string, options: { mode: "executed" }): Promise<OmFixture>;
+export async function createCrossOmFixture(t: TestContext, project = "garden", options: OmFixtureOptions): Promise<OmPreparedFixture> {
+  return createOmFixture(t, "cross", project, options);
 }
 
 /**

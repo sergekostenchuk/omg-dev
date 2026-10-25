@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { canonical, hashJson } from "../src/canonical.js";
@@ -147,9 +148,9 @@ test("missing, forged and masquerading fixture inputs are rejected at their exac
   };
   for (const value of [null, 42, {}, "unknown"]) assert.throws(() => gardenGraph(value as never), invalid("/variant"));
   for (const value of [null, 42, {}, "", "foreign/project"]) assert.throws(() => gardenGraph("standard", value as never), invalid("/project"));
-  for (const value of [undefined, null, {}, 42]) await assert.rejects(createOmFixture(value as never), invalid("/t"));
-  await assert.rejects(createOmFixture(t, null as never), invalid("/variant"));
-  await assert.rejects(createCrossOmFixture(t, null as never), invalid("/project"));
+  for (const value of [undefined, null, {}, 42]) await assert.rejects(createOmFixture(value as never, "standard", "garden", { mode: "executed" }), invalid("/t"));
+  await assert.rejects(createOmFixture(t, null as never, "garden", { mode: "executed" }), invalid("/variant"));
+  await assert.rejects(createCrossOmFixture(t, null as never, { mode: "executed" }), invalid("/project"));
   const malformed = structuredClone(fixture.graph);
   delete (malformed.nodes[0] as Partial<(typeof malformed.nodes)[number]>).title;
   assert.ok(validateGraph(malformed).findings.some(finding => finding.code === "graph_shape" && finding.target === "/nodes/0"));
@@ -333,12 +334,67 @@ test("LG01a executed uses accepted L3 and M8 M9 with real committed runs and rec
 });
 
 test("LG01a missing and masquerading modes fail before creating a fixture", async t => {
+  const invalid = (error: unknown) => error instanceof EngineError && error.code === OM_FIXTURE_ERROR
+    && canonical(error.details) === canonical({ target: "/mode" });
   for (const options of [null, {}, { mode: null }, { mode: "unknown" }, 1, [], "", "must-never-load-this-era", "stages", "n2", "executed"]) {
-    const invalid = (error: unknown) => error instanceof EngineError && error.code === OM_FIXTURE_ERROR
-      && canonical(error.details) === canonical({ target: "/mode" });
     await assert.rejects(createOmFixture(t, "standard", "garden", options as never), invalid);
     await assert.rejects(createCrossOmFixture(t, "garden", options as never), invalid);
   }
+  // @ts-expect-error the fixture mode is required
+  await assert.rejects(createOmFixture(t, "standard", "garden"), invalid);
+  await assert.rejects(createOmFixture(t, "standard", "garden", undefined as never), invalid);
+  // @ts-expect-error the fixture mode is required
+  await assert.rejects(createCrossOmFixture(t, "garden"), invalid);
+  await assert.rejects(createCrossOmFixture(t, "garden", undefined as never), invalid);
+});
+
+test("LG01a both fixture doors refuse a missing or foreign mode before any state, file or process is made", () => {
+  const url = (name: string) => new URL(name, import.meta.url).href;
+  const probe = `
+    import processes from 'node:child_process';
+    import files from 'node:fs';
+    import { syncBuiltinESMExports } from 'node:module';
+    const effects = [];
+    for (const name of ['exec', 'execFile', 'execSync', 'execFileSync', 'spawn', 'spawnSync', 'fork']) {
+      processes[name] = () => { effects.push(name); throw new Error('A refused mode started a process through ' + name); };
+    }
+    files.mkdtempSync = () => { effects.push('mkdtempSync'); throw new Error('A refused mode created temporary state'); };
+    syncBuiltinESMExports();
+    const { createOmFixture, createCrossOmFixture } = await import(${JSON.stringify(url("./om-fixture.js"))});
+    const { EngineError } = await import(${JSON.stringify(url("../src/errors.js"))});
+    for (const name of ['mkdirSync', 'writeFileSync', 'rmSync']) {
+      files[name] = () => { effects.push(name); throw new Error('A refused mode touched the file system through ' + name); };
+    }
+    syncBuiltinESMExports();
+    const context = { after() { effects.push('after'); } };
+    const doors = {
+      createOmFixture: (...mode) => createOmFixture(context, "standard", "garden", ...mode),
+      createCrossOmFixture: (...mode) => createCrossOmFixture(context, "garden", ...mode),
+    };
+    const values = [['absent'], ['undefined', undefined], ['null', null], ['empty string', ''], ['unknown string', 'refine'],
+      ['wrong case', 'Executed'], ['number', 1], ['object', {}], ['array', ['n2']], ['function', () => 'stages']];
+    const rows = [];
+    for (const [door, call] of Object.entries(doors)) for (const [label, ...mode] of values) {
+      let returned, error;
+      try { returned = call(...mode); } catch (thrown) { error = thrown; }
+      const promise = returned instanceof Promise;
+      if (promise) await returned.then(() => { error = undefined; }, thrown => { error = thrown; });
+      rows.push({ door, label, promise, refused: error !== undefined, engine: error instanceof EngineError, code: error?.code, details: error?.details });
+    }
+    process.stdout.write(JSON.stringify({ rows, effects }) + '\\n');
+  `;
+  const child = spawnSync(process.execPath, ["--no-warnings", "--input-type=module", "-e", probe], { encoding: "utf8", timeout: 120_000 });
+  assert.ifError(child.error);
+  assert.equal(child.status, 0, child.stderr);
+  const { rows, effects } = JSON.parse(child.stdout.trim().split("\n").at(-1)!) as {
+    rows: { door: string; label: string; promise: boolean; refused: boolean; engine: boolean; code: string; details: unknown }[]; effects: string[] };
+  assert.equal(rows.length, 2 * 10);
+  for (const row of rows) {
+    const where = `${row.door} with ${row.label}`;
+    assert.deepEqual([row.refused, row.engine, row.code, row.details], [true, true, OM_FIXTURE_ERROR, { target: "/mode" }], where);
+    assert.equal(row.promise, true, `${where}: both doors refuse as a rejected promise`);
+  }
+  assert.deepEqual(effects, [], "A refused mode makes no temporary state, no file and no process");
 });
 
 // Q2.1: a check of a refusal names its code. The two helpers below are the only way the OM suites check one, so these
