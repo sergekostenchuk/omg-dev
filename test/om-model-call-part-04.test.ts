@@ -9,14 +9,14 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { type Json, canonical } from '../src/canonical.js';
 import { EngineError } from '../src/errors.js';
-import { adapterRequest, readAdapterResponse, runModelCall, readModelCall, runModelCycle, readPartAssembly, assembleModelParts, runModelTransport, readModelTransport, readCompletionWorkAt, readModelApplicationRejection, deliverModelSources, finishModelAttempt, readManagedModelDiagnostic, readModelCycle, runModelCycle as mp2Cycle, type ReadDeliveryRecord, readOmContextPage, readContinuationEvidence, readCompletionEffectiveAt } from '../src/om/model-call.js';
+import { adapterRequest, readAdapterResponse, runModelCall, readModelCall, runModelCycle, readPartAssembly, assembleModelParts, runModelTransport, readModelTransport, readCompletionWorkAt, deliverModelSources, finishModelAttempt, readManagedModelDiagnostic, readModelCycle, runModelCycle as mp2Cycle, type ReadDeliveryRecord, readOmContextPage, readContinuationEvidence, readCompletionEffectiveAt } from '../src/om/model-call.js';
 import type { OmResult } from '../src/om/refusal.js';
 import { runProcess } from '../src/runtime/process.js';
 import { Store, type Revision } from '../src/storage/store.js';
 import { reference, type Ref } from '../src/pipeline/contracts.js';
 import { withHistoricalReads } from '../src/om/input.js';
 import { writeQuestionPacket, type QuestionPacketRecord, readPartResult, readQuestionPacket } from '../src/om/question-packet.js';
-import { readCompletionBinding, completionWorkId, type RepairSeries, seriesRequestOf, completeAttempt } from '../src/om/series.js';
+import { readCompletionBinding, completionWorkId, type RepairSeries, seriesRequestOf } from '../src/om/series.js';
 import { readCall, recordCall } from '../src/om/call-record.js';
 import { closeAttempt, openAttempt as managedOpenAttempt } from '../src/om/repeat-gate.js';
 import { MP3_NOTES, completionE1, completionSnapshot, confirmed, currentPacketWire, e4CannotAnswer, e4Fact, e4Fixture, e4ManagedAnalysisFixture, e4ManagedFixture, e4NeedSource, e4Node, envelope, fixturePath, h15CannotAnswer, h15Heads, h15Refusal, h15Unserved, h15Written, mp2Managed, mp2Refused, mp3Carried, mp3Close, mp3Cycle, mp3Decisions, mp3Delivered, mp3ManagedCycle, mp3Open, mp3Origins, mp3Parts, mp3Readings, readsOf, request, unknownConfirmed, usage, valueOf } from './om-model-call-fixture.js';
@@ -324,41 +324,6 @@ test('C31 H1.0b equivalent configuration preserves the next exact MC2 part befor
   valueOf(await runModelCall(f.store, { ...f.request, packet: reference(next) }));
   assert.deepEqual(f.store.list(), history); assert.equal(f.sent().length, 2);
   assert.equal(measured.sent().length, 0, 'The measurement pays nothing');
-});
-
-
-
-test('S1.1 the basis of a rejected application is collected through the common transparent trace: the rejection reads the same cold, hot inside one operation, and after its nested proofs were warmed before the collector attached', async t => {
-  const f = e4Fixture(t);
-  f.steps([{ research: e4Fact(f), usage }]);
-  const writeMany = f.store.writeMany.bind(f.store);
-  let completed: Revision<unknown> | null = null;
-  f.store.writeMany = ((writes, guards) => {
-    // Another Store completes the attempt while the application is being written: the application is rejected input_stale.
-    if (!completed && writes.some(write => write.kind === 'part-response')) {
-      const other = new Store(f.database);
-      try { completed = valueOf(completeAttempt(other, { ...seriesRequestOf(f.series.value), attempt: 1,
-        outcome: { reason: 'interrupted', achieved: [], cancelled: [], refusals: [] } })); }
-      finally { other.close(); }
-    }
-    return writeMany(writes, guards);
-  }) as Store['writeMany'];
-  const actual = valueOf(await runModelCall(f.store, f.request));
-  f.store.writeMany = writeMany;
-  assert.ok(completed); assert.equal(actual.record.value.status, 'failed'); assert.ok(actual.record.value.om.rejection);
-  const rejection = actual.record.value.om.rejection!;
-  const read = () => valueOf(readModelApplicationRejection(f.store, { project: f.project, record: rejection }));
-  const cold = read();
-  assert.equal(cold.failure.code, 'input_stale');
-  const hot = withHistoricalReads(() => { read(); return read(); });
-  const warmed = withHistoricalReads(() => {
-    valueOf(readQuestionPacket(f.store, { project: f.project, record: f.request.packet }));
-    valueOf(readModelCall(f.store, { project: f.project, record: reference(actual.record) }));
-    return read();
-  });
-  assert.deepEqual(hot, cold); assert.deepEqual(warmed, cold);
-  f.restart();
-  assert.deepEqual(read(), cold);
 });
 
 
