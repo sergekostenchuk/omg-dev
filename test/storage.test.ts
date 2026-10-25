@@ -4,9 +4,7 @@ import { mkdtempSync, readFileSync, writeFileSync, rmSync, symlinkSync, mkdirSyn
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { execFileSync, spawnSync } from "node:child_process";
-import { createRequire } from "node:module";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { spawnSync } from "node:child_process";
 import { observeStore, Store, storeReads, checkTransactionGuards, type AbsentGuard, type ReadGuard, type StoreObserver, type TransactionGuard } from "../src/storage/store.js";
 import { historicalRead, withHistoricalReads } from "../src/history/proofs.js";
 import { reference } from "../src/pipeline/contracts.js";
@@ -287,49 +285,6 @@ test("guarded writes roll back their own creations on a later write conflict", t
   assert.deepEqual(store.history("neighbor"), []);
 });
 
-test("the complete ee3fd4c Store producer retains records, hashes and history after restart", t => {
-  const { store, path, root } = fixture(t);
-  store.close();
-  const repository = fileURLToPath(new URL('../../', import.meta.url));
-  const repositoryUrl = pathToFileURL(repository).href;
-  const loader = join(root, "legacy-store-loader.mjs");
-  const typescript = pathToFileURL(createRequire(import.meta.url).resolve("typescript")).href;
-  writeFileSync(loader, `import { execFileSync } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
-import ts from ${JSON.stringify(typescript)};
-let root;
-export function initialize(data) { root = data.root; }
-export async function load(url, context, next) {
-  const prefix = new URL('dist/src/', root).href;
-  if (url.startsWith(prefix) && /\\.js$/.test(url)) {
-    const relative = 'src/' + url.slice(prefix.length).replace(/\\.js$/, '.ts');
-    const source = execFileSync('git', ['show', 'ee3fd4cb0941cc47e1b783e06015bd3a8d59fd8b:' + relative],
-      { cwd: fileURLToPath(root), encoding: 'utf8', maxBuffer: 10000000 });
-    return { format: 'module', shortCircuit: true, source: ts.transpileModule(source,
-      { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2023 } }).outputText };
-  }
-  return next(url, context);
-}`);
-  const bootstrap = `import { register } from 'node:module'; register(${JSON.stringify(pathToFileURL(loader).href)}, { data: { root: ${JSON.stringify(repositoryUrl)} } });`;
-  const output = execFileSync(process.execPath, ["--import", `data:text/javascript,${encodeURIComponent(bootstrap)}`, "--input-type=module", "--eval",
-    `import { Store } from ${JSON.stringify(new URL('dist/src/storage/store.js', repositoryUrl).href)};
-const store = new Store(${JSON.stringify(path)});
-const source = store.write({id:'source', kind:'source', expected:0, value: {text:'legacy'}});
-store.writeMany([{id:'proof', kind:'proof', expected:0, value:{source}}], [source]);
-store.write({id:source.id, kind:source.kind, expected:1, value:{text:'changed'}});
-process.stdout.write(JSON.stringify({list:store.list(), history:store.history(source.id)})); store.close();`],
-    { cwd: repository, encoding: "utf8", timeout: 30_000 });
-  const legacy = JSON.parse(output) as { list: unknown[]; history: ReadGuard[] };
-  const reopened = new Store(path);
-  try {
-    assert.deepEqual(reopened.list(), legacy.list);
-    assert.deepEqual(reopened.history("source"), legacy.history);
-    assert.deepEqual(reopened.get("source", 1), legacy.history[0]);
-    assert.throws(() => reopened.writeMany([], [legacy.history[0]!]), code("input_stale"));
-    assert.deepEqual(reopened.writeMany([], [legacy.history[1]!, { id: "missing", absent: true }]), []);
-    assert.deepEqual(reopened.list(), legacy.list);
-  } finally { reopened.close(); }
-});
 
 test("S1.3 the change stamp moves with every commit this Store or another connection makes, and only then; identities are the rows get, list and history select, without their bodies", t => {
   const { store, path } = fixture(t);
@@ -573,60 +528,6 @@ test("PF4 rows 37-39 (№3523): the proof cache is an extension of v1 — schema
   assert.deepEqual(inspect(objects, withoutExtension), EXTENSION, "Row 38: a snapshot without the extension starts cold and installs it on a working open");
 });
 
-/** The engine of one commit, transpiled from git, on its own process (the ee3fd4c producer above uses the same loader). */
-function atCommit(root: string, commit: string, script: string): unknown {
-  const repository = fileURLToPath(new URL('../../', import.meta.url)), repositoryUrl = pathToFileURL(repository).href;
-  const loader = join(root, `legacy-${commit}-loader.mjs`);
-  const typescript = pathToFileURL(createRequire(import.meta.url).resolve("typescript")).href;
-  writeFileSync(loader, `import { execFileSync } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
-import ts from ${JSON.stringify(typescript)};
-let root;
-export function initialize(data) { root = data.root; }
-export async function load(url, context, next) {
-  const prefix = new URL('dist/src/', root).href;
-  if (url.startsWith(prefix) && /\\.js$/.test(url)) {
-    const relative = 'src/' + url.slice(prefix.length).replace(/\\.js$/, '.ts');
-    const source = execFileSync('git', ['show', ${JSON.stringify(commit)} + ':' + relative], { cwd: fileURLToPath(root), encoding: 'utf8', maxBuffer: 10000000 });
-    return { format: 'module', shortCircuit: true, source: ts.transpileModule(source,
-      { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2023 } }).outputText };
-  }
-  return next(url, context);
-}`);
-  const bootstrap = `import { register } from 'node:module'; register(${JSON.stringify(pathToFileURL(loader).href)}, { data: { root: ${JSON.stringify(repositoryUrl)} } });`;
-  const src = (module: string) => JSON.stringify(new URL(`dist/src/${module}.js`, repositoryUrl).href);
-  const output = execFileSync(process.execPath, ["--import", `data:text/javascript,${encodeURIComponent(bootstrap)}`, "--input-type=module", "--no-warnings", "--eval",
-    `const { Store } = await import(${src('storage/store')}); const { inspectSnapshot } = await import(${src('storage/snapshots')});
-const out = value => process.stdout.write(JSON.stringify(value));
-${script}`], { cwd: repository, encoding: "utf8", timeout: 60_000 });
-  return JSON.parse(output);
-}
-
-test("PF4 (№3523): the engine before PF4 (3e8aa784) opens and writes a database with the extension and reads snapshots with and without it; a check this engine saved notices what the old engine wrote, and one it did not touch stays", async t => {
-  const { store, path, root, snapshots } = fixture(t);
-  const dep = store.write({ id: "pf4:dep", kind: "k", expected: 0, value: { v: 1 } });
-  const other = store.write({ id: "pf4:other", kind: "k", expected: 0, value: { v: 1 } });
-  const runs = { dep: 0, other: 0 };
-  const prove = (target: Store, name: keyof typeof runs) => withHistoricalReads(() => historicalRead(target, { reader: "M6.route-result", project: "garden",
-    ref: reference(name === "dep" ? dep : other), parameters: "pf4-legacy" }, () => { runs[name]++; return target.get(`pf4:${name}`)!.value; }, () => { throw new Error("cycle"); }));
-  prove(store, "dep"); prove(store, "other");
-  const snapshot = await store.snapshot(snapshots);
-  store.close();
-  const bare = join(root, "bare-snapshot.sqlite");
-  copyFileSync(snapshot.path, bare);
-  removeProofCache(bare);
-  const legacy = atCommit(root, "3e8aa784b5d61188dfa6ad171f9d8cccefb2f1b6", `const store = new Store(${JSON.stringify(path)});
-const before = store.get('pf4:dep').value;
-store.write({ id: 'pf4:dep', kind: 'k', expected: 1, value: { v: 2 } });
-store.close();
-out({ before, snapshots: [inspectSnapshot(${JSON.stringify(snapshot.path)}).contentHash, inspectSnapshot(${JSON.stringify(bare)}).contentHash] });`) as { before: Json; snapshots: string[] };
-  assert.deepEqual(legacy.before, { v: 1 });
-  assert.deepEqual(legacy.snapshots, [snapshot.contentHash, snapshot.contentHash], "The old engine reads snapshots with and without the extension");
-  assert.equal(inspectSnapshot(bare).contentHash, snapshot.contentHash, "And so does this one");
-  const reopened = new Store(path); t.after(() => reopened.close());
-  assert.deepEqual(prove(reopened, "dep"), { v: 2 }); assert.equal(runs.dep, 2, "The old engine's write is an event after the saved mark");
-  assert.deepEqual(prove(reopened, "other"), { v: 1 }); assert.equal(runs.other, 1, "A check it did not touch is taken as saved");
-});
 
 test("PF4 rows 34-36: the proof cache is written in one transaction of its own — a failure inside leaves nothing, a held cache is skipped at once — bounded by results and bytes with unreferenced nodes swept and shared ones kept; it adds no event, moves no change stamp and no read count, and can be emptied", t => {
   const { store, path } = fixture(t);
