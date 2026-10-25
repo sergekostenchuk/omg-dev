@@ -128,23 +128,6 @@ function fixture(t: test.TestContext, label = "case", StoreType: typeof Store = 
   return { root, path, store, adapter, config, series, goal: attemptGoal };
 }
 
-function request(f: Fixture, over: Partial<RecordCallRequest> = {}): RecordCallRequest {
-  return {
-    call: "research-price-1",
-    purpose: "model-research",
-    basis: null,
-    block: BLOCK,
-    gaps: [
-      { id: "gap:contract", goal: "price contract", field: "contract", consumer: BLOCK },
-      { id: "gap:producer", goal: "price producer", field: "producer", consumer: BLOCK },
-    ],
-    series: reference(f.series), attempt: 1, goal: f.goal,
-    dispatch: { adapter: reference(f.adapter), config: reference(f.config) },
-    packet: { question: "who produces the price?", neighbours: ["cart", "catalogue"] },
-    ...over,
-  };
-}
-
 let unique = 0;
 const next = (): number => (unique += 1);
 
