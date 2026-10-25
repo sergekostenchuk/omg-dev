@@ -42,6 +42,45 @@ function sample(t: test.TestContext) {
   return { root, store, source, context, basis, input, payload };
 }
 
+// LG21: explicit current carrier for format tests; sample keeps the bytes of its other consumers.
+function exactBriefLabel(payload: Record<string, any>, domain: string, ref: Ref): string {
+  const label = payload.brief.labels.find((row: { domain: string; value: unknown }) =>
+    row.domain === domain && canonical(row.value) === canonical(ref));
+  assert.ok(label, `${domain}: ${canonical(ref)}`);
+  return label.label;
+}
+function currentBrief(input: Record<string, any>, basis: BriefBasis) {
+  // A fresh root has no prior deliveries: publish the explicit empty readings contract, without inventing history.
+  const payload = withReadings(deriveBrief(input, basis), { snapshots: [], entries: [] }, Number.MAX_SAFE_INTEGER);
+  assert.equal(payload.brief.contract, BRIEF_CONTENT_CONTRACT);
+  assert.deepEqual(briefReadings(payload), { contract: READINGS_CONTRACT, snapshots: [], entries: [] });
+  assert.deepEqual(basis.neighbors, { contract: NEIGHBOR_CONTRACT, works: [] });
+  assert.ok(packetPrompt(payload).includes('# Accepted work of neighbouring roots'));
+  assert.ok(packetPrompt(payload).includes(canonical(basis.neighbors)));
+  const selected = JSON.parse(packetPrompt(payload).split('# Scope and exact context\n')[1]!.split('\n')[0]!).input.selected;
+  assert.equal(selected.contract, BASIS_SPECIFICATION_CONTRACT);
+  const specification = basis.accepted.find(row => row.stage === 'specification')!;
+  const features = basis.accepted.find(row => row.stage === 'features')!;
+  assert.deepEqual(selected.contracts, [{ source: exactBriefLabel(payload, 'context', specification.ref),
+    index: 0, pointer: '/content/fields/behaviorContracts/0', value: (specification.fields.behaviorContracts as Json[])[0] }]);
+  assert.deepEqual(selected.preparations, [{ source: exactBriefLabel(payload, 'context', features.ref),
+    index: 0, featureIndex: 0, pointer: '/content/fields/featurePreparation/0', value: (features.fields.featurePreparation as Json[])[0] }]);
+  assert.deepEqual(selected.constraints, { source: exactBriefLabel(payload, 'context', specification.ref),
+    pointer: '/content/fields/constraints', value: specification.fields.constraints });
+  assert.equal(selected.bases.selected.length, 2);
+  assert.ok(selected.bases.selected.every((row: { bases: unknown[] }) => row.bases.length > 0));
+  return payload;
+}
+function currentSample(t: test.TestContext) {
+  const f = selectionBasis(t);
+  const basis: BriefBasis = { ...f.basis, briefContract: BRIEF_CONTENT_CONTRACT, selection: BASIS_BRIEF_SELECTION_CONTRACT,
+    neighbors: { contract: NEIGHBOR_CONTRACT, works: [] },
+    input: { ...f.basis.input as object, requirements: f.sections.flatMap(section => section.requirements) } as Json };
+  const input = { ...f.input, questions: f.input.questions.map(question => ({ ...question,
+    contract: { ...question.contract, requirements: ['garden-R1'] } })) };
+  return { ...f, basis, input, payload: currentBrief(input, basis) };
+}
+
 test('MP1 №3066 flow identity stays byte-exact in the lower module; the public frame wrapper still validates', () => {
   for (const level of [1, 2, 3] as const) for (const anchor of [null, 'sleep:harvest']) {
     const binding = { level, producer: { node: 'garden-produce', port: 'out' },
@@ -127,7 +166,7 @@ test('MP1 №3041 bounded examples obey the complete result schema or are explic
 });
 
 test('MP1 wire hashes full P but measures T in UTF-16 and UTF-8; encoder rejects malformed declared forms without a fallback', t => {
-  const { payload } = sample(t), text = packetPrompt(payload, 'brief-request');
+  const { payload } = currentSample(t), text = packetPrompt(payload, 'brief-request');
   assert.notEqual(text, canonical(payload));
   assert.deepEqual(packetFingerprint(payload), { hash: hashJson(payload), chars: text.length, utf8Bytes: Buffer.byteLength(text) });
   assert.ok(Buffer.byteLength(text) > text.length);
@@ -144,6 +183,9 @@ test('MP1 wire hashes full P but measures T in UTF-16 and UTF-8; encoder rejects
       (error: unknown) => error instanceof EngineError && error.code === 'packet_brief_invalid');
   assert.throws(() => packetPrompt(payload, 'foreign'));
   assert.throws(() => packetPrompt({ ...payload, version: 'om-question-packet/brief-v2' }));
+});
+
+test('LG21 named standalone remainder: v3 and canonical packet fallbacks retain their own wire', () => {
   const old = { version: 'om-question-packet/v3', requestId: 'old', brief: { text: 'not a selector' } };
   assert.equal(packetPrompt(old), canonical(old));
   for (const oldPacket of [{ version: 'assessment/v1' }, { version: 'stop-analysis/v1' }, { version: 'origin-analysis/v1' }])
@@ -151,10 +193,10 @@ test('MP1 wire hashes full P but measures T in UTF-16 and UTF-8; encoder rejects
 });
 
 test('MP1 label domains are explicit; paths, values and selectors stay literal and duplicates survive', t => {
-  const { payload, source, context } = sample(t);
+  const { payload, source, context } = currentSample(t);
   const labels = payload.brief.labels as { domain: string; value: unknown; label: string }[];
-  const sourceLabel = labels.find(label => label.domain === 'source')!.label;
-  const contextLabel = labels.find(label => label.domain === 'context')!.label;
+  const sourceLabel = exactBriefLabel(payload, 'source', reference(source));
+  const contextLabel = exactBriefLabel(payload, 'context', reference(context));
   const q = labels.find(label => label.domain === 'question')!.label;
   const raw = { protocol: 'omg-answer/v3', requestId: payload.requestId, action: 'need_source', questionIds: [q, q], missing: 'literal S1', reads: [
     { action: 'read', path: 'S1', media: 'text/plain' }, { action: 'search', within: 'S1', query: 'S1' },
@@ -181,11 +223,13 @@ test('MP1 label domains are explicit; paths, values and selectors stay literal a
 });
 
 test('MP1 observed catalogue is reproducible, rejects missing references, preserves foreign JSON and never reads files', t => {
-  const { payload, basis, store, root, source } = sample(t);
+  const { payload, basis, store, root, source } = currentSample(t);
   const reversed = { ...basis, material: { ...basis.material, sources: [...basis.material.sources].reverse() } };
-  assert.deepEqual(deriveBrief({ ...payload, responseForm: { ...payload.responseForm, schema: packetAnswerSchema('fact') } }, reversed), payload);
-  assert.equal(payload.brief.manifest[0].unit, 'UTF-16');
-  assert.equal(payload.brief.manifest[0].length, source.value.content.length);
+  assert.deepEqual(currentBrief({ ...payload, responseForm: { ...payload.responseForm, schema: packetAnswerSchema('fact') } }, reversed), payload);
+  const entry = payload.brief.manifest.find((row: { source: Ref }) => canonical(row.source) === canonical(reference(source)));
+  assert.ok(entry);
+  assert.equal(entry.unit, 'UTF-16');
+  assert.equal(entry.length, source.value.content.length);
   const saved = briefMaterial(store, 'garden', root, false, [reference(source)]);
   new Evidence(store).document('garden', 'other', 'new, not reselected', 'text/plain', 0);
   assert.deepEqual(briefMaterial(store, 'garden', root, false, [reference(source)]), saved);
@@ -194,9 +238,9 @@ test('MP1 observed catalogue is reproducible, rejects missing references, preser
 });
 
 test('MP1 per-question wire schema accepts source labels and rejects raw references', t => {
-  const { payload } = sample(t), schema = new Ajv({ strict: true, allowUnionTypes: true }).compile(payload.responseForm.schema);
+  const { payload, source } = currentSample(t), schema = new Ajv({ strict: true, allowUnionTypes: true }).compile(payload.responseForm.schema);
   const q = payload.brief.labels.find((label: { domain: string }) => label.domain === 'question').label;
-  const d = payload.brief.labels.find((label: { domain: string }) => label.domain === 'source').label;
+  const d = exactBriefLabel(payload, 'source', reference(source));
   const reply = { protocol: 'omg-answer/v3', requestId: payload.requestId, action: 'answer', results: [
     { questionId: q, value: 'UTF-8', citations: [{ source: d, selector: { kind: 'text-range', start: 0, end: 1 } }] },
   ] };
@@ -266,7 +310,7 @@ test('MP2 (№2968 rows 7, 19) a brief without a correction or neighbours is the
 });
 
 test('MP1 material selection uses generic graph anchors, two importing tests, one-hop dependencies and a fixed observed catalogue', t => {
-  const f = sample(t), evidence = new Evidence(f.store);
+  const f = currentSample(t), evidence = new Evidence(f.store);
   const files: Record<string, string> = {
     'src/harvest.ts': 'import { rain } from "./weather.js"; export const crop = rain;',
     'src/weather.ts': 'import "./deep.js"; export const rain = true;', 'src/deep.ts': 'export const deeper = true;',
@@ -280,22 +324,22 @@ test('MP1 material selection uses generic graph anchors, two importing tests, on
   const graph = structuredClone(f.basis.graph);
   graph.nodes.find(node => node.id === f.basis.node)!.code = [{ path: 'src/harvest.ts', access: 'read', status: 'existing' }];
   const basis = { ...f.basis, graph, material: briefMaterial(f.store, 'garden', f.root, false) };
-  const packet = deriveBrief(f.input, basis), manifest = packet.brief.manifest as { path: string; completeness: string }[];
+  const packet = currentBrief(f.input, basis), manifest = packet.brief.manifest as { path: string; completeness: string }[];
   assert.deepEqual(manifest.filter(row => row.completeness === 'whole').map(row => row.path).sort(),
     ['package.json', 'src/harvest.ts', 'src/weather.ts', 'test/a.test.ts', 'test/b.test.ts']);
   const reversed = { ...basis, material: { ...basis.material, sources: [...basis.material.sources].reverse(), references: [...basis.material.references].reverse() } };
-  assert.deepEqual(deriveBrief(f.input, reversed), packet);
+  assert.deepEqual(currentBrief(f.input, reversed), packet);
   assert.equal(manifest.find(row => row.path === 'src/deep.ts')!.completeness, 'omitted');
   assert.equal(manifest.find(row => row.path === 'test/c.test.ts')!.completeness, 'omitted');
   assert.ok(packet.brief.text.includes('bounded heuristic'));
-  const bare = deriveBrief(f.input, { ...basis, materialBudget: 0 });
+  const bare = currentBrief(f.input, { ...basis, materialBudget: 0 });
   assert.ok(bare.brief.manifest.every((row: { completeness: string }) => row.completeness === 'omitted'));
   assert.equal(bare.brief.labels.length, packet.brief.labels.length, 'Budget omission never removes the address for an exact read');
 });
 
 
 test('MP1 complete Codex adapter prefix preserves LP2 paths and explains source/context label aliases before the answer', t => {
-  const f = sample(t), home = join(f.root, 'fixture-home'), personal = join(home, '.codex'), bin = join(f.root, 'bin'), temp = join(f.root, 'tmp');
+  const f = currentSample(t), home = join(f.root, 'fixture-home'), personal = join(home, '.codex'), bin = join(f.root, 'bin'), temp = join(f.root, 'tmp');
   for (const dir of [personal, bin, temp]) mkdirSync(dir, { recursive: true });
   writeFileSync(join(personal, 'config.toml'), 'model_catalog_json="/fixture/models.json"\nopenai_base_url="http://127.0.0.1:11435/api/codex/v1"\n');
   writeFileSync(join(personal, 'auth.json'), '{"auth_mode":"chatgpt","tokens":{"access_token":"FICTITIOUS-MP1"}}');
@@ -325,7 +369,7 @@ console.log(JSON.stringify({type:'turn.completed',usage:{input_tokens:10,output_
 });
 
 test('MP1 №3045 planned accepted entrypoints select saved anchor code and imports; field consumers select their block; text exposes meanings, not private Ref values', t => {
-  const f = sample(t), evidence = new Evidence(f.store);
+  const f = currentSample(t), evidence = new Evidence(f.store);
   const files: Record<string, string> = {
     'src/submit.ts': 'import { check } from "./check.js"; export const submit = check;',
     'src/check.ts': 'export const check = true;',
@@ -344,7 +388,7 @@ test('MP1 №3045 planned accepted entrypoints select saved anchor code and impo
   for (const fieldConsumer of [false, true]) {
     const basis = { ...f.basis, graph, material, node: fieldConsumer ? null : f.basis.node };
     const input = { ...f.input, questions: f.input.questions.map(question => ({ ...question, consumers: [f.basis.node!] })) };
-    const packet = deriveBrief(input, basis);
+    const packet = currentBrief(input, basis);
     assert.equal(accepted.contract!.entrypoint.status, 'planned');
     assert.equal(packet.brief.manifest.find((row: { source: Ref }) => row.source.id === document.id).completeness, 'whole');
     assert.ok(packet.brief.text.includes(document.value.content));
@@ -754,7 +798,8 @@ test('RB1 (№4343): a decision B1 applied reaches a v3 brief by the works and p
 });
 
 // ---- SP1a (№4714): the selected specification is a mandatory part of the brief scope, only in the selection era ----
-import { boundedBrief, BRIEF_SELECTION_CONTRACT } from '../src/om/packet-brief.js';
+import { boundedBrief, BRIEF_SELECTION_CONTRACT, BASIS_BRIEF_SELECTION_CONTRACT } from '../src/om/packet-brief.js';
+import { BASIS_SPECIFICATION_CONTRACT } from '../src/om/selected-specification.js';
 import { preparedField } from './preparation-fixture.js';
 import { discoveryBasisCatalogue } from '../src/discovery/discovery-outcome.js';
 import { conceptApplicationFindings, specificationApplicationFindings } from '../src/discovery/preparation-validation.js';
