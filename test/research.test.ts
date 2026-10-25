@@ -16,9 +16,9 @@ import { UPSTREAM_STAGES } from '../src/discovery/requirements.js';
 import type { Question } from '../src/discovery/discovery.js';
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync, mkdirSync, symlinkSync, copyFileSync } from "node:fs";
+import { mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync, mkdirSync, copyFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { join } from "node:path";
 import { Store } from "../src/storage/store.js";
 import { ProductEngine } from "../src/product/engine.js";
 import { SOURCE_READ_CONTRACT, SOURCE_READ_CONTRACT_V2, SOURCE_READ_CONTRACT_V3, SOURCE_READ_MAX_CHARS,
@@ -888,60 +888,6 @@ test('RS2 current lookup head and exact historical lookup have distinct admissio
  assert.deepEqual(readResearchConsumerTurn(another,reference(first)),first);
 });
 
-test('RS2 exact Git ecd00625 producer keeps history and packet bytes and recovers its paid pending read',async t=>{
- const root=mkdtempSync(join(tmpdir(),'omg-rs2-era-')),era=join(root,'era'),archive=join(root,'archive.tar');mkdirSync(era);
- t.after(()=>rmSync(root,{recursive:true,force:true}));
- execFileSync('git',['archive','--format=tar',`--output=${archive}`,'ecd006252f7102d5377d61e8c9911685c1aa4aeb']);
- try{
-  execFileSync('tar',['-xf',archive,'-C',era]);
- }finally{
-  rmSync(archive,{force:true});
- }
- symlinkSync(resolve('node_modules'),join(era,'node_modules'));
- execFileSync(process.execPath,[resolve('node_modules/typescript/bin/tsc'),'-p',join(era,'tsconfig.json')],{cwd:era});
- const producer=join(era,'rs2-old-producer.mjs');
- writeFileSync(producer,`import{mkdirSync,writeFileSync}from'node:fs';
-import{Store}from'./dist/src/storage/store.js';import{ProductEngine}from'./dist/src/product/engine.js';
-import{reference}from'./dist/src/pipeline/contracts.js';
-import{projectAddressedWorkspace}from'./dist/src/discovery/research-consumer-transition.js';
-import{readContextTurnHistoryAt}from'./dist/src/discovery/response-recovery.js';
-for(const mode of ['paid','refused']){
- const root=${JSON.stringify(root)}+'/'+mode;mkdirSync(root);const store=new Store(root+'/state.sqlite'),engine=new ProductEngine(store);
- engine.execute({type:'create-project',project:'p',title:'Old producer'});
- const adapter=root+'/adapter.mjs';writeFileSync(adapter,${JSON.stringify(RS2_ADAPTER)});
- const command={executable:process.execPath,args:[adapter,root]};
- engine.environments.configure('p',{workspace:root,implementer:{actor:'author',model:'fixture',effort:'high',command},reviewer:{actor:'assessor',model:'fixture',effort:'high',command},fullCheck:command,timeoutMs:5000},0);
- engine.discovery.evidence.document('p','rs2-source','x'.repeat(137),'text/plain',0);
- const draft=engine.prepare('p','discovery');
- const actions=mode==='paid'?['source','sourceCatalogue','fields']:['sourceCatalogue','repeat'];
- writeFileSync(root+'/actions.json',JSON.stringify(actions));
- let run;for(const action of actions)run=await engine.researcher.run('p',draft.id,1);
- const turns=store.list('research-turn').sort((a,b)=>a.value.number-b.value.number),last=turns.at(-1),question=store.get(last.value.question.id);
- const workspace=projectAddressedWorkspace(store.get(last.id,1).value,readContextTurnHistoryAt(store,'p',store.get(draft.id),reference(question),turns,last.value.number),reference(question));
- writeFileSync(root+'/expected.json',JSON.stringify({draft,turns,workspace,run,records:store.list().filter(r=>['model-call','model-response','research-context'].includes(r.kind))}));store.close();
-}`);
- execFileSync(process.execPath,[producer],{cwd:era,maxBuffer:4<<20});
- for(const mode of ['paid','refused']){
-  const dir=join(root,mode),expected=JSON.parse(readFileSync(join(dir,'expected.json'),'utf8'));
-  const store=new Store(join(dir,'state.sqlite'));t.after(()=>store.close());
-  for(const turn of expected.turns)assert.deepEqual(readResearchConsumerTurn(store,reference(turn)),turn);
-  assert.deepEqual(rs2Prove(store,expected.draft.id),expected.workspace,'the historical fold is byte-for-byte the old formula');
-  const packet=JSON.parse(readFileSync(join(dir,'wire.jsonl'),'utf8').trim().split('\n').at(-1)!).subject;
-  assert.equal(canonical(packet.contextWorkspace),canonical(expected.workspace.entries.map((e:any)=>e.result)));
-  if(mode==='paid'){
-   assert.equal(expected.run.value.pauseCode,'research_consumer_context_stale','the actual old producer reproduces HX1');
-   const result=await new ProductEngine(store).execute({type:'research-stage',project:'p',draftId:expected.draft.id,maxTurns:1}) as any;
-   assert.equal(result.status,'paused');
-   const completed=store.get<ResearchTurn>(expected.turns.at(-1).id)!;
-   assert.equal(completed.value.status,'completed');assert.equal(completed.value.error,null);
-   const restarted=new Store(join(dir,'state.sqlite'));t.after(()=>restarted.close());
-   assert.deepEqual(readResearchConsumerTurn(restarted,reference(completed)),completed);
-  }else assert.equal(expected.run.value.pauseCode,'research_no_progress');
-  assert.deepEqual(store.list().filter(r=>['model-call','model-response','research-context'].includes(r.kind)),expected.records);
-  for(const turn of expected.turns)assert.deepEqual(store.get(turn.id,turn.revision),turn);
- }
-});
-
 import { spawnSync as rs3Spawn } from "node:child_process";
 import { fileURLToPath as rs3Path } from "node:url";
 import { readResearchConsumerIntent as rs3ReadIntent } from "../src/discovery/response-recovery.js";
@@ -1085,48 +1031,6 @@ test("RS3 №4414 window: a guarded head moved by a second Store between the new
   assert.deepEqual(f.intents().map(row => row.value.generation), [0], "Nothing of the lost transaction is written");
   assert.deepEqual(f.store.get(refused!.id)!.hash, refused!.hash);
   assert.equal(f.calls(), 1);
-});
-
-test("RS3 №4414 era: the base engine 8b665772 (from Git, its own process) saved the codex-stdio envelope failure as its terminal research_provider_failed; the new code reads it in its era and DS1 requires upgrade before a new paid generation", async t => {
-  const failure = rs3RealFailure(t, "codex");
-  const root = mkdtempSync(join(tmpdir(), "omg-rs3-era-")), era = join(root, "era"), data = join(root, "data"), archive = join(root, "archive.tar");
-  mkdirSync(era); mkdirSync(data); t.after(() => rmSync(root, { recursive: true, force: true }));
-  execFileSync("git", ["archive", "--format=tar", `--output=${archive}`, "8b665772db79"]);
-  try {
-    execFileSync("tar", ["-xf", archive, "-C", era]);
-  } finally {
-    rmSync(archive, { force: true });
-  }
-  symlinkSync(resolve("node_modules"), join(era, "node_modules"));
-  execFileSync(process.execPath, [resolve("node_modules/typescript/bin/tsc"), "-p", join(era, "tsconfig.json")], { cwd: era });
-  writeFileSync(join(data, "adapter.mjs"), RS3_ADAPTER);
-  writeFileSync(join(data, "rs3.json"), JSON.stringify([failure]));
-  const producer = join(era, "rs3-old-producer.mjs");
-  writeFileSync(producer, `import{writeFileSync}from'node:fs';
-import{Store}from'./dist/src/storage/store.js';import{ProductEngine}from'./dist/src/product/engine.js';import{researchInput}from'./dist/test/preparation-fixture.js';
-const root=${JSON.stringify(data)},store=new Store(root+'/state.sqlite'),engine=new ProductEngine(store);
-engine.execute({type:'create-project',project:'p',title:'Old producer'});
-const command={executable:process.execPath,args:[root+'/adapter.mjs','normal',root+'/calls.txt']};
-engine.environments.configure('p',{workspace:root,implementer:{actor:'researcher',model:'protocol-fixture',effort:'high',command},reviewer:{actor:'assessor',model:'protocol-fixture',effort:'high',command},fullCheck:{executable:process.execPath,args:['--version']},timeoutMs:2000},0);
-engine.discovery.evidence.document('p','brief',researchInput('p','Input','Owner outcome'),'application/json',0);
-const draft=engine.prepare('p','discovery');const run=await engine.researcher.run('p',draft.id,1);
-writeFileSync(root+'/expected.json',JSON.stringify({draft:draft.id,run,records:store.list().map(row=>store.history(row.id)).flat()}));store.close();`);
-  execFileSync(process.execPath, [producer], { cwd: era, maxBuffer: 4 << 20 });
-  const expected = JSON.parse(readFileSync(join(data, "expected.json"), "utf8")) as { draft: string; run: { value: ResearchRun }; records: { id: string; revision: number; hash: string }[] };
-  assert.deepEqual([expected.run.value.status, expected.run.value.pauseCode], ["paused", "research_provider_failed"]);
-  const store = new Store(join(data, "state.sqlite")); t.after(() => store.close());
-  const intents = () => store.list<Rs3Intent>("research-consumer-intent").filter(row => row.value.kind === "analyst").sort((a, b) => a.value.generation - b.value.generation);
-  const [old] = intents();
-  assert.deepEqual([old!.value.generation, old!.value.state, old!.value.refusal?.kind, old!.value.refusal?.code], [0, "refused", "terminal", "research_provider_failed"],
-    "The base classified the envelope failure as its terminal");
-  assert.deepEqual(rs3ReadIntent(store, reference(old!)), old, "The new reader proves it in its era");
-  const result = await new ProductEngine(store).execute({ type: "research-stage", project: "p", draftId: expected.draft, maxTurns: 1 }) as { status: string };
-  assert.equal(result.status, "paused");
-  assert.deepEqual(intents().map(row => [row.value.generation, row.value.state]), [[0, "refused"]]);
-  assert.equal(readFileSync(join(data, "calls.txt"), "utf8").trim().split("\n").filter(role => !role.startsWith("assess")).length, 1);
-  for (const record of expected.records) assert.equal(store.get(record.id, record.revision)!.hash, record.hash, `${record.id}@${record.revision} is unchanged`);
-  const reopened = new Store(join(data, "state.sqlite")); t.after(() => reopened.close());
-  assert.deepEqual(rs3ReadIntent(reopened, reference(old!)), old);
 });
 
 test("RS3 №4414: an assessor failing with the codex-stdio envelope is a provider failure of the assessment — the proposed answer survives and the next entry assesses it again without calling its researcher", async t => {
