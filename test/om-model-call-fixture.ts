@@ -692,12 +692,6 @@ export function completionE1(f: ReturnType<typeof e4Fixture>, packet = f.packet,
 
 
 
-export const H15_BASE_COMMIT = '479b307f8aa3d43745f5313c1f5c8a712bd7d55a';
-
-
-export const H10A_COMMIT = '7aa19cc95adc5c94152c17425d17b6e88d64617f';
-
-
 export const h15CannotAnswer = { protocol: 'omg-answer/v2', requestId: '$requestId', action: 'cannot_answer', code: 'cannot_answer', message: 'never needed' };
 
 
@@ -821,22 +815,6 @@ export function mp2Step(f: ReturnType<typeof e4Fixture>, step: { record: Ref }) 
 
 
 export const mp2Managed = (t: TestContext, capacity = 100_000, retry = false) => e4Fixture(t, 'node', capacity, 0, 1000, true, true, false, undefined, undefined, retry);
-
-
-
-/** The accepted MP1 producer (its merged commit) and the base before it. */
-export const MP1_COMMIT = '5ccc463e8c8520019a10e2ab52761650b4817cfd', MP2_BASE_COMMIT = 'dd5fc67dec910d3c26c6516c0c2ebfc60413f981';
-
-
-/** A managed node fixture whose root packet is issued by the given producer in its own process, not by this code. */
-export function mp2IssuedBy(t: TestContext, commit: string) {
-  const f = e4Fixture(t, 'node', 100_000, 0, 1000, true, false);
-  const issued = h15AtCommit(f, commit, `mp2-packet-${commit.slice(0, 7)}`, `const { writeQuestionPacket } = await import(src('om/question-packet.js'));
-const { runModelCall } = await import(src('om/model-call.js'));
-out(reference(take(writeQuestionPacket(store, args)).record));`, f.packetRequest) as Ref;
-  const packet = f.store.get<QuestionPacketRecord>(issued.id)!;
-  return { f, packet, request: { ...f.request, packet: issued } };
-}
 
 
 
@@ -991,74 +969,6 @@ export const mp3DecisionOf = (packet: { value: { packet: unknown } }, delivery: 
 
 
 export const MP3_SCOPES = [['empty directory', {}], ['non-empty directory', { 'a.txt': 'alpha' }]] as const;
-
-
-
-/**
- * MP3 era (№2981 §7): the accepted MP1 producer from Git — its engine and its own fixtures, in a process of its own — runs a
- * managed attempt that delivers an addressed read and is refused, and G7 closes it. Nothing of it is imitated here.
- */
-export function mp3PriorAttempt(t: TestContext, commit: string) {
-  const directory = mkdtempSync(join(tmpdir(), 'omg-mp3-prior-'));
-  t.after(() => rmSync(directory, { recursive: true, force: true }));
-  const repository = fileURLToPath(new URL('../../', import.meta.url)), repositoryUrl = pathToFileURL(repository).href;
-  const loader = join(directory, 'prior-loader.mjs');
-  const typescript = pathToFileURL(createRequire(import.meta.url).resolve('typescript')).href;
-  writeFileSync(loader, `import { execFileSync } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
-import ts from ${JSON.stringify(typescript)};
-let root;
-export function initialize(data) { root = data.root; }
-export async function load(url, context, next) {
-  const prefix = new URL('dist/', root).href;
-  if (!url.startsWith(prefix) || !/\\.js$/.test(url)) return next(url, context);
-  const relative = url.slice(prefix.length).replace(/\\.js$/, '.ts');
-  let source = execFileSync('git', ['show', ${JSON.stringify(commit + ':')} + relative], { cwd: fileURLToPath(root), encoding: 'utf8', maxBuffer: 20000000 });
-  if (relative === 'test/om-model-call.test.ts') {
-    source = source.replace('import test from "node:test";', 'const test = Object.assign(() => {}, { skip() {}, only() {} });');
-    source += '\\nexport { e4Fixture, e4NeedSource, e4CannotAnswer, completionSnapshot };';
-  }
-  return { format: 'module', shortCircuit: true, source: ts.transpileModule(source,
-    { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2023 } }).outputText };
-}
-`);
-  const bootstrap = `import { register } from 'node:module'; register(${JSON.stringify(pathToFileURL(loader).href)}, { data: { root: ${JSON.stringify(repositoryUrl)} } });`;
-  const script = `
-const root = ${JSON.stringify(repositoryUrl)}, src = name => new URL('dist/src/' + name, root).href;
-const fixtures = await import(new URL('dist/test/om-model-call.test.js', root).href);
-const { reference } = await import(src('pipeline/contracts.js'));
-const { runModelCycle } = await import(src('om/model-call.js'));
-const { closeAttempt } = await import(src('om/repeat-gate.js'));
-const { seriesRequestOf } = await import(src('om/series.js'));
-const { Evidence } = await import(src('evidence/evidence.js'));
-const { writeFileSync } = await import('node:fs'), { join } = await import('node:path');
-const take = result => { if (!result.ok) throw Error(JSON.stringify(result.refusal)); return result.value; };
-const f = fixtures.e4Fixture({ after() {} }, 'fact', 100000, 0, 5000, true, true, false, undefined, (store, project, folder) => {
-  writeFileSync(join(folder, 'mp3-notes.txt'), ${JSON.stringify(MP3_NOTES)});
-  new Evidence(store).file(project, 'mp3-notes', folder, 'mp3-notes.txt', 'text/plain', 0);
-});
-const notes = f.store.get('source:' + f.project + ':mp3-notes');
-const need = { ...fixtures.e4NeedSource(f, [{ action: 'read_source', source: reference(notes), selector: { kind: 'text-range', start: 0, end: 9 } }]),
-  questionIds: f.packet.value.packet.questions.map(question => question.id) };
-f.steps([{ research: need }, { research: fixtures.e4CannotAnswer(f) }]);
-const cycle = take(await runModelCycle(f.store, f.request));
-const work = fixtures.completionSnapshot(f);
-take(closeAttempt(f.store, { ...seriesRequestOf(f.series.value), attempt: 1, outcome: { reason: 'refused', accepting: [], cancelling: [], refusals: work.refusals } }));
-process.stdout.write(JSON.stringify({ root: f.root, database: f.database, project: f.project, packetRequest: f.packetRequest, routes: reference(f.routes),
-  batch: f.batch.id, series: f.series.id, notes: reference(notes), cycle: reference(cycle.record), packet: reference(f.packet), scenario: f.scenario }));
-f.store.close();
-`;
-  const output = JSON.parse(execFileSync(process.execPath, ['--import', `data:text/javascript,${encodeURIComponent(bootstrap)}`,
-    '--input-type=module', '--eval', script], { cwd: repository, encoding: 'utf8', maxBuffer: 20_000_000 })) as {
-    root: string; database: string; project: string; packetRequest: QuestionPacketRequest; routes: Ref; batch: string; series: string;
-    notes: Ref; cycle: Ref; packet: Ref; scenario: string };
-  t.after(() => rmSync(output.root, { recursive: true, force: true }));
-  return output;
-}
-
-
-// The code before MP3 — merged MP1 and MP2 (om/module 08be75a7).
-export const MP3_PRIOR_COMMIT = '08be75a785bac8d2cc88efe930dc05be9ffd4cc6';
 
 
 
