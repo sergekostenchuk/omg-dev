@@ -20,7 +20,7 @@ import { writeGuarded } from "../src/om/refs.js";
 import type { OmResult, Refusal } from "../src/om/refusal.js";
 import { collectGaps, gateGaps, gapId, prepareGaps, prepareCurrentGaps, writeGaps, readGaps, GAP_REFUSAL_CODES,
   type GapSources, type GapCollection, type GapRequest, type GapReadRequest, type GapRecord } from "../src/om/gaps.js";
-import { gardenGraph, createOmFixture, type OmFixture } from "./om-fixture.js";
+import { gardenGraph, createOmFixture, type OmFixture, type OmPreparedFixture } from "./om-fixture.js";
 import { preparedFeatures } from "./product-fixture.js";
 import { answerTechnicalFixture } from "./technical-research-fixture.js";
 import { answerLayerFixture } from "./layer-design-fixture.js";
@@ -107,16 +107,20 @@ function currentRequest(f: OmFixture): GapRequest & { works: ProposalRequest } {
     upper: level === 2 ? null : { horizon: reference(horizon.gate), frame: upperFrame } } });
   return { project: f.project, input: reference(input), graph: reference(f.graphRevision), horizon: reference(horizon.gate), operations: frame(2), works: frame(3) };
 }
-function nativeRequest(f: OmFixture): GapRequest & { works: ProposalRequest } {
-  const input = delivered(writeOmInput(f.store, { project: f.project, expected: 0,
-    stages: Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(f.stages[stage])])) as Record<UpstreamStage, Ref> }));
+/** Several independent gap records of the current producer: an n2 fixture's own input, its accepted L2 frame and
+ * the still-open works obligations of its L3 (the current unaccepted-works request, workZoneContract accepted-l2-v1). */
+function unsealedRequest(f: OmPreparedFixture): GapRequest & { works: ProposalRequest } {
+  const input = f.store.get<OmInputRecord>(`om-input:${f.project}`)!;
+  const upperFrame = reference(f.store.get(`om-frame:${f.project}:2`)!);
   const horizon = delivered(writeHorizon(f.store, { project: f.project, input: reference(input), graph: reference(f.graphRevision),
-    refinement: reference(f.store.get(`phase:${f.project}:L2`)!), available: {},
+    refinement: reference(f.layers[2]), available: {},
     choice: { choiceVersion: "gaps-choice", features: [{ outcome: "garden-result" }], excluded: [] } }));
-  const frame = (level: FrameLevel): ProposalRequest => ({ proposals: [], frame: { project: f.project, level,
-    graph: reference(f.graphRevision), horizon: reference(horizon.gate), layer: reference(f.layers[level]), frame: null,
-    upper: level === 2 ? null : { horizon: reference(horizon.gate), frame: null } } });
-  return { project: f.project, input: reference(input), graph: reference(f.graphRevision), horizon: reference(horizon.gate), operations: frame(2), works: frame(3) };
+  const operations: ProposalRequest = { proposals: [], frame: { project: f.project, level: 2, graph: reference(f.graphRevision),
+    horizon: reference(horizon.gate), layer: reference(f.layers[2]!), frame: upperFrame, upper: null } };
+  const works: ProposalRequest = { proposals: [], frame: { project: f.project, level: 3, graph: reference(f.graphRevision),
+    horizon: reference(horizon.gate), layer: null, frame: null,
+    upper: { horizon: reference(horizon.gate), frame: upperFrame }, workZoneContract: "accepted-l2-v1" } };
+  return { project: f.project, input: reference(input), graph: reference(f.graphRevision), horizon: reference(horizon.gate), operations, works };
 }
 
 test("S1 D1 shares the full historical set only inside one operation and keeps current admission fresh", async t => {
@@ -191,7 +195,7 @@ test("D1 rejects a current request corrupted to the previous-era shape, on read 
 });
 
 test("S1 D1 separates semantic Store views and never caches a failed historical read", { todo: "NR1 №3591: записанное не перепроверяется при чтении — проверка была у производителя при записи" }, async t => {
-  const f = await createOmFixture(t), saved = delivered(writeGaps(f.store, nativeRequest(f)));
+  const f = await createOmFixture(t, "standard", "garden", { mode: "executed" }), saved = delivered(writeGaps(f.store, currentRequest(f)));
   const request: GapReadRequest = { sources: clone(saved.sources) as GapRequest, records: saved.records.map(reference) };
   const sentinel = new Error("historical storage failure");
   let failRead = true, gets = 0;
@@ -593,8 +597,13 @@ test("native D1 prepares without writes, persists exact B1 and C3 sources and re
   assert.ok(Object.isFrozen(saved.records[0]!.value.gap.evidence));
 });
 
+test("a current request supplies several independent gap records including the missing inventory", async t => {
+  const f = await createOmFixture(t, "standard", "garden", { mode: "n2" }), saved = delivered(writeGaps(f.store, unsealedRequest(f)));
+  assert.ok(saved.records.length > 1, "the current preparation supplies several independent gaps");
+  assert.ok(saved.records.some(row => row.value.gap.code === "inventory_missing"), "the missing inventory is one of them");
+});
 test("stored gap history survives source and graph heads plus reopen while G4 rejects missing or self-consistent forged records", { todo: "NR1 №3646: согласованная перезапись цепочки до новейшей записи — om-fsck её не видит; решение позже" }, async t => {
-  const f = await createOmFixture(t), request = nativeRequest(f), saved = delivered(writeGaps(f.store, request));
+  const f = await createOmFixture(t, "standard", "garden", { mode: "n2" }), request = unsealedRequest(f), saved = delivered(writeGaps(f.store, request));
   const refs = saved.records.map(reference), before = revisions(f.store);
   assert.ok(refs.length > 1, "the native input supplies several independent gaps");
   refusedAs(readGaps(f.store, { sources: clone(saved.sources) as GapRequest, records: [] }), "gap_missing");
@@ -678,7 +687,7 @@ test("new and reused gap preparations guard source, graph, proposals and saved g
 });
 
 test("storage boundaries reject foreign exact references and status imitations without swallowing execution faults", { todo: "NR1 №3591/№3646: записанное читается доверенно; эту порчу базы ловит om-fsck на старте (test/om-fsck.test.ts)" }, async t => {
-  const f = await createOmFixture(t), request = nativeRequest(f), saved = delivered(writeGaps(f.store, request));
+  const f = await createOmFixture(t, "standard", "garden", { mode: "executed" }), request = currentRequest(f), saved = delivered(writeGaps(f.store, request));
   const records = saved.records.map(reference), fakeInput = f.store.write({ id: "om-input:foreign", kind: "om-input", expected: 0,
     value: { state: "accepted", input: {}, hash: hashJson({}), gaps: [] } });
   const before = revisions(f.store);
