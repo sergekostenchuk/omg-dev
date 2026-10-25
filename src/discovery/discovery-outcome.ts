@@ -810,11 +810,14 @@ export async function publishVariantHandoff(store: Store, project: string, reque
     .find(row => row?.value.spec.field === 'frame');
   handoffRequire(frameQuestion?.value.status === 'answered' && same(frameQuestion.value.answer, value.frame), 'The frame is no longer the current accepted frame');
   const state = store.get(variantStateId(project, draft.id));
-  const mode = store.get(`project-mode:${project}`) ? readProjectMode(store, project) : null;
+  const modeId = `project-mode:${project}`;
+  const beforeFirstMode = value.reason === 'early_limit' && value.result === null
+    && !store.get(modeId) && store.history(modeId).length === 0;
+  const mode = beforeFirstMode ? null : readProjectMode(store, project);
   handoffRequire(basis.selection ? state && same(reference(state), basis.selection) : !state,
     'The handoff no longer owns the current selection');
   const guards: TransactionGuard[] = [reference(current.draft), reference(current.question), reference(frameQuestion), value.frame, value.plan,
-    mode ? mode.ref : { id: `project-mode:${project}`, absent: true }, state ? reference(state) : { id: variantStateId(project, draft.id), absent: true }];
+    mode ? mode.ref : { id: modeId, absent: true }, state ? reference(state) : { id: variantStateId(project, draft.id), absent: true }];
   if (readiness.status === 'ready') guards.push(...readiness.guards);
   if (value.stop) guards.push(...value.stop.grounds);
   for (const ref of [value.snapshot, value.result, value.decision, value.scope, value.choice]) if (ref) guards.push(ref);

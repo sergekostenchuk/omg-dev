@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { reference } from '../src/pipeline/contracts.js';
 import { Store, type Revision } from '../src/storage/store.js';
 import { Discovery, type DiscoveryDraft, type Question } from '../src/discovery/discovery.js';
@@ -26,7 +27,7 @@ import { EngineError } from '../src/errors.js';
 import type { ModelCall } from '../src/runtime/model-usage.js';
 const history = (store: Store) => store.list().flatMap(row => store.history(row.id));
 const typedRefusal = (error: unknown) => error instanceof EngineError;
-async function setup(t: test.TestContext, questions: PlanQuestion[] = [planQuestion('q-one', 'industry')], initialMode: 'questions'|'bypass' = 'questions') {
+async function setup(t: test.TestContext, questions: PlanQuestion[] = [planQuestion('q-one', 'industry')], initialMode: 'questions'|'bypass'|null = 'questions') {
   const f = discoveryFixture(t, 'omg-4r2-');
   f.engine.execute({ type: 'create-project', project: 'p', title: 'Runner generation' });
   const settings = join(f.root, 'settings.json'), wire = join(f.root, 'wire.ndjson'), adapter = join(f.root, 'adapter.mjs');
@@ -70,10 +71,13 @@ console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,u
     const record = setProjectMode(f.store, request, sessions.authority(login.value.bearer)).record;
     assert.ok(sessions.revoke(login.value.bearer).ok); return record;
   }
-  const initial = mode(initialMode), cal = f.store.write({ id: 'variant-calibration', kind: 'transport-fixture', expected: 0, value: { projectId: 'p' } });
-  for (const kind of ['proposal', 'decision'] as const) await researchCall(environment.value.implementer, environment.value, 'Calibrate variant step',
-    { variantSubject: { contract: VARIANT_SUBJECT_CONTRACT, kind, ...(kind === 'proposal' ? {snapshot: reference(cal)} : {set: reference(cal)}), mode: reference(initial), expectedSelection: null }, history: [] }, undefined,
-    { store: f.store, draftId: calibration.id, questionId: calibration.value.questions[0]!, purpose: `variant-${kind}` });
+  const initial = initialMode === null ? null : mode(initialMode);
+  if (initial) {
+    const cal = f.store.write({ id: 'variant-calibration', kind: 'transport-fixture', expected: 0, value: { projectId: 'p' } });
+    for (const kind of ['proposal', 'decision'] as const) await researchCall(environment.value.implementer, environment.value, 'Calibrate variant step',
+      { variantSubject: { contract: VARIANT_SUBJECT_CONTRACT, kind, ...(kind === 'proposal' ? {snapshot: reference(cal)} : {set: reference(cal)}), mode: reference(initial), expectedSelection: null }, history: [] }, undefined,
+      { store: f.store, draftId: calibration.id, questionId: calibration.value.questions[0]!, purpose: `variant-${kind}` });
+  }
   writeFileSync(wire, '');
   const run = (limit = 8, store = f.store, restoreOnly = false) => new Researcher(store, new Discovery(store), new ProductEngine(store).environments)
     .run('p', v.draft.id, limit, undefined, { producerPolicy: { discovery: 7 }, restoreOnly });
@@ -310,4 +314,57 @@ test('4R.2: structural usage and a copied receipt cannot manufacture a stage ear
   const request = { draft: reference(f.store.get<DiscoveryDraft>(f.v.draft.id)!), result: null, decision: null, scope: null, earlyLimit: true };
   for (const store of [f.store, f.open()]) await assert.rejects(() => publishVariantHandoff(store, 'p', request), typedRefusal);
   assert.equal(f.store.list('discovery-variant-handoff').length, 0); assert.deepEqual(history(f.store), before); assert.deepEqual(f.wires(), wire);
+});
+
+// Explicit negative corruption: remove only the live head, keeping every exact mode revision.
+function loseModeHead(store: Store) {
+  const sql = new DatabaseSync(store.path);
+  try { sql.prepare('DELETE FROM heads WHERE entity_id=?').run('project-mode:p'); } finally { sql.close(); }
+  assert.equal(store.get('project-mode:p'), null); assert.ok(store.history('project-mode:p').length);
+}
+const completeHistory = (store: Store) => ({ records: history(store), mode: store.history('project-mode:p'), money: money(store) });
+for (const cold of [false, true]) test(`4R2-01: a new owner choose handoff refuses a lost current mode (${cold ? 'cold' : 'hot'})`, async t => {
+  const f = await setup(t); await f.run(2);
+  const act = owner(f.store, choiceScope(f)), scope = publishVariantScope(f.store, 'p', reference(act.decision)).scope;
+  assert.equal(f.store.list('discovery-variant-handoff').length, 0); loseModeHead(f.store);
+  const store = cold ? f.open() : f.store, before = completeHistory(store), wire = f.wires();
+  await assert.rejects(() => publishVariantHandoff(store, 'p', { draft: act.decision.value.draft, result: act.decision.value.set,
+    decision: reference(act.decision), scope: reference(scope) }), { code: 'project_mode_unset' });
+  assert.deepEqual(completeHistory(store), before); assert.deepEqual(f.wires(), wire);
+  assert.equal(store.list('discovery-variant-handoff').length, 0);
+});
+test('4R2-01: a real pre-generation budget limit can precede the first project mode', async t => {
+  const f = await setup(t, undefined, null); f.configure({ assessorTokens: V7_STAGE_TOKEN_CEILING - 1000 });
+  assert.equal(f.store.get('project-mode:p'), null); assert.deepEqual(f.store.history('project-mode:p'), []);
+  const run = await f.run(2), handoff = await saved(f, run);
+  assert.equal(handoff.value.reason, 'early_limit'); assert.equal(handoff.value.next, 'dossier');
+  for (const field of ['snapshot', 'result', 'set', 'decision', 'scope', 'choice'] as const) assert.equal(handoff.value[field], null);
+  assert.equal(subjectCalls(f, 'proposal').length, 0); assert.equal(subjectCalls(f, 'decision').length, 0);
+  assert.deepEqual(f.store.history('project-mode:p'), []); await fixed(f, run);
+});
+test('4R2-01: pre-generation budget limit cannot mistake a lost historical mode for its first mode', async t => {
+  const f = await setup(t); f.configure({ assessorTokens: V7_STAGE_TOKEN_CEILING - 1000 });
+  const write = f.store.writeMany.bind(f.store); let cut = false;
+  f.store.writeMany = ((ws, guards) => {
+    if (ws.some(row => row.kind === 'discovery-variant-handoff')) { cut = true; throw new Error('cut before handoff'); }
+    return write(ws, guards);
+  }) as typeof f.store.writeMany;
+  await f.run(2); f.store.writeMany = write; assert.ok(cut);
+  assert.equal(f.store.list('discovery-variant-handoff').length, 0); loseModeHead(f.store);
+  const before = completeHistory(f.store), wire = f.wires();
+  for (const store of [f.store, f.open()]) await assert.rejects(() => publishVariantHandoff(store, 'p', {
+    draft: reference(store.get<DiscoveryDraft>(f.v.draft.id)!), result: null, decision: null, scope: null, earlyLimit: true,
+  }), { code: 'project_mode_unset' });
+  assert.deepEqual(completeHistory(f.store), before); assert.deepEqual(f.wires(), wire);
+});
+test('4R2-01: historical owner handoff and its exact replay survive loss of the current mode', async t => {
+  const f = await setup(t); await f.run(2); owner(f.store, choiceScope(f));
+  const run = await f.run(1, f.open(), true), handoff = await saved(f, run), value = handoff.value;
+  loseModeHead(f.store); const before = completeHistory(f.store), wire = f.wires();
+  for (const store of [f.store, f.open()]) {
+    assert.deepEqual((await readVariantHandoff(store, 'p', reference(handoff))).record, handoff);
+    const replay = await publishVariantHandoff(store, 'p', { draft: value.draft, result: value.result, decision: value.decision, scope: value.scope });
+    assert.equal(replay.repeated, true); assert.deepEqual(replay.record, handoff);
+  }
+  assert.deepEqual(completeHistory(f.store), before); assert.deepEqual(f.wires(), wire);
 });
