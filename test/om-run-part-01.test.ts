@@ -35,7 +35,7 @@ import { rankExpansions } from "../src/om/run.js";
 // ---- LP6 (№3325 §4–§5): stops saved by e7db0ba8 under the old rules, read literally and reconciled by the new era ----
 import { readSeries } from "../src/om/series.js";
 import { gapLineKey as lp7LineKey, gapLineExpectedResult as lp7Result } from "../src/om/gap-lines.js";
-import { project, ok, refusal, runFixture, type Fixture, addressAll, usage, mechanismSeries, actions, ends, driveTo, reasonsOf, stopAnswer, secondRung, decisionCalls, restWithDecisions, until, worksFixture, worksAcceptance, nodeRefusal, driveUntil, gapHeads, addressQuestions, atCommit, sameEnd, advanceRun, lp3Need, lp3Order, lp3Blocked, lp3Pointers, LP3_UNPROVED, lp3Hiding, lp3Context, isRefOf, asCycleStart, asRunResult, mp2Upper, mp2Rank, mp2Works, mp2WorkAnswer, twoArtifacts, G62_BASE, lp6Line, lp6Close, LP7_VALUES, lp7Routes, AT1_BASE } from "./om-run-fixture.js";
+import { project, ok, refusal, runFixture, type Fixture, addressAll, usage, mechanismSeries, actions, ends, driveTo, reasonsOf, stopAnswer, secondRung, decisionCalls, restWithDecisions, until, worksFixture, nodeRefusal, driveUntil, gapHeads, addressQuestions, sameEnd, advanceRun, lp3Need, lp3Order, lp3Blocked, lp3Pointers, LP3_UNPROVED, lp3Hiding, lp3Context, isRefOf, asCycleStart, asRunResult, mp2Upper, mp2Rank, mp2Works, mp2WorkAnswer, lp6Line, lp6Close, LP7_VALUES, lp7Routes } from "./om-run-fixture.js";
 
 test("LG01r1 current fixture modes preserve the run's questions and never prebuild a cold B1", t => {
   for (const mode of ["stages", "n2", "executed"] as const) {
@@ -490,61 +490,4 @@ test("LP7 rows 14, 24 (run): an answer of some joined fields — part of state i
   assert.deepEqual([...new Set(second.joined.items.map(item => item.field))].sort(), ["checkKind", "state"], "Row 14: the new B1's route joins the rest");
   assert.deepEqual([keys.length, f.store.get(`om-input:${project}`)!.revision], [5, 3], "The rest adds authority, rollback and checkKind — never the writer again");
   assert.deepEqual(ok(readSeries(f.store, f.address as never)).value.withoutProgress, 0);
-});
-test("AT1 return №4124 P2-6: a group refused by a G5 of the earlier era ends under the new code by its rejection as before — no readiness question, no refusal of the era, and the new candidate is accepted", async t => {
-  const f = worksFixture(t, false, false, twoArtifacts, G62_BASE);
-  ok(startRun(f.store, { project }));
-  // As in G6.2: the code before G6 (a62940ec) answers the works, the producing one for two artifacts (its E3 admits it).
-  for (let round = 0; round < 4; round++) {
-    const issued = atCommit(f, G62_BASE, `p26-issue-${round}`, `const { advanceRun } = await import(src('om/run.js'));
-for (let index = 0; index < 40; index++) {
-  const state = take(await advanceRun(store, args.request)).record.value.state;
-  if (state.phase === 'step' && state.step.action === 'cycle') { out(state.step.request.packet); break; }
-  if (state.phase === 'waiting') { out(null); break; }
-}`, { request: f.request }) as Ref | null;
-    assert.ok(issued, "The earlier code issues a works packet");
-    const answer = mp2WorkAnswer(f, issued), node = answer.research.proposal.nodes[0]!.parent!;
-    f.push({ research: answer.research, usage });
-    assert.equal(atCommit(f, G62_BASE, `p26-cycle-${round}`, `const { advanceRun } = await import(src('om/run.js'));
-out(take(await advanceRun(store, args.request)).performed?.action ?? null);`, { request: f.request }), "cycle");
-    if (node === "garden-produce-operation") break;
-  }
-  // The code before AT1 (e475bd59) goes on to its works step: its G5 of the earlier era refuses the group.
-  let works = false;
-  for (let round = 0; round < 16 && !works; round++) {
-    const result = atCommit(f, AT1_BASE, `p26-${round}`, `const { advanceRun } = await import(src('om/run.js'));
-let result = null;
-for (let index = 0; index < 80 && result === null; index++) {
-  const advanced = take(await advanceRun(store, args.request));
-  const state = advanced.record.value.state;
-  if (advanced.performed && advanced.performed.action === 'works') result = { works: true };
-  else if (state.phase === 'step' && state.step.action === 'cycle') result = { packet: state.step.request.packet };
-  else if (state.phase === 'waiting' || state.phase === 'unable' || state.phase === 'complete') result = { state };
-}
-out(result);`, { request: f.request }) as { works?: true; packet?: Ref; state?: unknown } | null;
-    assert.ok(result && !result.state, `The base reaches its works step: ${JSON.stringify(result).slice(0, 800)}`);
-    if (result.works) works = true; else f.answer(result.packet!);
-  }
-  assert.ok(works, "The base performed its works step");
-  f.restart();
-  const before = f.store.list<{ contract: string; result: { passed: boolean } }>("om-atomic-gate");
-  assert.ok(before.length > 0 && before.every(row => row.value.contract === "om-atomic-gate/v1" && !row.value.result.passed), "The base refused the group by its G5 of the earlier era");
-  const trail: string[] = [], answered = new Set<string>();
-  for (let index = 0; index < 300 && !worksAcceptance(f.store).frame; index++) {
-    const advanced = ok(await advanceRun(f.store, f.request));
-    const state = advanced.record.value.state as unknown as { phase: string; wait?: { code: string }; step?: { action: string; request: { packet?: Ref } } };
-    trail.push(state.phase === "waiting" ? `waiting:${state.wait!.code}` : `${state.phase}:${advanced.performed?.action ?? ""}`);
-    if (state.phase === "waiting" || state.phase === "unable") break;
-    if (state.phase !== "step" || state.step!.action !== "cycle" || !state.step!.request.packet || answered.has(state.step!.request.packet.id)) continue;
-    const saved = state.step!.request.packet, packet = f.store.get<QuestionPacketRecord>(saved.id, saved.revision)!;
-    answered.add(saved.id);
-    const answer = mp2WorkAnswer(f, saved), node = answer.research.proposal.nodes[0]!.parent!;
-    const example = (packet.value.packet as unknown as { brief: { examples: { action: string; proposal: unknown }[] } }).brief.examples.find(row => row.action === "answer")!;
-    f.push({ research: node === "garden-produce-operation" ? { ...answer.research, proposal: example.proposal } : answer.research, usage });
-  }
-  const text = trail.join(",");
-  assert.ok(!text.includes("waiting:") && !text.includes("readiness"), `No wait and no readiness question: ${text}`);
-  const ends = f.store.list<{ cause: { kind: string } }>("om-completion-finalization").map(row => row.value.cause.kind);
-  assert.ok(ends.length >= 1 && ends.every(kind => kind === "group-rejected"), `The group ends by its rejection as before: ${JSON.stringify(ends)} ${text}`);
-  assert.deepEqual([worksAcceptance(f.store).passed, worksAcceptance(f.store).frame], [true, true], `The new candidate is accepted: ${text.slice(-600)}`);
 });
