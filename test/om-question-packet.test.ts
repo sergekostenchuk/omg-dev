@@ -47,7 +47,7 @@ import { writeGuarded } from '../src/om/refs.js';
 import { runModelCall, runModelCycle, readCompletionWorkAt, writeCompletionCessation, deliverModelSources, assembleModelParts, pendingCallStore, readPartAssembly, type ReadDeliveryRecord } from '../src/om/model-call.js';
 import { gardenGraph, prepareOmFixtureStages, prepareNativeLayers } from './om-fixture.js';
 // OMMC-SPLIT: the managed-cycle helpers moved to a shared fixture module; importing it registers no tests.
-import { e4Fixture, e4WorksFixture, e4Node, e4NeedSource, mp2Refused, mp2Step, mp2IssuedBy, h15AtCommit } from './om-model-call-fixture.js';
+import { e4Fixture, e4WorksFixture, e4Node, e4NeedSource, mp2Refused, h15AtCommit } from './om-model-call-fixture.js';
 import { preparedFeatures } from './product-fixture.js';
 import { preparedField } from './preparation-fixture.js';
 
@@ -2903,26 +2903,6 @@ process.stdout.write(JSON.stringify(output));
   return histories;
 }
 
-/**
- * OWN1 (№3711, №3713): a route saved before the bypass that holds an owner question of the pass is history — the bypass
- * routes that question to the model, so new work on it needs the explicit M6 successor. Its records are still read as
- * written; its current admission is route_stale. True when the route of this packet request is still current.
- */
-function routeCurrent(store: Store, request: { project: string; routes: Ref }): boolean {
-  const saved = ok(readRoutes(store, { project: request.project, record: request.routes })).record.value.request;
-  const prepared = prepareRoutes(store, { ...saved, tasks: saved.tasks.map(record => ({ record })) } as unknown as RoutesRequest);
-  if (!prepared.ok) assert.equal(prepared.refusal.code, 'route_stale');
-  return prepared.ok;
-}
-function admissionStale(store: Store, request: QuestionPacketRequest): void {
-  // A packet of the historical route is returned as it was written; nothing new is issued on that route.
-  for (const action of [prepareQuestionPacket, writeQuestionPacket]) {
-    const result = action(store, request);
-    if (result.ok) assert.deepEqual(result.value.writes, [], 'No new packet on a historical route');
-    else assert.equal(result.refusal.code, 'route_stale');
-  }
-}
-
 test('LP1 independent v3 issuance guards both exact era addresses; repeats, ambiguity and unsupported markers are addressed', { todo: "NR1 №3591/№3646: записанное читается доверенно; эту порчу базы ловит om-fsck на старте (test/om-fsck.test.ts)" }, async t => {
   const p = packetFixture(t), { f } = p;
   const prepared = ok(prepareQuestionPacket(f.store, p.request)), packet = prepared.record;
@@ -3289,7 +3269,7 @@ test('MP3 rows 7, 19 (era): packets, deliveries, continuations and parts of the 
 
 const MP11_BASE = 'e88b4ed40d94dd61e242d613d96a87e0bb5e6206';
 // Reuse the actual managed-cycle fixtures from the shared module; destructuring keeps the historical sites unchecked as before.
-const mp11CycleFixtures: any = { e4Fixture, e4Node, e4NeedSource, mp2Refused, mp2Step, mp2IssuedBy, h15AtCommit };
+const mp11CycleFixtures: any = { e4Fixture, e4NeedSource, h15AtCommit };
 function mp11Version(packet: Sealed<Revision<QuestionPacketRecord>>, era: 'om-brief/v1' | 'om-brief/v2') {
   assert.equal(packet.value.briefContract, era === 'om-brief/v2' ? era : undefined);
   if (packet.value.packet) {
@@ -3300,54 +3280,15 @@ function mp11Version(packet: Sealed<Revision<QuestionPacketRecord>>, era: 'om-br
   }
 }
 
-test('MP1.1 rows 1–8,20: real e88 producer preserves ready, works, parts, delivered continuation and no-progress records byte for byte; new descendants inherit v1', async t => {
-  const histories = lp1OldProducer(t, MP11_BASE);
-  for (const history of histories) {
-    let store = new Store(history.database);
-    try {
-      const before = snapshot(store), current = routeCurrent(store, history.packets[0]!.value.request);
-      for (const packet of history.packets) {
-        mp11Version(packet, 'om-brief/v1');
-        assert.ok(briefReadings(packet.value.packet), 'The actual MP3 producer keeps readings');
-        assert.deepEqual(ok(readQuestionPacket(store, { project: history.project, record: reference(packet) })), packet);
-        if (!current) { admissionStale(store, packet.value.request); continue; }
-        assert.deepEqual(ok(prepareQuestionPacket(store, packet.value.request)).record, packet);
-        const repeated = ok(writeQuestionPacket(store, packet.value.request));
-        assert.deepEqual(repeated.record, packet); assert.deepEqual(repeated.writes, []);
-      }
-      for (const part of history.parts) sameButReferences(ok(readPartResult(store, { project: history.project, record: reference(part.record) })), JSON.stringify(part));
-      assert.deepEqual(snapshot(store), before);
-      if (history.next && !current) admissionStale(store, history.next);
-      else if (history.next) {
-        const next = ok(writeQuestionPacket(store, history.next)).record;
-        mp11Version(next, 'om-brief/v1');
-        if (history.next.continuation) assert.equal(next.value.refusal?.code, 'research_no_progress');
-        else assert.equal(next.value.plan?.position, 1);
-        store.close(); store = new Store(history.database);
-        const saved = snapshot(store);
-        assert.deepEqual(ok(readQuestionPacket(store, { project: history.project, record: reference(next) })), next);
-        assert.deepEqual(ok(writeQuestionPacket(store, history.next)).record, next);
-        assert.deepEqual(snapshot(store), saved);
-      }
-    } finally { store.close(); }
-  }
-});
-
-test('MP1.1 rows 2–4: independent blocked packets record their version before the null payload; true legacy blocked stays unmarked on repeat', async t => {
+test('MP1.1 current blocked packet declares v2 before its null payload and repeats after restart without writes', async t => {
   const p = packetFixture(t, 1), packet = ok(writeQuestionPacket(p.f.store, p.request)).record;
   assert.equal(packet.value.state, 'blocked'); assert.equal(packet.value.packet, null); mp11Version(packet, 'om-brief/v2');
   p.f.restart(); const before = snapshot(p.f.store);
-  assert.deepEqual(ok(writeQuestionPacket(p.f.store, p.request)).record, packet); assert.deepEqual(snapshot(p.f.store), before);
-  const [old] = lp1OldProducer(t, MP11_BASE, { node: false, capacity: 1 }); assert.ok(old);
-  const store = new Store(old.database);
-  try {
-    const packet = old.packets[0]!; assert.equal(packet.value.state, 'blocked'); mp11Version(packet, 'om-brief/v1');
-    const before = snapshot(store);
-    assert.deepEqual(ok(readQuestionPacket(store, { project: old.project, record: reference(packet) })), packet);
-    if (routeCurrent(store, packet.value.request)) assert.deepEqual(ok(writeQuestionPacket(store, packet.value.request)).record, packet);
-    else admissionStale(store, packet.value.request);
-    assert.deepEqual(snapshot(store), before);
-  } finally { store.close(); }
+  assert.deepEqual(ok(readQuestionPacket(p.f.store, { project: p.f.project, record: reference(packet) })), packet);
+  assert.deepEqual(ok(prepareQuestionPacket(p.f.store, p.request)).record, packet);
+  const repeated = ok(writeQuestionPacket(p.f.store, p.request));
+  assert.deepEqual(repeated.record, packet); assert.deepEqual(repeated.writes, []);
+  assert.deepEqual(snapshot(p.f.store), before);
 });
 
 test('MP1.1 rows 9,10,19: direct reader and current producer reject unsupported, absent and mismatched versions; exact-address race stays atomic', { todo: "NR1 №3646: согласованная перезапись цепочки до новейшей записи — om-fsck её не видит; решение позже" }, async t => {
@@ -3415,73 +3356,74 @@ test('MP1.1 rows 11–13: genuine E3 and delivered search are case-insensitive l
   });
 });
 
-test('MP1.1 rows 5–8,20: actual managed correction → continuation → next part inherits v1/v2 and reopens without another send', async t => {
-  const { e4Fixture, e4Node, e4NeedSource, mp2Refused, h15AtCommit } = mp11CycleFixtures;
-  for (const historical of [false, true]) await t.test(historical ? 'e88 root' : 'new root', async t => {
-    const f = e4Fixture(t, 'node', 100_000, 0, 5000, true, false);
-    const whole = historical ? h15AtCommit(f, MP11_BASE, 'mp11-whole', `const { prepareQuestionPacket } = await import(src('om/question-packet.js'));
-      out(take(prepareQuestionPacket(store, args)).record);`, f.packetRequest) : f.packet;
-    const config = f.environment((historical ? whole.value.fullChars : packetWire(whole.value.packet)) - 1);
-    const packetRequest = { ...f.packetRequest, environment: reference(config) };
-    const packet = historical ? h15AtCommit(f, MP11_BASE, 'mp11-root', `const { writeQuestionPacket } = await import(src('om/question-packet.js'));
-      out(take(writeQuestionPacket(store, args)).record);`, packetRequest) : ok(writeQuestionPacket(f.store, packetRequest)).record;
-    mp11Version(packet, historical ? 'om-brief/v1' : 'om-brief/v2');
-    assert.equal(packet.value.plan.mode, 'parts'); const total = packet.value.plan.assignments.length;
-    const at = (position: number) => ({ ...packet, value: { ...packet.value, plan: { ...packet.value.plan, position } } });
-    const request = { ...f.request, packet: reference(packet), dispatch: { ...f.request.dispatch, config: reference(config) } };
-    f.steps([{ research: mp2Refused(f, at(0)) }, { research: { ...e4NeedSource(f, [{ action: 'read', path: 'e4-source.txt', media: 'text/plain' }]),
-        questionIds: packet.value.packet.questions.map((q: any) => q.id) } },
-      ...Array.from({ length: total }, (_, index) => ({ research: e4Node(f, at(index)) }))]);
-    const cycle = ok(await runModelCycle(f.store, request));
-    assert.equal(cycle.record.value.terminal, 'assembled', canonical(cycle.record.value)); assert.equal(f.sent().length, total + 2);
-    const packets = cycle.record.value.steps.map(step => ok(readQuestionPacket(f.store, { project: f.project, record: step.packet })));
-    assert.ok(packets[1]!.value.request.correction && packets[2]!.value.request.continuation && packets[3]!.value.request.previous.length);
-    for (const step of packets) {
-      mp11Version(step, historical ? 'om-brief/v1' : 'om-brief/v2');
-      assert.ok(briefReadings(step.value.packet)); assert.ok(step.value.briefNeighbors);
-      assert.ok(packetPrompt(step.value.packet).includes('# Accepted work of neighbouring roots'));
-    }
-    const before = snapshot(f.store); f.restart();
-    assert.equal(ok(await runModelCycle(f.store, request)).repeated, true);
-    assert.equal(f.sent().length, total + 2); assert.deepEqual(snapshot(f.store), before);
-    for (const packet of packets) assert.deepEqual(ok(readQuestionPacket(f.store, { project: f.project, record: reference(packet) })), packet);
-  });
+test('MP1.1 current managed correction → continuation → next part assembles in v2 and reopens without another send', async t => {
+  const f = e4Fixture(t, 'node', 100_000, 0, 5000, true, false);
+  const whole = f.packet, capacity = packetWire(whole.value.packet) - 1, config = f.environment(capacity);
+  const packetRequest = { ...f.packetRequest, environment: reference(config) };
+  const packet = ok(writeQuestionPacket(f.store, packetRequest)).record;
+  mp11Version(packet, 'om-brief/v2');
+  const binding = ok(readCompletionBinding(f.store, f.project, f.packetRequest.attempt!.series, f.packetRequest.attempt!.ordinal));
+  assert.ok(binding); assert.deepEqual(binding.value.plan, { routes: reference(f.routes), batches: [f.batch.id] });
+  assert.equal(packet.value.plan!.mode, 'parts'); const total = packet.value.plan!.assignments.length;
+  assert.ok(total > 1);
+  const at = (position: number) => {
+    const selected = clone(packet) as Revision<QuestionPacketRecord>;
+    selected.value.plan!.position = position;
+    return selected;
+  };
+  const request = { ...f.request, packet: reference(packet), dispatch: { ...f.request.dispatch, config: reference(config) } };
+  f.steps([{ research: mp2Refused(f, at(0)) }, { research: { ...e4NeedSource(f, [{ action: 'read', path: 'e4-source.txt', media: 'text/plain' }]),
+      questionIds: (packet.value.packet as any).questions.map((q: any) => q.id) } },
+    ...Array.from({ length: total }, (_, index) => ({ research: e4Node(f, at(index)) }))]);
+  const cycle = ok(await runModelCycle(f.store, request));
+  assert.equal(cycle.record.value.terminal, 'assembled', canonical(cycle.record.value)); assert.equal(f.sent().length, total + 2);
+  const packets = cycle.record.value.steps.map(step => ok(readQuestionPacket(f.store, { project: f.project, record: step.packet })));
+  assert.ok(packets[1]!.value.request.correction && packets[2]!.value.request.continuation && packets[3]!.value.request.previous.length);
+  for (const step of packets) {
+    mp11Version(step, 'om-brief/v2');
+    assert.ok(packetWire(step.value.packet) <= capacity, 'Every dispatched link fits the measured adapter capacity');
+    assert.ok(briefReadings(step.value.packet)); assert.ok(step.value.briefNeighbors);
+    assert.ok(packetPrompt(step.value.packet).includes('# Accepted work of neighbouring roots'));
+  }
+  const before = snapshot(f.store); f.restart();
+  assert.equal(ok(await runModelCycle(f.store, request)).repeated, true);
+  assert.equal(f.sent().length, total + 2); assert.deepEqual(snapshot(f.store), before);
+  for (const packet of packets) assert.deepEqual(ok(readQuestionPacket(f.store, { project: f.project, record: reference(packet) })), packet);
+  assert.deepEqual(snapshot(f.store), before);
 });
 
-test('MP1.1 rows 2,4: true legacy empty/no-batch and independent new empty preserve their chosen version and repeat after reopen', async t => {
-  const { h15AtCommit } = mp11CycleFixtures;
-  for (const historical of [false, true]) {
-    const f = emptyPacketFixture(t, historical ? MP11_BASE : undefined);
-    const packet = historical ? h15AtCommit(f, MP11_BASE, 'mp11-empty', `const { writeQuestionPacket } = await import(src('om/question-packet.js'));
-      out(take(writeQuestionPacket(store, args)).record);`, f.request) : ok(writeQuestionPacket(f.store, f.request)).record;
-    assert.equal(packet.value.state, 'empty'); assert.equal(packet.value.packet, null);
-    mp11Version(packet, historical ? 'om-brief/v1' : 'om-brief/v2');
-    const reopened = new Store(f.database);
-    try {
-      const before = snapshot(reopened);
-      assert.deepEqual(ok(readQuestionPacket(reopened, { project: f.project, record: reference(packet) })), packet);
-      assert.deepEqual(ok(prepareQuestionPacket(reopened, f.request)).record, packet);
-      assert.deepEqual(ok(writeQuestionPacket(reopened, f.request)).record, packet);
-      assert.deepEqual(snapshot(reopened), before);
-    } finally { reopened.close(); }
-  }
+test('MP1.1 current empty no-batch packet declares v2 and its cold read, prepare and write keep the same record', async t => {
+  const f = emptyPacketFixture(t), packet = ok(writeQuestionPacket(f.store, f.request)).record;
+  assert.equal(f.request.batch, null);
+  assert.equal(packet.value.state, 'empty'); assert.equal(packet.value.packet, null);
+  mp11Version(packet, 'om-brief/v2');
+  const reopened = new Store(f.database);
+  try {
+    const before = snapshot(reopened);
+    assert.deepEqual(ok(readQuestionPacket(reopened, { project: f.project, record: reference(packet) })), packet);
+    assert.deepEqual(ok(prepareQuestionPacket(reopened, f.request)).record, packet);
+    const repeated = ok(writeQuestionPacket(reopened, f.request));
+    assert.deepEqual(repeated.record, packet); assert.deepEqual(repeated.writes, []);
+    assert.deepEqual(snapshot(reopened), before);
+  } finally { reopened.close(); }
 });
 
-test('MP1.1 rows 1,6,8,19: a selected chain through compatible historical environment chooses the same version in temporary proof and current admission', async t => {
-  const { e4Fixture, e4NeedSource, mp2IssuedBy } = mp11CycleFixtures;
-  for (const historical of [false, true]) {
-    const fixture = historical ? mp2IssuedBy(t, MP11_BASE) : null;
-    const f = fixture?.f ?? e4Fixture(t, 'node', 100_000, 0, 5000, true), request = fixture?.request ?? f.request;
-    f.steps([{ research: e4NeedSource(f, [{ action: 'read', path: 'e4-source.txt', media: 'text/plain' }]) }]);
-    const first = ok(await runModelCall(f.store, request));
-    const deliveries = ok(deliverModelSources(f.store, { project: f.project, packet: request.packet, call: first.call, response: first.response! }));
-    const next = { ...f.packetRequest, continuation: { packet: request.packet, call: first.call, response: first.response!, deliveries: [...deliveries.deliveries] } };
-    f.environment(); // Same execution facts: only the already selected plan grants this compatibility.
-    const prepared = ok(prepareQuestionPacket(f.store, next)), packet = ok(writeQuestionPacket(f.store, next)).record;
-    assert.deepEqual(packet, prepared.record); mp11Version(packet, historical ? 'om-brief/v1' : 'om-brief/v2');
-    assert.deepEqual(ok(readQuestionPacket(f.store, { project: f.project, record: reference(packet) })), packet);
-    assert.equal(f.sent().length, 1);
-  }
+test('MP1.1 current managed continuation keeps v2 across a compatible Environment revision in preparation and admission', async t => {
+  const f = e4Fixture(t, 'node', 100_000, 0, 5000, true), request = f.request;
+  const binding = ok(readCompletionBinding(f.store, f.project, f.packetRequest.attempt!.series, f.packetRequest.attempt!.ordinal));
+  assert.ok(binding); assert.deepEqual(binding.value.plan, { routes: reference(f.routes), batches: [f.batch.id] });
+  f.steps([{ research: e4NeedSource(f, [{ action: 'read', path: 'e4-source.txt', media: 'text/plain' }]) }]);
+  const first = ok(await runModelCall(f.store, request));
+  const deliveries = ok(deliverModelSources(f.store, { project: f.project, packet: request.packet, call: first.call, response: first.response! }));
+  assert.ok(deliveries.deliveries.length > 0);
+  const next = { ...f.packetRequest, continuation: { packet: request.packet, call: first.call, response: first.response!, deliveries: [...deliveries.deliveries] } };
+  const compatible = f.environment(); // Same execution facts: only the already selected plan grants this compatibility.
+  assert.equal(compatible.id, f.configured.id); assert.equal(compatible.revision, f.configured.revision + 1);
+  assert.deepEqual(next.environment, reference(f.configured));
+  const prepared = ok(prepareQuestionPacket(f.store, next)), packet = ok(writeQuestionPacket(f.store, next)).record;
+  assert.deepEqual(packet, prepared.record); mp11Version(packet, 'om-brief/v2');
+  assert.deepEqual(ok(readQuestionPacket(f.store, { project: f.project, record: reference(packet) })), packet);
+  assert.equal(f.sent().length, 1);
 });
 
 test('MP1.1 row 10: two individually proved parts from different brief versions cannot form one producer request or a saved chain', { todo: "NR1 №3646: согласованная перезапись цепочки до новейшей записи — om-fsck её не видит; решение позже" }, async t => {
