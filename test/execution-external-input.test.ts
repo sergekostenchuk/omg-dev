@@ -3,9 +3,6 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { DatabaseSync } from 'node:sqlite';
-import { execFileSync } from 'node:child_process';
-import { createRequire } from 'node:module';
-import { fileURLToPath, pathToFileURL } from 'node:url';
 import { join } from 'node:path';
 import { canonical, canonicalSorted, hashJson } from '../src/canonical.js';
 import { checkedPlanDerivation, planDerivation, type ArtifactReceipt, type MachinePlan, type TaskInput, receiptId } from '../src/compiler/model.js';
@@ -42,7 +39,6 @@ import { git, Environments, type ExecutionRoot } from '../src/runtime/environmen
 import { Store, type Revision, type Write } from '../src/storage/store.js';
 import { enrichedGraph } from './enriched-graph-fixture.js';
 import { exampleGraph } from './graph-fixture.js';
-import { preparedFeatures, refinedLayers } from './product-fixture.js';
 import { executionFixture, refreshExecutionPlan } from './execution-fixture.js';
 import { prepareNativeLayers, prepareOmFixtureStages, explicitMapping, markedWorks } from './om-fixture.js';
 
@@ -213,7 +209,8 @@ function prepareExternalWorks(engine: ProductEngine, desired: Graph, reject = fa
 }
 
 export function externalInputFixture(t: TestContext, mode: ExternalInputMode = 'inside', configure?:
-  (engine: ProductEngine, graph: Graph, workspace: string) => void, prepareGraph?: (graph: Graph) => void, current: boolean | 'reject-mixed' | 'missing-source' | 'wrong-source' = false) {
+  (engine: ProductEngine, graph: Graph, workspace: string) => void, prepareGraph?: (graph: Graph) => void,
+  current: boolean | 'reject-mixed' | 'missing-source' | 'wrong-source' = true) {
   const directory = realpathSync(mkdtempSync(join(tmpdir(), 'omg-external-input-'))), workspace = join(directory, 'repo');
   mkdirSync(workspace);
   const journal = join(directory, 'calls.jsonl'), agent = join(directory, 'agent.mjs');
@@ -233,35 +230,27 @@ if(mode==='consume-mutation') { const {consume}=await import('./consume.mjs'); a
   const initial = git(workspace, ['rev-parse', 'HEAD']);
   let store = new Store(join(directory, 'state.sqlite')), engine = new ProductEngine(store);
   t.after(() => { store.close(); rmSync(directory, { recursive: true, force: true }); });
-  const graph = current && current !== 'reject-mixed' ? currentExternalInputGraph(mode) : externalInputGraph(mode), artifact = mode === 'control' ? 'p-data' : 'p-external';
+  const graph = current !== 'reject-mixed' ? currentExternalInputGraph(mode) : externalInputGraph(mode), artifact = mode === 'control' ? 'p-data' : 'p-external';
   prepareGraph?.(graph);
-  if (current) prepareOmFixtureStages(engine, 'p', graph);
-  else preparedFeatures(engine, 'p', graph);
+  prepareOmFixtureStages(engine, 'p', graph);
   const source = engine.discovery.evidence.document('p', current === 'missing-source' ? 'unrelated' : artifact,
     current === 'wrong-source' ? JSON.stringify('not a number') : '2', 'application/json', 0);
   const command = { executable: process.execPath, args: [agent, journal, mode] };
   engine.environments.configure('p', { workspace, implementer: { actor: 'worker', model: 'protocol-fixture', effort: 'high', command },
     reviewer: { actor: 'reviewer', model: 'protocol-fixture', effort: 'high', command },
     fullCheck: { executable: process.execPath, args: ['check.mjs', 'all'] }, timeoutMs: 10_000,
-    ...(current ? { requestCapacityChars: 100_000 } : {}) }, 0);
+    requestCapacityChars: 100_000 }, 0);
   configure?.(engine, graph, workspace);
-  if (current) {
-    try {
-      const result = prepareExternalWorks(engine, graph, current === 'reject-mixed');
-      // G5 derives the rejected in-horizon supplier as internal; its collector lawfully asks for no Source.
-      assert.deepEqual(result.gate.value.request.sources, current === 'reject-mixed' ? [] : [reference(source)]);
-      if (current === 'reject-mixed') throw new EngineError('external_fixture_rejected', 'G5 rejected the original two-artifact work',
-        { findings: result.gate.value.result.findings, state: result.accepted.state });
-    }
-    catch (error) {
-      if (error instanceof EngineError) t.diagnostic(JSON.stringify({ code: error.code, message: error.message, at: error.details }));
-      throw error;
-    }
+  try {
+    const result = prepareExternalWorks(engine, graph, current === 'reject-mixed');
+    // G5 derives the rejected in-horizon supplier as internal; its collector lawfully asks for no Source.
+    assert.deepEqual(result.gate.value.request.sources, current === 'reject-mixed' ? [] : [reference(source)]);
+    if (current === 'reject-mixed') throw new EngineError('external_fixture_rejected', 'G5 rejected the original two-artifact work',
+      { findings: result.gate.value.result.findings, state: result.accepted.state });
   }
-  else {
-    refinedLayers(engine, 'p');
-    const feasibility = engine.refinement.assess('p', 0);
-    const stage = engine.refinement.publish('p', reference(feasibility), 0); engine.pipeline.accept('p', 'om-g2', stage.revision);
+  catch (error) {
+    if (error instanceof EngineError) t.diagnostic(JSON.stringify({ code: error.code, message: error.message, at: error.details }));
+    throw error;
   }
   const plan = engine.compiler.compile('p');
   const compilation = engine.compiler.publish('p', reference(plan), 0); engine.pipeline.accept('p', 'compilation', compilation.revision);
@@ -271,7 +260,7 @@ if(mode==='consume-mutation') { const {consume}=await import('./consume.mjs'); a
     options: { retry: false, maxContextChars: 100_000, maxCorrections: 0 } };
 }
 
-/** Current consumers use M8; the default above remains the serialized v3 historical producer. */
+/** Current consumers use M8; every call names its exact current variant. */
 function currentExternalInputFixture(t: TestContext, mode: ExternalInputMode = 'inside',
   configure?: (engine: ProductEngine, graph: Graph, workspace: string) => void, prepareGraph?: (graph: Graph) => void) {
   return externalInputFixture(t, mode, configure, prepareGraph, true);
@@ -457,16 +446,21 @@ test('plan derivation uses the namespace position, including a legacy project na
 
 test('new marker is mandatory for historical read and a no-write compile result after reopening', t => {
   const f = currentExternalInputFixture(t);
+  const snapshot = () => canonical(f.store.list().flatMap(row => f.store.history(row.id)));
   for (const marker of [undefined, null, 'external-inputs/unknown']) {
     const variant = externalPlanVariant(f.store, f.plan, value => {
       if (marker === undefined) delete value.derivation;
       else Object.assign(value, { derivation: marker });
     });
     f.reopen();
+    const beforeRead = snapshot();
     assert.throws(() => f.engine.compiler.read(variant.id), addressedPlan('plan_derivation_invalid', variant.id));
+    assert.equal(snapshot(), beforeRead, 'the refused read writes nothing');
     const altered = { ...variant, id: f.plan.id, revision: f.plan.revision };
     replaceSaved(f.store, altered); f.reopen();
+    const beforeCompile = snapshot();
     assert.throws(() => f.engine.compiler.compile('p'), addressedPlan('plan_derivation_invalid', f.plan.id));
+    assert.equal(snapshot(), beforeCompile, 'the refused compile writes nothing');
     replaceSaved(f.store, f.plan);
   }
 });
@@ -685,197 +679,6 @@ test('M8 external Source stays exact through compilation and the independent wri
   }
 });
 
-const V3_HISTORY_BASE = 'e1e87e9596d1be7fb390564782e5aa60f5431e0b';
-const V3_HISTORY_LOADER = String.raw`import {execFileSync} from 'node:child_process';
-import {appendFileSync} from 'node:fs';
-import {fileURLToPath} from 'node:url';
-let root,ts,manifest,base;
-export async function initialize(data){root=data.root;manifest=data.manifest;base=data.base;ts=(await import(data.typescript)).default;}
-export async function load(url,context,next){
- const prefix=new URL('dist/',root).href;
- if(url.startsWith(prefix)&&/\.js$/.test(url)){
-  const relative=url.slice(prefix.length).replace(/\.js$/,'.ts');
-  if(relative.startsWith('src/')||relative.startsWith('test/')){
-   const source=execFileSync('git',['show',base+':'+relative],{cwd:fileURLToPath(root),encoding:'utf8',maxBuffer:10000000});
-   appendFileSync(manifest,relative+'\n');
-   return {format:'module',shortCircuit:true,source:ts.transpileModule(source,
-    {compilerOptions:{module:ts.ModuleKind.ESNext,target:ts.ScriptTarget.ES2023}}).outputText};
-  }
- }
- return next(url,context);
-}`;
-
-interface V3HistoricalExecution {
-  directory: string; workspace: string; database: string; journal: string;
-  plan: Revision<MachinePlan>; records: Revision<any>[]; calls: unknown[];
-  runs: Revision<TaskRun>[]; receipts: Revision<ArtifactReceipt>[];
-  options: { retry: boolean; maxContextChars: number; maxCorrections: number };
-  source: Revision<any> | null;
-  failure: { code: string; message: string } | null;
-}
-
-function v3HistoricalExecution(t: TestContext, scenario: 'defective-external' | 'defective-external-control' | 'defective-external-control-unexecuted' | 'defective-external-unexecuted'
-  | 'unexecuted' | 'pending' | 'completed'): V3HistoricalExecution {
-  const directory = mkdtempSync(join(tmpdir(), 'omg-v3-whole-git-'));
-  t.after(() => rmSync(directory, { recursive: true, force: true }));
-  const repository = fileURLToPath(new URL('../../', import.meta.url));
-  const loader = join(directory, 'loader.mjs'), producer = join(directory, 'producer.mjs'), manifest = join(directory, 'loaded-src.txt');
-  writeFileSync(loader, V3_HISTORY_LOADER);
-  // The current fixture supplies data and the controlled agent only. Every src module,
-  // including ProductEngine, Compiler, Executor and their transitive readers, is base Git.
-  writeFileSync(producer, `import assert from 'node:assert/strict';
-import {mkdtempSync,mkdirSync,readFileSync,realpathSync,rmSync,writeFileSync} from 'node:fs';
-import {tmpdir} from 'node:os';import {join} from 'node:path';import {pathToFileURL} from 'node:url';
-const repository=process.argv[2],scenario=process.argv[3],src=path=>pathToFileURL(join(repository,'dist/src',path)).href,
- helpers=path=>pathToFileURL(join(repository,'dist/test',path)).href;
-const {Store}=await import(src('storage/store.js'));
-const {ProductEngine}=await import(src('product/engine.js'));
-const {Executor}=await import(src('execution/runner.js'));
-const {executionInputs}=await import(src('execution/inputs.js'));
-const {reference}=await import(src('pipeline/contracts.js'));
-const {git}=await import(src('runtime/environment.js'));
-const {requireGraph}=await import(src('graph/validate.js'));
-const {preparedFeatures,refinedLayers}=await import(helpers('product-fixture.js'));
-const {enrichedGraph}=await import(helpers('enriched-graph-fixture.js'));
-const {exampleGraph}=await import(helpers('graph-fixture.js'));
-const {executionFixture}=await import(helpers('execution-fixture.js'));
-const EXTERNAL_AGENT=${JSON.stringify(EXTERNAL_AGENT)};
-${externalInputGraph.toString()}
-${externalInputFixture.toString()}
-const cleanup=[],context={after:fn=>cleanup.push(fn)};
-let fixture;
-try {
- fixture=scenario.startsWith('defective-external')?externalInputFixture(context,scenario.startsWith('defective-external-control')?'control':'inside'):executionFixture(context);
- const f=fixture;let failure=null,runs;
- assert.equal(f.plan.value.derivation,undefined);
- assert.match(f.plan.id,/^plan:p:[a-f0-9]{64}$/);
- if(scenario==='unexecuted'||scenario.endsWith('-unexecuted')) {
-  runs=[];
-  if(scenario==='defective-external-control-unexecuted') {
-   const consumer=f.plan.value.tasks.find(task=>task.node==='p-consume-work');
-   try {executionInputs(f.store,f.plan,consumer,{path:f.workspace,head:f.plan.value.base.head});assert.fail('The old control reader must still fail without running a task');}
-   catch(error){assert.equal(error.code,'execution_input_missing');failure={code:error.code,message:error.message};}
-  }
- }
- else if(scenario==='pending') {
-  const executor=new Executor(f.store,f.engine.compiler,f.engine.environments,()=>{throw new Error('historical afterGitPublish crash');});
-  await assert.rejects(executor.run('p',reference(f.plan),f.options),/historical afterGitPublish crash/);
-  runs=f.store.list('task-run');
-  assert.equal(runs.length,1);assert.equal(runs[0].value.state,'commit_pending');
-  assert.equal(git(f.store.get('execution-root:p').value.path,['rev-parse','HEAD']),runs[0].value.commit);
- } else {
-  runs=await f.engine.executor.run('p',reference(f.plan),f.options);
-  if(scenario==='completed') assert.deepEqual(runs.map(run=>run.value.state),['committed','committed']);
-  else {
-   assert.deepEqual(runs.map(run=>run.value.state),scenario==='defective-external-control'?['needs_plan']:['committed','needs_plan']);
-   const consumer=f.plan.value.tasks.find(task=>task.node==='p-consume-work');
-   if(scenario==='defective-external-control') {
-    assert.deepEqual(consumer.inputs[0].source,reference(f.source));assert.equal(consumer.inputs[0].producerTask,null);
-    assert.equal(consumer.inputs[0].connector,'p-external-prerequisite');
-    assert.equal(f.plan.value.graphSnapshot.connectors.some(connector=>connector.id===consumer.inputs[0].connector),false);
-    assert.ok(f.plan.value.guards.some(ref=>ref.id===f.source.id));
-   } else {
-    assert.equal(consumer.inputs[0].source,null);assert.ok(consumer.inputs[0].producerTask);
-    assert.equal(f.plan.value.guards.some(ref=>ref.id===f.source.id),false);
-   }
-   try {executionInputs(f.store,f.plan,consumer,f.store.get('execution-root:p').value);assert.fail('Old external execution must fail');}
-   catch(error){assert.equal(error.code,scenario==='defective-external-control'?'execution_input_missing':'execution_input_foreign');failure={code:error.code,message:error.message};}
-  }
- }
- const result={directory:f.directory,workspace:f.workspace,database:f.store.path,journal:join(f.directory,'calls.jsonl'),
-  plan:f.plan,records:f.store.list().flatMap(row=>f.store.history(row.id)),calls:f.calls(),runs,receipts:f.store.list('artifact'),options:f.options,
-  source:scenario.startsWith('defective-external')?f.source:null,failure};
- f.store.close();process.stdout.write(JSON.stringify(result));
-} catch(error){for(const fn of cleanup)try{fn();}catch{}throw error;}
-`);
-  const typescript = pathToFileURL(createRequire(import.meta.url).resolve('typescript')).href;
-  const bootstrap = `import{register}from'node:module';register(${JSON.stringify(pathToFileURL(loader).href)},
-{data:{root:${JSON.stringify(pathToFileURL(repository).href)},typescript:${JSON.stringify(typescript)},manifest:${JSON.stringify(manifest)},base:${JSON.stringify(V3_HISTORY_BASE)}}});`;
-  const environment = { ...process.env }; delete environment.NODE_TEST_CONTEXT;
-  const raw = execFileSync(process.execPath, ['--import', `data:text/javascript,${encodeURIComponent(bootstrap)}`, producer, repository, scenario],
-    { cwd: repository, env: environment, encoding: 'utf8', timeout: 120_000, maxBuffer: 40_000_000 });
-  const old = JSON.parse(raw) as V3HistoricalExecution;
-  t.after(() => rmSync(old.directory, { recursive: true, force: true }));
-  const loaded = new Set(readFileSync(manifest, 'utf8').trim().split('\n'));
-  for (const path of ['src/product/engine.ts', 'src/compiler/compiler.ts', 'src/compiler/derive.ts', 'src/compiler/inputs.ts',
-    'src/execution/runner.ts', 'src/execution/inputs.ts', 'src/execution/task-obligations.ts', 'src/ownership/writer-index.ts'])
-    assert.ok(loaded.has(path), `The historical process must load ${path} from the same Git producer`);
-  return old;
-}
-
-function v3SavedRowsUnchanged(store: Store, records: Revision<any>[]): void {
-  for (const row of records) assert.deepEqual(store.get(row.id, row.revision), row,
-    `Saved ${row.id}@${row.revision} must preserve its original bytes, hash and timestamps`);
-}
-
-function v3DurableExecutionHeads(store: Store): Revision<any>[] {
-  return store.list().filter(row => ['plan', 'task-run', 'artifact', 'writer-index', 'execution-root', 'execution-result', 'stage'].includes(row.kind));
-}
-
-test('whole historical Git producer keeps its defective external plan sealed and does not retrofit a Source', async t => {
-  const old = v3HistoricalExecution(t, 'defective-external');
-  let store = new Store(old.database);
-  try {
-    let engine = new ProductEngine(store);
-    assert.deepEqual(engine.compiler.read(old.plan.id), old.plan);
-    const consumer = old.plan.value.tasks.find(task => task.node === 'p-consume-work')!;
-    assert.ok(consumer.inputs[0]!.producerTask);
-    assert.equal(consumer.inputs[0]!.source, null);
-    assert.equal(old.plan.value.guards.some(ref => ref.id === old.source!.id), false);
-    const root = store.get<ExecutionRoot>('execution-root:p')!.value;
-    assert.throws(() => executionInputs(store, old.plan, consumer, root), old.failure!);
-    const retried = await engine.executor.run('p', reference(old.plan), { ...old.options, retry: true });
-    assert.deepEqual(retried.map(run => run.value.state), ['committed', 'needs_plan']);
-    assert.deepEqual(retried.find(run => run.value.taskId === consumer.id)!.value.inputs, []);
-    assert.deepEqual(JSON.parse(`[${readFileSync(old.journal, 'utf8').trim().split('\n').join(',')}]`), old.calls,
-      'A retry cannot dispatch the consumer with a Source absent from its sealed plan');
-    assert.deepEqual(store.list('plan'), [old.plan]);
-    assert.deepEqual(store.get(old.source!.id), old.source);
-    v3SavedRowsUnchanged(store, old.records);
-    store.close(); store = new Store(old.database); engine = new ProductEngine(store);
-    assert.deepEqual(engine.compiler.read(old.plan.id), old.plan);
-    v3SavedRowsUnchanged(store, old.records);
-  } finally { store.close(); }
-});
-
-test('whole historical Git producer preserves afterGitPublish recovery and exact completed repetitions', async t => {
-  for (const scenario of ['pending', 'completed'] as const) await t.test(scenario, async t => {
-    const old = v3HistoricalExecution(t, scenario);
-    let store = new Store(old.database);
-    try {
-      let engine = new ProductEngine(store);
-      assert.deepEqual(engine.compiler.read(old.plan.id), old.plan);
-      if (scenario === 'pending') {
-        const pending = old.runs[0]!;
-        const recovered = await engine.executor.recover('p');
-        assert.equal(recovered.length, 1);
-        assert.deepEqual(recovered[0]!.value, { ...pending.value, state: 'committed', child: null, updatedAt: recovered[0]!.value.updatedAt });
-        assert.equal(recovered[0]!.revision, pending.revision + 1);
-        assert.deepEqual(store.get(pending.id, pending.revision), pending);
-        assert.deepEqual(JSON.parse(`[${readFileSync(old.journal, 'utf8').trim().split('\n').join(',')}]`), old.calls,
-          'Published commit recovery does not rerun the old implementation, checks or review');
-      }
-      const completed = await engine.executor.run('p', reference(old.plan), old.options);
-      assert.deepEqual(completed.map(run => run.value.state), ['committed', 'committed']);
-      if (scenario === 'completed') {
-        assert.deepEqual(completed, old.runs);
-        assert.deepEqual(store.list('artifact'), old.receipts);
-      }
-      for (const run of completed) assert.deepEqual(run.value.plan, reference(old.plan));
-      for (const receipt of store.list<ArtifactReceipt>('artifact')) assert.deepEqual(receipt.value.plan, reference(old.plan));
-      assert.deepEqual(store.list('plan'), [old.plan]);
-      v3SavedRowsUnchanged(store, old.records);
-      const saved = v3DurableExecutionHeads(store), calls = readFileSync(old.journal, 'utf8');
-      store.close(); store = new Store(old.database); engine = new ProductEngine(store);
-      assert.deepEqual(engine.compiler.read(old.plan.id), old.plan);
-      assert.deepEqual(await engine.executor.recover('p'), []);
-      assert.deepEqual(await engine.executor.run('p', reference(old.plan), old.options), completed);
-      assert.deepEqual(v3DurableExecutionHeads(store), saved);
-      assert.equal(readFileSync(old.journal, 'utf8'), calls);
-      v3SavedRowsUnchanged(store, old.records);
-    } finally { store.close(); }
-  });
-});
 
 
 test('the G5 contract does not admit the native multiple-artifact supplier fixture as an M8 work', () => {
@@ -891,95 +694,6 @@ test('the G5 contract does not admit the native multiple-artifact supplier fixtu
 });
 
 
-test('a historical external requires input with an already sealed Source upgrades its execution era and commits', async t => {
-  const failed = v3HistoricalExecution(t, 'defective-external-control');
-  const failedStore = new Store(failed.database);
-  try {
-    assert.equal(failed.failure!.code, 'execution_input_missing');
-    assert.deepEqual(failed.runs.map(run => run.value.state), ['needs_plan']);
-    const consumer = failed.plan.value.tasks[0]!;
-    assert.throws(() => executionInputs(failedStore, failed.plan, consumer, failedStore.get<ExecutionRoot>('execution-root:p')!.value), failed.failure!);
-    assert.throws(() => new ProductEngine(failedStore).compiler.compile('p'), { code: 'om_not_ready' },
-      'A failed execution still requires renewed current admission; the new derivation cannot bypass it');
-    v3SavedRowsUnchanged(failedStore, failed.records);
-  } finally { failedStore.close(); }
-  const old = v3HistoricalExecution(t, 'defective-external-control-unexecuted');
-  const store = new Store(old.database);
-  try {
-    const engine = new ProductEngine(store);
-    assert.deepEqual(engine.compiler.read(old.plan.id), old.plan);
-    assert.equal(old.failure!.code, 'execution_input_missing');
-    assert.deepEqual(old.runs, []);
-    const plan = engine.compiler.compile('p');
-    assert.notEqual(plan.id, old.plan.id, 'Source already present in an old plan does not repair the old execution formula');
-    assert.equal(plan.value.derivation, 'external-inputs/v1');
-    const { derivation: _derivation, hash: _newHash, ...newBody } = plan.value;
-    const { hash: _oldHash, ...oldBody } = old.plan.value;
-    assert.deepEqual(newBody, oldBody, 'All old task and basis bytes may match while the execution era must still change');
-    const compilation = engine.compiler.publish('p', reference(plan), store.get('stage:p:compilation')!.revision);
-    engine.pipeline.accept('p', 'compilation', compilation.revision);
-    const runs = await engine.executor.run('p', reference(plan), old.options);
-    assert.deepEqual(runs.map(run => run.value.state), ['committed'], canonical(runs.map(run => run.value.error)));
-    assert.deepEqual(runs[0]!.value.inputs, [reference(old.source!)]);
-    assert.deepEqual(store.get(old.source!.id), old.source);
-    assert.deepEqual(store.get(old.plan.id), old.plan);
-    v3SavedRowsUnchanged(store, old.records);
-  } finally { store.close(); }
-});
-
-test('a fresh historical external supplier inside the plan compiles a new Source-bound era', async t => {
-  const old = v3HistoricalExecution(t, 'defective-external-unexecuted');
-  const store = new Store(old.database);
-  try {
-    const engine = new ProductEngine(store);
-    assert.deepEqual(engine.compiler.read(old.plan.id), old.plan);
-    assert.deepEqual(store.list('task-run'), []);
-    const oldConsumer = old.plan.value.tasks.find(task => task.node === 'p-consume-work')!;
-    assert.ok(oldConsumer.inputs[0]!.producerTask); assert.equal(oldConsumer.inputs[0]!.source, null);
-    const plan = engine.compiler.compile('p'), consumer = plan.value.tasks.find(task => task.node === oldConsumer.node)!;
-    assert.notEqual(plan.id, old.plan.id); assert.equal(plan.value.derivation, 'external-inputs/v1');
-    const unchanged = (value: MachinePlan) => value.tasks.map(task => ({ node: task.node, id: task.id, signature: task.signature,
-      produces: task.produces, ownership: task.ownership })).sort((left, right) => left.node.localeCompare(right.node));
-    assert.deepEqual(unchanged(plan.value), unchanged(old.plan.value), 'Changing the input derivation preserves task identities, signatures, outputs and ownership');
-    assert.deepEqual(consumer.inputs, [{ connector: 'p-external-flow', artifact: 'p-external', producerTask: null, receipt: null, source: reference(old.source!) }]);
-    assert.ok(plan.value.guards.some(ref => canonical(ref) === canonical(reference(old.source!))));
-    const compilation = engine.compiler.publish('p', reference(plan), store.get('stage:p:compilation')!.revision);
-    engine.pipeline.accept('p', 'compilation', compilation.revision);
-    const runs = await engine.executor.run('p', reference(plan), old.options);
-    assert.deepEqual(runs.map(run => run.value.state), ['committed', 'committed'], canonical(runs.map(run => run.value.error)));
-    assert.deepEqual(engine.compiler.read(old.plan.id), old.plan);
-    v3SavedRowsUnchanged(store, old.records);
-  } finally { store.close(); }
-});
-
-test('a genuine unexecuted legacy v2 without external task inputs repeats after restart without writes', t => {
-  const old = v3HistoricalExecution(t, 'unexecuted');
-  let store = new Store(old.database);
-  try {
-    assert.equal(old.plan.value.version, 2); assert.equal(old.plan.value.derivation, undefined);
-    assert.deepEqual(store.list('task-run'), []);
-    assert.ok(old.plan.value.tasks.every(task => task.inputs.every(input => !old.plan.value.graphSnapshot.artifacts.find(artifact => artifact.id === input.artifact)!.external)));
-    for (let repeat = 0; repeat < 2; repeat++) {
-      store.close(); store = new Store(old.database);
-      const engine = new ProductEngine(store), before = canonical(store.list().flatMap(row => store.history(row.id)));
-      assert.deepEqual(engine.compiler.compile('p'), old.plan);
-      assert.deepEqual(engine.compiler.compile('p', [{ id: 'unavailable-extra-guard', revision: 1, hash: '0'.repeat(64) }]), old.plan,
-        'An already completed repeat preserves the former extraGuards behavior');
-      assert.deepEqual(engine.compiler.read(old.plan.id), old.plan);
-      assert.equal(canonical(store.list().flatMap(row => store.history(row.id))), before);
-      assert.deepEqual(store.get('current-plan:p')!.value, reference(old.plan));
-    }
-    v3SavedRowsUnchanged(store, old.records);
-    const corrupted = structuredClone(old.plan.value) as unknown as Record<string, unknown>;
-    delete corrupted['tasks'];
-    const { hash: _oldHash, ...corruptBody } = corrupted; corrupted['hash'] = hashJson(corruptBody);
-    replaceSaved(store, { ...old.plan, value: corrupted, hash: hashJson(corrupted) });
-    store.close(); store = new Store(old.database);
-    const before = canonical(store.list().flatMap(row => store.history(row.id)));
-    assert.throws(() => new ProductEngine(store).compiler.compile('p'), addressedPlan('plan_corrupt', old.plan.id));
-    assert.equal(canonical(store.list().flatMap(row => store.history(row.id))), before);
-  } finally { store.close(); }
-});
 
 test('without an exact legacy v2 record nonexternal compilation creates only the new era', t => {
   const f = executionFixture(t, "normal", { route: "om" });
@@ -991,51 +705,6 @@ test('without an exact legacy v2 record nonexternal compilation creates only the
   assert.deepEqual(f.store.get('current-plan:p')!.value, reference(f.plan));
 });
 
-test('new exact plan wins over an existing legacy v2 and a corrupt new record never falls back', t => {
-  const old = v3HistoricalExecution(t, 'unexecuted');
-  let store = new Store(old.database);
-  try {
-    const plan = externalPlanVariant(store, old.plan, value => { value.derivation = 'external-inputs/v1'; });
-    store.close(); store = new Store(old.database);
-    let engine = new ProductEngine(store), before = canonical(store.list().flatMap(row => store.history(row.id)));
-    assert.deepEqual(engine.compiler.read(plan.id), plan);
-    assert.deepEqual(engine.compiler.compile('p'), plan);
-    assert.equal(canonical(store.list().flatMap(row => store.history(row.id))), before);
-    assert.deepEqual(store.get('current-plan:p')!.value, reference(old.plan), 'A completed repeat writes no pointer');
-    const value = structuredClone(plan.value); delete value.derivation;
-    replaceSaved(store, { ...plan, value, hash: hashJson(value) });
-    store.close(); store = new Store(old.database); engine = new ProductEngine(store);
-    before = canonical(store.list().flatMap(row => store.history(row.id)));
-    assert.throws(() => engine.compiler.compile('p'), addressedPlan('plan_derivation_invalid', plan.id));
-    assert.equal(canonical(store.list().flatMap(row => store.history(row.id))), before);
-    assert.deepEqual(store.get(old.plan.id), old.plan);
-    v3SavedRowsUnchanged(store, old.records);
-  } finally { store.close(); }
-});
-
-test('legacy no-write compilation keeps its original admission guards when a second Store changes a dependency', t => {
-  const old = v3HistoricalExecution(t, 'unexecuted');
-  const store = new Store(old.database), second = new Store(old.database);
-  try {
-    const engine = new ProductEngine(store), source = store.get<Source>('source:p:brief')!;
-    assert.ok(old.plan.value.guards.some(ref => canonical(ref) === canonical(reference(source))));
-    const get = store.get.bind(store), plans = store.list('plan'), pointer = store.get('current-plan:p');
-    let raced = false;
-    store.get = ((id: string, revision?: number) => {
-      const found = get(id, revision);
-      if (!raced && id === old.plan.id && revision === undefined) {
-        raced = true;
-        new ProductEngine(second).discovery.evidence.document('p', 'brief', 'A changed dependency after original admission checks', 'text/plain', source.revision);
-      }
-      return found;
-    }) as typeof store.get;
-    try { assert.throws(() => engine.compiler.compile('p'), { code: 'plan_stale' }); }
-    finally { store.get = get; }
-    assert.ok(raced); assert.deepEqual(store.list('plan'), plans); assert.deepEqual(store.get('current-plan:p'), pointer);
-    assert.equal(store.get<Source>(source.id)!.revision, source.revision + 1);
-    v3SavedRowsUnchanged(store, old.records);
-  } finally { second.close(); store.close(); }
-});
 
 test('two external connectors retain both task inputs while sharing one exact Source guard', t => {
   const f = currentExternalInputFixture(t, 'inside', undefined, graph => {
