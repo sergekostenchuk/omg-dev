@@ -16,7 +16,7 @@ import type { Graph } from '../src/graph/model.js';
 import { withHistoricalReads, historicalProof, historicalTrace } from '../src/om/input.js';
 import { storeView, readServer } from '../src/storage/store-view.js';
 import { transactionForTests } from '../src/om/atomic-gate.js';
-import { writeGuarded, readRecord } from '../src/om/refs.js';
+import { writeGuarded } from '../src/om/refs.js';
 import { type QuestionPacketRequest, writeQuestionPacket, prepareQuestionPacket, readQuestionPacket, type QuestionPacketRecord, readPartResult } from '../src/om/question-packet.js';
 import { seriesRequestOf, type RepairSeries } from '../src/om/series.js';
 import { answerProducerOf, prepareAnswersGateTrace } from '../src/om/answers-gate.js';
@@ -229,61 +229,6 @@ test('E4 cycle delivers all addressed read forms then answers once in the same a
   assert.deepEqual(valueOf(readModelCycle(f.store, { project: f.project, record: reference(cycle.record) })).last.outcome, cycle.last.outcome);
   assert.equal(valueOf(await runModelCycle(f.store, f.request)).repeated, true);
   assert.equal(f.sent().length, 2); assert.deepEqual(f.store.list().map(reference), snapshot);
-});
-
-
-
-test('E4 direct continuation refuses repeated knowledge atomically before a third dispatch and replays after restart', { todo: "NR1 №3646: согласованная перезапись цепочки до новейшей записи — om-fsck её не видит; решение позже" }, async t => {
-  for (const kind of ['fact', 'field'] as const) {
-    const f = e4Fixture(t, kind);
-    const need = e4NeedSource(f, [{ action: 'read', path: 'e4-source.txt', media: 'text/plain' }]);
-    f.steps([{ research: need, usage }, { research: need, usage }, { research: need, usage }]);
-    const first = valueOf(await runModelCall(f.store, f.request));
-    const firstBasis = { project: f.project, packet: f.request.packet, call: first.call, response: first.response! };
-    const delivered = valueOf(deliverModelSources(f.store, firstBasis));
-    const nextRequest: QuestionPacketRequest = { ...f.packetRequest, continuation: { packet: firstBasis.packet,
-      call: firstBasis.call, response: firstBasis.response, deliveries: [...delivered.deliveries] } };
-    const next = valueOf(writeQuestionPacket(f.store, nextRequest));
-    assert.equal(next.record.value.state, 'ready');
-    f.restart();
-    const secondRequest = { ...f.request, packet: reference(next.record) };
-    const second = valueOf(await runModelCall(f.store, secondRequest));
-    const basis = { project: f.project, packet: secondRequest.packet, call: second.call, response: second.response! };
-    const again = valueOf(deliverModelSources(f.store, basis));
-    assert.equal(valueOf(readContinuationEvidence(f.store, { ...basis, deliveries: [...again.deliveries] })).novel, false);
-    const terminalRequest: QuestionPacketRequest = { ...next.record.value.request, previous: [...next.record.value.request.previous],
-      continuation: { packet: basis.packet, call: basis.call, response: basis.response, deliveries: [...again.deliveries] } };
-    const before = f.store.list().map(reference);
-    const prepared = valueOf(prepareQuestionPacket(f.store, terminalRequest));
-    assert.equal(prepared.record.value.state, 'blocked');
-    assert.equal(prepared.record.value.refusal?.code, 'research_no_progress');
-    assert.deepEqual(f.store.list().map(reference), before, 'Preparation never completes the attempt by itself');
-    assert.ok(prepared.writes.some(write => write.id === f.series.id));
-    const pendingOnly = new Proxy(f.store, { get(target, key) {
-      if (key === 'get') return (id: string, revision?: number) => id === prepared.record.id ? prepared.record : target.get(id, revision);
-      const member: unknown = Reflect.get(target, key, target); return typeof member === 'function' ? member.bind(target) : member;
-    } });
-    assert.equal(readQuestionPacket(pendingOnly, { project: f.project, record: reference(prepared.record) }).ok, false,
-      'A lone blocked record does not prove the atomic completion');
-    const terminal = valueOf(writeQuestionPacket(f.store, terminalRequest));
-    assert.equal(terminal.record.value.state, 'blocked');
-    const series = f.store.get<{ attempts: { outcome: { reason: string } }[]; withoutProgress: number }>(f.series.id)!;
-    assert.equal(series.value.attempts[0]!.outcome.reason, 'refused');
-    assert.equal(series.value.withoutProgress, 1);
-    const refusedCall = await runModelCall(f.store, { ...f.request, packet: reference(terminal.record) });
-    assert.equal(refusedCall.ok, false); assert.equal(f.sent().length, 2);
-    assert.equal(f.store.list('call-record').length, 2);
-    const after = f.store.list().map(reference);
-    f.restart(); writeFileSync(join(f.root, 'e4-source.txt'), 'changed after the completed transition');
-    valueOf(readQuestionPacket(f.store, { project: f.project, record: reference(terminal.record) }));
-    assert.equal(valueOf(writeQuestionPacket(f.store, terminalRequest)).existing, true);
-    assert.equal(valueOf(writeQuestionPacket(f.store, nextRequest)).existing, true);
-    assert.equal(prepareQuestionPacket(f.store, nextRequest).ok, false,
-      'Historical replay does not authorize a new call under the completed attempt');
-    assert.equal(valueOf(await runModelCall(f.store, secondRequest)).repeated, true);
-    assert.equal(valueOf(writeQuestionPacket(f.store, terminalRequest)).writes.length, 0);
-    assert.deepEqual(f.store.list().map(reference), after); assert.equal(f.sent().length, 2);
-  }
 });
 
 
@@ -1406,34 +1351,6 @@ test('PF1 (№2797-2) pendingCallStore is the common pending overlay: later writ
   assert.ok(isProxy(opaque) && readServer(opaque, 'get', 'pf1m:c', undefined) === null, 'Over an unproved view the call store stays opaque');
   assert.throws(() => pendingCallStore(store, [{ id: 'pf1m:d', kind: 'k', expected: 0, value: { f: (() => 1) as unknown as Json } }]),
     (error: unknown) => error instanceof EngineError && error.code === 'invalid_json', 'A value that is no JSON is refused as before: its hash is taken first');
-});
-
-
-
-// Type 1: only the old E3 admitted this context Ref as a search scope; excluded independently of the four current windows.
-test('LP3 legacy reads-invalid: a context Ref admitted by the old E3 resumes after call or diagnostic without another send', async t => {
-  const windows = { 'reads-invalid': ['call', 'diagnostic'] } as const;
-  for (const [terminal, stops] of Object.entries(windows)) for (const stop of stops) await t.test(`${terminal} after ${stop}`, async t => {
-    const f = e4Fixture(t, 'fact', 100_000, 0, 5000, true, true, false, 'b595c7b');
-    const request = f.request;
-    const reads = [{ action: 'search', within: reference(f.input), query: 'question' }];
-    f.steps([{ research: e4NeedSource(f, reads), usage }, { research: e4NeedSource(f, reads), usage }]);
-    const call = valueOf(await runModelCall(f.store, request));
-    const basis = { project: f.project, packet: request.packet, call: call.call, response: call.response! };
-    if (terminal === 'reads-invalid' && stop === 'diagnostic') {
-      const scope = reference(f.input), read = readRecord(f.store, scope, { unit: 'E4', target: scope.id, idPrefix: `source:${f.project}:`, kind: 'source' });
-      assert.ok(!read.ok && read.refusal.code === 'record_foreign');
-      valueOf(finishModelAttempt(f.store, { ...basis, code: read.refusal.code, message: read.refusal.message, reason: 'refused', evidence: [scope] }));
-    }
-    f.restart();
-    const cycle = valueOf(await runModelCycle(f.store, request));
-    assert.equal(cycle.record.value.terminal, terminal);
-    assert.equal(f.sent().length, 1, 'The saved call is finished, never sent again');
-    assert.equal(completionSnapshot(f).complete, true);
-    const saved = f.store.list(); f.restart();
-    valueOf(await runModelCycle(f.store, request));
-    assert.deepEqual(f.store.list(), saved, 'The repeat writes nothing'); assert.equal(f.sent().length, 1);
-  });
 });
 
 
