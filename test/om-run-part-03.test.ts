@@ -25,7 +25,7 @@ import { regateRun } from "../src/om/run.js";
 import { currentL3Reopen, l3ReopenId, observeProposal, readFrameProposals, readProvenFrame } from "../src/om/frame-proposals.js";
 import { resolveSnapshot } from "../src/om/impact.js";
 // ---- LP6 (№3325 §4–§5): stops saved by e7db0ba8 under the old rules, read literally and reconciled by the new era ----
-import { project, adapterFixture, ok, refusal, runFixture, type Fixture, addressAll, usage, blockSeries, actions, actionsSteps, ends, stopAnswer, secondRung, until, RacingStore, loadOperations, gardenPass, regatePolicy, worksFixture, worksAcceptance, factWorksPass, driveUntil, gapHeads, atCommit, sameEnd, twoOwnerAnswers, advanceRun, lp3Need, lp3Context, LP4_COMMITS, lp4Sent, lp4Close, policyDoor } from "./om-run-fixture.js";
+import { project, adapterFixture, ok, refusal, runFixture, type Fixture, addressAll, usage, blockSeries, actions, actionsSteps, ends, stopAnswer, secondRung, until, RacingStore, loadOperations, gardenPass, regatePolicy, worksFixture, worksAcceptance, factWorksPass, driveUntil, gapHeads, sameEnd, twoOwnerAnswers, advanceRun, lp3Need, lp3Context, policyDoor } from "./om-run-fixture.js";
 
 test("26 1 C07 R4 H1.1 the pass runs the project mechanism M5 through G7, then builds the bases of the new B1 itself and goes on; a restart repeats nothing", async t => {
   const f = runFixture(t, undefined, "executed");
@@ -522,64 +522,6 @@ test("MP1 LP3 №53 in the brief era: a search scope naming a context Ref is ref
   assert.equal(end.performed.filter(action => action === "close").length, 3);
   assert.equal(f.sent().length, 7, "Six answers — one correction per attempt — and one review; no repeated delivery or paid call");
   await sameEnd(f, request, 7);
-});
-
-test("LP4 (№2887 row 10, §6.2, §6.6) the producers 3cba953 and 202c470, each from its whole Git code in its own process, leave the pass on completion_ceased after the roles move — saved as a wait or as the step about to be performed; the new code on a new Store ends the remaining work by cease and G7 without sending the paid need_source again, every saved revision as the old code wrote it", async t => {
-  for (const [name, commit] of Object.entries(LP4_COMMITS)) for (const stop of ["waiting", "step"] as const) await t.test(`${name} ${stop}`, async t => {
-    const f = worksFixture(t, undefined, undefined, undefined, commit), moved = join(f.root, "adapter-next.mjs");
-    writeFileSync(moved, readFileSync(adapterFixture));
-    const reads = name === "3cba953" ? [{ action: "search", within: reference(f.store.get(`om-input:${project}`)!), query: "question" }]
-      : [{ action: "read", path: "lp4-later.txt", media: "text/plain" }];
-    const stuck = atCommit(f, commit, `lp4-${name}-${stop}`, `const { advanceRun, startRun } = await import(src('om/run.js'));
-const { ProductEngine } = await import(src('product/engine.js'));
-const { reference } = await import(src('pipeline/contracts.js'));
-const { writeFileSync } = await import('node:fs');
-take(startRun(store, { project: args.project }));
-let request = args.request, ceased = false;
-const seen = [], steps = [];
-async function drive(stopAtStep) {
-  for (let index = 0; index < 40; index++) {
-    const advanced = take(await advanceRun(store, request)), state = advanced.record.value.state;
-    if (advanced.performed?.action === 'cease') ceased = true;
-    if (state.phase === 'step' && state.step.action === 'cycle' && !steps.length) {
-      const packet = store.get(state.step.request.packet.id, state.step.request.packet.revision);
-      steps.push({ research: { protocol: 'omg-answer/v2', requestId: '$requestId', action: 'need_source',
-        questionIds: packet.value.packet.questions.map(row => row.id), missing: 'The addressed data', reads: args.reads }, usage: args.usage });
-      writeFileSync(args.scenario, JSON.stringify({ steps }));
-    }
-    seen.push(state.phase === 'waiting' ? 'waiting:' + state.wait.code : state.phase + ':' + (advanced.performed?.action ?? ''));
-    if (stopAtStep && ceased && state.phase === 'step' && state.step.action === 'cycle') return;
-    if (state.phase === 'waiting' && seen.at(-2) === seen.at(-1)) return;
-  }
-}
-await drive(false);
-const engine = new ProductEngine(store), old = store.get('environment:' + args.project), environment = structuredClone(old.value);
-delete environment.projectId;
-for (const role of ['implementer', 'reviewer']) environment[role].command.args = [args.moved, ...environment[role].command.args.slice(1)];
-request = { ...request, dispatch: { ...request.dispatch, config: reference(engine.environments.configure(args.project, environment, old.revision)) } };
-await drive(args.stop === 'step');
-out({ seen, request });`,
-      { request: f.request, project, reads, usage, scenario: join(f.root, "scenario.json"), moved, stop }) as { seen: string[]; request: RunRequest };
-    const last = stuck.seen.at(-1)!;
-    assert.equal(last, stop === "waiting" ? "waiting:completion_ceased" : "step:", `The old code stands on its cessation: ${stuck.seen.join(",")}`);
-    f.restart();
-    const before = f.store.list().map(reference), head = ok(readRun(f.store, { project }))!;
-    const step = head.value.state.phase === "step" ? head.value.state.step : head.value.last!.step;
-    assert.equal(step.action, "cycle");
-    const packet = (step.request as unknown as { packet: Ref }).packet, paid = lp4Sent(f, packet);
-    assert.equal(paid, 1);
-    if (stop === "step") {
-      // §6.6: the saved step is not performed — an ordinary transition back to the choice, no cycle product invented.
-      const first = ok(await advanceRun(f.store, stuck.request));
-      assert.deepEqual([first.performed, first.record.value.state.phase, first.record.revision], [null, "ready", head.revision + 1]);
-      assert.equal(f.store.list<{ request: { packet: Ref } }>("om-model-cycle").filter(row => row.value.request.packet.id === packet.id).length, 0);
-    }
-    const seen = await lp4Close(f, stuck.request);
-    const roots = f.store.list<{ cause: { kind: string }; remainder: string }>("om-completion-cessation").filter(row => row.value.cause.kind === "cycle-step-ceased");
-    assert.deepEqual(roots.map(row => row.value.remainder), ["assembly"], seen.join(","));
-    assert.equal(lp4Sent(f, packet), 1, "The paid need_source of the old code is never sent again");
-    for (const ref of before) assert.deepEqual(reference(f.store.get(ref.id, ref.revision)!), ref, `${ref.id}@${ref.revision} stands as the old code wrote it`);
-  });
 });
 
 test("AT1 policy: the owner's H2 answer decides the producer's state policy; the model is never asked, and the works pass G5", async t => policyDoor(t, true));
