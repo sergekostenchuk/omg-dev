@@ -1,8 +1,10 @@
 import { variantSnapshotReadiness, produceVariantSnapshot, readVariantSnapshot } from "./variant-snapshot.js";
-import { prepareVariantSession, applyVariantSession, readVariantExecutionSession, readVariantGeneration,
-  type ProvenVariantGeneration } from "./variant-session.js";
+import { prepareVariantSession, applyVariantSession, readVariantExecutionSession, readVariantGeneration, readVariantModelDecision,
+  type ProvenVariantModelDecision, type ProvenVariantGeneration } from "./variant-session.js";
 import { VARIANT_SUBJECT_CONTRACT, type VariantExecutionSession } from "./discovery-variants.js";
 import { variantStateId, readVariantStateStructural } from "./variant-decision.js";
+import { readVariantOwnerDecision } from "./discovery-decision.js";
+import { publishVariantScope, readCurrentVariantScope } from "./variant-scope.js";
 import { readProjectMode } from "../product/project-mode.js";
 import { REQUEST_MANIFEST_CONTRACT, CONTEXT_PREPARATION_CONTRACT } from "./request-parts.js";
 import { currentPlan, v7CheckpointPrefixes, planAttemptSelection, planOwnerSubject, rejectedPlanOwnerRequest, provePlanQuestions, selectV7AnalystRecovery } from "./v7-plan-questions.js";
@@ -1564,18 +1566,17 @@ export class Researcher {
 
   /** Restore the saved physical identity before today's plan/mode can select new work.
    * Session-only and prepared operations remain unpaid; the caller admits those separately. */
-  private restoreV7VariantGenerations(project: string, draftId: string): {
+  private restoreV7Variants(project: string, draftId: string): {
     pending: { session: Revision<VariantExecutionSession>; intent: Revision<ResearchConsumerIntent> | null }[];
-    published: ProvenVariantGeneration[];
+    published: ProvenVariantGeneration[]; decisions: ProvenVariantModelDecision[];
   } {
     const pending: { session: Revision<VariantExecutionSession>; intent: Revision<ResearchConsumerIntent> | null }[] = [];
-    const published: ProvenVariantGeneration[] = [];
+    const published: ProvenVariantGeneration[] = [], decisions: ProvenVariantModelDecision[] = [];
     for (const row of this.store.list<VariantExecutionSession>("discovery-variant-session")) {
-      if (row.value?.projectId !== project || row.value.draft?.id !== draftId) continue;
+      const original = this.store.get<VariantExecutionSession>(row.id, 1);
+      if (original?.value?.projectId !== project || original.value.draft?.id !== draftId) continue;
       let session = readVariantExecutionSession(this.store, project, reference(row));
-      requireCondition(session.value.variantSubject.kind === "proposal", "research_variant_choice_unavailable",
-        "Saved variant decisions need the connected decision producer; generation cannot interpret them");
-      let intent = findResearchConsumerIntent(this.store, project, "variant-proposal", session.id, draftId);
+      let intent = findResearchConsumerIntent(this.store, project, session.value.purpose, session.id, draftId);
       if (intent?.value.state === "running") {
         resumeResearchConsumerExecution(this.store, project, reference(intent));
         session = applyVariantSession(this.store, project, reference(intent));
@@ -1585,11 +1586,13 @@ export class Researcher {
         session = applyVariantSession(this.store, project, reference(intent));
         const results = (intent.value.outputs ?? []).filter(ref => {
           const kind = this.store.get(ref.id, ref.revision)?.kind;
-          return kind === "discovery-variant-set" || kind === "discovery-variant-none";
+          return session.value.variantSubject.kind === "proposal"
+            ? kind === "discovery-variant-set" || kind === "discovery-variant-none" : kind === "discovery-variant-model-decision";
         });
         requireCondition(results.length === 1, "research_variant_generation_missing",
           "The saved execution is not a published generation; retain its paid identity");
-        published.push(readVariantGeneration(this.store, project, results[0]!));
+        if (session.value.variantSubject.kind === "proposal") published.push(readVariantGeneration(this.store, project, results[0]!));
+        else decisions.push(readVariantModelDecision(this.store, project, results[0]!));
       } else {
         requireCondition(intent?.value.state !== "refused", "research_consumer_execution_refused",
           "The original variant execution is refused; a new run does not buy it again");
@@ -1598,24 +1601,89 @@ export class Researcher {
         pending.push({ session, intent });
       }
     }
-    return { pending, published };
+    return { pending, published, decisions };
   }
 
-  private variantGenerationPause(project: string, generation: ProvenVariantGeneration): never {
+  /** Paid history is already restored. Only a current proven act can authorize a scope;
+   * a new decision goes through the same managed admission/reservation as a direct B.2 client. */
+  private async advanceV7VariantChoice(project: string, generation: ProvenVariantGeneration,
+    variants: ReturnType<Researcher["restoreV7Variants"]>, allowNew: boolean, allowance: boolean,
+    signal: AbortSignal | undefined, beforeSend: () => void): Promise<void> {
     const result = generation.publication.result, session = generation.session;
     const mode = readProjectMode(this.store, project);
-    const state = this.store.get(variantStateId(project, session.value.draft.id));
-    const stale = canonical(mode.ref) !== canonical(session.value.variantSubject.mode)
-      || !generation.state || !state || canonical(reference(state)) !== canonical(generation.state);
-    const code = stale ? "research_variant_context_stale" : result.kind === "discovery-variant-none"
-      ? "research_no_variants" : mode.mode === "questions" ? "research_variant_owner_required" : "research_variant_choice_unavailable";
-    throw new EngineError(code, canonical({ code, result: result.ref, session: reference(session),
-      subject: session.value.variantSubject, publicationState: generation.state, currentMode: mode.ref,
-      door: code === "research_variant_owner_required" ? "discovery-variant-choice" : null,
-      message: stale ? "The paid generation retains its original mode/state; it is not reassigned to today's selection"
-        : result.kind === "discovery-variant-none" ? "The paid generation published no_variants"
-        : mode.mode === "questions" ? "An explicit owner choice of this exact set is required"
-        : "The model choice producer is not connected; a recommendation is no decision" }));
+    requireCondition(generation.state, "research_variant_context_stale",
+      "The paid generation was retained without applying to the selection");
+    const head = this.store.get(variantStateId(project, session.value.draft.id));
+    const state = head ? readVariantStateStructural(this.store, project, session.value.draft.id, reference(head)).record : null;
+    const pause = (code: string, message: string, details: object = {}): never => {
+      throw new EngineError(code, canonical({ code, result: result.ref, session: reference(session),
+        subject: session.value.variantSubject, publicationState: generation.state, currentMode: mode.ref,
+        decision: null, scope: null, ...details, message }));
+    };
+    requireCondition(state && canonical(state.value.draft) === canonical(session.value.draft)
+      && canonical(state.value.result) === canonical(result.ref), "research_variant_context_stale",
+      "The paid generation is not the current exact selection; retain its historical result");
+    if (result.kind === "discovery-variant-none") {
+      requireCondition(generation.state && canonical(reference(state)) === canonical(generation.state),
+        "research_variant_context_stale", "The no_variants publication does not own today's selection");
+      pause("research_no_variants", "The paid generation published no_variants", { reason: "no_variants", next: "dossier" });
+    }
+    if (state.value.decision) {
+      const ref = state.value.decision, kind = this.store.get(ref.id, ref.revision)?.kind;
+      requireCondition(kind === "discovery-variant-model-decision" || kind === "discovery-variant-owner-decision",
+        "discovery_variant_decision_invalid", "The current selection needs a proven model or owner act");
+      const choice = kind === "discovery-variant-owner-decision" ? readVariantOwnerDecision(this.store, project, ref)
+        : readVariantModelDecision(this.store, project, ref);
+      const applied = "grant" in choice ? reference(choice.state) : choice.state;
+      requireCondition(applied && canonical(applied) === canonical(reference(state))
+        && canonical(choice.decision.value.set) === canonical(result.ref)
+        && canonical(choice.decision.value.draft) === canonical(session.value.draft),
+        "discovery_variant_stale", "Only this exact set's proven applied choice is current");
+      const outcome = choice.decision.value.outcome;
+      let scope: Ref | null = null;
+      if (outcome.kind === "choose") {
+        publishVariantScope(this.store, project, ref);
+        const current = readCurrentVariantScope(this.store, project, session.value.draft);
+        requireCondition(canonical(current.choice.ref) === canonical(ref), "discovery_variant_stale",
+          "The selected owner/model act moved before its scope was read");
+        scope = reference(current.scope);
+      }
+      pause("research_variant_handoff_unavailable", "The proven choice is retained; its handoff consumer is not connected",
+        { draft: session.value.draft, set: result.ref, mode: choice.decision.value.mode,
+          decision: ref, selection: applied, scope, reason: outcome.kind, next: outcome.kind === "choose" ? "deep" : "dossier" });
+    }
+    requireCondition(generation.state && canonical(reference(state)) === canonical(generation.state),
+      "research_variant_context_stale", "The generation lost its proven undecided selection");
+    const previous = variants.decisions.filter(choice => canonical(choice.decision.value.set) === canonical(result.ref));
+    if (mode.mode === "questions") pause("research_variant_owner_required", "An explicit owner choice of this exact set is required",
+      { door: "discovery-variant-choice", draft: session.value.draft, set: result.ref, mode: mode.ref, expectedSelection: reference(state),
+        paidDecision: previous[0]?.decision.ref ?? null, stale: previous[0]?.stale ?? null });
+    if (previous.length) pause("research_variant_context_stale", "The paid decision was retained without applying to this selection",
+      { decision: previous[0]!.decision.ref, stale: previous[0]!.stale });
+    requireCondition(allowNew, "research_restore_complete", "Saved work is restored; a new decision needs an explicit v7 allowance");
+    requireCondition(allowance, "research_turns_exhausted", "Research call allowance reached before variant choice");
+    const pending = variants.pending.filter(operation => operation.session.value.variantSubject.kind === "decision"
+      && canonical(operation.session.value.variantSubject.set) === canonical(result.ref));
+    requireCondition(pending.length <= 1, "research_variant_generation_ambiguous", "Several unpaid decision identities need an explicit resolution");
+    const operation = pending[0], effective = this.environments.effective(project);
+    const subject = operation?.session.value.variantSubject ?? { contract: VARIANT_SUBJECT_CONTRACT,
+      kind: "decision" as const, set: result.ref, mode: mode.ref, expectedSelection: reference(state) };
+    requireCondition(canonical(subject.mode) === canonical(mode.ref) && canonical(subject.expectedSelection) === canonical(reference(state)),
+      "research_consumer_context_stale", "The unpaid decision retains its original mode and selection");
+    const role = operation ? [effective.environment.value.implementer, effective.environment.value.reviewer]
+      .find(candidate => candidate.actor === operation.session.value.actor) : effective.environment.value.implementer;
+    requireCondition(role, "research_consumer_context_stale", "The unpaid decision lost its original actor");
+    const prepared = operation?.intent ? { session: operation.session, intent: operation.intent }
+      : prepareVariantSession(this.store, { projectId: project, variantSubject: subject, environment: effective.environment, role,
+        prompt: "Choose one exact member of this paid set or reject_all. Return choose/key/reason or reject_all/reason. The generation recommendation is not a decision." });
+    const value = prepared.intent.value;
+    requireCondition(canonical(value.dispatch) === canonical(effective.environment.value), "research_consumer_context_stale",
+      "The unpaid decision environment changed");
+    beforeSend();
+    await researchCall(value.role, value.dispatch, value.cursor.prompt, value.cursor.context, signal,
+      { store: this.store, draftId: value.draft.id, questionId: value.question.id, purpose: value.kind,
+        consumerIntent: reference(prepared.intent), session: value.owner });
+    applyVariantSession(this.store, project, reference(this.store.get<ResearchConsumerIntent>(prepared.intent.id)!));
   }
 
   /** The v7 open frontier uses the ordinary managed transport and K.
@@ -1632,7 +1700,7 @@ export class Researcher {
       "research_busy", "This draft already has an active researcher");
     try {
       for (;;) {
-        const variants = this.restoreV7VariantGenerations(project, draftId);
+        const variants = this.restoreV7Variants(project, draftId);
         const synthesis = this.v7SynthesisRecovery(project, draftId);
         const reserved = synthesis?.deliveryTurn != null ? reference(synthesis.session) : undefined;
         if (reserved) requireCondition(run && synthesis!.session.value.delivery?.run === id
@@ -1911,9 +1979,13 @@ export class Researcher {
         });
         requireCondition(pendingVariants.length <= 1 && !(pendingVariants.length && generations.length),
           "research_variant_generation_ambiguous", "The plan has incompatible saved generation operations");
-        if (generations.length && run) this.variantGenerationPause(project, generations[0]!);
-        const readiness = variantSnapshotReadiness(this.store, project);
         const allowNew = !options.restoreOnly && producerContractEra("discovery", options.producerPolicy) === 7;
+        const advanceChoice = async () => this.advanceV7VariantChoice(project, generations[0]!, variants, allowNew, used < limit, signal, () => {
+          if (run!.value.status !== "running") run = this.save(run!, { status: "running", owner, ownerQuestion: null, error: null, pauseCode: null });
+          used++;
+        });
+        if (generations.length && run) { await advanceChoice(); continue; }
+        const readiness = variantSnapshotReadiness(this.store, project);
         // Prove saved operations and readiness first. A cold refusal preserves the exact
         // addressed pause even if other questions remain uncovered; it claims no readiness.
         const lastSubject = turns.length ? planSubjectOf(turns[turns.length - 1]!.value) : null;
@@ -1928,7 +2000,7 @@ export class Researcher {
                 limit, inputs: plan.draft.value.inputs, ownerQuestion: null, error: null, pauseCode: null, owner, requestChars: 0 } }],
               [reference(plan.draft), reference(plan.question), ...readiness.guards])[0]!;
           }
-          if (generations.length) this.variantGenerationPause(project, generations[0]!);
+          if (generations.length) { await advanceChoice(); continue; }
           requireCondition(allowNew, "research_restore_complete", "Saved work is restored; a new generation needs an explicit v7 allowance");
           requireCondition(used < limit, "research_turns_exhausted", "Research call allowance reached before variant generation");
           requireCondition(readiness.generationAllowed, "research_budget_exhausted",

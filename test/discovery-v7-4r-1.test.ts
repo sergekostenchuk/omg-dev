@@ -44,7 +44,8 @@ let prior=[];try{prior=readFileSync(${JSON.stringify(wire)},'utf8').trim().split
 appendFileSync(${JSON.stringify(wire)},JSON.stringify(r)+'\\n');
 let research=s.actions?.[prior.filter(row=>!row.subject.assessmentSubject&&!row.subject.variantSubject).length]??{action:'answer',question:q,value:{type:'impossible',code:'source_unavailable',evidence:[],text:'No accessible source'},citations:[]};
 if(research.question==='$selected')research.question=q;
-if(r.subject.variantSubject){
+if(r.subject.variantSubject?.kind==='decision')research=s.reject?{action:'reject_all',reason:'Model rejects this exact set'}:{action:'choose',key:'v1',reason:'Model chooses the bounded member'};
+else if(r.subject.variantSubject){
  const grounds=[r.subject.variantSubject.snapshot],keys=['value','user','payer','costAndTime','risk','mandateFit'];
  research=s.none?{action:'no_variants',reasons:[{code:'bounded_search',message:'No bounded variant',grounds}],searchLimits:['Saved sweep only'],unknowns:['Demand unknown']}
  :{action:'variants',variants:[{key:'v1',title:'Bounded variant',proposal:{bounded:true},criteria:Object.fromEntries(keys.map(key=>[key,{conclusion:'Bounded model proposal',grounds,assumptions:[],unknowns:['Demand unknown'],quantity:null}]))}],scale:Object.fromEntries(keys.map(key=>[key,'Same bounded scale'])),comparison:'One bounded option',recommendation:{key:'v1',reason:'Only bounded candidate'},searchLimits:['Saved sweep only'],unknowns:['Demand unknown']};
@@ -73,9 +74,9 @@ console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,u
     assert.ok(sessions.revoke(login.value.bearer).ok); return record;
   }
   const initial = mode(initialMode), cal = f.store.write({ id: 'variant-calibration', kind: 'transport-fixture', expected: 0, value: { projectId: 'p' } });
-  await researchCall(environment.value.implementer, environment.value, 'Calibrate generation',
-    { variantSubject: { contract: VARIANT_SUBJECT_CONTRACT, kind: 'proposal', snapshot: reference(cal), mode: reference(initial), expectedSelection: null }, history: [] }, undefined,
-    { store: f.store, draftId: calibration.id, questionId: calibration.value.questions[0]!, purpose: 'variant-proposal' });
+  for (const kind of ['proposal', 'decision'] as const) await researchCall(environment.value.implementer, environment.value, 'Calibrate variant step',
+    { variantSubject: { contract: VARIANT_SUBJECT_CONTRACT, kind, ...(kind === 'proposal' ? {snapshot: reference(cal)} : {set: reference(cal)}), mode: reference(initial), expectedSelection: null }, history: [] }, undefined,
+    { store: f.store, draftId: calibration.id, questionId: calibration.value.questions[0]!, purpose: `variant-${kind}` });
   writeFileSync(wire, '');
   const run = (limit = 8, store = f.store, restoreOnly = false) => new Researcher(store, new Discovery(store), new ProductEngine(store).environments)
     .run('p', v.draft.id, limit, undefined, { producerPolicy: { discovery: 7 }, restoreOnly });
@@ -112,11 +113,14 @@ test('4R.1: ordinary runner restores MR/P, covers the whole sweep including appl
   assert.deepEqual(history(f.store), before); assert.equal(f.wires().length, sent);
 });
 
-test('4R.1: bypass preserves the recommendation as a recommendation and pauses at unavailable choice without another generation', async t => {
-  const f = await setup(t, undefined, 'bypass'); const result = await f.run(2);
-  assert.equal(result.value.pauseCode, 'research_variant_choice_unavailable', JSON.stringify(result.value));
-  assert.equal(f.generationCalls().length, 1);
-  const state = f.store.list<any>('discovery-variant-state')[0]!; assert.equal(state.value.decision, null);
+test('4R.1: bypass buys a separate model choice after generation and pauses at the exact scope before handoff', async t => {
+  const f = await setup(t, undefined, 'bypass'); const result = await f.run(3);
+  assert.equal(result.value.pauseCode, 'research_variant_handoff_unavailable', JSON.stringify(result.value));
+  assert.equal(f.generationCalls().filter(row => row.subject.variantSubject.kind === 'proposal').length, 1);
+  assert.equal(f.generationCalls().filter(row => row.subject.variantSubject.kind === 'decision').length, 1);
+  const state = f.store.list<any>('discovery-variant-state')[0]!; assert.ok(state.value.decision);
+  assert.deepEqual(JSON.parse(result.value.error!).decision, state.value.decision);
+  assert.ok(JSON.parse(result.value.error!).scope);
   const before = history(f.store), sent = f.wires().length;
   assert.deepEqual(await f.run(2, f.open(), true), result);
   assert.deepEqual(history(f.store), before); assert.equal(f.wires().length, sent);
