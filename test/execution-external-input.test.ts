@@ -769,6 +769,56 @@ test(`current nonexternal M8 compilation first creates only the external-inputs-
   }
 });
 
+for (const namespace of ['old', 'unknown'] as const) for (const marker of ['current', 'absent'] as const)
+test(`LG41 saved ${namespace}-namespace imitation with ${marker} marker is refused by read/gate/publish/context/detail hot/cold without writes or sends`, t => {
+  const f = uncompiledNonexternalFixture(t), plan = f.engine.compiler.compile('p');
+  assert.equal(plan.id, f.planned.id); assert.deepEqual(plan.value, f.value);
+  const task = plan.value.tasks[0]!;
+  assert.ok(task); assert.deepEqual(f.engine.compiler.gate('p', reference(plan)).findings, []);
+  const original = compilationSnapshot(f.store), calls = f.calls();
+  for (const cold of [false, true]) {
+    if (cold) f.reopen();
+    assert.deepEqual(f.engine.compiler.read(plan.id), plan);
+    assert.equal(compilationSnapshot(f.store), original); assert.deepEqual(f.calls(), calls);
+    assert.deepEqual(f.engine.compiler.compile('p'), plan);
+    assert.equal(compilationSnapshot(f.store), original); assert.deepEqual(f.calls(), calls);
+  }
+
+  // Explicit negative address imitation over a real current M8 plan, not a historical producer.
+  const { hash: _hash, ...body } = structuredClone(plan.value);
+  if (marker === 'absent') delete body.derivation;
+  const hash = hashJson(body), value = { ...body, hash };
+  const id = namespace === 'old' ? `plan:p:${hash}` : `plan:p:external-inputs-unknown:${hash}`;
+  const imitation = f.store.write<MachinePlan>({ id, kind: 'plan', expected: 0, value });
+  assert.deepEqual(f.store.get(id), imitation);
+  assert.equal(imitation.hash, hashJson(value)); assert.equal(imitation.value.hash, hashJson(body));
+  assert.equal(Object.hasOwn(imitation.value, 'derivation'), marker === 'current');
+  const afterImitation = compilationSnapshot(f.store);
+  for (const cold of [false, true]) {
+    if (cold) f.reopen();
+    const ref = reference(imitation);
+    const doors = {
+      read: () => f.engine.compiler.read(id),
+      gate: () => f.engine.compiler.gate('p', ref),
+      publish: () => f.engine.compiler.publish('p', ref, 0),
+      context: () => f.engine.compiler.context('p', ref, task.id, 200_000),
+      detail: () => f.engine.compiler.detail('p', ref, task.id, 'graph', { id: task.node, pointer: '', start: null, end: null }, 200_000),
+    };
+    for (const [name, door] of Object.entries(doors)) {
+      assert.equal(compilationSnapshot(f.store), afterImitation);
+      assert.throws(door, error => {
+        assert.ok(error instanceof EngineError); assert.equal(error.code, 'plan_derivation_invalid');
+        assert.deepEqual(error.details, { unit: 'compiler/model', target: id, field: 'id' }); return true;
+      }, `${name}, cold=${cold}`);
+      assert.equal(compilationSnapshot(f.store), afterImitation); assert.deepEqual(f.calls(), calls);
+    }
+    assert.deepEqual(f.engine.compiler.read(plan.id), plan);
+    assert.equal(compilationSnapshot(f.store), afterImitation); assert.deepEqual(f.calls(), calls);
+    assert.deepEqual(f.engine.compiler.compile('p'), plan);
+    assert.equal(compilationSnapshot(f.store), afterImitation); assert.deepEqual(f.calls(), calls);
+  }
+});
+
 test('old-address imitation cannot bypass the Environment guard of the first current nonexternal plan transaction', t => {
   const f = uncompiledNonexternalFixture(t), fake = imitatePreExternalPlan(f);
   const second = new Store(f.store.path); t.after(() => second.close());

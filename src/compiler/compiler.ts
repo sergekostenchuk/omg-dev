@@ -70,7 +70,8 @@ export class Compiler {
   read(id: string): Revision<MachinePlan> {
     const plan = this.store.get<MachinePlan>(id);
     requireCondition(plan && plan.kind === "plan", "plan_missing", "Machine plan is missing");
-    const derivation = planDerivation(plan.id);
+    if (planDerivation(plan.id) !== EXTERNAL_INPUT_DERIVATION) throw new EngineError('plan_derivation_invalid',
+      'The plan address must use the external-inputs/v1 namespace', { unit: 'compiler/model', target: plan.id, field: 'id' });
     const om = requireBasis(this.store, plan.value);
     if (Object.hasOwn(plan.value, 'taskContextContract')) {
       if (!isTaskContextContract(plan.value.taskContextContract) || !om) throw new EngineError('context_source_invalid',
@@ -85,9 +86,7 @@ export class Compiler {
     const graph = this.store.get<Graph>(plan.value.graph.id, plan.value.graph.revision);
     requireCondition(graph?.kind === "graph" && graph.hash === plan.value.graph.hash
       && hashJson(graph.value) === hashJson(plan.value.graphSnapshot), "plan_foreign", "Plan must bind its exact graph version");
-    const externalRules = derivation === EXTERNAL_INPUT_DERIVATION ? { externalInputs: derivation } : {};
-    const external = (artifact: string) => derivation === EXTERNAL_INPUT_DERIVATION
-      && graph.value.artifacts.some(item => item.id === artifact && item.external);
+    const external = (artifact: string) => graph.value.artifacts.some(item => item.id === artifact && item.external);
     const derived = (() => {
       if (om) {
         const deliveries = om.value.producer.deliveries, ownership = deliveries.ownership;
@@ -112,7 +111,7 @@ export class Compiler {
           const input = matches[0]!;
           return resolveArtifact(this.store, plan.value.projectId, graph.value, plan.value.base, producer, artifact,
             [...(input.source ? [input.source] : []), ...(input.receipt ? [input.receipt] : [])]);
-        }, { version: plan.value.version, owner, researchObligations, ...externalRules });
+        }, { version: plan.value.version, owner, researchObligations, externalInputs: EXTERNAL_INPUT_DERIVATION });
       }
       const owners = plan.value.version === 2 ? new Owners(this.store, plan.value.projectId, plan.value.base) : null;
       const basis = this.store.get<Feasibility>(plan.value.feasibility.id, plan.value.feasibility.revision)!;
@@ -121,7 +120,7 @@ export class Compiler {
       return deriveTasks(plan.value.projectId, graph.hash, requireGraph(graph.value), (producer, artifact) =>
         external(artifact) ? resolvePlanExternalSource(this.store, plan, artifact)
           : resolveArtifact(this.store, plan.value.projectId, graph.value, plan.value.base, producer, artifact, plan.value.guards),
-      { version: plan.value.version, owner: path => owners?.latest(path) ?? null, ...(researchObligations ? { researchObligations } : {}), ...externalRules });
+      { version: plan.value.version, owner: path => owners?.latest(path) ?? null, ...(researchObligations ? { researchObligations } : {}), externalInputs: EXTERNAL_INPUT_DERIVATION });
     })();
     requireCondition(hashJson(derived.tasks) === hashJson(plan.value.tasks), "plan_derivation_mismatch", "Tasks must be derived from the bound map without manual edits");
     checkedPlanDerivation(plan);
