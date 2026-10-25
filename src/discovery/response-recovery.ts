@@ -1580,6 +1580,7 @@ export function consumerResultCapacity(store: Store, intent: ResearchConsumerInt
       inputsHash: hashJson(draft.value.inputs), basis: intent.basis, owner: intent.owner,
       // DR3a3-K: two plan-questions of one plan Question never share a declaration.
       ...(cursorSubject(intent) ? { subject: cursorSubject(intent) } : {}),
+      ...(Object.hasOwn(context, 'deepPreparation') ? { deepPreparation: context.deepPreparation } : {}),
       ...(isVariantConsumer(intent) ? { variantSubject:decodeVariantSubject(cursor.variantSubject),
         purpose:intent.kind,actor:intent.role.actor } : {}) },
     role: ['synthesis', 'consolidation'].includes(intent.kind) ? 'synthesizer'
