@@ -41,10 +41,10 @@ import { writeGaps, readGaps, type GapRequest, type GapMoment } from '../src/om/
 import { writeGapLines, readGapLines, gapLineKey, gapLineExpectedResult } from '../src/om/gap-lines.js';
 import { prepareQuestionTasks, writeQuestionPacket, partResponseId, preparePartResult, type QuestionPacketRequest } from '../src/om/question-packet.js';
 import { writeRoutes } from '../src/om/routes.js';
-import { openSeries, beginAttempt, completeAttempt, type RepairSeries } from '../src/om/series.js';
+import { openSeries, beginAttempt, completeAttempt, readCompletionBinding, type RepairSeries } from '../src/om/series.js';
 import { recordCall } from '../src/om/call-record.js';
 import { openAttempt as managedOpenAttempt } from '../src/om/repeat-gate.js';
-import type { ModelCallRequest, ModelTransportRequest } from '../src/om/model-call.js';
+import type { ModelCallRequest, ModelTransportRequest, TransportModelCall } from '../src/om/model-call.js';
 import { processStopRefusal, writeProcessStopWitness } from '../src/runtime/process-identity.js';
 import { readLateModelReceipt } from '../src/discovery/model-call-recovery.js';
 import type { ModelCall } from '../src/runtime/model-usage.js';
@@ -56,6 +56,7 @@ import { explicitMapping, gardenGraph, prepareNativeLayers } from './om-fixture.
 import { preparedFeatures } from './product-fixture.js';
 import { preparedField } from './preparation-fixture.js';
 import { taskObligationExecutionFixture } from './execution-fixture.js';
+import { e4ManagedAnalysisFixture } from './om-model-call-fixture.js';
 
 const { fixtureAnswer }: { fixtureAnswer: (packet: unknown, answer: unknown) => unknown } = await import(new URL('../../test/om-adapter-fixture.mjs', import.meta.url).href);
 
@@ -1281,34 +1282,24 @@ function e4RecoveryFixture(t: TestContext, managed: boolean) {
   return { root, database, project, graph, input, source, routes, gaps, batch, packet, request, series, scenario, trace, store, engine };
 }
 
-function e4AnalysisRecoveryFixture(t: TestContext) {
-  const root = mkdtempSync(join(tmpdir(), 'omg-e4-analysis-recovery-')), database = join(root, 'state.sqlite');
-  const store = new Store(database);
-  t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
-  const project = 'analysis', block = 'analyzed-block', address = { project, block, line: 1 };
-  const goal = { key: 'analysis-fixture-goal', questions: ['Address one contract'], result: 'A supported contract' };
-  ok(openSeries(store, { ...address, slice: 'analysis-slice', predecessor: null, basis: null } as never));
-  let series = ok(beginAttempt(store, { ...address, attempt: 1, goal })) as Revision<RepairSeries>;
-  for (const attempt of [1, 2, 3]) {
-    if (attempt > 1) ok(beginAttempt(store, { ...address, attempt, goal }));
-    series = ok(completeAttempt(store, { ...address, attempt,
-      outcome: { reason: 'result', achieved: [], cancelled: [], refusals: [] } })) as Revision<RepairSeries>;
+/**
+ * The A6 transport of the recovery test stands on the shared genuine paid managed stop: three attempts, each owning the complete M6
+ * batch, paid through E2/E4 and closed at G7 as off-form, and the admitted stop-analysis call over that stop. The preparation is pinned
+ * here, so the recovered call is never one of its payments.
+ */
+async function e4AnalysisRecoveryFixture(t: TestContext) {
+  const f = await e4ManagedAnalysisFixture(t, 'stop-analysis', 30_000);
+  const series = f.store.get<RepairSeries>(f.series.id)!;
+  assert.deepEqual(series.value.stop?.attempts, [1, 2, 3]);
+  assert.deepEqual(series.value.attempts.map(attempt => [attempt.ordinal, attempt.outcome?.reason]), [[1, 'off-form'], [2, 'off-form'], [3, 'off-form']]);
+  for (const ordinal of [1, 2, 3]) assert.ok(ok(readCompletionBinding(f.store, f.project, reference(series), ordinal)), `Attempt ${ordinal} is managed`);
+  assert.ok(f.preparationCalls.length > 0, 'The stop is paid by saved model calls');
+  for (const ref of f.preparationCalls) {
+    const saved = f.store.get<ModelCall>(ref.id, ref.revision);
+    assert.ok(saved && saved.kind === 'model-call' && same(reference(saved), ref), `${ref.id} is a saved model call`);
   }
-  const basis = { kind: 'series-stop' as const, series: reference(series), attempt: 3 };
-  const scenario = join(root, 'scenario.json'), trace = join(root, 'trace.jsonl');
-  const command = { executable: process.execPath, args: [e4AdapterPath, '--scenario', scenario, '--trace', trace] };
-  const environment = new Environments(store).configure(project, { workspace: root,
-    implementer: { actor: 'analysis-executor', model: 'fixture', effort: 'high', command },
-    reviewer: { actor: 'analysis-reviewer', model: 'fixture', effort: 'high', command }, fullCheck: command, timeoutMs: 30_000 }, 0);
-  const adapter = store.write({ id: `adapter:${project}`, kind: 'dispatch-adapter', expected: 0, value: { protocol: 'codex-stdio' } });
-  const packet = { task: 'Diagnose the named ground', note: 'No fabricated A6 protocol', basis } as unknown as Json;
-  const reviewGoal = { key: 'stop-analysis', questions: ['What caused this ground?'], result: 'A cause or explicit hypothesis with an addressed change' };
-  const admitted = ok(recordCall(store, project, { call: 'e4:stop-analysis', purpose: 'stop-analysis', basis, block,
-    gaps: [{ id: 'stop-analysis', goal: 'stop-analysis', field: 'cause-and-change', consumer: 'A6:stop-analysis' }],
-    series: reference(series), attempt: 3, goal: reviewGoal,
-    dispatch: { adapter: reference(adapter), config: reference(environment) }, packet }));
-  const request: ModelTransportRequest = { project, call: reference(admitted.call), packet, role: 'reviewer' };
-  return { root, database, project, packet, request, series, scenario, trace, store };
+  assert.deepEqual(f.sent(), [], 'Nothing of the analysis itself was sent yet');
+  return f;
 }
 
 function e4Fact(f: ReturnType<typeof e4RecoveryFixture>) {
@@ -1360,17 +1351,27 @@ function e4EnsureProject(store: Store, project: string) {
 for (const kind of ['ordinary', 'managed', 'transport'] as const) {
   test(`D8.5 r3 remark 1: paid witness evidence binds the final OM recovery body (${kind})`, async t => {
     const product = kind !== 'transport';
-    const f = product ? e4RecoveryFixture(t, kind === 'managed') : e4AnalysisRecoveryFixture(t);
+    const f = product ? e4RecoveryFixture(t, kind === 'managed') : await e4AnalysisRecoveryFixture(t);
     e4EnsureProject(f.store, f.project);
     const research = product ? e4Fact(f as ReturnType<typeof e4RecoveryFixture>)
       : { cause: 'Received local analysis evidence', hypothesis: true };
     writeFileSync(f.scenario, JSON.stringify({ steps: [{ research, usage: e4Usage }] }));
     const checkpoint = join(f.root, 'paid-exchange.json');
+    const preparation = product ? [] : (f as Awaited<ReturnType<typeof e4AnalysisRecoveryFixture>>).preparationCalls;
+    const kept = preparation.map(ref => f.store.get<ModelCall>(ref.id));
     const driver = e4Driver(t, f.database, f.root, product ? 'call' : 'transport', f.request, checkpoint);
     const pending = await e4Checkpoint(checkpoint, driver.child);
     const exchange = pending.writes!.find(write => write.kind === 'om-model-exchange')!.value as unknown as {
       process: ProcessResult; launchError: null };
-    const dispatch = f.store.list<ModelCall>('model-call')[0]!;
+    let dispatch = f.store.list<ModelCall>('model-call')[0]!;
+    if (!product) {
+      const admitted = (f.request as ModelTransportRequest).call;
+      const targets = f.store.list<ModelCall & Partial<Pick<TransportModelCall, 'transport'>>>('model-call')
+        .filter(row => row.value.transport !== undefined && same(row.value.transport.request.call, admitted));
+      assert.equal(targets.length, 1, 'Exactly one transport call pays the admitted stop analysis');
+      dispatch = targets[0]!;
+      assert.ok(!preparation.some(ref => ref.id === dispatch.id), 'The recovered call is none of the preparation payments');
+    }
     assert.equal(dispatch.value.execution?.phase, 'authorized');
     await killE4Driver(driver);
     const provider = dispatch.value.providerProcess!;
@@ -1385,5 +1386,6 @@ for (const kind of ['ordinary', 'managed', 'transport'] as const) {
     assert.ok(late, `${kind}: the late receipt must resolve against the saved recovery body`);
     assert.deepEqual(late.value.recovered, reference(recovered));
     assert.equal(late.value.evidence.process!.stdout, exchange.process.stdout);
+    assert.deepEqual(preparation.map(ref => f.store.get<ModelCall>(ref.id)), kept, 'The preparation payments are unchanged by the recovery');
   });
 }
