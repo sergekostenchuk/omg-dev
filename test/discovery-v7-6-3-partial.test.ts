@@ -20,10 +20,13 @@ import { answerDiscoveryFixture } from './product-fixture.js';
 import { readVariantHandoff } from '../src/discovery/discovery-outcome.js';
 import { variantRecordId } from '../src/discovery/discovery-variants.js';
 import { EngineError } from '../src/errors.js';
-import { canonical } from '../src/canonical.js';
+import { canonical, hashJson } from '../src/canonical.js';
 import { producePartialDossier, readPartialDossier, readDossierManifestStructural, projectDossierManifest, DOSSIER_MANIFEST_KIND, type DossierManifest } from '../src/discovery/dossier-manifest.js';
 import { publishVariantHandoff } from '../src/discovery/discovery-outcome.js';
 import type { ClaimAddress } from '../src/discovery/claim-address.js';
+import { applyDiscoveryAssessment, proveAppliedAttemptClassification } from '../src/discovery/v7-progress.js';
+import { attemptAccountKey } from '../src/discovery/v7-attempt-assessment.js';
+import type { PaidDiscoveryAttemptsAssessment } from '../src/discovery/research-model.js';
 
 // Include orphaned history as well as current heads after the explicit missing-head corruptions.
 function history(store: Store): string {
@@ -285,4 +288,79 @@ test('6.3 partial: a real chosen deep route is refused; a later proven rejection
     assert.deepEqual((await readPartialDossier(store,'p',reference(first.record))).record,first.record);
     assert.deepEqual((await producePartialDossier(store,'p',reference(f.handoff))).record,first.record);
   });
+});
+
+
+async function paidBeforeProgress(t: test.TestContext, restoreBeforeHandoff = false) {
+  const f = await setup(t, [planQuestion('q-one', 'industry'), planQuestion('q-two', 'industry')]);
+  const claim = {id:'awaiting-p', kind:'hypothesis', text:'Paid MR is not applied acceptance', axis:'industry',
+    planQuestions:[{planAnswer:f.v.planAnswer, planQuestionId:'q-one'}], scope:{variants:'common'},
+    basis:{howToVerify:'Independent evidence'}};
+  f.configure({assessorTokens:V7_STAGE_TOKEN_CEILING-1000, actions:[{action:'answer', question:'$selected',
+    value:{type:'submitted', contract:'discovery-claims/v7', value:{claims:[claim]}}, citations:[]}]});
+  const write = f.store.writeMany.bind(f.store); let cut = false, address: ClaimAddress | undefined;
+  f.store.writeMany = ((writes, guards) => {
+    if (!cut && writes.some(w => w.kind === 'v7-progress-application')) {
+      cut = true; throw new EngineError('partial_paid_cut', 'Paid MR saved; stop immediately before atomic P');
+    }
+    const rows = write(writes, guards);
+    for (const row of rows) if (row.kind === 'research-attempt' && (row.value as any).end.type === 'submitted') {
+      address = {project:'p', container:reference(row), containerKind:row.kind, pointer:'/claims/0', claimId:claim.id};
+      f.configure({classification:[{claim:address, accepted:true}]});
+    }
+    return rows;
+  }) as typeof f.store.writeMany;
+  try { await f.run(1); }
+  catch (error) { if (!(error instanceof EngineError) || error.code !== 'partial_paid_cut') throw error; }
+  finally { f.store.writeMany = write; }
+  assert.ok(cut); assert.ok(address);
+  const paid = f.store.list<PaidDiscoveryAttemptsAssessment>('discovery-assessment');
+  assert.equal(paid.length, 1); assert.equal(f.store.list('v7-progress-application').length, 0);
+  const restored = restoreBeforeHandoff ? applyDiscoveryAssessment(f.store, 'p', reference(paid[0]!)) : null;
+  const handoff = (await publishVariantHandoff(f.store, 'p', {draft:reference(f.store.get(f.v.draft.id)!),
+    result:null, decision:null, scope:null, earlyLimit:true})).record;
+  assert.equal((await readVariantHandoff(f.store, 'p', reference(handoff))).verification, 'proven');
+  return {...f, handoff, paid:paid[0]!, address:address!, restored};
+}
+
+test('6.3-PARTIAL-01: paid MR before P preserves unassessed material and its exact historical fixed point after real recovery', async t => {
+  const f = await paidBeforeProgress(t), handoff = reference(f.handoff);
+  const first = await producePartialDossier(f.store, 'p', handoff);
+  assert.deepEqual(first.materials, [{claim:f.address, status:'unassessed', assessment:null}]);
+  assert.deepEqual(first.assessments, []);
+  assert.ok(first.record.value.reasons[0]!.grounds.some(r => canonical(r) === canonical(reference(f.paid))));
+  for (const store of [f.store, f.open()]) await unchanged(f, store, async () => {
+    const {repeated:_, ...proof} = first;
+    assert.deepEqual(await readPartialDossier(store, 'p', reference(first.record)), proof);
+    assert.deepEqual(await producePartialDossier(store, 'p', handoff), {...first, repeated:true});
+  });
+  const wire = f.wires(), calls = money(f.store);
+  const recovery = applyDiscoveryAssessment(f.open(), 'p', reference(f.paid));
+  assert.equal(recovery.repeated, false);
+  assert.equal(proveAppliedAttemptClassification(f.store, f.address).status, 'accepted');
+  assert.deepEqual(f.wires(), wire); assert.deepEqual(money(f.store), calls);
+  for (const store of [f.store, f.open()]) await unchanged(f, store, async () => {
+    const read = await readPartialDossier(store, 'p', reference(first.record));
+    assert.deepEqual(read.record, first.record); assert.deepEqual(read.materials, first.materials); assert.deepEqual(read.assessments, []);
+    assert.deepEqual(await producePartialDossier(store, 'p', handoff), {...first, repeated:true});
+  });
+});
+
+for (const lost of ['application', 'account', 'substituted-account'] as const)
+test(`6.3-PARTIAL-01: proof fault (${lost}) refuses without an unassessed downgrade`, async t => {
+  const f = await paidBeforeProgress(t, true), first = await producePartialDossier(f.store, 'p', reference(f.handoff));
+  assert.equal(first.materials[0]!.status, 'accepted'); assert.deepEqual(first.assessments, [reference(f.paid)]);
+  const id = lost === 'application' ? f.restored!.applications[0]!.id : attemptAccountKey(f.paid.value.subject.packet, f.address.container);
+  assert.ok(first.record.value.reasons[0]!.grounds.some(r => r.id === id));
+  // Explicit negative read faults: immutable Store history itself is not rewritten.
+  for (const store of [f.store, f.open()]) {
+    const get = store.get.bind(store), original = get<Record<string, unknown>>(id, 1)!;
+    const badValue = {...original.value, streak:-1};
+    const substituted = {...original, value:badValue, hash:hashJson(badValue)};
+    store.get = ((key, revision) => key === id ? lost === 'substituted-account' ? substituted : null : get(key, revision)) as typeof store.get;
+    try {
+      await unchanged(f, store, () => readPartialDossier(store, 'p', reference(first.record)), true);
+      await unchanged(f, store, () => producePartialDossier(store, 'p', reference(f.handoff)), true);
+    } finally { store.get = get; }
+  }
 });

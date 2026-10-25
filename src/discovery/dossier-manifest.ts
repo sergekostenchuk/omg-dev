@@ -1,6 +1,6 @@
 import { withHistoricalReads, pendingSnapshotView } from '../history/proofs.js';
 import { type DiscoveryDraft, type Question } from './discovery.js';
-import type { ResearchAnswer, PaidDiscoveryAttemptsAssessment, V7ProgressApplication } from './research-model.js';
+import type { ResearchAnswer, PaidDiscoveryAttemptsAssessment, V7ProgressApplication, V7AttemptAccount, V7ProgressState } from './research-model.js';
 import { currentPlan, proveAttempt, provePlanQuestions } from './v7-plan-questions.js';
 import { canonical, hashJson, type Json } from '../canonical.js';
 import { EngineError } from '../errors.js';
@@ -15,7 +15,7 @@ import { readVariantGeneration, readVariantModelDecision } from './variant-sessi
 import { readVariantOwnerDecision } from './discovery-decision.js';
 import { variantStateId, type VariantHandoff } from './variant-decision.js';
 import { readDiscoveryAssessment } from './research-assessment.js';
-import { proveAppliedAttemptClassification } from './v7-progress.js';
+import { proveAppliedAttemptClassification, readV7ProgressStateAt } from './v7-progress.js';
 import { readProjectMode } from '../product/project-mode.js';
 import { uniqueTransactionGuards, transactionGuardsCurrent } from '../runtime/environment.js';
 import { readResearchConsumerExecution, readResearchAttemptBinding, type ResearchConsumerIntent } from './response-recovery.js';
@@ -23,6 +23,7 @@ import { readAssessmentSessionOutcomeAt } from './assessment-session.js';
 import { discoveryAssessmentId } from './research-consumer-transition.js';
 import type { ModelCall } from '../runtime/model-usage.js';
 import { attemptBindingId, type ResearchAttemptBinding } from './v7-managed-attempt.js';
+import { attemptAccountKey, v7ProgressStateId } from './v7-attempt-assessment.js';
 import { proveIssuedAnswer, savedAcceptanceAct } from './projection-reader.js';
 
 /** DR6 6.1 (codex-omg №9189, раздел DR6): the closed structural form of the
@@ -228,6 +229,7 @@ export function readDossierContradictionsAt(store: Store, project: string, manif
 export interface ProvenPartialDossier {
   verification: 'partial'; record: Revision<DossierManifest>; handoff: Revision<VariantHandoff>;
   materials: { claim: ClaimAddress; status: 'accepted' | 'rejected' | 'unassessed'; assessment: Ref | null }[];
+  /** Applied classification grounds only; every paid MR also remains in record.reasons[].grounds. */
   assessments: Ref[]; contradictions: ProvenDossierContradiction[];
 }
 
@@ -238,6 +240,25 @@ function dossierExact<T>(store: Store, at: Ref, kind?: string): Revision<T> {
   if (!row || kind && row.kind !== kind || !dossierSame(reference(row), at) || hashJson(row.value as never) !== row.hash)
     invalid('grounds', 'An exact dossier ground is missing or changed', 'discovery_dossier_invalid', at);
   return row;
+}
+
+/** The proven handoff fixes the temporal cut, not an assertion of acceptance.
+ * Find its own immutable event with bounded queries, including gaps in the
+ * journal. No current-head inventory or caller-supplied cursor is trusted. */
+function handoffBoundary(store: Store, handoff: Ref): number {
+  const last = store.lastEvent();
+  let low = 1, high = last, found: number | null = null;
+  while (low <= high) {
+    const middle = Math.floor((low + high) / 2);
+    const event = store.eventsPage(middle - 1, last, 1)[0];
+    if (!event) break;
+    const row = store.getAtEvent(event.sequence, handoff.id, handoff.revision);
+    if (row) { found = event.sequence; high = middle - 1; }
+    else low = event.sequence + 1;
+  }
+  if (found === null || !dossierSame(store.eventAt(found), handoff))
+    invalid('handoff', 'The exact handoff lost its committed boundary');
+  return found;
 }
 
 /** The inventory is anchored in the saved snapshot applications, or the
@@ -330,6 +351,23 @@ async function partialProjection(store: Store, project: string, handoffRef: Ref)
     }
   }
   const materials: ProvenPartialDossier['materials'] = [];
+  // MR is paid evidence even before P. Only P present at the saved handoff
+  // classifies material; a later recovery must not rewrite this exact cut.
+  const boundary = route.stop ? handoffBoundary(store, handoffRef) : null;
+  if (boundary !== null) {
+    const states = new Set<string>();
+    for (const paid of assessments.values()) {
+      const id = v7ProgressStateId(paid.value.subject.packet);
+      if (states.has(id)) continue;
+      states.add(id);
+      const state = store.getAtEvent<V7ProgressState>(boundary, id);
+      if (state) {
+        readV7ProgressStateAt(store, reference(state));
+        keep(reference(state));
+      }
+    }
+  }
+  const classifications = new Map<string, Ref>();
   // Preserve every submitted claim, including rejected and unassessed ones.
   // Explicit cross-container links retain their other side as well.
   const claimMap = new Map<string, { address: ClaimAddress; value: Record<string, unknown> }>();
@@ -347,13 +385,20 @@ async function partialProjection(store: Store, project: string, handoffRef: Ref)
   for (const item of claimMap.values()) for (const key of ['contradicts', 'refutedBy'] as const)
     for (const target of (item.value[key] ?? []) as ClaimAddress[]) addClaim(target);
   for (const { address } of claimMap.values()) {
-    const classified = [...assessments.values()].some(paid => [...paid.value.novelty.accepted, ...paid.value.novelty.rejected]
+    const declared = [...assessments.values()].some(paid => [...paid.value.novelty.accepted, ...paid.value.novelty.rejected]
       .some(entry => dossierSame(entry.claim, address)));
-    if (!classified) materials.push({ claim: address, status: 'unassessed', assessment: null });
+    const attempt = attempts.get(canonical(address.container))!.attempt.value;
+    const accountId = attemptAccountKey(attempt, address.container);
+    const account = boundary === null ? store.get<V7AttemptAccount>(accountId, 1)
+      : store.getAtEvent<V7AttemptAccount>(boundary, accountId, 1);
+    if (!declared || !account && boundary !== null)
+      materials.push({ claim: address, status: 'unassessed', assessment: null });
     else {
+      // An existing but broken account/application is an error, never unassessed.
       const proof = proveAppliedAttemptClassification(store, address), exact = reference(proof.assessment);
       if (!assessments.has(canonical(exact))) invalid('assessments', 'The original classification is absent from the saved route');
-      keep(reference(proof.application));
+      if (account) keep(reference(account));
+      keep(reference(proof.application)); classifications.set(canonical(exact), exact);
       materials.push({ claim: address, status: proof.status, assessment: exact });
     }
   }
@@ -391,13 +436,14 @@ async function partialProjection(store: Store, project: string, handoffRef: Ref)
       message: route.stop?.message ?? `The proven variant handoff ends with ${code}`,
       grounds: [handoffRef, ...[...grounds.values()].filter(r => !dossierSame(r, handoffRef)).sort((a,b) => canonical(a).localeCompare(canonical(b)))] }],
     axes, unknowns, contradictions: [...pairs.values()].sort((a,b) => a.id.localeCompare(b.id)) });
-  const refs = [...assessments.values()].map(reference).sort((a,b) => canonical(a).localeCompare(canonical(b)));
+  const refs = [...classifications.values()].sort((a,b) => canonical(a).localeCompare(canonical(b)));
   const contradictions = checkDossierContradictionEvidence(store, value, questions.map(q => q.planQuestionId), { assessments: refs });
   return { value, handoff, materials, assessments: refs, contradictions };
 }
 
 export async function readPartialDossier(store: Store, project: string, at: Ref): Promise<ProvenPartialDossier> {
   const record = readDossierManifestStructural(store, project, at).record;
+  for (const reason of record.value.reasons) for (const ground of reason.grounds) dossierExact(store, ground);
   const link = record.value.reasons[0]?.grounds[0];
   if (!link) invalid('handoff', 'A partial dossier fixes its exact proven handoff');
   const proof = await partialProjection(store, project, link);
