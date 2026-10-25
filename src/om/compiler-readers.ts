@@ -8,7 +8,7 @@ import { readHorizon } from './horizon.js';
 import { readOmInput } from './input.js';
 import { registerCompilerOmReaders, type CompilerOmReaders } from '../compiler/om-readers.js';
 import { gateFeasibility, readFeasibility } from './feasibility.js';
-import { neighborsOf, readNeighbors } from './neighbors.js';
+import { neighborsOf } from './neighbors.js';
 import { readAtomicGate } from './atomic-gate.js';
 import { readAcceptedFrame } from './frame-accept.js';
 import { readFrame } from './frame-obligations.js';
@@ -50,7 +50,6 @@ export const readTaskContextBasis: CompilerOmReaders['readTaskContextBasis'] = (
 // point (product/engine); the slot itself never loads this module. The assignment
 // below is where tsc checks every real reader against the slot's structural types.
 registerCompilerOmReaders({
-  readFeasibility, gateFeasibility, neighborsOf, readNeighbors, readAtomicGate,
-  readAcceptedFrame, readFrame, readDeliveries, readWorksFrame, readTaskContextBasis,
+  readFeasibility, gateFeasibility, neighborsOf, readFrame, readDeliveries, readWorksFrame, readTaskContextBasis,
   readTaskSpecification: taskSpecificationReader(),
 });

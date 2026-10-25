@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { canonical } from '../src/canonical.js';
 import { EngineError } from '../src/errors.js';
-import { gateFeasibility, neighborsOf, readAcceptedFrame, readAtomicGate, readDeliveries, readFeasibility, readFrame, readNeighbors,
+import { gateFeasibility, neighborsOf, readDeliveries, readFeasibility, readFrame,
   readWorksFrame, readTaskContextBasis, readTaskSpecification, registerCompilerOmReaders, type CompilerOmReaders, type ObligationHandoffForm } from '../src/compiler/om-readers.js';
 import type { ObligationHandoff } from '../src/graph/obligation-handoff.js';
 import type { readFeasibility as omReadFeasibility } from '../src/om/feasibility.js';
@@ -20,10 +20,10 @@ import type { Store } from '../src/storage/store.js';
 
 const ROOT = fileURLToPath(new URL('../../', import.meta.url));
 const SRC = pathToFileURL(join(ROOT, 'dist/src/')).href, TST = pathToFileURL(join(ROOT, 'dist/test/')).href;
-const NAMES = ['readFeasibility', 'gateFeasibility', 'neighborsOf', 'readNeighbors', 'readAtomicGate', 'readAcceptedFrame',
+const NAMES = ['readFeasibility', 'gateFeasibility', 'neighborsOf',
   'readFrame', 'readDeliveries', 'readWorksFrame', 'readTaskContextBasis', 'readTaskSpecification'] as const;
 type Name = typeof NAMES[number];
-const wrappers = { readFeasibility, gateFeasibility, neighborsOf, readNeighbors, readAtomicGate, readAcceptedFrame, readFrame,
+const wrappers = { readFeasibility, gateFeasibility, neighborsOf, readFrame,
   readDeliveries, readWorksFrame, readTaskContextBasis, readTaskSpecification } as unknown as Record<Name, (...args: unknown[]) => unknown>;
 
 const ref = (id: string): Ref => ({ id, revision: 1, hash: 'a'.repeat(64) });
@@ -40,10 +40,6 @@ function calls(): [Name, unknown[], Record<string, unknown>][] {
     ['readFeasibility', [store, { project, record }], { project, record }],
     ['gateFeasibility', [store, { project, record }], { project, record }],
     ['neighborsOf', [probe(), 'garden-consume-work', probe()], { work: 'garden-consume-work' }],
-    ['readNeighbors', [store, { project, neighbors: ref('om-neighbors:garden:n') }], { project, neighbors: ref('om-neighbors:garden:n') }],
-    ['readAtomicGate', [store, { project, record: ref('om-atomic-gate:garden:g') }], { project, record: ref('om-atomic-gate:garden:g') }],
-    ['readAcceptedFrame', [store, { project, level: 3, graph: ref('graph:garden'), layer: ref('graph-layer:garden:3'), frame }],
-      { project, level: 3, frame }],
     ['readFrame', [store, frameRequest], { project, level: 3, frame }],
     ['readDeliveries', [store, { project, candidate, ownership }], { project, candidate }],
     ['readWorksFrame', [store, { project, candidate }], { project, candidate }],

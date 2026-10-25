@@ -14,8 +14,6 @@ import type { Revision, Store, TransactionGuard } from "../storage/store.js";
 
 // ---- Requests: the exact shapes the real readers take.
 export interface RecordReadRequest { project: string; record: Ref }
-export interface NeighborReadRequest { project: string; neighbors: Ref }
-export interface AcceptedFrameRequest { project: string; level: 2 | 3; graph: Ref; layer: Ref; frame: Ref }
 export interface CandidateReadRequest { project: string; candidate: Ref }
 export interface FrameRequest {
   project: string; level: 2 | 3; horizon: Ref; graph: Ref; layer: Ref | null; frame: Ref | null;
@@ -84,12 +82,6 @@ export interface OmFeasibilityView {
   };
 }
 export interface FeasibilityAdmission { readonly passed: true; readonly record: Ref; readonly guards: readonly TransactionGuard[]; readonly references: readonly Ref[] }
-export interface AcceptedFrameView {
-  readonly frame: OmRecord<{ readonly acceptance: { readonly candidate: Ref;
-    readonly gate: { readonly name: "G3"; readonly basis?: never } | { readonly name: "G5"; readonly basis: Ref } } }> | null;
-}
-export interface AtomicGateView { readonly request: { readonly candidate: Ref; readonly neighbors: Ref;
-  readonly taskContextContract?: "omg-task-context/v2" | "omg-task-context/v3" } }
 export type TaskContextBasis = { contract: "omg-task-context/v2" | "omg-task-context/v3"; gate: Ref; horizon: Ref; input: Ref };
 export interface SpecificationBases {
   catalogue: { contract: 'discovery-basis-catalogue/v1'; source: Ref;
@@ -163,15 +155,11 @@ export interface CompilerOmReaders {
   readonly readFeasibility: (store: Store, request: RecordReadRequest) => OmReaderResult<OmRecord<OmFeasibilityView>>;
   readonly gateFeasibility: (store: Store, request: RecordReadRequest) => OmReaderResult<FeasibilityAdmission>;
   readonly neighborsOf: (graph: Graph, work: string, sources: NeighborSources) => OmReaderResult<Frozen<NeighborPacket>>;
-  readonly readNeighbors: (store: Store, request: NeighborReadRequest) => OmReaderResult<Frozen<Revision<NeighborCollection>>>;
-  readonly readAtomicGate: (store: Store, request: RecordReadRequest) => OmReaderResult<OmRecord<AtomicGateView>>;
-  readonly readAcceptedFrame: (store: Store, request: AcceptedFrameRequest) => OmReaderResult<AcceptedFrameView>;
   readonly readFrame: (store: Store, request: FrameRequest) => OmReaderResult<FrameReadView>;
   readonly readDeliveries: (store: Store, request: DeliveryReadRequest) => OmReaderResult<DeliveryView>;
   readonly readWorksFrame: (store: Store, request: CandidateReadRequest) => OmReaderResult<OmRecord<WorksFrameView>>;
 }
-const READERS = Object.freeze(["readFeasibility", "gateFeasibility", "neighborsOf", "readNeighbors", "readAtomicGate",
-  "readAcceptedFrame", "readFrame", "readDeliveries", "readWorksFrame", "readTaskContextBasis", "readTaskSpecification"] as const);
+const READERS = Object.freeze(["readFeasibility", "gateFeasibility", "neighborsOf", "readFrame", "readDeliveries", "readWorksFrame", "readTaskContextBasis", "readTaskSpecification"] as const);
 
 let installed: CompilerOmReaders | null = null;
 /**
@@ -186,8 +174,7 @@ export function registerCompilerOmReaders(readers: CompilerOmReaders): void {
   // Each member is read exactly once: the copy is what is checked and installed, so an accessor cannot pass the check
   // with one value and install another.
   const kit: CompilerOmReaders = Object.freeze({ readFeasibility: readers.readFeasibility, gateFeasibility: readers.gateFeasibility,
-    neighborsOf: readers.neighborsOf, readNeighbors: readers.readNeighbors, readAtomicGate: readers.readAtomicGate,
-    readAcceptedFrame: readers.readAcceptedFrame, readFrame: readers.readFrame, readDeliveries: readers.readDeliveries,
+    neighborsOf: readers.neighborsOf, readFrame: readers.readFrame, readDeliveries: readers.readDeliveries,
     readWorksFrame: readers.readWorksFrame, readTaskContextBasis: readers.readTaskContextBasis, readTaskSpecification: readers.readTaskSpecification });
   const missing = READERS.find(name => typeof kit[name] !== "function");
   if (missing) throw invalid(missing);
@@ -212,12 +199,6 @@ export const gateFeasibility: CompilerOmReaders["gateFeasibility"] = (store, req
   reader("gateFeasibility", request, ["project", "record"])(store, request);
 export const neighborsOf: CompilerOmReaders["neighborsOf"] = (graph, work, sources) =>
   reader("neighborsOf", { work }, ["work"])(graph, work, sources);
-export const readNeighbors: CompilerOmReaders["readNeighbors"] = (store, request) =>
-  reader("readNeighbors", request, ["project", "neighbors"])(store, request);
-export const readAtomicGate: CompilerOmReaders["readAtomicGate"] = (store, request) =>
-  reader("readAtomicGate", request, ["project", "record"])(store, request);
-export const readAcceptedFrame: CompilerOmReaders["readAcceptedFrame"] = (store, request) =>
-  reader("readAcceptedFrame", request, ["project", "level", "frame"])(store, request);
 export const readFrame: CompilerOmReaders["readFrame"] = (store, request) =>
   reader("readFrame", request, ["project", "level", "frame"])(store, request);
 export const readDeliveries: CompilerOmReaders["readDeliveries"] = (store, request) =>
