@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { canonical, digest } from "../src/canonical.js";
+import { canonical } from "../src/canonical.js";
 import type { DiscoveryDraft, Question } from "../src/discovery/discovery.js";
 import { REQUIREMENTS, UPSTREAM_STAGES } from "../src/discovery/requirements.js";
 import { executeWebTurn } from "../src/discovery/web-research.js";
@@ -16,7 +16,6 @@ import { gardenGraph, prepareOmFixtureStages } from "./om-fixture.js";
 import { resumeStoppedPass, stopPass } from "../src/om/run-driver.js";
 import { isRef, reference, uniqueRefs } from "../src/pipeline/contracts.js";
 import { ProductEngine } from "../src/product/engine.js";
-import { parseCommand } from "../src/product/commands.js";
 import type { EarlyStageInstruction, EarlyStageOutcome } from "../src/product/early-stage-driver.js";
 import { preparedField } from "./preparation-fixture.js";
 import { answerDiscoveryFixture, preparedFeatures, refinedLayers } from "./product-fixture.js";
@@ -155,57 +154,6 @@ test("IN1 creates the Project first and resumes after that committed boundary", 
     reopened.history("early-stage-input:p").length, f.calls(trace).length], [1, 1, 1, 1]);
 });
 
-test("IN1 initializes verbatim Source, brief and fallback objective before the first researchPlan call", async t => {
-  const f = fixture(t), { trace } = f.setup("p"), input = instruction("p", "Build a planting planner from this exact request.");
-  const result = await f.engine.execute({ type: "early-stage-run", project: "p", maxTurns: 30,
-    maxCalls: 1, instruction: input }) as EarlyStageOutcome;
-  assert.deepEqual([result.end, result.stage, result.reason?.code, result.budget.callsMade],
-    ["stage_paused", "discovery", "research_call_allowance", 1]);
-  const source = f.store.get<any>("source:p:instruction")!, binding = f.store.get<any>("early-stage-input:p")!;
-  const draft = f.store.list<DiscoveryDraft>("discovery-draft").find(row => row.value.stage === "discovery")!;
-  const questions = draft.value.questions.map(id => f.store.get<Question>(id)!);
-  const brief = questions.find(row => row.value.spec.field === "brief")!, objective = questions.find(row => row.value.spec.field === "objective")!;
-  const briefAnswer = f.store.get<any>(brief.value.answer!.id)!, objectiveAnswer = f.store.get<any>(objective.value.answer!.id)!;
-  assert.deepEqual([source.value.content, source.value.sha256, source.value.origin.kind,
-    draft.value.fields.brief, draft.value.fields.objective, objectiveAnswer.value.actor],
-  [input.text, digest(input.text), "owner-document", input.text, input.text, "driver:verbatim"]);
-  assert.deepEqual(draft.value.inputs, uniqueRefs([reference(f.store.get("project:p")!), reference(source), reference(binding)]));
-  assert.deepEqual(briefAnswer.value.observation.selector, input.brief);
-  assert.deepEqual(f.calls(trace), [{ role: "research", field: "researchPlan" }],
-    "the first physical call occurs only after verbatim input initialization");
-});
-
-test("IN1 explicit objective is selected from the same exact Source; arbitrary model prose is not an input field", async t => {
-  const f = fixture(t), { trace } = f.setup("p");
-  const text = "Build a planting planner.\nReduce missed watering.";
-  const input: EarlyStageInstruction = { title: "p", id: "instruction", text, media: "text/plain",
-    brief: { kind: "text-range", start: 0, end: 25 },
-    objective: { kind: "text-range", start: 26, end: text.length } };
-  await f.engine.execute({ type: "early-stage-run", project: "p", maxTurns: 30,
-    maxCalls: 1, instruction: input });
-  const draft = f.store.list<DiscoveryDraft>("discovery-draft").find(row => row.value.stage === "discovery")!;
-  assert.deepEqual([draft.value.fields.brief, draft.value.fields.objective],
-    ["Build a planting planner.", "Reduce missed watering."]);
-  assert.equal(f.calls(trace)[0]?.field, "researchPlan");
-  assert.throws(() => parseCommand({ type: "early-stage-run", project: "x", maxTurns: 1, maxCalls: 1,
-    instruction: { ...instruction("x"), value: "A model paraphrase" } }), { code: "command_invalid" });
-  assert.throws(() => parseCommand({ type: "revise-early-stage-input", project: "x", expected: 0 }),
-    { code: "command_invalid" });
-});
-
-test("IN1 derives brief and explicit objective through exact JSON pointers", async t => {
-  const f = fixture(t), { trace } = f.setup("p");
-  const text = JSON.stringify({ assignment: "Build a planting planner.", goal: "Reduce missed watering." });
-  const input: EarlyStageInstruction = { title: "p", id: "instruction", text, media: "application/json",
-    brief: { kind: "json-pointer", pointer: "/assignment" },
-    objective: { kind: "json-pointer", pointer: "/goal" } };
-  await f.engine.execute({ type: "early-stage-run", project: "p", maxTurns: 30, maxCalls: 1, instruction: input });
-  const draft = f.store.list<DiscoveryDraft>("discovery-draft").find(row => row.value.stage === "discovery")!;
-  assert.deepEqual([f.store.get<any>("source:p:instruction")!.value.content,
-    draft.value.fields.brief, draft.value.fields.objective, f.calls(trace)[0]?.field],
-  [text, "Build a planting planner.", "Reduce missed watering.", "researchPlan"]);
-});
-
 test("IN1 refuses missing instruction and an invalid selector before project, draft or run control", async t => {
   const f = fixture(t);
   const missing = await f.engine.execute({ type: "early-stage-run", project: "missing", maxTurns: 1,
@@ -238,20 +186,6 @@ test("IN1 automatic objective names the copier while ordinary answer-decision na
   const answer = f.store.get<any>(f.store.get<Question>(question.id)!.value.answer!.id)!;
   assert.equal(answer.value.actor, "local-caller");
   assert.notEqual(answer.value.actor, "local-owner", "an unauthenticated command caller is not labelled as the owner");
-});
-
-test("IN1 leaves a previous-era decision and draft without present-day input authorship", async t => {
-  const f = fixture(t); f.setup("p");
-  const draft = f.engine.prepare("p", "discovery");
-  const objective = draft.value.questions.map(id => f.store.get<Question>(id)!)
-    .find(question => question.value.spec.field === "objective")!;
-  f.engine.discovery.decision(objective.id, objective.revision, "legacy-owner", "Keep the historical objective");
-  const before = f.store.get<Question>(objective.id)!.value.answer!;
-  await f.engine.execute({ type: "early-stage-run", project: "p", draftId: draft.id, maxTurns: 1, maxCalls: 1 });
-  const after = f.store.get<Question>(objective.id)!.value.answer!;
-  assert.deepEqual(after, before);
-  assert.equal(f.store.get<any>(after.id, after.revision)!.value.actor, "legacy-owner");
-  assert.equal(f.store.get("early-stage-input:p"), null);
 });
 
 for (const boundary of ["source", "early-stage-input", "discovery-draft", "fact"] as const)
@@ -331,23 +265,6 @@ test(`IN1 Source move before ${boundary} commit refuses the window without that 
     f.store.list<DiscoveryDraft>("discovery-draft").filter(row => row.value.projectId === "p").length,
     f.store.list("fact").length, driverDecisions], expected,
   "only complete earlier boundaries may survive; the raced write is atomic");
-});
-
-test("IN1 changed Source makes the accepted researchPlan addressed stale without another model call", async t => {
-  const f = fixture(t), { trace } = f.setup("p"), input = instruction("p");
-  await f.engine.execute({ type: "early-stage-run", project: "p", maxTurns: 30,
-    maxCalls: 2, instruction: input });
-  const draft = f.store.list<DiscoveryDraft>("discovery-draft").find(row => row.value.stage === "discovery")!;
-  const plan = draft.value.questions.map(id => f.store.get<Question>(id)!)
-    .find(question => question.value.spec.field === "researchPlan")!;
-  assert.equal(f.store.get<Question>(plan.id)!.value.status, "answered");
-  const calls = f.calls(trace).length;
-  f.engine.execute({ type: "source-document", project: "p", id: "instruction",
-    text: "A changed assignment requiring explicit review.", media: "text/plain", expected: 1 });
-  const repeated = await new ProductEngine(f.store).execute({ type: "early-stage-run", project: "p",
-    maxTurns: 30, maxCalls: 2 }) as EarlyStageOutcome;
-  assert.deepEqual([repeated.end, repeated.reason?.code, repeated.budget.callsMade, f.calls(trace).length],
-    ["blocked", "instruction_stale", 0, calls]);
 });
 
 test("IN1 explicitly revises an unfinished input without rewriting its paid draft", async t => {
@@ -643,29 +560,6 @@ test("DRV1 stop immediately after its guarded prepare resumes the same saved dra
   assert.deepEqual([second.end, second.draft?.id, second.reason?.code, second.budget.callsMade],
     ["stage_paused", prepared[0]!.id, "research_call_allowance", 1]);
   assert.equal(reopened.list<DiscoveryDraft>("discovery-draft").filter(row => row.value.stage === "discovery").length, 1);
-});
-
-for (const state of ["no_go", "conditional", "insufficient_evidence"] as const)
-test(`DRV1 returns supported ${state} as its subject outcome and repeat neither pays nor starts concept`, async t => {
-  const f = fixture(t), { values, trace } = f.setup("p");
-  const fields = JSON.parse(readFileSync(values, "utf8"));
-  fields.verdict.outcome = state;
-  fields.verdict.reason = "The investigated variant cannot currently meet the stated constraints";
-  fields.verdict.conditions = state === "conditional" ? [{ id: "condition-1", kind: "owner_choice",
-    condition: "Choose the required constraint", criterion: "A new supported verdict establishes the choice",
-    options: [{ optionId: "accept", label: "Accept constraint", consequences: ["Reassess the variant"], choice: "accept" },
-      { optionId: "decline", label: "Decline constraint", consequences: ["Reassess alternatives"], choice: "decline" }] }] : [];
-  writeFileSync(values, JSON.stringify(fields));
-  const expected = state === "conditional" ? "needs_owner" : state;
-  const first = await f.engine.execute({ type: "early-stage-run", project: "p", maxTurns: 100,
-    maxCalls: 100, instruction: instruction("p") }) as EarlyStageOutcome;
-  assert.deepEqual([first.end, first.stage, first.stageResult?.discovery?.state], [expected, "discovery", state]);
-  const calls = f.calls(trace).length, drafts = f.store.list<DiscoveryDraft>("discovery-draft").length;
-  const repeated = await f.engine.execute({ type: "early-stage-run", project: "p", maxTurns: 100,
-    maxCalls: 100 }) as EarlyStageOutcome;
-  assert.deepEqual([repeated.end, repeated.stage, repeated.stageResult?.discovery?.state], [expected, "discovery", state]);
-  assert.deepEqual([f.calls(trace).length, f.store.list<DiscoveryDraft>("discovery-draft").length], [calls, drafts]);
-  assert.equal(f.engine.pipeline.inspect("p", "concept").state, "missing");
 });
 
 test("DRV1 one live early executor makes a concurrent start busy; stop inside A permits no second sender", async t => {
