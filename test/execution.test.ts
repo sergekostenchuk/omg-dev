@@ -524,10 +524,8 @@ import { chmodSync, mkdtempSync, mkdirSync, realpathSync, lstatSync, rmSync } fr
 import { tmpdir } from "node:os";
 import { delimiter, dirname } from "node:path";
 import { execFileSync } from "node:child_process";
-import { createRequire } from "node:module";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 import { ProductEngine } from "../src/product/engine.js";
-import { preparedFeatures, refinedLayers } from "./product-fixture.js";
 import { enrichedGraph } from "./enriched-graph-fixture.js";
 import { exampleGraph } from "./graph-fixture.js";
 import { configureReaderPilot, prepareReaderPilot, type ReaderPilotSettings, type ExecutionAdmissionSettings } from "../src/discovery/reader-pilot.js";
@@ -649,7 +647,7 @@ process.exit(result.status ?? 1);
 `;
 const EX1_BUDGET: Omit<ExecutionAdmissionSettings, "plan"> = { roleLaunches: 40, softInput: 6_000_000, roleReserve: { implement: 5000, review: 2000 }, maxCorrections: 1 };
 function ex1Fixture(t: test.TestContext, options: { timeoutMs?: number; ignoreModules?: boolean; modules?: boolean; admit?: boolean; tap?: boolean; progress?: boolean;
-  legacy?: boolean; budget?: Partial<Omit<ExecutionAdmissionSettings, "plan">>; implementer?: { executable: string; args: string[] } } = {}) {
+  budget?: Partial<Omit<ExecutionAdmissionSettings, "plan">>; implementer?: { executable: string; args: string[] } } = {}) {
   const directory = realpathSync(mkdtempSync(join(tmpdir(), "omg-ex1-"))), workspace = join(directory, "repo"), bin = join(directory, "bin");
   mkdirSync(workspace); mkdirSync(bin);
   git(workspace, ["init", "-b", "main"]);
@@ -670,8 +668,7 @@ function ex1Fixture(t: test.TestContext, options: { timeoutMs?: number; ignoreMo
     proof.command = { executable: process.execPath, args: ["check.mjs", proof.node.includes("produce") ? "produce" : "consume"] };
     for (const mutation of proof.contract!.counterfactuals) mutation.command = { executable: process.execPath, args: ["check.mjs", "mutation"] };
   }
-  if (options.legacy) preparedFeatures(engine, "p", graph);
-  else prepareOmFixtureStages(engine, "p", graph);
+  prepareOmFixtureStages(engine, "p", graph);
   // `progress`: the full check prints progress on stdout while its failure stays on stderr (№3986-2).
   writeFileSync(join(directory, "full.mjs"), options.tap ? EX2_TAP_FULL(directory)
     : options.progress ? EX1_FULL(directory).replace("\nappendFileSync(", "\nconsole.log('Building candidate...');\nappendFileSync(") : EX1_FULL(directory));
@@ -679,11 +676,8 @@ function ex1Fixture(t: test.TestContext, options: { timeoutMs?: number; ignoreMo
   engine.environments.configure("p", { workspace, implementer: { actor: "worker", model: "fixture", effort: "high", command: options.implementer ?? adapter },
     reviewer: { actor: "reviewer", model: "fixture", effort: "high", command: adapter },
     fullCheck: { executable: process.execPath, args: [join(directory, "full.mjs")] }, timeoutMs: options.timeoutMs ?? 30_000,
-    ...(options.legacy ? {} : { requestCapacityChars: 100_000 }) }, 0);
-  if (options.legacy) {
-    refinedLayers(engine, "p"); const feasibility = engine.refinement.assess("p", 0);
-    const stage = engine.refinement.publish("p", reference(feasibility), 0); engine.pipeline.accept("p", "om-g2", stage.revision);
-  } else prepareNativeLayers(engine, "p", graph, "executed");
+    requestCapacityChars: 100_000 }, 0);
+  prepareNativeLayers(engine, "p", graph, "executed");
   const plan = engine.compiler.compile("p"); const compilation = engine.compiler.publish("p", reference(plan), 0); engine.pipeline.accept("p", "compilation", compilation.revision);
   writeFileSync(join(bin, "codex"), PROVIDER(directory, database)); chmodSync(join(bin, "codex"), 0o755);
   const path = process.env["PATH"]; process.env["PATH"] = `${bin}${delimiter}${path}`; t.after(() => { process.env["PATH"] = path; });
@@ -1062,53 +1056,6 @@ test("EX1 C the managed worktree reads the workspace's ignored dependencies thro
   await assert.rejects(h.run({ retry: true }), { code: "worktree_dependencies_invalid" });
 });
 
-/** Runs `body` with every engine module loaded from exactly `commit`, in its own process (the era check of om-run). */
-function ex1AtCommit(directory: string, database: string, commit: string, name: string, body: string): unknown {
-  const repository = fileURLToPath(new URL("../../", import.meta.url));
-  const loader = join(directory, `${name}-loader.mjs`), producer = join(directory, `${name}-producer.mjs`), served = join(directory, `${name}-served.log`);
-  const typescript = pathToFileURL(createRequire(import.meta.url).resolve("typescript")).href;
-  writeFileSync(served, "");
-  writeFileSync(loader, `import { execFileSync } from 'node:child_process';
-import { appendFileSync, realpathSync } from 'node:fs';
-import { fileURLToPath, pathToFileURL } from 'node:url';
-import ts from ${JSON.stringify(typescript)};
-let root, log, prefixes;
-export function initialize(data) {
-  root = data.root; log = data.log;
-  prefixes = [root, pathToFileURL(realpathSync(fileURLToPath(root)) + '/').href].map(base => new URL('dist/src/', base).href);
-}
-export async function load(url, context, next) {
-  const prefix = prefixes.find(item => url.startsWith(item));
-  if (prefix && /\\.js$/.test(url)) {
-    const relative = 'src/' + url.slice(prefix.length).replace(/\\.js$/, '.ts');
-    appendFileSync(log, relative + '\\n');
-    const source = execFileSync('git', ['show', ${JSON.stringify(commit)} + ':' + relative], { cwd: fileURLToPath(root), encoding: 'utf8', maxBuffer: 10000000 });
-    return { format: 'module', shortCircuit: true, source: ts.transpileModule(source,
-      { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2023 } }).outputText };
-  }
-  if (url.startsWith('file:') && url.includes('/dist/src/') && !url.includes('/node_modules/'))
-    throw new Error('An engine module outside the era checkout: ' + url);
-  return next(url, context);
-}`);
-  writeFileSync(producer, `import { join } from 'node:path';
-import { pathToFileURL } from 'node:url';
-const [repository, database] = process.argv.slice(2);
-const src = path => pathToFileURL(join(repository, 'dist/src', path)).href;
-const { Store } = await import(src('storage/store.js'));
-const { ProductEngine } = await import(src('product/engine.js'));
-const store = new Store(database), engine = new ProductEngine(store);
-const out = value => process.stdout.write(JSON.stringify(value));
-try {
-${body}
-} finally { store.close(); }`);
-  const bootstrap = `import { register } from 'node:module'; register(${JSON.stringify(pathToFileURL(loader).href)},
-    { data: { root: ${JSON.stringify(pathToFileURL(repository).href)}, log: ${JSON.stringify(served)} } });`;
-  const output: unknown = JSON.parse(execFileSync(process.execPath, ["--import", `data:text/javascript,${encodeURIComponent(bootstrap)}`, producer, repository, database],
-    { cwd: repository, encoding: "utf8", timeout: 180_000, maxBuffer: 10_000_000, env: { ...process.env } }));
-  const loaded = readFileSync(served, "utf8").split("\n").filter(Boolean);
-  assert.ok(loaded.includes("src/storage/store.ts") && loaded.includes("src/execution/runner.ts"), `The producer ran on the modules of ${commit}: ${loaded.join(", ")}`);
-  return output;
-}
 
 test("EX1 a launch record is closed once, from sent; a subject without its exact task, attempt, role or ordinal is refused before any write", t => {
   const directory = realpathSync(mkdtempSync(join(tmpdir(), "omg-ex1-send-")));
@@ -1262,7 +1209,6 @@ test("EX2 №3986-1 the outcome a correction answers survives a refused launch: 
 });
 
 // ---- EX3 (№4000): a task's correction limit is an integer 0..3, the task's in all ----
-const EX3_BASE = "e3f2b98eb5d232caae3a0956bc8d17bbaa136f70";
 const taskOne = (f: ReturnType<typeof ex1Fixture>) => f.plan.value.tasks[0]!;
 const implementsOf = (f: ReturnType<typeof ex1Fixture>) => f.provider().filter(call => call.mode === "implement" && call.task === taskOne(f).id);
 
@@ -1350,28 +1296,8 @@ test("EX3 the shared limits stop an execution with corrections left: launches or
   assert.deepEqual([implementsOf(g).length, correctionsUsed(g.store, g.plan, taskOne(g))], [1, 0], "AT3a: the review of the failed check took the input the correction needed");
 });
 
-test("EX3 era: the base stops a task at its negative review with its one correction spent; under a new admission of three the new code continues it — the saved review is shown to the correction, never bought again, and the count goes on from the base's", async t => {
-  const f = ex1Fixture(t, { legacy: true, tap: true });
-  f.behave({ "implement:1": "wrong", "review:1": "code" });
-  const command = JSON.stringify(f.command());
-  assert.deepEqual(ex1AtCommit(f.directory, f.database, EX3_BASE, "ex3-era", `
-out((await engine.execute(${command})).map(run => run.value.state));`), ["needs_code"]);
-  f.reopen();
-  const stopped = f.store.list<TaskRun>("task-run")[0]!;
-  assert.deepEqual([stopped.value.attempt, stopped.value.review?.verdict], [2, "request_changes"]);
-  await assert.rejects(f.run({ retry: true, maxCorrections: 1 }), { code: "execution_corrections_exhausted" }, "the base's admission reads as it wrote it");
-  assert.equal(correctionsUsed(f.store, f.plan, taskOne(f)), 1);
-  f.admit(f.execution({ maxCorrections: 3 }));
-  const runs = await f.run({ retry: true, maxCorrections: 3 });
-  assert.deepEqual(runs.map(run => [run.value.state, run.value.attempt]), [["committed", 3], ["committed", 1]]);
-  assert.deepEqual(f.provider().map(call => call.mode), ["implement", "implement", "review", "implement", "review", "implement", "review"],
-    "the saved negative review is not bought again before its correction");
-  assert.deepEqual(implementsOf(f)[2]!.correction!.review, { verdict: "request_changes", kind: "code", findings: ["The result is wrong"] });
-  assert.equal(correctionsUsed(f.store, f.plan, taskOne(f)), 2);
-});
 
 // ---- EX4 (№4016): the rule of paths; a task's addressed limit in all; one limit per task in every branch ----
-const EX4_BASE = "39c63aad5f14730a45430c2ca016c61d8dea6307";
 const addressedTo = (f: ReturnType<typeof ex1Fixture>, task: string, maxCorrections: number, general: Partial<Omit<ExecutionAdmissionSettings, "plan">> = {}) =>
   f.admit(f.execution({ ...general, taskCorrections: [{ task, maxCorrections }] }));
 
@@ -1410,36 +1336,6 @@ test("EX4 an addressed limit names one exact task of this plan, once: a task of 
   assert.deepEqual(runs.map(run => run.value.state), ["committed", "committed"], "a command of five is not refused under the addressed limit");
 });
 
-test("EX4 era: the three corrections the base used count — an addressed five gives exactly two more; a restart and a repeated admission give no sixth; the limit is absolute, and the neighbouring task keeps the ordinary three", async t => {
-  const f = ex1Fixture(t, { legacy: true, budget: { maxCorrections: 3 } });
-  f.behave({ implement: "wrong" });
-  const command = JSON.stringify(f.command({ maxCorrections: 3 }));
-  assert.deepEqual(ex1AtCommit(f.directory, f.database, EX4_BASE, "ex4-era", `
-out((await engine.execute(${command})).map(run => [run.value.state, run.value.attempt]));`), [["needs_code", 4]]);
-  f.reopen();
-  // AT3a return №4141 P2-1: the base's saved failed check is first reviewed once (no implementation); then the limit stands.
-  const [reviewed] = await f.run({ retry: true, maxCorrections: 3 });
-  assert.deepEqual([reviewed!.value.state, reviewed!.value.attempt, reviewed!.value.review?.kind, implementsOf(f).length], ["needs_code", 4, "code", 4]);
-  await assert.rejects(f.run({ retry: true, maxCorrections: 3 }), { code: "execution_corrections_exhausted" }, "the base's records read as it wrote them");
-  await assert.rejects(f.run({ retry: true, maxCorrections: 5 }), { code: "execution_corrections_exceeded" }, "five is no limit without its address");
-  assert.equal(correctionsUsed(f.store, f.plan, taskOne(f)), 3);
-  const one = taskOne(f).id, two = f.plan.value.tasks[1]!;
-  addressedTo(f, one, 5);
-  const more = await f.run({ retry: true, maxCorrections: 5 });
-  assert.deepEqual([more[0]!.value.state, more[0]!.value.attempt, implementsOf(f).length, correctionsUsed(f.store, f.plan, taskOne(f))], ["needs_code", 6, 6, 5]);
-  await assert.rejects(f.run({ retry: true, maxCorrections: 5 }), { code: "execution_corrections_exhausted" });
-  f.reopen();
-  addressedTo(f, one, 5);
-  await assert.rejects(f.run({ retry: true, maxCorrections: 5 }), { code: "execution_corrections_exhausted" }, "a repeated admission restates five, it adds nothing");
-  assert.equal(implementsOf(f).length, 6, "no sixth correction reaches the provider");
-  // A new decision of six is six in all: exactly one more, which here succeeds; the next task is held to the ordinary three.
-  addressedTo(f, one, 6);
-  f.behave({ implement: "wrong", "implement:7": "ok" });
-  const last = await f.run({ retry: true, maxCorrections: 6 });
-  assert.deepEqual(last.map(run => [run.value.state, run.value.attempt]), [["committed", 7], ["needs_code", 4]]);
-  assert.deepEqual([correctionsUsed(f.store, f.plan, taskOne(f)), correctionsUsed(f.store, f.plan, two)], [6, 3]);
-  assert.equal(f.provider().filter(call => call.mode === "implement" && call.task === two.id).length, 4, "the neighbour's own count, never the addressed one");
-});
 
 test("EX4 one limit per task in every branch — after a failed check, after a negative review, on retry: the addressed task takes its two, its neighbour under an ordinary none takes none; the correction after a review is given that saved finding and the rule of paths", async t => {
   const f = ex1Fixture(t, { budget: { maxCorrections: 0 } });
@@ -1476,7 +1372,6 @@ test("EX4 the shared limits stop a task earlier than its addressed limit: launch
 });
 
 // ---- EX5 (№4035): the five classes of self-review in the requests of both roles; every confirmed finding in one pass ----
-const EX5_BASE = "abd9dd8943400f4ff978439f8feb9957a7c9d4af";
 const absence = "ABSENCE: the intake store is missing — CLI command opens it with create-if-missing — after a lost response it reports persisted=false";
 const masquerade = "MASQUERADE: an empty file without tables in place of the store — serve opens it as a new store — POST /api/command answers on a fresh canon";
 const briefsOf = (f: ReturnType<typeof ex1Fixture>, mode: string) => f.provider().filter(call => call.mode === mode);
@@ -1530,21 +1425,6 @@ test("EX5 a review that finds the plan unexecutable among code defects returns a
   assert.equal(f.provider().length, 2, "a plan finding buys nothing on a retry");
 });
 
-test("EX5 era: a negative review the base saved is read as it wrote it — its correction under the new code is given that finding with the five classes, and the task commits", async t => {
-  const f = ex1Fixture(t, { legacy: true });
-  f.behave({ "review:1": "code:The result is wrong" });
-  const command = JSON.stringify(f.command({ maxCorrections: 0 }));
-  assert.deepEqual(ex1AtCommit(f.directory, f.database, EX5_BASE, "ex5-era", `
-out((await engine.execute(${command})).map(run => run.value.state));`), ["needs_code"]);
-  assert.ok(!f.provider()[0]!.brief.includes(FIVE_CLASSES), "the base asked by its own rule");
-  f.reopen();
-  const runs = await f.run({ retry: true, maxCorrections: 1 });
-  assert.deepEqual(runs.map(run => [run.value.state, run.value.attempt]), [["committed", 2], ["committed", 1]]);
-  const correction = briefsOf(f, "implement")[1]!;
-  assert.deepEqual(correction.correction!.review, { verdict: "request_changes", kind: "code", findings: ["The result is wrong"] });
-  assert.ok(correction.brief.includes(FIVE_CLASSES) && correction.brief.includes(CORRECTION_CLASSES));
-  assert.deepEqual(f.provider().map(call => call.mode), ["implement", "review", "implement", "review", "implement", "review"], "the saved review is not bought again");
-});
 
 test("EX5 №4045 a reviewer that answers exactly in the forms its brief states is understood: a pass commits with no correction, changes go to a correction with every finding, a plan finding stops", async t => {
   const f = ex1Fixture(t);
@@ -1572,7 +1452,6 @@ test("EX5 №4045 a reviewer that answers exactly in the forms its brief states 
 });
 
 // ---- EX6 (№4068): the owner's clarification of an exact task's contract, in its admission, with no recompilation ----
-const EX6_BASE = "145d833e4937836033883bd2ef66846c4753ad39";
 const VARIANT_1 = "Решение владельца (вариант 1): новый канон создаётся только явной инициализацией (CLI init). Приём поручения и восстановление работают с существующим каноном; его отсутствие не доказывает отсутствие commit. serve и npm run dev без канона не создают пустую базу и отвечают требованием явного init — это поведение по контракту, а не регрессия NEIGHBOURS.";
 
 test("EX6 an owner's clarification of an exact task reaches that task's implementation, its correction and its review, and no other task's", async t => {
@@ -1621,27 +1500,9 @@ test("EX6 a clarification names one exact task of this plan, once, with its text
   assert.deepEqual((await f.run({ maxCorrections: 1 })).map(run => run.value.state), ["committed", "committed"]);
 });
 
-test("EX6 era: without a clarification every request is byte for byte the base's, and the admission the base wrote reads as it wrote it", async t => {
-  const f = ex1Fixture(t, { legacy: true });
-  const command = JSON.stringify(f.command({ maxCorrections: 1 }));
-  assert.deepEqual(ex1AtCommit(f.directory, f.database, EX6_BASE, "ex6-era", `
-out((await engine.execute(${command})).map(run => run.value.state));`), ["committed", "committed"]);
-  const g = ex1Fixture(t, { legacy: true });
-  assert.deepEqual((await g.run({ maxCorrections: 1 })).map(run => run.value.state), ["committed", "committed"]);
-  // AT3a: the requests are the base's but for exactly what AT3a adds under admission — the unexecutable outcome of the
-  // implementation (the engine's rule and the adapter's line) and the addressed form of the review rules.
-  const beforeAT3a = (brief: string) => brief.replace(` ${IMPLEMENT_UNEXECUTABLE}`, "")
-    .replace("When the contract cannot be executed as planned, return instead exactly outcome (\"contract_unexecutable\") and findings (array of {text, address}) as the request describes.\n", "")
-    .replace(reviewClasses("execution/v2"), REVIEW_CLASSES);
-  assert.deepEqual(g.provider().map(call => beforeAT3a(call.brief)), f.provider().map(call => call.brief), "no clarification, the base's requests");
-  f.reopen();
-  assert.deepEqual((await f.run({ retry: true, maxCorrections: 1 })).map(run => run.value.state), ["committed", "committed"]);
-  assert.equal(f.provider().length, 4, "the base's results stand; nothing is bought again");
-});
 
 
 // ---- AT3a (№4125): needs_plan only by an addressed finding; a failed full check is read by the reviewer first ----
-const AT3A_BASE = "e475bd594fc2f4cde4fb58b6f26f2083f7c00954";
 test("AT3a probes: an address is the exact attempt — another plan, task, attempt or tree, an unknown requirement, a path inside the write paths, a check that was not run, did not fail or does not hold the failure — each refused by its producer", t => {
   const f = ex1Fixture(t, { admit: false });
   const task = taskOne(f), plan = reference(f.plan);
@@ -1737,23 +1598,6 @@ test("AT3a row 10: the saved outcome of a failed check's review is read on a rep
   assert.deepEqual(f.provider().map(call => call.mode), ["implement", "review"], "nothing is bought again");
 });
 
-test("AT3a rows 11, 12: era — the code before AT3a stops a task on a plan finding of strings, and the new code reads it as it wrote it; without admission the requests and outcomes stay as they were", async t => {
-  const f = ex1Fixture(t, { legacy: true });
-  f.behave({ "review:1": "plan" });
-  const command = JSON.stringify(f.command());
-  assert.deepEqual(ex1AtCommit(f.directory, f.database, AT3A_BASE, "at3a-era", `
-out((await engine.execute(${command})).map(run => run.value.state));`), ["needs_plan"]);
-  f.reopen();
-  const saved = f.store.list<TaskRun>("task-run")[0]!;
-  assert.deepEqual([saved.value.review?.findings, saved.value.review?.contract, saved.value.planDefect], [["The responsibility cannot deliver"], undefined, undefined]);
-  const [again] = await f.run({ retry: true });
-  assert.deepEqual([again!.value.state, again!.revision, f.provider().length], ["needs_plan", saved.revision, 2], "read by its own era, nothing bought");
-  const legacy = legacyExecutionFixture(t, "plan-defect");
-  const [stopped] = await legacy.engine.executor.run("p", reference(legacy.plan), legacy.options);
-  assert.deepEqual([stopped!.value.state, stopped!.value.review?.findings, stopped!.value.review?.contract], ["needs_plan", ["The proposed responsibility cannot deliver the required result"], undefined],
-    "without admission a plan finding of strings stops as before (legacy repair route)");
-  assert.ok(!legacy.calls().some(call => JSON.stringify(call.subject).includes("answerForm")), "no addressed form is asked without admission");
-});
 
 /** The engine in its own process, dying at once after the first task-run write the predicate (JS over `item`) accepts. */
 async function ex1ProcessWhen(f: ReturnType<typeof ex1Fixture>, extra: Record<string, unknown>, predicate: string): Promise<number | null> {
@@ -1785,31 +1629,6 @@ test("AT3a row 10 (№4135): a lost process between the failed full check and it
 });
 
 // ---- AT3a return №4141: the saved failed check is reviewed as saved; the unexecutable answer binds the real working copy ----
-test("AT3a return №4141 P2-1: the live form of task 1 — a needs_code the code before AT3a wrote, with its candidate, a failed full check, no review and no correction left — is reviewed once as saved, with no implementation bought and no correction slot opened", async t => {
-  for (const [verdict, state] of [["plan-addressed", "needs_plan"], ["ok", "needs_code"]] as const) {
-    const f = ex1Fixture(t, { legacy: true, tap: true });
-    f.behave({ "implement:1": "wrong" });
-    const command = JSON.stringify(f.command({ maxCorrections: 0 }));
-    assert.deepEqual(ex1AtCommit(f.directory, f.database, AT3A_BASE, `at3a-live-${verdict}`, `
-out((await engine.execute(${command})).map(run => run.value.state));`), ["needs_code"]);
-    f.reopen();
-    const saved = f.store.list<TaskRun>("task-run")[0]!;
-    assert.deepEqual([saved.value.state, saved.value.review, saved.value.checks.some(check => check.result.exitCode !== 0), saved.value.tree !== null, f.sends().map(row => row.value.role)],
-      ["needs_code", null, true, true, ["implement"]], "the live form: candidate, failed check, no review");
-    f.behave({ review: verdict });
-    const [run] = await f.run({ retry: true, maxCorrections: 0 });
-    assert.equal(run!.value.state, state, verdict);
-    assert.deepEqual(f.sends().map(row => [row.value.role, row.value.attempt]).sort(), [["implement", 1], ["review", 1]], `${verdict}: one review, no implementation`);
-    assert.deepEqual([run!.value.attempt, run!.value.tree, run!.value.checks], [1, saved.value.tree, saved.value.checks], `${verdict}: the same attempt, candidate and saved check`);
-    assert.equal(correctionsUsed(f.store, f.plan, taskOne(f)), 0, `${verdict}: no correction slot is opened`);
-    assert.ok(briefsOf(f, "review")[0]!.brief.includes("The full check FAILED"), `${verdict}: the reviewer is given the saved failure`);
-    if (state === "needs_plan") assert.equal(run!.value.planDefect!.findings[0]!.address!.check!.index, 0);
-    // A repeat buys no second review: a stopped plan stays stopped; a code verdict with no correction left is refused as before.
-    if (state === "needs_code") await assert.rejects(f.run({ retry: true, maxCorrections: 0 }), { code: "execution_corrections_exhausted" });
-    else await f.run({ retry: true, maxCorrections: 0 });
-    assert.equal(f.sends().length, 2, `${verdict}: a repeat buys no second review`);
-  }
-});
 
 test("AT3a return №4141 P2-2: a lost process between a failed full check and its review keeps that failure — the repeat reviews the saved result, never runs the check again, and a pass of it is impossible even when a second run would be green", async t => {
   const f = ex1Fixture(t, { tap: true });
