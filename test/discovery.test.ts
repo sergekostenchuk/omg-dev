@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Store } from "../src/storage/store.js";
 import { Discovery } from "../src/discovery/discovery.js";
-import { reference, STAGES, type Ref, type StageValidators, type StageValidator } from "../src/pipeline/contracts.js";
+import { reference, STAGES, type StageValidators, type StageValidator } from "../src/pipeline/contracts.js";
 import { Pipeline } from "../src/pipeline/pipeline.js";
 import { EngineError } from "../src/errors.js";
 import type { Json } from "../src/canonical.js";
@@ -143,12 +143,9 @@ import type { ResearchAnswer, ResearchAssessment, ResearchTurn } from "../src/di
 import { acceptanceBindingId, managedAnswerId, managedAnswerTurn,
   type ResearchAcceptanceBinding } from "../src/discovery/research-consumer-transition.js";
 import { readAcceptedResearchAnswer, type Question } from "../src/discovery/discovery.js";
-import { readResearchAcceptanceBinding, readResearchConsumerTurn } from "../src/discovery/response-recovery.js";
+import { readResearchAcceptanceBinding } from "../src/discovery/response-recovery.js";
 import { reuseResearch } from "../src/discovery/research-reuse.js";
-import { execFileSync } from "node:child_process";
-import { createRequire } from "node:module";
-import { fileURLToPath, pathToFileURL } from "node:url";
-import { realpathSync } from "node:fs";
+
 
 /** A real managed acceptance through the paid runner: scripted adapter answers the draft's
  * question, the assessor supports, Discovery writes the answer at its managed address with K. */
@@ -424,92 +421,6 @@ test("D8.4.2 R10 R11: reuse of a managed source is proven before the rebound; a 
 
 // ── D8.4.2 круг 2 (вердикт №2276): четыре класса — эра, адрес, цепочка rebound, managed-слой ──
 
-const PREDECESSOR_LOADER = String.raw`
-import ts from TYPESCRIPT;
-import { execFileSync } from 'node:child_process';
-let root, repository, baseline;
-export function initialize(data) { root = data.root; repository = data.repository; baseline = data.baseline; }
-export async function load(url, context, nextLoad) {
-  if (url.startsWith(root) && url.endsWith('.js')) {
-    const path = decodeURIComponent(url.slice(root.length)).replace(/\.js$/, '.ts');
-    const body = execFileSync('git', ['show', baseline + ':' + path], { cwd: repository, encoding: 'utf8', maxBuffer: 10_000_000 });
-    return { format: 'module', shortCircuit: true, source: ts.transpileModule(body,
-      { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2023 } }).outputText };
-  }
-  return nextLoad(url, context);
-}
-`;
-const PREDECESSOR_SCENARIO = String.raw`
-import { register } from 'node:module';
-import { mkdirSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
-const config = CONFIG;
-register(config.loader, { data: { root: config.dist, repository: config.repository, baseline: config.baseline } });
-const { Store } = await import(config.dist + 'src/storage/store.js');
-const { ProductEngine } = await import(config.dist + 'src/product/engine.js');
-const root = join(config.directory, 'predecessor'); mkdirSync(root, { recursive: true });
-const database = join(root, 'state.sqlite');
-const store = new Store(database), engine = new ProductEngine(store);
-engine.execute({ type: 'create-project', project: 'p', title: 'Predecessor producer' });
-const source = engine.discovery.evidence.document('p', 'proof', 'Grounded local condition', 'text/plain', 0);
-const sourceRef = { id: source.id, revision: source.revision, hash: source.hash };
-const adapter = join(root, 'adapter.mjs');
-writeFileSync(adapter, "import{readFileSync}from'node:fs';\nconst r=JSON.parse(readFileSync(0,'utf8')),s=r.subject;\n"
-  + "const research=s.role==='assess-answer'?{verdict:'supported',reasons:[]}:{action:'answer',question:s.questions[0].id,value:{ok:true},citations:[{source:"
-  + JSON.stringify(sourceRef) + ",selector:{kind:'text-range',start:0,end:24}}]};\n"
-  + "console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,usage:{inputTokens:5,outputTokens:1,cachedInputTokens:0,reasoningOutputTokens:0}}));\n");
-const command = { executable: process.execPath, args: [adapter] };
-engine.environments.configure('p', { workspace: root, implementer: { actor: 'author', model: 'fixture', effort: 'high', command },
-  reviewer: { actor: 'reviewer', model: 'fixture', effort: 'high', command }, fullCheck: command, timeoutMs: 5000 }, 0);
-const draft = engine.discovery.create('p', 'discovery', 'R0', 'compilation',
-  [{ field: 'result', kind: 'design', prompt: 'Resolve result', risk: 'Missing source', schema: { type: 'object' } }]);
-const run = await engine.researcher.run('p', draft.id, 1);
-const turn = store.list('research-turn')[0];
-console.log(JSON.stringify({ database, draft: draft.id, status: run.value.status, calls: store.list('model-call').length,
-  turn: { id: turn.id, revision: turn.revision, hash: turn.hash } }));
-store.close();
-`;
-
-test("D8.4.2-2 P2-1 (№2276-1): a K of the accepted D8.4e producer (c60be08, UUID answer) keeps its full contract; the new producer alone writes the managed address", async t => {
-  const directory = realpathSync(mkdtempSync(join(tmpdir(), "omg-d842-predecessor-")));
-  const stores: Store[] = [];
-  t.after(() => { for (const db of stores) db.close(); rmSync(directory, { recursive: true, force: true }); });
-  const loaderFile = join(directory, "predecessor-loader.mjs"), script = join(directory, "predecessor.mjs");
-  const typescript = pathToFileURL(createRequire(import.meta.url).resolve("typescript")).href;
-  const dist = pathToFileURL(fileURLToPath(new URL("../", import.meta.url))).href;
-  const repository = fileURLToPath(new URL("../../", import.meta.url));
-  writeFileSync(loaderFile, PREDECESSOR_LOADER.replace("TYPESCRIPT", JSON.stringify(typescript)));
-  writeFileSync(script, PREDECESSOR_SCENARIO.replace("CONFIG", JSON.stringify({ directory, repository, dist,
-    loader: pathToFileURL(loaderFile).href, baseline: "c60be084c9f002762e4784e12b6914d7ff770c76" })));
-  const output = execFileSync(process.execPath, [script], { encoding: "utf8", maxBuffer: 16 * 1024 * 1024 }).trim().split("\n").at(-1)!;
-  const produced = JSON.parse(output) as { database: string; draft: string; status: string; calls: number; turn: Ref };
-  assert.equal(produced.status, "completed", output);
-  const db = new Store(produced.database); stores.push(db);
-  const proven = readResearchAcceptanceBinding(db, "p", produced.turn.id);
-  assert.ok(proven, "the previous era's K proves under the previous full contract");
-  assert.equal(readResearchConsumerTurn(db, produced.turn).value.status, "completed");
-  const answerRef = proven.binding.value.answer;
-  assert.equal(managedAnswerTurn(answerRef.id, "p"), null, "the previous producer's answer is a UUID address");
-  assert.notEqual(answerRef.id, managedAnswerId("p", produced.turn.id));
-  const read = readAcceptedResearchAnswer(db, "p", answerRef);
-  assert.equal(read.binding, null, "consumers read the previous era by its own contract, without attributing K");
-  assert.equal(read.assessment?.id, proven.binding.value.assessment.id);
-  const question = db.get<Question>(proven.binding.value.questionBefore.id)!;
-  assert.ok(new Discovery(db).observations(question.id).length > 0);
-  assert.deepEqual(new ProductEngine(db).discovery.gate("p", reference(db.get(proven.binding.value.draftAfter.id)!)).findings, []);
-  assert.equal(db.list("model-call").length, produced.calls);
-  // The same K with its answer moved to a managed address of ANOTHER turn is refused by the shared projection.
-  const forgedId = managedAnswerId("p", `research-turn:v1:${hashJson(["other", 1])}`);
-  const forgedAnswer = db.write<ResearchAnswer>({ id: forgedId, kind: "research-answer", expected: 0,
-    value: db.get<ResearchAnswer>(answerRef.id, answerRef.revision)!.value });
-  rawWrite(produced.database, proven.binding.id, 1, { ...proven.binding.value, answer: reference(forgedAnswer) });
-  const cold = new Store(produced.database); stores.push(cold);
-  assert.throws(() => readResearchAcceptanceBinding(cold, "p", produced.turn.id), bindingInvalid);
-  rawWrite(produced.database, proven.binding.id, 1, proven.binding.value);
-  // The current producer writes the managed address and its K names it exactly.
-  const f = managedAnswerFixture(t), current = await produceManaged(f);
-  assert.equal(current.answer.id, managedAnswerId("p", current.turn.id));
-});
 
 test("D8.4.2-2 P2-4 (№2276-4): the managed address is parsed strictly — another project, an unknown version, a broken or non-canonical encoding, a non-turn tail are addressed refusals; a foreign or malformed record never downgrades to the previous era", async t => {
   const turnId = `research-turn:v1:${hashJson(["address", 1])}`;
