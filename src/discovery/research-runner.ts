@@ -1,3 +1,9 @@
+import { variantSnapshotReadiness, produceVariantSnapshot, readVariantSnapshot } from "./variant-snapshot.js";
+import { prepareVariantSession, applyVariantSession, readVariantExecutionSession, readVariantGeneration,
+  type ProvenVariantGeneration } from "./variant-session.js";
+import { VARIANT_SUBJECT_CONTRACT, type VariantExecutionSession } from "./discovery-variants.js";
+import { variantStateId, readVariantStateStructural } from "./variant-decision.js";
+import { readProjectMode } from "../product/project-mode.js";
 import { REQUEST_MANIFEST_CONTRACT, CONTEXT_PREPARATION_CONTRACT } from "./request-parts.js";
 import { currentPlan, v7CheckpointPrefixes, planAttemptSelection, planOwnerSubject, rejectedPlanOwnerRequest, provePlanQuestions, selectV7AnalystRecovery } from "./v7-plan-questions.js";
 import { applyDiscoveryAssessment, v7ProgressBaseline } from "./v7-progress.js";
@@ -503,7 +509,7 @@ export class Researcher {
           const originalAction = admittedResearchAction(originalTurn.value.action);
           requireCondition(originalAction.action === "read_bundle", "research_consumer_intent_invalid",
             "The reader continuation belongs to a source bundle action");
-          const result = await resumeReadBundleIntent(this.store, reference(outstanding), dispatch, pilot, signal, retryPermits);
+          const result = await resumeReadBundleIntent(this.store, reference(outstanding), dispatch, pilot, signal, retryPermits, { restoreOnly });
           const saved = this.store.writeMany<ResearchRun | ResearchTurn>([
             { id: run.id, kind: run.kind, expected: run.revision,
               value: { ...run.value, status: "running", owner, error: null, pauseCode: null } },
@@ -905,7 +911,7 @@ export class Researcher {
             requireCondition(new Set(savedRuns.map(canonical)).size <= 1,
               "research_consumer_intent_invalid", "The pending bundle has several original run bindings");
             const result = await readBundle(this.store, dispatch, pilot, reference(pending[0]!), action.purpose, action.inputs,
-              signal, { run: savedRuns[0] ?? reference(run), turn: reference(pendingTurn) }, retryPermits);
+              signal, { run: savedRuns[0] ?? reference(run), turn: reference(pendingTurn) }, retryPermits, { restoreOnly });
             readReaderResultAt(this.store, project, reference(result));
             observation = { ref: reference(result), observations: result.value.observations, coverage: result.value.coverage, unresolved: result.value.unresolved };
             turnProof = { kind: 'read-bundle', result: { ref: reference(result), value: result.value } };
@@ -1339,7 +1345,7 @@ export class Researcher {
   /** A queued child consumes the exact paid planner's draft, question and
    * dispatch. The common reader owns its own reservation and paid replay. */
   private async applyV7QueuedChild(project: string, run: Revision<ResearchRun>, child: Revision<ResearchTurn>,
-    signal?: AbortSignal): Promise<Revision<ResearchRun>> {
+    signal?: AbortSignal, restoreOnly = false): Promise<Revision<ResearchRun>> {
     requireCondition(isRef(child.value.plannedBy), "research_consumer_intent_invalid", "A queued child needs its planner");
     const parent = readResearchConsumerTurn(this.store, child.value.plannedBy) as Revision<ManagedResearchTurn>;
     const producer = readResearchConsumerIntent(this.store, parent.value.consumerIntent);
@@ -1378,7 +1384,7 @@ export class Researcher {
           requireCondition(pilot?.kind === "reader-pilot" && (!savedProfile || canonical(reference(pilot)) === canonical(savedProfile)),
             "reader_pilot_required", "The queued bundle needs its current or saved paid reader profile");
           result = await readBundle(this.store, producer.value.dispatch, pilot, reference(question), action.purpose,
-            action.inputs, signal, consumer);
+            action.inputs, signal, consumer, undefined, { restoreOnly });
         }
         readReaderResultAt(this.store, project, reference(result));
         observation = { ref: reference(result), observations: result.value.observations,
@@ -1556,6 +1562,62 @@ export class Researcher {
     return run;
   }
 
+  /** Restore the saved physical identity before today's plan/mode can select new work.
+   * Session-only and prepared operations remain unpaid; the caller admits those separately. */
+  private restoreV7VariantGenerations(project: string, draftId: string): {
+    pending: { session: Revision<VariantExecutionSession>; intent: Revision<ResearchConsumerIntent> | null }[];
+    published: ProvenVariantGeneration[];
+  } {
+    const pending: { session: Revision<VariantExecutionSession>; intent: Revision<ResearchConsumerIntent> | null }[] = [];
+    const published: ProvenVariantGeneration[] = [];
+    for (const row of this.store.list<VariantExecutionSession>("discovery-variant-session")) {
+      if (row.value?.projectId !== project || row.value.draft?.id !== draftId) continue;
+      let session = readVariantExecutionSession(this.store, project, reference(row));
+      requireCondition(session.value.variantSubject.kind === "proposal", "research_variant_choice_unavailable",
+        "Saved variant decisions need the connected decision producer; generation cannot interpret them");
+      let intent = findResearchConsumerIntent(this.store, project, "variant-proposal", session.id, draftId);
+      if (intent?.value.state === "running") {
+        resumeResearchConsumerExecution(this.store, project, reference(intent));
+        session = applyVariantSession(this.store, project, reference(intent));
+        intent = this.store.get<ResearchConsumerIntent>(intent.id)!;
+      }
+      if (intent?.value.state === "applied") {
+        session = applyVariantSession(this.store, project, reference(intent));
+        const results = (intent.value.outputs ?? []).filter(ref => {
+          const kind = this.store.get(ref.id, ref.revision)?.kind;
+          return kind === "discovery-variant-set" || kind === "discovery-variant-none";
+        });
+        requireCondition(results.length === 1, "research_variant_generation_missing",
+          "The saved execution is not a published generation; retain its paid identity");
+        published.push(readVariantGeneration(this.store, project, results[0]!));
+      } else {
+        requireCondition(intent?.value.state !== "refused", "research_consumer_execution_refused",
+          "The original variant execution is refused; a new run does not buy it again");
+        requireCondition(session.value.cursor === 0, "discovery_variant_session_invalid",
+          "A completed variant session lost its applied intent");
+        pending.push({ session, intent });
+      }
+    }
+    return { pending, published };
+  }
+
+  private variantGenerationPause(project: string, generation: ProvenVariantGeneration): never {
+    const result = generation.publication.result, session = generation.session;
+    const mode = readProjectMode(this.store, project);
+    const state = this.store.get(variantStateId(project, session.value.draft.id));
+    const stale = canonical(mode.ref) !== canonical(session.value.variantSubject.mode)
+      || !generation.state || !state || canonical(reference(state)) !== canonical(generation.state);
+    const code = stale ? "research_variant_context_stale" : result.kind === "discovery-variant-none"
+      ? "research_no_variants" : mode.mode === "questions" ? "research_variant_owner_required" : "research_variant_choice_unavailable";
+    throw new EngineError(code, canonical({ code, result: result.ref, session: reference(session),
+      subject: session.value.variantSubject, publicationState: generation.state, currentMode: mode.ref,
+      door: code === "research_variant_owner_required" ? "discovery-variant-choice" : null,
+      message: stale ? "The paid generation retains its original mode/state; it is not reassigned to today's selection"
+        : result.kind === "discovery-variant-none" ? "The paid generation published no_variants"
+        : mode.mode === "questions" ? "An explicit owner choice of this exact set is required"
+        : "The model choice producer is not connected; a recommendation is no decision" }));
+  }
+
   /** The v7 open frontier uses the ordinary managed transport and K.
    * Paid work is resolved before today's plan, environment or allowance admits a new send. */
   private async runPlanAttempts(project: string, draftId: string, limit: number, signal: AbortSignal | undefined,
@@ -1570,6 +1632,7 @@ export class Researcher {
       "research_busy", "This draft already has an active researcher");
     try {
       for (;;) {
+        const variants = this.restoreV7VariantGenerations(project, draftId);
         const synthesis = this.v7SynthesisRecovery(project, draftId);
         const reserved = synthesis?.deliveryTurn != null ? reference(synthesis.session) : undefined;
         if (reserved) requireCondition(run && synthesis!.session.value.delivery?.run === id
@@ -1622,9 +1685,11 @@ export class Researcher {
           requireCondition(run, "research_consumer_intent_invalid", "The saved reader queue lost its run");
           const repeatingContextPause = run.value.status === "paused" && run.value.pauseCode === "research_no_progress"
             && turnAction(turn.value).action === "read_context";
-          if (run.value.status !== "running" && !repeatingContextPause) run = this.save(run,
+          const readerRestoreOnly = options.restoreOnly || producerContractEra('discovery', options.producerPolicy) !== 7;
+          const stoppedReader = readerRestoreOnly && turnAction(turn.value).action === 'read_bundle';
+          if (run.value.status !== "running" && !repeatingContextPause && !stoppedReader) run = this.save(run,
             { status: "running", owner, error: null, pauseCode: null }, [reference(turn)]);
-          run = await this.applyV7QueuedChild(project, run, turn, signal);
+          run = await this.applyV7QueuedChild(project, run, turn, signal, readerRestoreOnly);
           continue;
         }
         const unsentAnalyst = outstanding?.value.state === "prepared"
@@ -1830,13 +1895,75 @@ export class Researcher {
           `[${refused.id}] Paid response retained for this plan subject; call ${refused.value.refusal!.call.id}`);
         if (run) run = await this.checkpointV7Attempts(project,draftId,run,turns,owner,signal,
           !options.restoreOnly && producerContractEra('discovery',options.producerPolicy) === 7, next => { run = next; });
-        const selection = planAttemptSelection(this.store, project);
-        requireCondition(selection.draft.id === draftId, "plan_questions_invalid", "The selected plan belongs to another draft");
-        if (!selection.next && run) {
-          if (run.value.status === "completed") return run;
-          return this.save(run, { status: "completed", ownerQuestion: null, error: null, pauseCode: null },
-            [reference(selection.draft), reference(selection.question), ...selection.attempts.map(reference), ...selection.guards]);
+        const plan = currentPlan(this.store, project);
+        requireCondition(plan.draft.id === draftId, "plan_questions_invalid", "The selected plan belongs to another draft");
+        const generations = variants.published.filter(generation => {
+          const subject = generation.session.value.variantSubject;
+          return subject.kind === "proposal"
+            && canonical(readVariantSnapshot(this.store, project, subject.snapshot).value.plan) === canonical(plan.planAnswer);
+        });
+        requireCondition(generations.length <= 1, "research_variant_generation_ambiguous",
+          "Several published generations name this plan; retain their exact identities instead of choosing one");
+        const pendingVariants = variants.pending.filter(operation => {
+          const subject = operation.session.value.variantSubject;
+          return subject.kind === "proposal"
+            && canonical(readVariantSnapshot(this.store, project, subject.snapshot).value.plan) === canonical(plan.planAnswer);
+        });
+        requireCondition(pendingVariants.length <= 1 && !(pendingVariants.length && generations.length),
+          "research_variant_generation_ambiguous", "The plan has incompatible saved generation operations");
+        if (generations.length && run) this.variantGenerationPause(project, generations[0]!);
+        const readiness = variantSnapshotReadiness(this.store, project);
+        const allowNew = !options.restoreOnly && producerContractEra("discovery", options.producerPolicy) === 7;
+        // Prove saved operations and readiness first. A cold refusal preserves the exact
+        // addressed pause even if other questions remain uncovered; it claims no readiness.
+        const lastSubject = turns.length ? planSubjectOf(turns[turns.length - 1]!.value) : null;
+        if (!allowNew && run?.value.status === "paused" && lastSubject
+          && canonical(lastSubject.planAnswer) === canonical(plan.planAnswer) && !pendingVariants.length
+          && ["project_mode_unset", "research_turns_exhausted", "research_restore_complete"].includes(run.value.pauseCode ?? "")) return run;
+        if (readiness.status === "ready") {
+          if (!run) {
+            const effective = this.environments.effective(project);
+            run = this.store.writeMany<ResearchRun>([{ id, kind: "research-run", expected: 0,
+              value: { projectId: project, draftId, environment: reference(effective.environment), status: "paused", turns: 0,
+                limit, inputs: plan.draft.value.inputs, ownerQuestion: null, error: null, pauseCode: null, owner, requestChars: 0 } }],
+              [reference(plan.draft), reference(plan.question), ...readiness.guards])[0]!;
+          }
+          if (generations.length) this.variantGenerationPause(project, generations[0]!);
+          requireCondition(allowNew, "research_restore_complete", "Saved work is restored; a new generation needs an explicit v7 allowance");
+          requireCondition(used < limit, "research_turns_exhausted", "Research call allowance reached before variant generation");
+          requireCondition(readiness.generationAllowed, "research_budget_exhausted",
+            readiness.generationRefusal?.message ?? "The stage budget admits no new generation");
+          const mode = readProjectMode(this.store, project), operation = pendingVariants[0];
+          const snapshot = operation ? readVariantSnapshot(this.store, project, (operation.session.value.variantSubject as
+            Extract<VariantExecutionSession["variantSubject"], { kind: "proposal" }>).snapshot)
+            : produceVariantSnapshot(this.store, project).record;
+          const state = this.store.get(variantStateId(project, plan.draft.id));
+          if (state) readVariantStateStructural(this.store, project, plan.draft.id, reference(state));
+          const subject = operation?.session.value.variantSubject ?? { contract: VARIANT_SUBJECT_CONTRACT,
+            kind: "proposal" as const, snapshot: reference(snapshot), mode: mode.ref, expectedSelection: state ? reference(state) : null };
+          requireCondition(canonical(subject.mode) === canonical(mode.ref), "research_consumer_context_stale",
+            "The unpaid saved generation belongs to another exact mode");
+          const effective = this.environments.effective(project);
+          const role = operation ? [effective.environment.value.implementer, effective.environment.value.reviewer]
+            .find(candidate => candidate.actor === operation.session.value.actor) : effective.environment.value.implementer;
+          requireCondition(role, "research_consumer_context_stale", "The unpaid saved generation lost its original actor");
+          const prepared = operation?.intent ? { session: operation.session, intent: operation.intent }
+            : prepareVariantSession(this.store, { projectId: project, variantSubject: subject, environment: effective.environment,
+              role, prompt: "Propose one to three bounded variants or no_variants from this exact saved sweep. Keep one common scale, exact grounds, unknowns and search limits. A recommendation is not a choice." });
+          const v = prepared.intent.value;
+          requireCondition(canonical(v.dispatch) === canonical(effective.environment.value), "research_consumer_context_stale",
+            "The unpaid saved generation environment changed");
+          if (run.value.status !== "running") run = this.save(run, { status: "running", owner, ownerQuestion: null, error: null, pauseCode: null });
+          used++;
+          await researchCall(v.role, v.dispatch, v.cursor.prompt, v.cursor.context, signal,
+            { store: this.store, draftId: v.draft.id, questionId: v.question.id, purpose: v.kind,
+              consumerIntent: reference(prepared.intent), session: v.owner });
+          applyVariantSession(this.store, project, reference(this.store.get<ResearchConsumerIntent>(prepared.intent.id)!));
+          continue;
         }
+        const selection = planAttemptSelection(this.store, project);
+        requireCondition(selection.next, readiness.status === "early_limit" ? "research_budget_exhausted" : "discovery_variant_not_ready",
+          canonical({ code: readiness.status, reasons: readiness.reasons }));
         requireCondition(!options.restoreOnly && producerContractEra("discovery", options.producerPolicy) === 7,
           "research_contract_upgrade_required", "New v7 work requires its explicit producer policy");
         const effective = this.environments.effective(project), environment = effective.environment;
@@ -1845,7 +1972,6 @@ export class Researcher {
             limit, inputs: uniqueRefs([...selection.draft.value.inputs, ...effective.guards]), ownerQuestion: null,
             error: null, pauseCode: null, owner, requestChars: 0 } }],
           [reference(selection.draft), reference(selection.question), reference(environment), ...selection.guards])[0]!;
-        if (!selection.next) return this.save(run, { status: "completed", error: null, pauseCode: null });
         if (used >= limit) return this.save(run, { status: "paused", pauseCode: "research_turns_exhausted",
           error: "Research turn allowance reached; paid attempts are preserved" });
         const subject: V7PlanSubject = { contract: V7_PLAN_SUBJECT_CONTRACT,

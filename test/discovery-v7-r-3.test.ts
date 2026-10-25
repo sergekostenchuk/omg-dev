@@ -471,10 +471,10 @@ function beforeApply(f: Awaited<ReturnType<typeof runnerSetup>>) {
 const runnerTraversal = (f: { store: Store; v: { draft: Revision<DiscoveryDraft> } }, store = f.store) =>
   discoveryTraversal(store, store.get<DiscoveryDraft>(f.v.draft.id)!)!;
 
-test('R.3 end to end: the ordinary runner completes its run on a front of proved unknowns, which does not accept Discovery', async t => {
+test('R.3 end to end: the ordinary runner pauses after the broad pass on proved unknowns without accepting Discovery', async t => {
   const f = await runnerSetup(t); f.finishFrontier();
   const run = await f.run();
-  assert.equal(run.value.status, 'completed', JSON.stringify(run.value));
+  assert.equal(run.value.status,'paused');assert.equal(run.value.pauseCode,'project_mode_unset',JSON.stringify(run.value));
   const read = runnerTraversal(f);
   assert.equal(read.end, 'completed');
   assert.deepEqual(read.subjects.map(row => [row.subject.planQuestionId, row.outcome, row.applications.length, row.pending.length]),
@@ -501,7 +501,7 @@ test('R.3 end to end: a run marked completed with its paid assessment unapplied 
   assert.deepEqual(pending.subjects[0]!.applications, []);
   // The free recovery of the runner applies the paid assessment without another send; the front is then completed.
   const sent = f.wires().length, done = await f.run(1, f.open(), false);
-  assert.equal(done.value.status, 'completed', JSON.stringify(done.value));
+  assert.equal(done.value.status,'paused');assert.equal(done.value.pauseCode,'research_restore_complete',JSON.stringify(done.value));
   assert.equal(f.wires().length, sent);
   const read = runnerTraversal(f, f.open());
   assert.equal(read.end, 'completed');

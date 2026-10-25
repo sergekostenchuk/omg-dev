@@ -1412,7 +1412,50 @@ export function readResearchConsumerTurn(store: Store, ref: Ref): Revision<Recor
   }
   return saved;
 }
-function checkConsumerClaimOrigins(store: Store, projectId?: string, draftId?: string): void {
+interface ReaderClaimScope {
+  projectId: string; rootKey: string; intents: Revision<ResearchConsumerIntent>[];
+}
+function readerLineageMember(row: Revision<ResearchConsumerIntent> | null | undefined, projectId: string, rootKey: string): boolean {
+  return row?.value?.projectId === projectId && row.value.cursor?.rootKey === rootKey;
+}
+/** Reader proofs cannot recursively prove a later variant whose snapshot contains this reader.
+ * Both immutable origins and current claims select the scope; a damaged head cannot leave it. */
+function checkReaderClaimOrigins(store: Store, scope: ReaderClaimScope): void {
+  const ids = new Set(scope.intents.map(row => row.id)), linked = new Set<string>();
+  for (const intent of scope.intents) for (const row of store.history<ResearchConsumerIntent>(intent.id))
+    if (isRef(row.value?.call)) linked.add(row.value.call.id);
+  const calls = new Map(store.list<ModelCall>('model-call').map(call => [call.id, call]));
+  for (const id of linked) {
+    const call = store.get<ModelCall>(id);
+    if (!call || call.kind !== 'model-call') consumerInvalid(id, 'The reader lost its physical call');
+    calls.set(id, call);
+  }
+  for (const call of calls.values()) {
+    const first = store.get<ModelCall>(call.id, 1);
+    const originRef = (call.value as ModelCall & { consumerIntent?: Ref })?.consumerIntent;
+    const initialRef = (first?.value as (ModelCall & { consumerIntent?: Ref }) | undefined)?.consumerIntent;
+    if (!linked.has(call.id) && !(isRef(originRef) && ids.has(originRef.id))
+      && !(isRef(initialRef) && ids.has(initialRef.id))) continue;
+    if (!call.id.startsWith('model-call:consumer:v1:') || first?.kind !== 'model-call'
+      || !isRef(originRef) || !isRef(initialRef) || canonical(originRef) !== canonical(initialRef)
+      || !ids.has(initialRef.id)) consumerInvalid(call.id, 'The reader physical origin is missing or substituted');
+    const origin = readResearchConsumerIntent(store, initialRef);
+    const head = store.get<ResearchConsumerIntent>(origin.id);
+    if (!head) consumerInvalid(origin.id, 'The reader call lost its current consumer intent');
+    const intent = readResearchConsumerIntent(store, reference(head));
+    if (origin.value.kind !== 'reader' || intent.value.kind !== 'reader'
+      || !readerLineageMember(origin, scope.projectId, scope.rootKey)
+      || !readerLineageMember(intent, scope.projectId, scope.rootKey)
+      || call.value.purpose !== 'reader' || first.value.purpose !== 'reader'
+      || call.value.projectId !== scope.projectId || first.value.projectId !== scope.projectId
+      || call.value.draftId !== origin.value.draft.id || call.value.draftId !== intent.value.draft.id
+      || first.value.draftId !== origin.value.draft.id
+      || canonical(intent.value.call) !== canonical(reference(first)))
+      consumerInvalid(call.id, 'The physical reader call is not owned by its exact original lineage');
+  }
+}
+function checkConsumerClaimOrigins(store: Store, projectId?: string, draftId?: string, readerScope?: ReaderClaimScope): void {
+  if (readerScope) { checkReaderClaimOrigins(store, readerScope); return; }
   for (const call of store.list<ModelCall>('model-call')) {
     if (projectId !== undefined && (call.value.projectId !== projectId || draftId !== undefined && call.value.draftId !== draftId)) continue;
     const managed = call.id.startsWith('model-call:consumer:v1:');
@@ -1494,11 +1537,16 @@ export function findPendingResearchConsumerIntentByRoot(store: Store, projectId:
 export function listResearchConsumerIntentsByRoot(store: Store, projectId: string, rootKey: string): Revision<ResearchConsumerIntent>[] {
   if (!store || typeof store.list !== 'function' || typeof projectId !== 'string' || !projectId
     || typeof rootKey !== 'string' || !rootKey) consumerInvalid('research-consumer-intent', 'Reader lineage lookup needs project and root key');
-  checkConsumerClaimOrigins(store);
-  return store.list<ResearchConsumerIntent>('research-consumer-intent')
-    .map(record => readResearchConsumerIntent(store, reference(record)))
-    .filter(record => record.value.projectId === projectId && record.value.kind === 'reader'
-      && record.value.cursor.rootKey === rootKey);
+  const candidates = store.list<ResearchConsumerIntent>('research-consumer-intent').filter(row =>
+    readerLineageMember(row, projectId, rootKey) || readerLineageMember(store.get<ResearchConsumerIntent>(row.id, 1), projectId, rootKey));
+  for (const row of candidates) {
+    const first = store.get<ResearchConsumerIntent>(row.id, 1);
+    if (row.value?.kind !== 'reader' || first?.value?.kind !== 'reader'
+      || !readerLineageMember(row, projectId, rootKey) || !readerLineageMember(first, projectId, rootKey))
+      consumerInvalid(row.id, 'The original reader lineage cannot be renamed or moved by its head');
+  }
+  checkConsumerClaimOrigins(store, undefined, undefined, { projectId, rootKey, intents: candidates });
+  return candidates.map(record => readResearchConsumerIntent(store, reference(record)));
 }
 /** Rebuild the declaration from the exact producer, never today's heads. */
 export function consumerResultCapacity(store: Store, intent: ResearchConsumerIntent,

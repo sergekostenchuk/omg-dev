@@ -143,7 +143,7 @@ test('S6.2: a cold paid turn finishes before the next prepared analyst admission
   assert.deepEqual(cold.list('model-call'), calls); assert.deepEqual(cold.list('research-budget-ledger'), ledger);
   assert.equal(f.wires().length, 1);
   f.finishFrontier();const done = await f.run(1, cold);
-  assert.equal(done.value.status, 'completed', JSON.stringify(done.value));
+  assert.equal(done.value.status,'paused');assert.equal(done.value.pauseCode,'research_turns_exhausted',JSON.stringify(done.value));
   assert.deepEqual(f.wires().filter(wire => !wire.subject.assessmentSubject).map(wire => wire.subject.question.id), ['block', 'support']);
   assert.deepEqual(f.wires().filter(wire => wire.subject.assessmentSubject).map(wire => wire.subject.assessmentSubject.packet.planQuestionId), ['block', 'support']);
   assert.equal(cold.list('v7-progress-application').length, 2);
@@ -179,7 +179,7 @@ test('S6.2: an old paid attempt completes its own binding before selecting the r
   assert.deepEqual(cold.list('model-call'), calls); assert.deepEqual(cold.list('research-budget-ledger'), ledger);
   assert.equal(f.wires().length, 1);
   f.finishFrontier();const done = await f.run(1, cold);
-  assert.equal(done.value.status, 'completed', JSON.stringify(done.value));
+  assert.equal(done.value.status,'paused');assert.equal(done.value.pauseCode,'research_turns_exhausted',JSON.stringify(done.value));
   const attempts = cold.list('research-attempt').map(row => proveAttempt(cold, reference(row)).attempt.value);
   assert.equal(attempts.length, 2);
   assert.deepEqual(new Set(attempts.map(attempt => canonical(attempt.planAnswer))),

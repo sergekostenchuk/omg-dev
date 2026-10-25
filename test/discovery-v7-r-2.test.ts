@@ -12,6 +12,7 @@ import {answerDiscoveryFixture} from './product-fixture.js';
 import {researchCall} from '../src/discovery/research-protocol.js';
 import {Researcher} from '../src/discovery/research-runner.js';
 import {planAttemptSelection} from '../src/discovery/v7-plan-questions.js';
+import {variantSnapshotReadiness} from '../src/discovery/variant-snapshot.js';
 import {readV7ProgressStateAt} from '../src/discovery/v7-progress.js';
 import {stageBudgetSegmentId} from '../src/discovery/stage-token-budget.js';
 import {budgetUsage,type BudgetSegment} from '../src/runtime/research-budget.js';
@@ -142,21 +143,24 @@ test('R.2: three assessed attempts stall one question, then another question con
     }
     return write(writes,guards);
   }) as typeof f.store.writeMany;
-  const run=await f.run(8);assert.equal(guarded,6);
-  assert.equal(run.value.status,'completed',JSON.stringify(run.value));assert.equal(run.value.turns,6);
-  assert.deepEqual(analystSubjects(f),['block','block','block','support','support','support']);
+  const run=await f.run(8);assert.equal(guarded,4);
+  assert.equal(run.value.status,'paused',JSON.stringify(run.value));assert.equal(run.value.pauseCode,'project_mode_unset');assert.equal(run.value.turns,4);
+  assert.deepEqual(analystSubjects(f),['block','block','block','support']);
   assert.deepEqual(assessments(f).map(w=>w.subject.assessmentSubject.packet.planQuestionId),analystSubjects(f));
   for(const question of ['block','support']) {
-    const state=progress(f,question);assert.equal(state.value.summary.count,3);
-    assert.equal(state.value.summary.streak,3);assert.equal(state.value.summary.outcome,'stalled');
+    const state=progress(f,question),count=question==='block'?3:1;assert.equal(state.value.summary.count,count);
+    assert.equal(state.value.summary.streak,count);assert.equal(state.value.summary.outcome,question==='block'?'stalled':'open');
     assert.deepEqual(state.value.subject,{project:'p',planAnswer:f.v.planAnswer,planQuestionId:question});
   }
-  assert.equal(f.store.list('research-attempt').length,6);assert.equal(f.store.list('v7-attempt-account').length,6);
+  assert.equal(f.store.list('research-attempt').length,4);assert.equal(f.store.list('v7-attempt-account').length,4);
+  assert.equal(f.store.list('v7-progress-application').length,4);assert.equal(assessments(f).length,4);
+  assert.equal(f.store.list('discovery-variant-set').length,0);assert.equal(f.store.list('discovery-variant-none').length,0);
   assert.deepEqual(f.store.get<DiscoveryDraft>(f.v.draft.id),f.v.draft);
-  assert.equal(planAttemptSelection(f.open(),'p').next,null);
+  assert.equal(planAttemptSelection(f.open(),'p').next!.planQuestionId,'support');
+  assert.equal(variantSnapshotReadiness(f.open(),'p').status,'ready');
   const before=fullHistory(f),sent=f.wires().length;
-  assert.equal((await f.run(1,f.open(),false)).value.status,'completed');
-  assert.equal((await f.run(8,f.open())).value.status,'completed');
+  assert.deepEqual(await f.run(1,f.open(),false),run);
+  assert.deepEqual(await f.run(8,f.open()),run);
   assert.deepEqual(fullHistory(f),before);assert.equal(f.wires().length,sent);
 });
 
@@ -164,7 +168,7 @@ test('R.2: all blocking questions precede supporting questions, preserving each 
   const f=await setup(t,[planQuestion('s-first','market'),planQuestion('b-first','industry','blocking'),
     planQuestion('b-second','people','blocking'),planQuestion('s-last','risks')]);
   f.outcomes({'b-first':'unknown','b-second':'unknown','s-first':'unknown','s-last':'unknown'});
-  const run=await f.run();assert.equal(run.value.status,'completed',JSON.stringify(run.value));
+  const run=await f.run();assert.equal(run.value.status,'paused',JSON.stringify(run.value));assert.equal(run.value.pauseCode,'project_mode_unset');
   assert.deepEqual(analystSubjects(f),['b-first','b-second','s-first','s-last']);
   assert.equal(run.value.turns,4);
   for(const id of analystSubjects(f))assert.equal(progress(f,id).value.summary.outcome,'unknown');
@@ -173,7 +177,7 @@ test('R.2: all blocking questions precede supporting questions, preserving each 
 test('R.2: paid closed and unknown outcomes are not dispatched again on a cold entry', async t => {
   const closed={...planQuestion('block','industry','blocking'),criterion:'Name a testable hypothesis'};
   const f=await setup(t,[planQuestion('support','market'),closed]);f.outcomes({block:'closed',support:'unknown'});
-  const run=await f.run();assert.equal(run.value.status,'completed',JSON.stringify(run.value));
+  const run=await f.run();assert.equal(run.value.status,'paused',JSON.stringify(run.value));assert.equal(run.value.pauseCode,'project_mode_unset');
   assert.equal(progress(f,'block').value.summary.outcome,'closed');
   assert.equal(progress(f,'support').value.summary.outcome,'unknown');
   assert.deepEqual(analystSubjects(f),['block','support']);
@@ -203,18 +207,17 @@ test('R.2: cold admission preserves P count, run cursor, exact payments and the 
 
 test('R.2: a replacement edition with the same name has its own progress without resetting the run or payments', async t => {
   const f=await setup(t,[planQuestion('block','industry','blocking')]);
-  const first=await f.run();assert.equal(first.value.turns,3);const old=progress(f,'block');
+  const first=await f.run();assert.equal(first.value.turns,1);const old=progress(f,'block');
   const calls=f.store.list('model-call'),ledger=f.store.list('research-budget-ledger');
   const next=acceptNextPlanEdition(f,'p',f.v.draft,f.v.frameRef,f.v.planAnswer,[planQuestion('block','industry','blocking')]);
   const selection=planAttemptSelection(f.open(),'p');assert.equal(selection.next!.planQuestionId,'block');
   assert.deepEqual(selection.planAnswer,next.planAnswer);assert.equal(selection.attempts.length,0);
-  const run=await f.run(1,f.open());assert.equal(run.value.turns,4);assert.equal(run.value.pauseCode,'research_turns_exhausted');
+  const run=await f.run(1,f.open());assert.equal(run.value.turns,2);assert.equal(run.value.pauseCode,'research_turns_exhausted');
   assert.equal(progress(f,'block',next.planAnswer).value.summary.count,1);
   assert.deepEqual(progress(f,'block'),old);
   for(const row of [...calls,...ledger])assert.deepEqual(f.store.get(row.id,row.revision),row);
   const packets=assessments(f).map(w=>w.subject.assessmentSubject.packet);
-  assert.deepEqual(packets.slice(0,3).map(p=>p.planAnswer),[f.v.planAnswer,f.v.planAnswer,f.v.planAnswer]);
-  assert.deepEqual(packets[3].planAnswer,next.planAnswer);
+  assert.deepEqual(packets.map(p=>p.planAnswer),[f.v.planAnswer,next.planAnswer]);
 });
 
 test('R.2: a pending unpaid assessment blocks the frontier and new dispatch on cold restore', async t => {
@@ -270,7 +273,7 @@ test('R.2: a prepared unpaid dispatch of a replaced edition cannot bypass the cu
 });
 
 for(const cutSession of [false,true])test(`R.2: an open synthesis gets a new exact completed basis${cutSession?' across session-only interruption':''}`,async t=>{
- const f=await setup(t,[planQuestion('block','industry','blocking')]);
+ const f=await setup(t,[planQuestion('block','industry','blocking'),planQuestion('uncovered','risks')]);
  f.engine.execute({type:'configure-reader-pilot',project:'p',expected:0,settings:{experimental:true,active:true,stopAfter:'L2',
   reader:{actor:'reader',model:'fixture',effort:'high',speed:'inherited',command:f.command},agentCommand:f.command,
   maxRequestChars:100000,maxReadChars:20000,maxReplyChars:200000,maxCalls:50,maxReportedTokens:100000,
@@ -287,7 +290,9 @@ for(const cutSession of [false,true])test(`R.2: an open synthesis gets a new exa
  const sessions=f.store.list<any>('synthesis-session');assert.equal(sessions.length,2);
  const next=sessions.find(row=>row.value.basis.previousProposalRef?.id===previous.id)!;assert.ok(next);
  assert.deepEqual(next.value.basis.previousProposalRef,reference(previous));
- const final=await f.run(1,f.open());assert.equal(final.value.status,'completed',JSON.stringify(final.value));
+ const final=await f.run(1,f.open());assert.equal(final.value.status,'paused',JSON.stringify(final.value));assert.equal(final.value.pauseCode,'research_turns_exhausted');
+ const readiness=variantSnapshotReadiness(f.open(),'p');assert.equal(readiness.status,'not_ready');
+ assert.ok(readiness.reasons.some(reason=>reason.code==='question_uncovered'&&reason.message.includes('uncovered')));
  assert.equal(progress(f,'block').value.summary.count,3);assert.equal(progress(f,'block').value.summary.outcome,'stalled');
  assert.equal(f.wires().filter(row=>row.subject.dispatchMode==='planning').length,1);
  for(const row of [...paid,...ledger])assert.deepEqual(f.store.get(row.id,row.revision),row);
@@ -305,7 +310,7 @@ function cutPublishedSession(f: Setup) {
  return ()=>{f.store.writeMany=write;assert.ok(hit);};
 }
 test('R.2: the next saved-only basis preserves its exact negative owner review across a session-only cut',async t=>{
- const f=await setup(t,[planQuestion('block','industry','blocking')]);
+ const f=await setup(t,[planQuestion('block','industry','blocking'),planQuestion('uncovered','risks')]);
  f.engine.execute({type:'configure-reader-pilot',project:'p',expected:0,settings:{experimental:true,active:true,stopAfter:'L2',
   reader:{actor:'reader',model:'fixture',effort:'high',speed:'inherited',command:f.command},agentCommand:f.command,
   maxRequestChars:100000,maxReadChars:20000,maxReplyChars:200000,maxCalls:50,maxReportedTokens:100000,
@@ -337,7 +342,7 @@ test('R.2: the next saved-only basis preserves its exact negative owner review a
  const body=readArchiveBody(f.open(),f.store.get(sent.working.archive.id,sent.working.archive.revision)!).body;
  assert.deepEqual(body.history,[{...reviewed.value,ref:reference(reviewed)}]);assert.deepEqual(body.subject,subject);
  assert.deepEqual(f.store.list<any>('model-call').filter(row=>row.value.purpose==='escalation-assessor'),reviews);
- assert.equal((await f.run(1,f.open(),false)).value.pauseCode,'research_contract_upgrade_required');
+ assert.equal((await f.run(1,f.open(),false)).value.pauseCode,'research_turns_exhausted');
  const before=fullHistory(f),sentCount=f.wires().length;await f.run(1,f.open(),false);
  assert.deepEqual(fullHistory(f),before);assert.equal(f.wires().length,sentCount);
 });
@@ -373,7 +378,9 @@ for(const existing of [false,true])
 for(const race of [false,true])
 test(`R.2-01: old prepared ${kind} retains ${existing?'exact':'absent'} frontier at reservation${race?' against a second Store':''}`,async t=>{
   const plannerPrior=kind==='reading-planner'&&existing;
-  const f=await setup(t,[...(plannerPrior?[planQuestion('prior','market','blocking')]:[]),planQuestion('block','industry','blocking')]);
+  const f=await setup(t,[...(plannerPrior?[planQuestion('prior','market','blocking')]:[]),planQuestion('block','industry','blocking'),planQuestion('uncovered','risks')]);
+  const readiness=variantSnapshotReadiness(f.open(),'p');assert.equal(readiness.status,'not_ready');
+  assert.ok(readiness.reasons.some(reason=>reason.code==='question_uncovered'&&reason.message.includes('uncovered')));
   if(plannerPrior)f.outcomes({prior:'unknown'});
   if(existing){await f.run(1);assert.equal(progress(f,plannerPrior?'prior':'block').value.summary.outcome,plannerPrior?'unknown':'open');}
   if(kind==='reading-planner'){

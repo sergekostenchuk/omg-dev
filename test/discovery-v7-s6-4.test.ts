@@ -15,7 +15,8 @@ import { readResearchConsumerTurn } from '../src/discovery/response-recovery.js'
 import { splitPlannedContextRead, v7PlannerRounds, v7DispatchMode } from '../src/discovery/reading-plan.js';
 import { listResearchConsumerIntents } from '../src/discovery/response-recovery.js';
 import { ResearchSources } from '../src/discovery/research-sources.js';
-import { readSavedReaderBundleResult } from '../src/discovery/reader.js';
+import { readSavedReaderBundleResult, resumeReadBundleIntent } from '../src/discovery/reader.js';
+import { readerPilot } from '../src/discovery/reader-pilot.js';
 import { discoveryFixture, validFrame, planQuestion, validPlan, questionOf, type PlanQuestion } from "./discovery-v7-fixture.js";
 
 const fixture = (t: { after(fn: () => void): void }) => discoveryFixture(t, "omg-v7-s6-4-");
@@ -119,10 +120,10 @@ function queueProducts(f: Awaited<ReturnType<typeof setup>>) {
   // Only the run may gain a new pause reason at the public admission door.
   return f.store.list().filter(row => row.kind !== 'research-run').map(reference);
 }
-async function refuseNewWork(f: Awaited<ReturnType<typeof setup>>, store = f.open()) {
+async function refuseNewWork(f: Awaited<ReturnType<typeof setup>>, store = f.open(), expected='research_turns_exhausted') {
   const before = queueProducts(f);
   const stopped = await f.run(1, store, false);
-  assert.equal(stopped.value.pauseCode, 'research_contract_upgrade_required', JSON.stringify(stopped.value));
+  assert.equal(stopped.value.pauseCode, expected, JSON.stringify(stopped.value));
   assert.deepEqual(queueProducts(f), before);
   return stopped;
 }
@@ -365,7 +366,7 @@ test('S6.4: repeated context children retain the no-progress refusal and exact p
 });
 
 
-test('S6.4: a real unclaimed reader follows the public failed-child retry and executes once cold', async t => {
+test('S6.4: a real unclaimed reader follows the public failed-child retry and waits for explicit admission', async t => {
   const f=await setup(t,[planQuestion('block','industry','blocking')]);
   writeFileSync(join(f.root,'scope.txt'),'Exact condition.\nApplicable exception.\n');
   f.configure([{...planner,reads:[{action:'read_bundle',purpose:'Read condition',inputs:[{path:'scope.txt',media:'text/plain'}]}]},readerReply]);
@@ -387,15 +388,23 @@ test('S6.4: a real unclaimed reader follows the public failed-child retry and ex
   const pending=f.engine.execute({type:'retry-planned-read',project:'p',child:reference(failed)}) as Revision<any>;
   const rebound=f.store.get<any>(intent.id)!;
   assert.deepEqual(rebound.value.owner,reference(pending));assert.deepEqual(rebound.value.cursor.consumer.turn,reference(pending));
-  const result=await f.run(1,f.open(),false);
-  assert.equal(result.value.pauseCode,'research_contract_upgrade_required',JSON.stringify(result.value));
+  const paidBefore=f.store.list('model-call'),ledgerBefore=f.store.list('research-budget-ledger');
+  const cold=await f.run(1,f.open(),false);
+  assert.equal(cold.value.pauseCode,'research_restore_complete',JSON.stringify(cold.value));
+  assert.deepEqual(f.store.get(intent.id),rebound);assert.deepEqual(f.store.get(child.id),pending);
+  assert.deepEqual(f.store.list('model-call'),paidBefore);assert.deepEqual(f.store.list('research-budget-ledger'),ledgerBefore);
+  assert.equal(f.wires().length,1);
+  const fixed=f.history();assert.deepEqual(await f.run(1,f.open(),false),cold);assert.deepEqual(f.history(),fixed);
+  const effective=f.engine.environments.effective('p');
+  await resumeReadBundleIntent(f.store,reference(rebound),{...effective.environment.value,workspace:effective.root},readerPilot(f.store,'p')!,undefined,[]);
+  const resumed=await f.run(1,f.open(),false);assert.equal(resumed.value.pauseCode,'research_restore_complete');
   queueProducts(f);
   const completed=f.store.get<any>(child.id)!;
   assert.equal(completed.value.status,'completed');assert.equal(completed.value.error,null);
   assert.deepEqual(completed.value.replayedFrom,reference(failed));assert.deepEqual(completed.value.plannedBy,child.value.plannedBy);
   assert.deepEqual(readResearchConsumerTurn(f.store,reference(completed)),completed);assert.equal(f.wires().length,2);
   const history=f.history(),calls=f.store.list('model-call'),ledger=f.store.list('research-budget-ledger');
-  await refuseNewWork(f);assert.deepEqual(f.history(),history);
+  await refuseNewWork(f,f.open(),'research_restore_complete');assert.deepEqual(f.history(),history);
   assert.deepEqual(f.store.list('model-call'),calls);assert.deepEqual(f.store.list('research-budget-ledger'),ledger);assert.equal(f.wires().length,2);
 });
 

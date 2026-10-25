@@ -207,7 +207,7 @@ test('S6.7: a lawfully re-prepared synthesis claims once and hands off its actua
  const other=f.open(),pilot=readerPilot(other,'p')!,{projectId:_project,...settings}=pilot.value;
  new ProductEngine(other).execute({type:'configure-reader-pilot',project:'p',expected:pilot.revision,
   settings:{...settings,maxReplyChars:settings.maxReplyChars+1}});
- const result=await f.run(3,f.open());assert.equal(result.value.status,'completed',JSON.stringify(result.value));
+ const result=await f.run(3,f.open());assert.equal(result.value.status,'paused');assert.equal(result.value.pauseCode,'project_mode_unset',JSON.stringify(result.value));
  const saved=verifyDelivery(f,1),history=f.store.history<any>(first.id);
  assert.deepEqual(history.map(row=>row.value.state),['prepared','prepared','running','applied','applied']);
  assert.deepEqual(saved.intent.value.profile,reference(readerPilot(f.store,'p')!));
@@ -217,7 +217,7 @@ test('S6.7: a lawfully re-prepared synthesis claims once and hands off its actua
 
 test('S6.7: delivery projection refuses an absent basis, a foreign position and a second append',async t=>{
  const f=await setup(t,[planQuestion('block','industry','blocking')]);f.configure([toSynthesis,ended()]);
- f.finishFrontier();assert.equal((await f.run(3)).value.status,'completed');
+ f.finishFrontier();const broad=await f.run(3);assert.equal(broad.value.status,'paused');assert.equal(broad.value.pauseCode,'project_mode_unset');
  const {intent,original}=verifyDelivery(f,1);
  const applied=f.store.get<any>(intent.id,intent.revision-1)!,running=f.store.get<any>(intent.id,intent.revision-2)!;
  assert.deepEqual(projectSynthesisHandoffIntent(applied,running,reference(original)),intent.value);

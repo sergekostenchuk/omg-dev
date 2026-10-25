@@ -4,7 +4,7 @@ import { isRef, reference, type Ref } from '../pipeline/contracts.js';
 import type { Revision, Store, TransactionGuard } from '../storage/store.js';
 import { uniqueTransactionGuards } from '../runtime/environment.js';
 import type { DiscoveryDraft, Question } from './discovery.js';
-import type { PaidDiscoveryAttemptsAssessment, ResearchAnswer, V7ProgressApplication, V7ProgressState } from './research-model.js';
+import type { PaidDiscoveryAttemptsAssessment, ResearchAnswer, ResearchRun, V7ProgressApplication, V7ProgressState } from './research-model.js';
 import { currentPlan, provePlanQuestions } from './v7-plan-questions.js';
 import { discoveryTraversal, type V7TraversalBudget } from './discovery-outcome.js';
 import { discoveryAcceptanceActId, provenAcceptance, type DiscoveryAcceptanceAct } from './v7-contracts.js';
@@ -13,7 +13,7 @@ import { readV7AssessmentReplay, readV7ProgressStateAt } from './v7-progress.js'
 import { readDiscoveryAssessment } from './research-assessment.js';
 import { DISCOVERY_ASSESSMENT_KIND, v7ProgressStateId } from './v7-attempt-assessment.js';
 import { planSubjectOf, questionDispatchId, type V7PlanSubject } from './v7-managed-attempt.js';
-import { readResearchConsumerIntent, type ResearchConsumerIntent } from './response-recovery.js';
+import { readResearchConsumerIntent, consumerIntentContext, readResearchConsumerTurn, type ResearchConsumerIntent } from './response-recovery.js';
 import { readSynthesisSessionV3 } from './synthesis-session.js';
 import { synthesisReservationConsumed, SYNTHESIS_SESSION_V3_PREFIX } from './research-consumer-transition.js';
 import { stageBudgetSegmentId } from './stage-token-budget.js';
@@ -87,6 +87,46 @@ export interface VariantSnapshotReady {
 }
 export type VariantSnapshotReadiness = VariantSnapshotReady | VariantSnapshotRefusal;
 
+/** Each consumer keeps its subject at its own declared producer address. No structural-field fallback. */
+function planConsumerSubject(store: Store, row: Revision<ResearchConsumerIntent>, plan: Ref):
+  { intent: Revision<ResearchConsumerIntent>; subject: V7PlanSubject } | null {
+  const value = row.value;
+  let intent: Revision<ResearchConsumerIntent>, subject: V7PlanSubject | null;
+  if (value.kind === 'escalation-assessor' || value.kind === 'reader') {
+    intent = readResearchConsumerIntent(store, reference(row));
+    let turn;
+    if (value.kind === 'escalation-assessor') {
+      subject = planSubjectOf(consumerIntentContext(store, intent.value, intent.id));
+      if (!isRef(intent.value.cursor.pendingTurn)) invalid(row.id, 'Owner review lost its original pending turn');
+      turn = readResearchConsumerTurn(store, intent.value.cursor.pendingTurn);
+      if (turn.value.run !== intent.value.owner.id || turn.value.number !== intent.value.cursor.turn
+        || !same(subject, planSubjectOf(turn.value))) invalid(row.id, 'Owner review lost its exact pending subject/position');
+    } else {
+      const consumer = intent.value.cursor.consumer;
+      if (!consumer || !isRef(consumer.run) || !isRef(consumer.turn)
+        || !same(intent.value.owner, consumer.turn)) invalid(row.id, 'Reader lost its original consumer run/turn');
+      const run = exact<ResearchRun>(store, consumer.run, 'research-run');
+      turn = readResearchConsumerTurn(store, consumer.turn);
+      subject = planSubjectOf(turn.value);
+      if (run.value.projectId !== intent.value.projectId || run.value.draftId !== intent.value.draft.id
+        || turn.value.run !== run.id) invalid(row.id, 'Reader consumer belongs to another run/project/draft');
+    }
+    const anchor = exact<Question>(store, intent.value.question, 'question');
+    if (!subject || !same(turn.value.question, intent.value.question)
+      || anchor.value.projectId !== intent.value.projectId || anchor.value.draftId !== intent.value.draft.id
+      || anchor.value.spec.field !== 'plan' || !same(anchor.value.answer, subject.planAnswer))
+      invalid(row.id, 'The saved consumer lost its exact subject/Question/turn binding');
+  } else {
+    // Lawful abandoned ordinary work of an older edition is not current work.
+    const savedPlan = value.cursor?.subject?.planAnswer;
+    if (isRef(savedPlan) && !same(savedPlan, plan)) return null;
+    subject = planSubjectOf(value.cursor);
+    if (!subject) invalid(row.id, 'An own plan consumer lost its exact subject');
+    intent = readResearchConsumerIntent(store, reference(row));
+  }
+  return same(subject.planAnswer, plan) ? { intent, subject } : null;
+}
+
 /** Unfinished work of this exact edition, including a persisted session before its first intent. */
 function pendingOperations(store: Store, project: string, draft: Revision<DiscoveryDraft>, question: Ref, plan: Ref,
   guards: TransactionGuard[]): VariantReason[] {
@@ -94,12 +134,15 @@ function pendingOperations(store: Store, project: string, draft: Revision<Discov
   for (const row of store.list<ResearchConsumerIntent>('research-consumer-intent')) {
     const value = row.value;
     if (value?.projectId !== project || value.draft?.id !== draft.id || value.question?.id !== question.id) continue;
-    // Edition selection precedes its full reader: lawful abandoned work of an older edition is not current work.
-    const savedPlan = value.cursor?.subject?.planAnswer;
-    if (isRef(savedPlan) && !same(savedPlan, plan)) continue;
-    const subject = planSubjectOf(value.cursor);
-    if (!subject) invalid(row.id, 'An own plan consumer lost its exact subject');
-    const intent = readResearchConsumerIntent(store, reference(row));
+    // Variant execution has its own subject and restore-first runner path. Prove the exact
+    // consumer before separating it from MR/P; a renamed or structurally decorated intent is no bypass.
+    if (value.kind === 'variant-proposal' || value.kind === 'variant-decision') {
+      readResearchConsumerIntent(store, reference(row));
+      continue;
+    }
+    const consumer = planConsumerSubject(store, row, plan);
+    if (!consumer) continue;
+    const { intent, subject } = consumer;
     guards.push(reference(intent));
     if (intent.value.state === 'prepared' || intent.value.state === 'running') reasons.push({
       code: 'consumer_pending', message: `Plan question ${subject.planQuestionId} has an unfinished ${value.kind}`,

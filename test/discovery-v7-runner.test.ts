@@ -17,6 +17,7 @@ import { recordV7Attempt } from '../src/discovery/v7-attempts.js';
 import { proveClaimAddress } from '../src/discovery/claim-address.js';
 import { Researcher } from '../src/discovery/research-runner.js';
 import { planAttemptSelection, nextPlanQuestion, proveAttempt, type V7AttemptEnd } from '../src/discovery/v7-plan-questions.js';
+import {variantSnapshotReadiness} from '../src/discovery/variant-snapshot.js';
 import { readResearchConsumerTurn,  completeResearchAttemptTurn } from '../src/discovery/response-recovery.js';
 import { discoveryInspection } from '../src/discovery/discovery-outcome.js';
 import { executionAdmission, acceptedIssuance } from '../src/discovery/projection-reader.js';
@@ -109,7 +110,7 @@ test('R: real initial traversal orders blocking first, uses reservation @1 and l
   const batches:{purpose:string;kinds:string[]}[]=[],write=f.store.writeMany.bind(f.store);
   f.store.writeMany=((writes,guards=[])=>{const call=writes.find(w=>w.kind==='model-call'&&w.expected===0);if(call)batches.push({purpose:(call.value as any).purpose,kinds:writes.map(w=>w.kind)});return write(writes,guards);}) as typeof f.store.writeMany;
   f.configure([ended('refused'),ended()]);f.finishFrontier();
-  const run=await f.run();assert.equal(run.value.status,'completed',JSON.stringify(run.value));
+  const run=await f.run();assert.equal(run.value.status,'paused');assert.equal(run.value.pauseCode,'project_mode_unset',JSON.stringify(run.value));
   assert.deepEqual(f.wires().map(w=>w.subject.assessmentSubject?'assessor:'+w.subject.question.id:w.subject.question.id),['block','assessor:block','support','assessor:support']);
   assert.deepEqual(f.store.get(f.v.draft.id),beforeDraft);assert.deepEqual(f.store.get(f.v.plan.id),beforeQuestion);
   const attempts=f.store.list<any>('research-attempt');assert.equal(attempts.length,2);
@@ -150,7 +151,7 @@ test('R: default v7 stays off, allowance pauses before a new question and comple
   await assert.rejects(f.run(1,f.store,false),{code:'research_contract_upgrade_required'});assert.equal(f.wires().length,0);
   f.finishFrontier();const paused=await f.run(1);assert.equal(paused.value.status,'paused');assert.equal(paused.value.pauseCode,'research_turns_exhausted');
   assert.equal(f.store.list('research-attempt').length,1);assert.equal(f.wires().length,2);
-  const done=await f.run(1,f.open());assert.equal(done.value.status,'completed',JSON.stringify(done.value));assert.equal(f.wires().length,4);
+  const done=await f.run(1,f.open());assert.equal(done.value.status,'paused');assert.equal(done.value.pauseCode,'research_turns_exhausted',JSON.stringify(done.value));assert.equal(f.wires().length,4);
 });
 
 for(const recorded of [false,true])test(`R: plan replacement ${recorded?'finishes the recorded attempt':'keeps a paid answer pending at its exact door'}`,async t=>{
@@ -224,7 +225,7 @@ test('R: acceptance gates require a proved plan and keep the new stage-result ro
 });
 
 test('R: submitted and duplicate ends use ordinary paid calls without accepting their claims',async t=>{
-  const f=await setup(t,[planQuestion('block','industry','blocking')]);
+  const f=await setup(t,[planQuestion('block','industry','blocking'),planQuestion('uncovered','risks')]);
   const source=f.discovery.evidence.document('p','claim-basis','Evidence for claim','text/plain',0);
   const end={type:'submitted' as const,contract:DISCOVERY_CLAIMS_CONTRACT,value:{claims:[{id:'fact',kind:'fact',text:'Claim',axis:'industry',
     planQuestions:[{planAnswer:f.v.planAnswer,planQuestionId:'block'}],scope:{variants:'common'},
@@ -232,12 +233,18 @@ test('R: submitted and duplicate ends use ordinary paid calls without accepting 
   f.configure([{...ended(),value:end}]);
   const first=await f.run(1);assert.equal(first.value.pauseCode,'research_turns_exhausted',JSON.stringify(first.value));
   const original=f.store.list('research-attempt')[0]!;
+  const readiness=variantSnapshotReadiness(f.open(),'p');assert.equal(readiness.status,'not_ready');
+  assert.ok(readiness.reasons.some(reason=>reason.code==='question_uncovered'&&reason.message.includes('uncovered')));
   f.configure([ended(),{...ended(),value:{type:'duplicate',of:reference(original)}}]);
   const done=await f.run(1,f.open());assert.equal(done.value.pauseCode,'research_turns_exhausted',JSON.stringify(done.value));
-  assert.deepEqual(f.store.list<any>('research-attempt').map(a=>a.value.end.type).sort(),['duplicate','submitted']);
+  const attempts=f.store.list<any>('research-attempt');
+  assert.deepEqual(attempts.map(a=>a.value.end.type).sort(),['duplicate','submitted']);
+  assert.deepEqual(attempts.find(a=>a.value.end.type==='duplicate')!.value.end.of,reference(original));
   assert.equal(f.store.list('v7-attempt-account').length,2);assert.equal(f.wires().length,4);
+  assert.equal(f.wires().filter(w=>w.subject.assessmentSubject).length,2);
+  assert.equal(f.wires().filter(w=>!w.subject.assessmentSubject).length,2);
   assert.throws(()=>proveClaimAddress(f.store,{project:'p',container:reference(original),containerKind:'research-attempt',pointer:'/claims/0',claimId:'fact'}),{code:'claim_attempt_not_accepted'});
-  const restored=await f.run(1,f.open(),false);assert.equal(restored.value.pauseCode,'research_contract_upgrade_required');
+  const restored=await f.run(1,f.open(),false);assert.equal(restored.value.pauseCode,'research_turns_exhausted');
   const before=f.history();await f.run(1,f.open(),false);assert.deepEqual(f.history(),before);assert.equal(f.wires().length,4);
 });
 
@@ -289,8 +296,10 @@ test('R: source search and context reads precede a submitted end without accepti
   assert.equal(f.wires().length,4);assert.equal(f.store.list<any>('research-turn').filter(t=>t.value.status==='completed').length,3);
   const attempt=f.store.list('research-attempt')[0]!;
   assert.throws(()=>proveClaimAddress(f.store,{project:'p',container:reference(attempt),containerKind:'research-attempt',pointer:'/claims/0',claimId:'fact'}),{code:'claim_attempt_not_accepted'});
-  assert.equal((await f.run(1,f.open(),false)).value.pauseCode,'research_contract_upgrade_required');
-  const saved=f.history();await f.run(1,f.open(),false);assert.deepEqual(f.history(),saved);
+  const saved=f.history(),wires=f.wires();
+  assert.equal((await f.run(1,f.open(),false)).value.pauseCode,'research_turns_exhausted');
+  assert.deepEqual(f.history(),saved);assert.deepEqual(f.wires(),wires);
+  await f.run(1,f.open(),false);assert.deepEqual(f.history(),saved);assert.deepEqual(f.wires(),wires);
 });
 
 test('R: corrupt attempt heads are refused rather than treated as unanswered questions',async t=>{

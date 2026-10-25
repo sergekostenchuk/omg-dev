@@ -1,3 +1,4 @@
+import { variantSnapshotReadiness } from '../src/discovery/variant-snapshot.js';
 import { readV7ProgressStateAt } from '../src/discovery/v7-progress.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -161,25 +162,27 @@ for (const [name, limit, replies, tokens, code] of [
     assert.ok(!/Логический вопрос: (block|support)/.test(text));
   });
 
-test('S6.9: a completed run with applied return/noProgress assessments keeps the stage researching — nothing is accepted', async t => {
+test('S6.9: an applied broad pass paused before project mode keeps the stage researching — nothing is accepted', async t => {
   const f = await setup(t); f.configure([ended('refused'), ended()]);
-  const run = await f.run(); assert.equal(run.value.status, 'completed', JSON.stringify(run.value));
-  assert.equal(f.store.list('research-attempt').length, 6);
-  assert.equal(f.store.list('v7-progress-application').length, 6);
+  const run = await f.run(); assert.equal(run.value.status,'paused');assert.equal(run.value.pauseCode,'project_mode_unset',JSON.stringify(run.value));
+  assert.equal(f.store.list('research-attempt').length, 4);
+  assert.equal(f.store.list('v7-progress-application').length, 4);
   for(const state of f.store.list('v7-progress-state')) {
     const proof=readV7ProgressStateAt(f.open(),reference(state));
     assert.deepEqual(proof.value.subject.planAnswer,f.v.planAnswer);
   }
   for (const state of f.store.list<any>('v7-progress-state')) {
-    assert.equal(state.value.summary.count, 3); assert.equal(state.value.summary.streak, 3);
-    assert.equal(state.value.summary.outcome, 'stalled');
+    const block=state.value.subject.planQuestionId==='block';
+    assert.equal(state.value.summary.count,block?3:1);assert.equal(state.value.summary.streak,block?3:1);
+    assert.equal(state.value.summary.outcome,block?'stalled':'open');
   }
+  assert.equal(variantSnapshotReadiness(f.open(),'p').status,'ready');
   const { summary, candidate, text } = f.cold();
   assert.equal(summary.accepted, null, 'no accepted Discovery appears');
-  assert.equal(candidate.state, 'researching'); assert.equal(candidate.run!.status, 'completed');
-  assert.equal(candidate.run!.subjectBinding, undefined, 'a completed run has no stop to bind');
+  assert.equal(candidate.state, 'researching'); assert.equal(candidate.run!.status, 'paused');
+  assert.equal(candidate.run!.subjectBinding, 'unbound', 'the broad-pass pause precedes a new subject');
   assert.ok(text.includes('Исход: исследование не завершено') && text.includes('Принятый результат: ещё не принято.'), text);
-  assert.ok(!text.includes('Логический вопрос'));
+  assert.ok(text.includes('Логический вопрос: не закреплён — остановка до закрепления предмета плана'), text);
 });
 
 for (const damage of ['pause reason', 'pause turn subject', 'run turn count', 'owner question'] as const)

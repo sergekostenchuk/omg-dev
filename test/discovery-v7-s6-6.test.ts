@@ -124,8 +124,8 @@ for(const boundary of ['session','prepared','paid','applied'] as const)
   const callsBefore=f.wires().length;
   const result=await f.run(3,f.open(),boundary!=='paid' && boundary!=='applied');
   const admitted=boundary==='session'||boundary==='prepared';
-  assert.equal(result.value.status,admitted?'completed':'paused',JSON.stringify(result.value));
-  assert.equal(result.value.pauseCode,admitted?null:'research_assessment_pending');
+  assert.equal(result.value.status,'paused',JSON.stringify(result.value));
+  assert.equal(result.value.pauseCode,admitted?'project_mode_unset':'research_assessment_pending');
   assert.equal(sessions(f.store).length,1);assert.equal(sessions(f.store)[0]!.id,original.id);
   assert.equal(f.wires().filter(w=>!w.subject.assessmentSubject).length,2);
   assert.equal(f.wires().filter(w=>w.subject.assessmentSubject).length,admitted?1:0);assert.equal(callsBefore,boundary==='paid'||boundary==='applied'?2:1);
@@ -197,7 +197,7 @@ test('S6.6: paid lookup applies in restore-only; the next synthesis send require
   assert.deepEqual(await f.run(3,f.open(),false),restored);
   assert.deepEqual(snapshot(f),fixed,'second and third restore-only entries preserve complete history and payment');
  }
- f.finishFrontier();const resumed=await f.run(3,f.open());assert.equal(resumed.value.status,'completed',JSON.stringify(resumed.value));
+ f.finishFrontier();const resumed=await f.run(3,f.open());assert.equal(resumed.value.status,'paused');assert.equal(resumed.value.pauseCode,'project_mode_unset',JSON.stringify(resumed.value));
  assert.equal(f.wires().filter(w=>!w.subject.assessmentSubject).length,count+1);
  assert.equal(f.wires().filter(w=>w.subject.assessmentSubject).length,1);assert.equal(f.wires().filter(row=>row.subject.dispatchMode==='planning').length,1);
 });
@@ -236,7 +236,7 @@ test('S6.6: saved-only uses the exact subject notes without asking a new planner
  await assert.rejects(f.run(3,f.open(),false),{code:'research_contract_upgrade_required'});
  assert.deepEqual(snapshot(f),unadmitted);
  f.finishFrontier();const result=await f.run(3,f.open());
- assert.equal(result.value.status,'completed',JSON.stringify(result.value));assert.equal(f.wires().filter(w=>!w.subject.assessmentSubject).length,count+1);
+ assert.equal(result.value.status,'paused');assert.equal(result.value.pauseCode,'project_mode_unset',JSON.stringify(result.value));assert.equal(f.wires().filter(w=>!w.subject.assessmentSubject).length,count+1);
  assert.equal(f.wires().filter(w=>w.subject.assessmentSubject).length,1);
  assert.equal(f.wires().some(row=>row.subject.dispatchMode==='planning'),false);
  for(const session of sessions(f.store))readSynthesisSessionV3(f.open(),reference(session));
@@ -256,8 +256,8 @@ for(const boundary of ['reservation','paid'] as const)
  const reserved=sessions(f.store)[0]!;assert.deepEqual(reserved.value.delivered,session.value.delivered);
  assert.equal(reserved.value.delivery.turn,first.value.turns+1);const calls=f.wires().length;
  f.finishFrontier();const result=await f.run(3,f.open(),boundary!=='paid');
- assert.equal(result.value.status,boundary==='paid'?'paused':'completed',JSON.stringify(result.value));
- assert.equal(result.value.pauseCode,boundary==='paid'?'research_assessment_pending':null);
+ assert.equal(result.value.status,'paused',JSON.stringify(result.value));
+ assert.equal(result.value.pauseCode,boundary==='paid'?'research_assessment_pending':'project_mode_unset');
  assert.equal(f.wires().filter(w=>!w.subject.assessmentSubject).length,calls+(boundary==='paid'?0:1));
  assert.equal(f.wires().filter(w=>w.subject.assessmentSubject).length,boundary==='paid'?0:1);assert.equal(f.wires().filter(row=>row.subject.dispatchMode==='planning').length,1);
  readSynthesisSessionV3(f.open(),reference(sessions(f.store)[0]!));
@@ -287,7 +287,7 @@ test('S6.6: a real paid consolidation resumes in restore-only before another syn
  assert.equal(restored.value.pauseCode,'research_restore_complete',JSON.stringify(restored.value));
  assert.deepEqual(heads(f),paid);assert.equal(f.wires().length,calls);
  const session=readSynthesisSessionV3(f.open(),reference(sessions(f.store)[0]!));assert.ok(session.value.notes.some(note=>note.consolidated));
- f.finishFrontier();const completed=await f.run(3,f.open());assert.equal(completed.value.status,'completed',JSON.stringify(completed.value));
+ f.finishFrontier();const completed=await f.run(3,f.open());assert.equal(completed.value.status,'paused');assert.equal(completed.value.pauseCode,'project_mode_unset',JSON.stringify(completed.value));
  assert.equal(f.wires().filter(w=>!w.subject.assessmentSubject).length,calls+1);
  assert.equal(f.wires().filter(w=>w.subject.assessmentSubject).length,1);assert.equal(f.wires().filter(row=>row.subject.dispatchMode==='planning').length,1);
  for(const turn of f.store.list<any>('research-turn'))readResearchConsumerTurn(f.open(),reference(turn));
@@ -345,7 +345,7 @@ for (const foreign of [true, false])
  assert.throws(()=>readSynthesisSessionV3(f.open(),reference(broken)),{code:'synthesis_session_invalid'});
  if (foreign) {
   f.configure([ended()]);
-  f.finishFrontier();const result=await f.run(3,f.open());assert.equal(result.value.status,'completed',JSON.stringify(result.value));
+  f.finishFrontier();const result=await f.run(3,f.open());assert.equal(result.value.status,'paused');assert.equal(result.value.pauseCode,'project_mode_unset',JSON.stringify(result.value));
   assert.equal(f.wires().filter(w=>!w.subject.assessmentSubject).length,1);
   assert.equal(f.wires().filter(w=>w.subject.assessmentSubject).length,1);assert.deepEqual(f.store.get(broken.id),broken);
   const own=readSynthesisSessionV3(f.open(),reference(f.store.get<any>(original.id)!));

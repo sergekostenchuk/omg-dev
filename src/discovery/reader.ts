@@ -21,6 +21,15 @@ import { isResearchPreview } from './research-preview.js';
 import { projectPaidReaderResult, projectReaderSelection, readerDraftEquivalent } from './research-consumer-transition.js';
 
 export type ReaderSelection = ({ source: Ref } | { sourceIndex: number }) & { firstLine: number; lastLine: number };
+export interface ReaderExecutionOptions { readonly restoreOnly?: boolean }
+
+/** This invocation may restore paid identities, but cannot prepare or reserve another send. */
+function readerRestorePause(question: Ref, purpose: string, rootKey: string, pending: Ref | null): never {
+  const details = { question, purpose, rootKey, pending };
+  throw new EngineError('research_restore_complete', canonical({ code: 'research_restore_complete',
+    message: 'Saved reader work is restored; the unfinished request needs a new allowance', ...details }), details);
+}
+
 export interface ReaderResult {
   /** Current producer outputs name their derivation. */
   contract?: 'reader-result/v2'; producer?: 'paid' | 'combined' | 'reused' | 'outside'; intent?: Ref;
@@ -985,7 +994,13 @@ export function readerApplicationAdmission(store: Store, intent: Revision<Resear
 
 async function applyReaderIntent(store: Store, environment: Environment, pilot: Revision<ReaderPilot>, question: Ref,
   purpose: string, rootInputs: BundleInput[], rootKey: string, found: Revision<ResearchConsumerIntent>,
-  signal?: AbortSignal): Promise<Revision<ReaderResult>> {
+  signal?: AbortSignal, options: ReaderExecutionOptions = {}): Promise<Revision<ReaderResult>> {
+  if (options.restoreOnly) {
+    // A competitor may have paid/applied this same identity since the caller read it.
+    const current = store.get<ResearchConsumerIntent>(found.id);
+    if (current) found = readResearchConsumerIntent(store, reference(current));
+    if (found.value.state === 'prepared') readerRestorePause(question, purpose, rootKey, reference(found));
+  }
   if (found.value.state === 'applied') return appliedReaderResult(store, environment.projectId, question, purpose, found, rootKey, rootInputs);
   const cursor = readerCursor(store, found, rootKey, question, purpose, rootInputs);
   // Exact paid recovery precedes today's source, pilot and turn admission.
@@ -996,6 +1011,7 @@ async function applyReaderIntent(store: Store, environment: Environment, pilot: 
     readerApplicationAdmission(store, found);
     try {
       const { researchCall } = await import('./research-protocol.js');
+      if (options.restoreOnly) readerRestorePause(question, purpose, rootKey, reference(found));
       await researchCall(pilot.value.reader, environment, cursor.instruction, cursor.context, signal,
         { store, draftId: found.value.draft.id, questionId: question.id,
           purpose: 'reader', pilot, consumerIntent: reference(found), ...(isResearchPreview() ? { previewIntent: found } : {}) });
@@ -1095,7 +1111,7 @@ function readerAdmission(store: Store, environment: Environment, pilot: Revision
 async function readBundlePart(store: Store, environment: Environment, pilot: Revision<ReaderPilot>, question: Ref,
   purpose: string, inputs: BundleInput[], rootInputs: BundleInput[], rootKey: string, child: number[],
   consumer: ReaderConsumerBinding | null, rootSources: ReaderSource[] | null, lineage: number[][],
-  retryPermits: readonly Ref[], signal?: AbortSignal): Promise<Revision<ReaderResult>> {
+  retryPermits: readonly Ref[], signal?: AbortSignal, options: ReaderExecutionOptions = {}): Promise<Revision<ReaderResult>> {
   const step = readerResumeStep(store, environment.projectId, question, purpose, rootInputs, consumer, child);
   const key = step.key;
   const previous = 'intent' in step ? step.intent : null;
@@ -1104,12 +1120,21 @@ async function readBundlePart(store: Store, environment: Environment, pilot: Rev
   if (step.kind === 'refused' && !retryableResearchConsumerRefusal(store, previous!))
     throwSavedReaderRefusal(previous!);
   if (previous && previous.value.state !== 'refused') {
-    const selected = previous.value.state === 'prepared'
+    const selected = previous.value.state === 'prepared' && !options.restoreOnly
       ? reprepareUnsentReader(store, environment, pilot, question, purpose, rootInputs, rootKey, previous) : previous;
-    const result = await applyReaderIntent(store, environment, pilot, question, purpose, rootInputs, rootKey, selected, signal);
+    const result = await applyReaderIntent(store, environment, pilot, question, purpose, rootInputs, rootKey, selected, signal, options);
     if (canonical(previous.value.cursor.child) === canonical(child)) return result;
     return readBundlePart(store, environment, pilot, question, purpose, inputs, rootInputs, rootKey, child,
-      consumer, rootSources, lineage, retryPermits, signal);
+      consumer, rootSources, lineage, retryPermits, signal, options);
+  }
+  if (options.restoreOnly) {
+    const current = readerResumeStep(store, environment.projectId, question, purpose, rootInputs, consumer, child);
+    if (current.kind === 'completed') return current.result;
+    if (current.kind === 'assemble') return saveReaderAssembly(store, environment.projectId, current);
+    if (current.kind === 'pending' && current.intent.value.state === 'running')
+      return readBundlePart(store, environment, pilot, question, purpose, inputs, rootInputs, rootKey, child,
+        consumer, rootSources, lineage, retryPermits, signal, options);
+    readerRestorePause(question, purpose, rootKey, 'intent' in current ? reference(current.intent) : null);
   }
   const { draft, environmentGuards } = readerAdmission(store, environment, pilot, question);
   readerConsumerAdmission(store, environment.projectId, draft.id, question, purpose, rootInputs, consumer);
@@ -1172,7 +1197,7 @@ async function readBundlePart(store: Store, environment: Environment, pilot: Rev
       .map(half => half.map(source => ({ source: source.ref, range: source.visibleRange })));
     const parts:Revision<ReaderResult>[]=[];
     for(const [index,batch] of batches.entries())
-      parts.push(await readBundlePart(store,environment,pilot,question,purpose,batch,rootInputs,rootKey,[...child,index],consumer,rootSupplied,lineage,retryPermits,signal));
+      parts.push(await readBundlePart(store,environment,pilot,question,purpose,batch,rootInputs,rootKey,[...child,index],consumer,rootSupplied,lineage,retryPermits,signal,options));
     return save(combinedReaderOutcome(parts),{parts:parts.map(reference)});
   }
   const cursor: ReaderIntentCursor = { rootKey, purpose, rootInputs, rootSourceOrder: readerSourceOrder(rootSupplied), inputs, child, consumer,
@@ -1198,12 +1223,12 @@ async function readBundlePart(store: Store, environment: Environment, pilot: Rev
     'reader_intent_claim_conflict', 'A concurrent reader intent has a different saved source basis');
     intent = competing;
   }
-  return applyReaderIntent(store, environment, pilot, question, purpose, rootInputs, rootKey, intent, signal);
+  return applyReaderIntent(store, environment, pilot, question, purpose, rootInputs, rootKey, intent, signal, options);
 }
 
 export async function readBundle(store: Store, environment: Environment, pilot: Revision<ReaderPilot>, question: Ref,
   purpose: string, inputs: BundleInput[], signal?: AbortSignal,
-  consumer: ReaderConsumerBinding | null = null, retryPermits?: readonly Ref[]): Promise<Revision<ReaderResult>> {
+  consumer: ReaderConsumerBinding | null = null, retryPermits?: readonly Ref[], options: ReaderExecutionOptions = {}): Promise<Revision<ReaderResult>> {
   requireCondition(isRef(question) && typeof purpose === 'string' && !!purpose.trim()
     && Array.isArray(inputs) && inputs.length > 0 && (consumer === null || isRef(consumer.run) && isRef(consumer.turn)),
   'reader_request_invalid', 'A reader request needs its question, purpose and sources');
@@ -1227,14 +1252,22 @@ export async function readBundle(store: Store, environment: Environment, pilot: 
         'A question revision cannot replace the exact pending paid reader task');
     }
     const cursor = readerCursor(store, pending, rootKey, question, purpose, rootInputs);
-    const selected = pending.value.state === 'prepared'
+    const selected = pending.value.state === 'prepared' && !options.restoreOnly
       ? reprepareUnsentReader(store, environment, pilot, question, purpose, rootInputs, rootKey, pending)
       : pending;
-    const result = await applyReaderIntent(store, environment, pilot, question, purpose, rootInputs, rootKey, selected, signal);
+    const result = await applyReaderIntent(store, environment, pilot, question, purpose, rootInputs, rootKey, selected, signal, options);
     if (cursor.child.length === 0) return result;
     const recovered = readerResumeStep(store, environment.projectId, question, purpose, rootInputs, consumer);
     if (recovered.kind === 'completed') return recovered.result;
     if (recovered.kind === 'assemble') return saveReaderAssembly(store, environment.projectId, recovered);
+  }
+  if (options.restoreOnly) {
+    const current = readerResumeStep(store, environment.projectId, question, purpose, rootInputs, consumer);
+    if (current.kind === 'completed') return current.result;
+    if (current.kind === 'assemble') return saveReaderAssembly(store, environment.projectId, current);
+    if (current.kind === 'pending' && current.intent.value.state === 'running')
+      return readBundle(store, environment, pilot, question, purpose, rootInputs, signal, consumer, permits, options);
+    readerRestorePause(question, purpose, rootKey, 'intent' in current ? reference(current.intent) : null);
   }
   readerAdmission(store, environment, pilot, question);
   const lineageIntents = step.lineage;
@@ -1245,13 +1278,13 @@ export async function readBundle(store: Store, environment: Environment, pilot: 
     if (cursor.child.length) savedReaderSources(store, environment.projectId, cursor);
     return cursor.child;
   });
-  return readBundlePart(store, environment, pilot, question, purpose, rootInputs, rootInputs, rootKey, [], consumer, null, lineage, permits, signal);
+  return readBundlePart(store, environment, pilot, question, purpose, rootInputs, rootInputs, rootKey, [], consumer, null, lineage, permits, signal, options);
 }
 
 /** Resume through the original reader entry, including any unfinished child
  * bundle, using the saved public request and consumer instead of a new plan. */
 export async function resumeReadBundleIntent(store: Store, intentRef: Ref, environment: Environment,
-  pilot: Revision<ReaderPilot>, signal: AbortSignal | undefined, retryPermits: readonly Ref[]): Promise<Revision<ReaderResult>> {
+  pilot: Revision<ReaderPilot>, signal: AbortSignal | undefined, retryPermits: readonly Ref[], options: ReaderExecutionOptions = {}): Promise<Revision<ReaderResult>> {
   const intent = readResearchConsumerIntent(store, intentRef);
   requireCondition(intent.value.kind === 'reader' && intent.value.projectId === environment.projectId,
     'reader_intent_foreign', 'The selected intent is not a reader request in this project');
@@ -1260,5 +1293,5 @@ export async function resumeReadBundleIntent(store: Store, intentRef: Ref, envir
     && Array.isArray(cursor.rootInputs), 'reader_intent_cursor_invalid', 'The saved public reader request is incomplete');
   readerCursor(store, intent, cursor.rootKey, intent.value.question, cursor.purpose, cursor.rootInputs);
   return readBundle(store, environment, pilot, intent.value.question, cursor.purpose, cursor.rootInputs,
-    signal, cursor.consumer, retryPermits);
+    signal, cursor.consumer, retryPermits, options);
 }

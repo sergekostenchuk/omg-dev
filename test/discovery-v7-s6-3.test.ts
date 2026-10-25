@@ -115,7 +115,7 @@ function queueProducts(f: Awaited<ReturnType<typeof setup>>) {
 async function refuseNewWork(f: Awaited<ReturnType<typeof setup>>, store = f.open()) {
   const before = queueProducts(f);
   const stopped = await f.run(1, store, false);
-  assert.equal(stopped.value.pauseCode, 'research_contract_upgrade_required', JSON.stringify(stopped.value));
+  assert.equal(stopped.value.pauseCode, 'research_turns_exhausted', JSON.stringify(stopped.value));
   assert.deepEqual(queueProducts(f), before);
   return stopped;
 }

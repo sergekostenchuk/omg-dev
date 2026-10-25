@@ -134,7 +134,7 @@ test('R.1: each exact subject is assessed and applied before the next analyst ca
       second=true;assert.equal(f.store.list('v7-attempt-account').length,1);assert.equal(f.store.list('v7-progress-state').length,1);
     }return write(writes,guards);
   }) as typeof f.store.writeMany;
-  const run=await f.run();assert.equal(run.value.status,'completed',JSON.stringify(run.value));assert.ok(second);
+  const run=await f.run();assert.equal(run.value.status,'paused');assert.equal(run.value.pauseCode,'project_mode_unset',JSON.stringify(run.value));assert.ok(second);
   assert.equal(run.value.turns,2);assert.equal(f.store.list('research-attempt').length,2);
   assert.deepEqual(assessmentWires(f).map(w=>w.subject.assessmentSubject.packet.planQuestionId),['block','support']);
   assert.deepEqual(f.wires().map(w=>w.subject.assessmentSubject?'assessor':w.subject.question.id),['block','assessor','support','assessor']);
@@ -157,7 +157,7 @@ for(const boundary of ['paid','published','before-apply','after-apply'] as const
   assert.equal(f.store.list('v7-progress-state').length,boundary==='after-apply'?1:0);
   if(completed){const run=f.store.get<any>(stopped.id)!;f.store.write({id:run.id,kind:run.kind,expected:run.revision,value:{...run.value,status:'completed'}});}
   const sent=f.wires().length,ledger=f.store.list('research-budget-ledger');
-  const done=await f.run(1,f.open(),false);assert.equal(done.value.pauseCode,'research_contract_upgrade_required',JSON.stringify(done.value));
+  const done=await f.run(1,f.open(),false);assert.equal(done.value.pauseCode,'research_restore_complete',JSON.stringify(done.value));
   assert.equal(f.wires().length,sent);assert.deepEqual(f.store.list('research-budget-ledger'),ledger);
   assert.equal(f.store.list('v7-attempt-account').length,1);assert.equal(f.store.list('v7-progress-application').length,1);
   assert.equal(f.store.list<any>('v7-progress-state')[0]!.value.summary.count,1);assert.equal(done.value.turns,1);
@@ -182,7 +182,7 @@ test('R.1: an earlier paid pending answer is not skipped or counted while its as
  const paused=await f.run(1,f.open(),false);assert.equal(paused.value.status,'paused');assert.equal(paused.value.pauseCode,'research_assessment_pending',JSON.stringify(paused.value));
  assert.equal(paused.value.turns,1);assert.equal(f.store.list('v7-attempt-account').length,0);assert.equal(f.store.list('discovery-assessment').length,0);
  assert.equal(f.wires().length,sent);assert.deepEqual(f.store.list('research-budget-ledger'),ledger);
- const done=await f.run(1,f.open());assert.equal(done.value.status,'completed',JSON.stringify(done.value));assert.equal(done.value.turns,2);
+ const done=await f.run(1,f.open());assert.equal(done.value.status,'paused');assert.equal(done.value.pauseCode,'research_turns_exhausted',JSON.stringify(done.value));assert.equal(done.value.turns,2);
  assert.deepEqual(assessmentWires(f).map(w=>w.subject.assessmentSubject.packet.planQuestionId),['block','support']);
 });
 
@@ -232,7 +232,7 @@ for(const covered of [false,true])test(`R.1: stale paid packet covered=${covered
  const packet=packetOf(f);await competingFirst(f,packet);
  const before=counters(f),apps=f.store.list('v7-progress-application');
  const result=await f.run(1,f.open(),false);
- if(covered){assert.equal(result.value.pauseCode,'research_contract_upgrade_required',JSON.stringify(result.value));}
+ if(covered){assert.equal(result.value.pauseCode,'research_restore_complete',JSON.stringify(result.value));}
  else {assert.equal(result.value.pauseCode,'discovery_progress_stale',JSON.stringify(result.value));assert.equal(result.value.status,'paused');}
  assert.deepEqual(counters(f),before);assert.deepEqual(f.store.list('v7-progress-application'),apps);
  const again=await f.run(1,f.open(),false);assert.equal(again.value.status,result.value.status);assert.equal(again.value.pauseCode,result.value.pauseCode);
@@ -274,7 +274,7 @@ test('R.1: an already paid assessor checkpoint replays free and waits without N 
  assert.equal(f.store.list('v7-progress-state').length,0);assert.equal(f.store.list('discovery-assessment').length,0);
  assert.equal(f.wires().length,sent);assert.deepEqual(f.store.list('research-budget-ledger'),ledger);
  const before=f.history();await f.run(1,f.open(),false);assert.deepEqual(f.history(),before);
- f.configure();f.finishFrontier();const done=await f.run(1,f.open());assert.equal(done.value.status,'completed',JSON.stringify(done.value));
+ f.configure();f.finishFrontier();const done=await f.run(1,f.open());assert.equal(done.value.status,'paused');assert.equal(done.value.pauseCode,'project_mode_unset',JSON.stringify(done.value));
  assert.equal(done.value.turns,1);assert.equal(f.store.list('v7-attempt-account').length,1);
  assert.equal(f.store.list<any>('v7-progress-state')[0]!.value.summary.count,1);assert.equal(f.wires().length,sent+1);
  const stable=counters(f);await f.run(1,f.open(),false);assert.deepEqual(counters(f),stable);
@@ -293,7 +293,7 @@ test('R.1: a restored unpaid next intent cannot dispatch ahead of the previous p
  const waiting=await f.run(1,f.open(),false);assert.equal(waiting.value.pauseCode,'research_contract_upgrade_required',JSON.stringify(waiting.value));
  assert.equal(f.store.list('v7-attempt-account').length,1);assert.equal(f.store.list('v7-progress-application').length,1);
  assert.equal(f.store.get<any>(intent.id)!.value.state,'prepared');assert.equal(f.wires().length,sent);assert.deepEqual(f.store.list('research-budget-ledger'),ledger);
- const done=await f.run(1,f.open());assert.equal(done.value.status,'completed',JSON.stringify(done.value));
+ const done=await f.run(1,f.open());assert.equal(done.value.status,'paused');assert.equal(done.value.pauseCode,'research_turns_exhausted',JSON.stringify(done.value));
  assert.equal(f.store.list('v7-attempt-account').length,2);assert.equal(done.value.turns,2);
  assert.equal(f.store.get<any>(intent.id)!.value.state,'applied');
  assert.deepEqual(assessmentWires(f).map(w=>w.subject.assessmentSubject.packet.planQuestionId),['block','support']);
@@ -457,7 +457,7 @@ test(`R.1: replacement edition leaves ${boundary} old assessment uncounted and c
  const pending=await f.run(1,f.open(),false);
  assert.equal(pending.value.pauseCode,'research_assessment_pending',JSON.stringify(pending.value));
  assert.equal(f.wires().length,calls);assert.deepEqual(f.store.list('research-budget-ledger'),ledger);
- f.finishFrontier();const done=await f.run(1,f.open());assert.equal(done.value.status,'completed',JSON.stringify(done.value));
+ f.finishFrontier();const done=await f.run(1,f.open());assert.equal(done.value.status,'paused');assert.equal(done.value.pauseCode,'research_turns_exhausted',JSON.stringify(done.value));
  assert.deepEqual(f.wires().filter(w=>!w.subject.assessmentSubject).map(w=>w.subject.question.id),['block','new']);
  assert.deepEqual(assessmentWires(f).map(w=>w.subject.assessmentSubject.packet.planAnswer),[next.planAnswer]);
  assert.deepEqual(f.store.get(old.id,old.revision),old);
@@ -526,7 +526,7 @@ test(`R.1/S6.8: saved-only recovery retains the exact negative owner review${cut
  assert.deepEqual(f.store.list<any>('model-call').filter(row=>row.value.purpose==='escalation-assessor').map(reference),reviews);
  assert.equal(f.store.list('research-attempt').length,1);assert.equal(f.store.list('v7-attempt-account').length,1);
  assert.equal(readV7ProgressStateAt(f.open(),reference(f.store.list<any>('v7-progress-state')[0]!)).value.summary.count,1);
- const restored=await f.run(1,f.open(),false);assert.equal(restored.value.pauseCode,'research_contract_upgrade_required');
+ const restored=await f.run(1,f.open(),false);assert.equal(restored.value.pauseCode,'research_turns_exhausted');
  const fixed=f.history(),snapshot=counters(f);assert.deepEqual(await f.run(1,f.open(),false),restored);
  assert.deepEqual(f.history(),fixed);assert.deepEqual(counters(f),snapshot);
 });

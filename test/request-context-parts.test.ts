@@ -146,7 +146,7 @@ test('DRS1a2 first compact v7 analyst send: no prior preparation, one batch publ
   f.configure([ended('refused')]);
  f.finishFrontier();
   const done = await f.run();
-  assert.equal(done.value.status, 'completed', JSON.stringify(done.value));
+  assert.equal(done.value.status, 'paused');assert.equal(done.value.pauseCode, 'project_mode_unset', JSON.stringify(done.value));
   f.store.writeMany = write;
   assert.equal(f.wires().length, 2);
   assert.equal(f.wires().filter(w => w.subject.assessmentSubject).length, 1);
@@ -179,7 +179,7 @@ test('DRS1a2 first compact v7 analyst send: no prior preparation, one batch publ
   assert.deepEqual(readResearchConsumerIntent(cold, reference(intent!)).value, intent!.value);
   const saved = f.history(), calls = f.wires().length;
   const again = await f.run(8, cold, false, false);
-  assert.equal(again.value.status, 'completed', JSON.stringify(again.value));
+  assert.equal(again.value.status, 'paused');assert.equal(again.value.pauseCode, 'project_mode_unset', JSON.stringify(again.value));
   assert.equal(f.wires().length, calls, 'the cold repeat sends nothing');
   assert.equal(f.history(), saved, 'the cold repeat writes nothing');
 });
@@ -189,7 +189,7 @@ test('DRS1a2 continuation from a compact foundation: the call reads its own comp
   f.configure([readOwnArchive, ended()]);
  f.finishFrontier();
   const done = await f.run();
-  assert.equal(done.value.status, 'completed', JSON.stringify(done.value));
+  assert.equal(done.value.status, 'paused');assert.equal(done.value.pauseCode, 'project_mode_unset', JSON.stringify(done.value));
   const wires = f.wires();
   assert.equal(wires.length, 3);
   assert.equal(wires.filter(w => w.subject.assessmentSubject).length, 1);
@@ -211,7 +211,7 @@ test('DRS1a2 continuation from a compact foundation: the call reads its own comp
   // Cold: the whole chain re-reads without writes or sends.
   const saved = f.history(), calls = f.wires().length;
   const again = await f.run(8, f.open(), false, false);
-  assert.equal(again.value.status, 'completed', JSON.stringify(again.value));
+  assert.equal(again.value.status, 'paused');assert.equal(again.value.pauseCode, 'project_mode_unset', JSON.stringify(again.value));
   assert.equal(f.wires().length, calls);
   assert.equal(f.history(), saved);
 });
@@ -234,7 +234,7 @@ function viewWith(store: Store, id: string, change: (value: any) => any): Store 
 test('DRS1a2 subject binding: two plan-questions of one Question and the same id in two plan editions never share a preparation, at write and at read', async t => {
   const f = await setup(t, [planQuestion('block', 'industry', 'blocking'), planQuestion('support', 'market')]);
   f.configure([ended('refused'), ended()]);
-  f.finishFrontier();assert.equal((await f.run()).value.status, 'completed');
+  f.finishFrontier();assert.equal((await f.run()).value.pauseCode, 'project_mode_unset');
   const [a, b] = f.intents().sort((x, y) => x.value.cursor.turn - y.value.cursor.turn);
   assert.notEqual(a!.value.cursor.subject.planQuestionId, b!.value.cursor.subject.planQuestionId);
   assert.deepEqual(a!.value.question, b!.value.question, 'one physical plan Question');
@@ -245,7 +245,7 @@ test('DRS1a2 subject binding: two plan-questions of one Question and the same id
   // The next plan edition with the same plan-question id is another subject and another preparation.
   const next = acceptNextPlanEdition(f, 'p', f.v.draft, f.v.frameRef, f.v.planAnswer, [planQuestion('block', 'industry', 'blocking')]);
   f.configure([ended()]); writeFileSync(join(f.root, 'wire.ndjson'), '');
-  f.finishFrontier();assert.equal((await f.run()).value.status, 'completed');
+  f.finishFrontier();assert.equal((await f.run()).value.pauseCode, 'project_mode_unset');
   const edition2 = f.intents().find(row => canonical(row.value.cursor.subject.planAnswer) === canonical(next.planAnswer))!;
   assert.equal(edition2.value.cursor.subject.planQuestionId, 'block');
   assert.notEqual(edition2.value.preparation!.id, a!.value.preparation!.id);
@@ -282,7 +282,7 @@ test('DRS1a2 batch atomicity: a revision_conflict injected inside the publicatio
   assert.equal(f.wires().length, 0, 'nothing was sent');
   f.store.writeMany = write;
   const done = await f.run();
-  assert.equal(done.value.status, 'completed', JSON.stringify(done.value));
+  assert.equal(done.value.status, 'paused');assert.equal(done.value.pauseCode, 'project_mode_unset', JSON.stringify(done.value));
   // The paused run moved its owner revision, so the repeat is another step with its own preparation;
   // the injected record of the other writer stays untouched at its first revision.
   const [intent] = f.intents();
@@ -306,7 +306,7 @@ test('DRS1a2 budget refusal before the send: the compact intent waits prepared w
   await f.calibrate();
   f.configure([ended()]);f.finishFrontier();
   const done = await f.run();
-  assert.equal(done.value.status, 'completed', JSON.stringify(done.value));
+  assert.equal(done.value.status, 'paused');assert.equal(done.value.pauseCode, 'project_mode_unset', JSON.stringify(done.value));
   assert.equal(f.wires().length, 2);
   const [sent] = f.intents();
   assert.equal(sent!.id, prepared!.id, 'the same compact intent was sent');
@@ -352,7 +352,7 @@ test('DRS1a2 crash after the physical outcome, before the application: the cold 
 test('DRS1a2 damage and unknown contracts are typed refusals: part, revision, preparation contract, archive contract and intent contract; the whole-body archive reads literally', async t => {
   const f = await setup(t);
   f.configure([ended()]);
-  assert.equal((await f.run()).value.status, 'completed');
+  assert.equal((await f.run()).value.pauseCode, 'project_mode_unset');
   const [intent] = f.intents(), binding = preparationBinding(intent!.value), ref = intent!.value.preparation!;
   const preparation = f.store.get<ContextPreparation>(ref.id, 1)!;
   const part = preparation.value.parts[0]!;
@@ -379,7 +379,7 @@ test('DRS1a2 damage and unknown contracts are typed refusals: part, revision, pr
 test('DRS1a2 fsck and registry: the store the compact path wrote has no findings; preparation, compact archive and v2 intent name exact references and keep JSON inside parts as data', async t => {
   const f = await setup(t);
   f.configure([readOwnArchive, ended()]);
-  assert.equal((await f.run()).value.status, 'completed');
+  assert.equal((await f.run()).value.pauseCode, 'project_mode_unset');
   assert.deepEqual(checkStoreIntegrity(f.store).findings, []);
   const [intent] = f.intents(), preparation = f.store.get<ContextPreparation>(intent!.value.preparation!.id, 1)!;
   const fields = referenceSites(CONTEXT_PREPARATION_KIND, preparation.value).map(site => site.field);
@@ -402,7 +402,7 @@ test('DRS1a2 measurement: two identical real scenarios (12 project sources, init
       f.discovery.evidence.document('p', `market-${i}`, `Supply market note ${i}. `.repeat(80), 'text/plain', 0);
     f.configure([...['/body/role', '/body/stage', '/body/subject', '/body/inventory'].map(pointer => ({ ...readOwnArchive, pointer })), ended()]);
     f.finishFrontier();const done = await f.run(8, f.store, compact);
-    assert.equal(done.value.status, 'completed', JSON.stringify(done.value));
+    assert.equal(done.value.status, 'paused');assert.equal(done.value.pauseCode, 'project_mode_unset', JSON.stringify(done.value));
     assert.equal(f.wires().length, 6);
     assert.equal(f.wires().filter(w => w.subject.assessmentSubject).length, 1);
     const bytes = revisionBytes(f.store, kinds);

@@ -90,8 +90,7 @@ test('S6.1: paid context reads keep the complete run prefix across plan subjects
   f.configure([supplyRead, ended(), marketRead, ended()]);
  f.finishFrontier();
   const run = await f.run();
-  assert.equal(run.value.status, 'completed', JSON.stringify(run.value));
-  assert.equal(run.value.pauseCode, null);
+  assert.equal(run.value.status,'paused');assert.equal(run.value.pauseCode,'project_mode_unset',JSON.stringify(run.value));
   assert.deepEqual(f.wires().filter(wire => !wire.subject.assessmentSubject).map(wire => wire.subject.question.id), ['q-supply', 'q-supply', 'q-market', 'q-market']);
   const wires = f.wires().filter(wire => !wire.subject.assessmentSubject);
   const assessments = f.wires().filter(wire => wire.subject.assessmentSubject);

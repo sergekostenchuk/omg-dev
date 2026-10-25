@@ -171,7 +171,8 @@ function edition(f:Ready) {
 for(const necessary of [true,false])
  test(`S6.8: synthesis need_owner uses the logical subject and the real ${necessary?'necessary':'unnecessary'} review`,async t=>{
  const f=await setup(t,[planQuestion('block','industry','blocking')]),source=scenario(f,necessary);
- if(!necessary)f.finishFrontier();const result=await f.run(3);assert.equal(result.value.status,necessary?'needs_owner':'completed',JSON.stringify(result.value));
+ if(!necessary)f.finishFrontier();const result=await f.run(3);assert.equal(result.value.status,necessary?'needs_owner':'paused',JSON.stringify(result.value));
+ if(!necessary)assert.equal(result.value.pauseCode,'research_turns_exhausted');
  const reviewed=proveOwner(f,necessary,source);assert.equal(f.wires().length,necessary?3:5);
  proveAssessments(f,necessary?[]:['block']);
  assert.equal(f.wires().filter(row=>!row.subject.assessmentSubject).length,necessary?3:4);
@@ -307,7 +308,7 @@ for (const cutSession of [false,true])
   assert.deepEqual(snapshot(f),before);
   result=await f.run(4,f.open());
  }
- assert.equal(result.value.status,'completed',JSON.stringify(result.value));
+ assert.equal(result.value.status,'paused',JSON.stringify(result.value));assert.equal(result.value.pauseCode,'project_mode_unset');
  const reviewed=proveOwner(f,false,source);
  assert.deepEqual(reviewed.value.subject,subject);
  const requests=f.wires().slice(before.wire.length);
