@@ -93,8 +93,40 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
     }
     return;
   }
+  // 4O.3: the trusted local variant-choice command owns the whole scoped invitation/session lifecycle exactly like OC1
+  // and DR1a — no secret or bearer crosses stdin/stdout, so the general command/HTTP route has no credential to replay.
+  if (command === "owner-variant-choice") {
+    const [{ VariantChoiceSessions, issueVariantChoiceInvitation }, { answerVariantChoice },
+      { decodeVariantChoiceScope }] = await Promise.all([
+      import("./product/owner-authority.js"), import("./discovery/discovery-decision.js"),
+      import("./discovery/variant-decision.js")]);
+    const store = new Store(resolve(database)); const sessions = new VariantChoiceSessions(store);
+    let bearer: string | null = null;
+    try {
+      let request: unknown;
+      try { request = JSON.parse(readFileSync(0, "utf8")); }
+      catch { throw new EngineError("discovery_variant_invalid",
+        "owner-variant-choice reads one JSON request from stdin", { door: "owner-variant-choice" }); }
+      // The shared exact-shape decoder only names the scope; the invitation mint and the single answer producer prove it.
+      const scope = decodeVariantChoiceScope(request);
+      const issued = issueVariantChoiceInvitation(store, scope);
+      if (!issued.ok) throw new EngineError(issued.refusal.code, issued.refusal.message, issued.refusal.at);
+      const exchanged = sessions.exchange({ projectId: scope.projectId, invitation: issued.value.invitation });
+      if (!exchanged.ok) throw new EngineError(exchanged.refusal.code, exchanged.refusal.message, exchanged.refusal.at);
+      bearer = exchanged.value.bearer;
+      const authority = sessions.authority(bearer);
+      if (!authority) throw new EngineError("owner_session_missing", "The scoped local session was not established");
+      const outcome = answerVariantChoice(store, scope, authority);
+      console.log(JSON.stringify({ decision: reference(outcome.decision), state: reference(outcome.state),
+        repeated: outcome.repeated }));
+    } finally {
+      if (bearer && sessions.authority(bearer)) sessions.revoke(bearer);
+      store.close();
+    }
+    return;
+  }
   if (!["init", "inspect", "backup", "command"].includes(command ?? "")) {
-    throw new EngineError("invalid_command", "Usage: npm start -- init|inspect|backup|restore|owner-invite|owner-discovery-choice|owner-project-mode|command [database] [backup-directory]; choice/mode/command read JSON from stdin; probe --help");
+    throw new EngineError("invalid_command", "Usage: npm start -- init|inspect|backup|restore|owner-invite|owner-discovery-choice|owner-project-mode|owner-variant-choice|command [database] [backup-directory]; choice/mode/variant-choice/command read JSON from stdin; probe --help");
   }
   const store = new Store(resolve(database));
   try {
@@ -113,10 +145,12 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
 main().catch(error => {
   const details = error instanceof EngineError && error.details && typeof error.details === "object"
     ? error.details as { door?: unknown } : undefined;
-  const scopedOwnerError = ["owner-discovery-choice", "owner-project-mode"].includes(process.argv[2] ?? "")
-    || details?.door === "owner-discovery-choice" || details?.door === "owner-project-mode";
+  const scopedOwnerError = ["owner-discovery-choice", "owner-project-mode", "owner-variant-choice"].includes(process.argv[2] ?? "")
+    || details?.door === "owner-discovery-choice" || details?.door === "owner-project-mode"
+    || details?.door === "owner-variant-choice";
   console.error(JSON.stringify({ error: error instanceof EngineError ? error.code : "internal_error", message: error.message,
     ...(error instanceof EngineError && scopedOwnerError ? { details: error.details,
-      door: details?.door ?? (process.argv[2] === "owner-project-mode" ? "owner-project-mode" : "stage-summary") } : {}) }));
+      door: details?.door ?? (process.argv[2] === "owner-project-mode" ? "owner-project-mode"
+        : process.argv[2] === "owner-variant-choice" ? "owner-variant-choice" : "stage-summary") } : {}) }));
   process.exitCode = 1;
 });
