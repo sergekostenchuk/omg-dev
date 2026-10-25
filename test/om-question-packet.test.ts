@@ -31,7 +31,7 @@ import { writeOmObligations, normalizeOwnerGapAssignment, OM_OWNER_ASSIGNMENT_CO
 import { taskBindingId } from '../src/graph/task-obligations.js';
 import type { CarriedObligation } from '../src/graph/obligation-policy.js';
 import type { TaskObligationBinding } from '../src/graph/task-obligation-model.js';
-import { checkAnswerForm, prepareAnswerForm, checkNodeAnswerForm } from '../src/om/answer-form.js';
+import { checkAnswerForm, prepareAnswerForm, checkNodeAnswerForm, readPointerResult } from '../src/om/answer-form.js';
 import type { OmResult, Refusal, Sealed } from '../src/om/refusal.js';
 import { prepareRoutes, readRoutes, writeRoutes, type RoutesRecord, type RoutesRequest } from '../src/om/routes.js';
 import { prepareQuestionTasks, writeQuestionTasks, prepareQuestionPacket, writeQuestionPacket, readQuestionPacket,
@@ -3594,7 +3594,6 @@ test('LP7 row 29: a joined input packet is whole — ready when the capacity hol
 
 // ---- PF5 (№4235): one preparation derives each link of a continuation chain once ----
 import { packetDerivations } from '../src/om/question-packet.js';
-const PF5_BASE = '2785fca243698b923b994af3cff79ede3dc24e92';
 /** What a preparation gives its consumer, comparable across processes: the record, its guards, references and writes, or the refusal. */
 type PreparedSummary = { record: Ref; existing: boolean; guards: Json; references: Json; writes: Json } | { refusal: string };
 function preparedSummary(result: OmResult<Sealed<{ record: Revision<QuestionPacketRecord>; existing: boolean; guards: readonly unknown[];
@@ -3604,146 +3603,145 @@ function preparedSummary(result: OmResult<Sealed<{ record: Revision<QuestionPack
   return { record: reference(value.record), existing: value.existing, guards: value.guards as unknown as Json, references: value.references as unknown as Json,
     writes: value.writes.map(write => ({ id: write.id, expected: write.expected, hash: hashJson(write.value) })) as unknown as Json };
 }
-/** The preparations of `requests` by the base commit's engine, every module loaded from Git, in its own process (as routeAtCommit). */
-function preparedAtCommit(path: string, requests: readonly QuestionPacketRequest[]): PreparedSummary[] {
-  const root = dirname(path), repository = fileURLToPath(new URL('../../', import.meta.url)), served = join(root, 'pf5-base-served.log');
-  const loader = join(root, 'pf5-base-loader.mjs'), producer = join(root, 'pf5-base-producer.mjs'), input = join(root, 'pf5-base-input.json');
-  const typescript = pathToFileURL(createRequire(import.meta.url).resolve('typescript')).href;
-  writeFileSync(served, '');
-  writeFileSync(loader, `import { execFileSync } from 'node:child_process';
-import { appendFileSync, realpathSync } from 'node:fs';
-import { fileURLToPath, pathToFileURL } from 'node:url';
-import ts from ${JSON.stringify(typescript)};
-let root, log, prefixes;
-export function initialize(data) {
-  root = data.root; log = data.log;
-  prefixes = [root, pathToFileURL(realpathSync(fileURLToPath(root)) + '/').href].map(base => new URL('dist/src/', base).href);
-}
-export async function load(url, context, next) {
-  const prefix = prefixes.find(item => url.startsWith(item));
-  if (prefix && /\\.js$/.test(url)) {
-    const relative = 'src/' + url.slice(prefix.length).replace(/\\.js$/, '.ts');
-    appendFileSync(log, relative + '\\n');
-    const source = execFileSync('git', ['show', ${JSON.stringify(PF5_BASE)} + ':' + relative], { cwd: fileURLToPath(root), encoding: 'utf8', maxBuffer: 10000000 });
-    return { format: 'module', shortCircuit: true, source: ts.transpileModule(source,
-      { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2023 } }).outputText };
-  }
-  if (url.startsWith('file:') && url.includes('/dist/src/') && !url.includes('/node_modules/'))
-    throw new Error('An engine module outside the era checkout: ' + url);
-  return next(url, context);
-}`);
-  writeFileSync(producer, `import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
-import { pathToFileURL } from 'node:url';
-const [repository, database, input] = process.argv.slice(2);
-const src = path => pathToFileURL(join(repository, 'dist/src', path)).href;
-const { Store } = await import(src('storage/store.js'));
-const { prepareQuestionPacket } = await import(src('om/question-packet.js'));
-const { hashJson } = await import(src('canonical.js'));
-const { reference } = await import(src('pipeline/contracts.js'));
-const store = new Store(database);
-try {
-  process.stdout.write(JSON.stringify(JSON.parse(readFileSync(input, 'utf8')).map(request => {
-    const result = prepareQuestionPacket(store, request);
-    if (!result.ok) return { refusal: result.refusal.code };
-    const value = result.value;
-    return { record: reference(value.record), existing: value.existing, guards: value.guards, references: value.references,
-      writes: value.writes.map(write => ({ id: write.id, expected: write.expected, hash: hashJson(write.value) })) };
-  })));
-} finally { store.close(); }`);
-  writeFileSync(input, JSON.stringify(requests));
-  const bootstrap = `import { register } from 'node:module'; register(${JSON.stringify(pathToFileURL(loader).href)},
-    { data: { root: ${JSON.stringify(pathToFileURL(repository).href)}, log: ${JSON.stringify(served)} } });`;
-  const output = JSON.parse(execFileSync(process.execPath, ['--import', `data:text/javascript,${encodeURIComponent(bootstrap)}`, producer, repository, path, input],
-    { cwd: repository, encoding: 'utf8', timeout: 300_000, maxBuffer: 50_000_000 })) as PreparedSummary[];
-  assert.ok(readFileSync(served, 'utf8').split('\n').includes('src/om/question-packet.ts'), `The preparations ran on the modules of ${PF5_BASE}`);
-  return output;
-}
-
-test('PF5 (№4235): a chain of 1–5 continuations prepares each link once — N+1 derivations at depth N, where each link was derived twice per step — with the exact record, guards, references and writes of the base code 2785fca, a 6th link unwritten included, and its refusal codes for a foreign response or delivery', async t => {
-  const p = packetFixture(t, 100_000, gardenGraph(), true, false, { type: 'string' }, PF5_BASE), { f } = p;
-  // Five reads of five different values: each link adds knowledge, so each continuation is a ready packet.
-  const question = f.input.value.input.questions[0]! as unknown as Record<string, unknown>;
-  const pointers = Object.keys(question).filter(key => typeof question[key] === 'string' && (question[key] as string).length > 0).sort()
-    .map(key => `/input/questions/0/${key}`);
-  assert.ok(pointers.length >= 6, pointers.join(' '));
-  const link = (packet: Sealed<Revision<QuestionPacketRecord>>, pointer: string): QuestionPacketRequest =>
-    ({ ...p.request, continuation: sourceContinuation(p, packet, { action: 'read_context', record: reference(f.input), pointer }).continuation });
-  // SP1a (№4714 §2.1): a root today's code issues declares the selection era, which the base code cannot reproduce. The base
-  // code writes the root instead: a chain of the era before the selection, which the links today's code adds must keep.
-  let packet = atCommit({ root: f.root, path: f.database }, PF5_BASE, 'pf5-base-root', `const { writeQuestionPacket } = await import(src('om/question-packet.js'));
-out(take(writeQuestionPacket(store, args)).record);`, p.request) as Sealed<Revision<QuestionPacketRecord>>;
-  assert.equal(Object.hasOwn(packet.value, 'briefSelection'), false, 'The base root declares no selection era');
-  const requests: QuestionPacketRequest[] = [], counts: number[] = [], ours: PreparedSummary[] = [];
-  for (const pointer of pointers.slice(0, 5)) {
-    const request = link(packet, pointer), before = packetDerivations();
-    ours.push(preparedSummary(prepareQuestionPacket(f.store, request)));
-    counts.push(packetDerivations() - before);
-    requests.push(request);
-    packet = ok(writeQuestionPacket(f.store, request)).record;
-    assert.equal(packet.value.state, 'ready', `link ${requests.length} is a ready continuation`);
-    assert.equal(Object.hasOwn(packet.value, 'briefSelection'), false, `link ${requests.length} keeps the era of its root`);
-  }
-  // The sixth link is prepared, not written: its new record's bytes and hash are compared too.
-  const sixth = link(packet, pointers[5]!), before = packetDerivations();
-  const unwritten = preparedSummary(prepareQuestionPacket(f.store, sixth));
-  counts.push(packetDerivations() - before);
-  assert.deepEqual(counts, [2, 3, 4, 5, 6, 7], 'Each link of the chain, the prepared one included, is derived once in its preparation');
-  assert.ok('record' in unwritten && !unwritten.existing && Array.isArray(unwritten.writes) && unwritten.writes.length > 0);
-  // A foreign response or delivery under the third link is refused as before.
-  const third = requests[2]!.continuation!;
-  const response = f.store.get(third.response.id)!, delivery = f.store.get(third.deliveries[0]!.id)!;
-  const foreignResponse = f.store.write({ id: `${response.id}:pf5-foreign`, kind: response.kind, expected: 0, value: response.value });
-  const foreignDelivery = f.store.write({ id: `${delivery.id}:pf5-foreign`, kind: delivery.kind, expected: 0, value: delivery.value });
-  const refused = [{ ...requests[2]!, continuation: { ...third, response: reference(foreignResponse) } },
-    { ...requests[2]!, continuation: { ...third, deliveries: [reference(foreignDelivery)] } }];
-  const refusals = refused.map(request => preparedSummary(prepareQuestionPacket(f.store, request)));
-  assert.ok(refusals.every(row => 'refusal' in row), JSON.stringify(refusals));
-  // The written chain prepared again: an existing record, each link derived once as well.
-  const again = requests.map(request => {
-    const from = packetDerivations(), summary = preparedSummary(prepareQuestionPacket(f.store, request));
-    return { summary, count: packetDerivations() - from };
-  });
-  assert.deepEqual(again.map(row => row.count), [2, 3, 4, 5, 6]);
-  // The base code prepares the same requests on the same database, in its own process: the same existing records, guards,
-  // references and writes; the same new record of the sixth link; the same refusals.
-  const base = preparedAtCommit(f.store.path, [...requests, sixth, ...refused]);
-  const addedAbsence = { id: 'om-frame:garden:2', absent: true };
-  const legacySummary = (summary: PreparedSummary): PreparedSummary => {
-    if ('refusal' in summary) return summary;
-    assert.ok(Array.isArray(summary.guards));
-    const added = summary.guards.filter(guard => canonical(guard) === canonical(addedAbsence));
-    assert.deepEqual(added, [addedAbsence], 'The new preparation keeps the exact frame absence separately from the legacy contract');
-    return { ...summary, guards: summary.guards.filter(guard => canonical(guard) !== canonical(addedAbsence)) };
+test('PF5 current managed continuations derive each link once, preserve exact preparation and separate historical from current admission', async t => {
+  const f = e4Fixture(t, 'node', 100_000, 0, 5000, true);
+  const binding = ok(readCompletionBinding(f.store, f.project, f.packetRequest.attempt!.series, f.packetRequest.attempt!.ordinal));
+  assert.ok(binding);
+  assert.deepEqual(binding.value.plan, { routes: reference(f.routes), batches: [f.batch.id] });
+  assert.deepEqual(binding.value.goal, f.series.value.attempts[0]!.goal);
+  const currentPacket = (packet: Sealed<Revision<QuestionPacketRecord>>) => {
+    assert.equal(packet.value.state, 'ready'); mp11Version(packet, 'om-brief/v2');
+    assert.equal(packet.value.briefSelection, BASIS_BRIEF_SELECTION_CONTRACT);
+    assert.equal(briefReadings(packet.value.packet)!.contract, 'om-brief-readings/v1');
+    assert.ok(packet.value.briefNeighbors);
   };
-  assert.deepEqual(JSON.parse(JSON.stringify([...again.map(row => legacySummary(row.summary)), legacySummary(unwritten), ...refusals])), base);
-  // Before its write, each link's new record was the one the base code finds written: the same id, revision and hash.
-  for (const [index, row] of ours.entries()) {
-    const written = base[index]!;
-    assert.ok('record' in row && 'record' in written && !row.existing && written.existing);
-    assert.deepEqual([row.record, row.writes], [written.record, [{ id: written.record.id, expected: 0, hash: written.record.hash }]], `link ${index + 1}`);
+  currentPacket(f.packet);
+  // Six different saved values of this exact context; no old producer or synthetic positive response.
+  const pointers = ['/input/questions/0/id', '/input/questions/0/question', '/input/questions/0/kind',
+    '/input/questions/0/consumer', '/input/questions/0/moment', '/input/contracts/0/state/writer'];
+  const expected = pointers.map(pointer => readPointerResult(f.input.value, pointer));
+  assert.ok(expected.every(row => row?.outcome === 'complete'));
+  assert.equal(new Set(expected.map(row => canonical((row as { value: Json }).value))).size, 6);
+  const script: Record<string, unknown>[] = [];
+  const link = async (packet: Sealed<Revision<QuestionPacketRecord>>, index: number): Promise<QuestionPacketRequest> => {
+    script.push({ research: e4NeedSource(f, [{ action: 'read_context', record: reference(f.input), pointer: pointers[index]! }]) });
+    f.steps(script);
+    const call = ok(await runModelCall(f.store, { ...f.request, packet: reference(packet) }));
+    assert.ok(call.response);
+    const delivered = ok(deliverModelSources(f.store, { project: f.project, packet: reference(packet), call: call.call, response: call.response }));
+    assert.equal(delivered.deliveries.length, 1);
+    const delivery = f.store.get<ReadDeliveryRecord>(delivered.deliveries[0]!.id, delivered.deliveries[0]!.revision)!;
+    assert.deepEqual(reference(delivery), delivered.deliveries[0]);
+    assert.deepEqual(delivery.value.sources, [reference(f.input)]);
+    assert.deepEqual(delivery.value.data, expected[index]);
+    assert.equal(f.sent().length, index + 1);
+    return { ...f.packetRequest, continuation: { packet: reference(packet), call: call.call, response: call.response,
+      deliveries: [...delivered.deliveries] } };
+  };
+  const measure = (request: QuestionPacketRequest) => {
+    const saved = snapshot(f.store), sends = f.sent().length, from = packetDerivations();
+    const result = prepareQuestionPacket(f.store, request);
+    const count = packetDerivations() - from;
+    assert.deepEqual(snapshot(f.store), saved, 'Every preparation is read-only');
+    assert.equal(f.sent().length, sends);
+    return { result, count };
+  };
+  const requests: QuestionPacketRequest[] = [], packets: Sealed<Revision<QuestionPacketRecord>>[] = [f.packet], counts: number[] = [];
+  let packet: Sealed<Revision<QuestionPacketRecord>> = f.packet;
+  for (let index = 0; index < 5; index++) {
+    const request = await link(packet, index), measured = measure(request), prepared = ok(measured.result);
+    counts.push(measured.count); requests.push(request);
+    assert.equal(prepared.existing, false); assert.ok(prepared.writes.length > 0);
+    assert.equal(f.store.get(prepared.record.id), null);
+    const repeated = measure(request);
+    assert.equal(repeated.count, [2, 3, 4, 5, 6][index]);
+    assert.deepEqual(repeated.result, measured.result, 'Exact record, full guards/references and planned writes are stable');
+    const written = ok(writeQuestionPacket(f.store, request));
+    assert.deepEqual(written, prepared);
+    for (const write of prepared.writes) {
+      const actual = f.store.get(write.id, write.expected + 1)!;
+      assert.deepEqual(reference(actual), { id: write.id, revision: write.expected + 1, hash: hashJson(write.value) });
+      assert.equal(actual.kind, write.kind); assert.deepEqual(actual.value, write.value);
+    }
+    packet = written.record; packets.push(packet); currentPacket(packet);
   }
-  // №4244: two derivations of one link with a different `current` in one preparation never share a result. The engine's one
-  // path that derives a link both ways is its preparation after the environment moved: historically for the environment's
-  // proof, then currently on the admitted view — 7 + 7 here, neither served from the other; the outcome is the base code's.
-  const guarded = ok(prepareQuestionPacket(f.store, sixth));
-  const saved = await f.store.snapshot(join(f.root, 'pf5-absent-frame'));
-  const competing = new Store(saved.path);
+  const sixth = await link(packet, 5), measured = measure(sixth), unwritten = ok(measured.result);
+  counts.push(measured.count);
+  assert.deepEqual(counts, [2, 3, 4, 5, 6, 7]);
+  assert.equal(unwritten.existing, false); assert.ok(unwritten.writes.length > 0);
+  currentPacket(unwritten.record); assert.equal(f.store.get(unwritten.record.id), null);
+  const sixthRepeat = measure(sixth);
+  assert.equal(sixthRepeat.count, 7); assert.deepEqual(sixthRepeat.result, measured.result);
+
+  // Borrow real records from another link: deliberate foreign response/delivery, not manufactured positive history.
+  const third = requests[2]!.continuation!, first = requests[0]!.continuation!;
+  const negatives = [
+    { request: { ...requests[2]!, continuation: { ...third, response: first.response } }, code: 'record_foreign',
+      target: partResponseId(f.project, third.call), field: 'id' },
+    { request: { ...requests[2]!, continuation: { ...third, deliveries: [...first.deliveries] } }, code: 'model_delivery_invalid',
+      target: first.deliveries[0]!.id, field: 'delivery' },
+  ];
+  for (const cold of [false, true]) {
+    if (cold) f.restart();
+    const before = snapshot(f.store), sends = f.sent().length;
+    for (const { request, code, target, field } of negatives) {
+      const refusal = rejected(measure(request).result, code);
+      assert.deepEqual([refusal.at.target, refusal.at.field], [target, field]);
+    }
+    const again = requests.map((request, index) => {
+      const measured = measure(request), prepared = ok(measured.result);
+      assert.equal(prepared.existing, true); assert.deepEqual(prepared.writes, []);
+      assert.deepEqual(prepared.record, packets[index + 1]);
+      const repeated = measure(request);
+      assert.equal(repeated.count, [2, 3, 4, 5, 6][index]);
+      assert.deepEqual(preparedSummary(repeated.result), preparedSummary(measured.result), 'No guard or reference is filtered');
+      assert.deepEqual(ok(writeQuestionPacket(f.store, request)).record, prepared.record);
+      return measured.count;
+    });
+    assert.deepEqual(again, [2, 3, 4, 5, 6]);
+    for (const record of packets) {
+      assert.deepEqual(ok(readQuestionPacket(f.store, { project: f.project, record: reference(record) })), record);
+      currentPacket(record);
+    }
+    const preparedSixth = measure(sixth);
+    assert.equal(preparedSixth.count, 7); assert.deepEqual(preparedSixth.result, measured.result);
+    assert.equal(f.store.get(unwritten.record.id), null);
+    assert.deepEqual(snapshot(f.store), before); assert.equal(f.sent().length, sends);
+  }
+
+  // A lawful concurrent Environment update defeats exactly its old guard; all candidate writes remain atomic.
+  assert.ok(unwritten.guards.some(guard => same(guard, reference(f.configured))));
+  const rival = new Store(f.database);
+  let compatible: Revision<typeof f.configured.value>;
   try {
-    competing.write({ id: addedAbsence.id, kind: 'connection-frame', expected: 0, value: {} });
-    const beforeRace = snapshot(competing);
-    const outcome = writeGuarded(competing, { unit: 'M3', target: 'garden', guards: guarded.guards,
-      writes: [...guarded.writes, { id: 'pf5:neighbor', kind: 'neighbor', expected: 0, value: {} }] });
-    assert.equal(outcome.ok, false);
-    assert.equal(outcome.refusal.code, 'input_stale');
-    assert.equal(outcome.refusal.at.target, addedAbsence.id);
-    assert.deepEqual(snapshot(competing), beforeRace);
-    assert.equal(competing.get('pf5:neighbor'), null);
-  } finally { competing.close(); }
-  p.environment(100_000);
-  const from = packetDerivations(), moved = preparedSummary(prepareQuestionPacket(f.store, sixth));
-  assert.equal(packetDerivations() - from, 14);
-  assert.deepEqual(JSON.parse(JSON.stringify([legacySummary(moved)])), preparedAtCommit(f.store.path, [sixth]));
+    const { projectId: _project, ...configuration } = clone(f.configured.value);
+    compatible = new ProductEngine(rival).environments.configure(f.project, configuration, f.configured.revision);
+  } finally { rival.close(); }
+  assert.equal(compatible.revision, f.configured.revision + 1);
+  assert.deepEqual(compatible.value, f.configured.value);
+  const afterCompetitor = snapshot(f.store), sends = f.sent().length;
+  const outcome = writeGuarded(f.store, { unit: 'PF5', target: unwritten.record.id, guards: unwritten.guards,
+    writes: [...unwritten.writes, { id: 'pf5:neighbor', kind: 'neighbor', expected: 0, value: {} }] });
+  const stale = rejected(outcome, 'input_stale');
+  assert.deepEqual([stale.at.target, stale.at.ref], [f.configured.id, reference(f.configured)]);
+  assert.deepEqual(snapshot(f.store), afterCompetitor);
+  assert.equal(f.store.get(unwritten.record.id), null); assert.equal(f.store.get('pf5:neighbor'), null);
+  assert.equal(f.sent().length, sends);
+
+  // Historical proof on the original exact Environment, then current admission on the compatible head: 7 + 7.
+  for (const cold of [false, true]) {
+    if (cold) f.restart();
+    const moved = measure(sixth), prepared = ok(moved.result);
+    assert.equal(moved.count, 14, 'Historical and current derivations cannot reuse each other');
+    assert.deepEqual(prepared.record, unwritten.record);
+    assert.deepEqual(prepared.record.value.request.environment, reference(f.configured));
+    assert.ok(prepared.guards.some(guard => same(guard, reference(compatible))));
+    assert.ok(!prepared.guards.some(guard => same(guard, reference(f.configured))));
+    const repeat = measure(sixth);
+    assert.equal(repeat.count, 14); assert.deepEqual(repeat.result, moved.result);
+    assert.equal(f.store.get(unwritten.record.id), null);
+    assert.deepEqual(snapshot(f.store), afterCompetitor); assert.equal(f.sent().length, sends);
+  }
 });
 
 import { mkdirSync as rb1Mkdir, renameSync as rb1Rename } from 'node:fs';
