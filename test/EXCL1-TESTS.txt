@@ -32,7 +32,6 @@ om-question-packet.test.ts :: MP3 rows 7, 19 (era): packets, deliveries, continu
 om-question-packet.test.ts :: MP1.1 row 10: two individually proved parts from different brief versions cannot form one producer request or a saved chain # вид 1: эра e88b4ed4
 om-run-part-03.test.ts :: LP4 (№2887 row 10, §6.2, §6.6) the producers 3cba953 and 202c470, each from its whole Git code in its own process, leave the pass on completion_ceased after the roles move — saved as a wait or as the step about to be performed; the new code on a new Store ends the remaining work by cease and G7 without sending the paid need_source again, every saved revision as the old code wrote it # вид 1: эра 202c470, 3cba953
 om-run-part-02.test.ts :: LP4 (№2902, rows 3/4) a saved cycle whose step ceased, while its root also has a direct cause of higher priority (a lawfully replaced B1), is not performed: saved as the step or — by the code 202c470 in its own process — as the wait on completion_ceased, the new code goes back to the choice, which ceases the root by its direct cause, without a stop on completion_ceased and without another send # вид 1: эра 202c470
-om-series-current.test.ts :: B3 whole e1e87e9 producer retains applied series pointers legacy reads and exact repeats # вид 1: эра e1e87e9
 preparation.test.ts :: B1.1 real version 3 producer preserves schemas, accepted stage history and mapDesign validation after restart # вид 1: эра 1189043f
 research.test.ts :: RS2 exact Git ecd00625 producer keeps history and packet bytes and recovers its paid pending read # вид 1: эра ecd00625
 research.test.ts :: RS3 №4414 era: the base engine 8b665772 (from Git, its own process) saved the codex-stdio envelope failure as its terminal research_provider_failed; the new code reads it in its era and DS1 requires upgrade before a new paid generation # вид 1: эра 8b665772
@@ -41,9 +40,7 @@ storage.test.ts :: PF4 (№3523): the engine before PF4 (3e8aa784) opens and wri
 store-view.test.ts :: PF3 row 16: the versions the base code 5929ea25 wrote read cold, warm and after reopen exactly as that code reads them # вид 1: эра 5929ea25
 om-model-call-part-06.test.ts :: LP3 legacy reads-invalid: a context Ref admitted by the old E3 resumes after call or diagnostic without another send # вид 1: старый E3 допускал context Ref в search; только два reads-invalid окна (№6978)
 om-achievements.test.ts :: LP7 rows 23, 24: one answer to the joined input fields proves exactly the LP6 keys the split routing proves by parts, state components included; an answer of some proves only theirs, and their rest is joined again on the next B1 # вид 1, найден GUARD1
-om-series-transition-prepared.test.ts :: the whole b1143aa producer leaves its stopped legacy series and exact B1 horizon bytes unchanged # вид 1, найден GUARD1
 om-spend-report.test.ts :: E6 reads unchanged E1 bytes from the complete 0da9006 producer after restart # вид 1, найден GUARD1
-stage-checks.test.ts :: R2 №2419-5: a compile produced by the code of base 4c2d5b3 in its own process is read by the lower kit as by ProductEngine, and its repeat after a restart writes nothing # вид 1, найден GUARD1
 
 # GS3a: wake-choice supplements exist only for proposals admitted before the wakeTest requirement.
 product.test.ts :: DS1 explicit historical upstream uses its Git producer and leaves current fixtures on the current contract # вид 1: историческая эра (upstream Git producer / v3–v5), найден GUARD1 в финальном прогоне 4ce78bf2
