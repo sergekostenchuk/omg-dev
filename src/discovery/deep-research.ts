@@ -1,7 +1,16 @@
 import { hashJson, type Json } from '../canonical.js';
 import { EngineError } from '../errors.js';
-import { isRef, type Ref } from '../pipeline/contracts.js';
+import { isRef, reference, type Ref } from '../pipeline/contracts.js';
+import { Store, type Revision, type TransactionGuard } from '../storage/store.js';
+import { transactionGuardsCurrent, uniqueTransactionGuards } from '../runtime/environment.js';
+import { readProjectMode } from '../product/project-mode.js';
 import { decodeCoverageCell, type CoverageCell } from './coverage.js';
+import type { DiscoveryDraft } from './discovery.js';
+import { readExact } from './projection-reader.js';
+import { readVariantScope, readCurrentVariantScope, type ProvenVariantScope } from './variant-scope.js';
+import { readVariantSnapshot } from './variant-snapshot.js';
+import { variantSame } from './discovery-variants.js';
+import { currentPlan, provePlanQuestions, type V7PlanQuestion } from './v7-plan-questions.js';
 
 /** DR5 5.2-F (codex-omg №9189, №9615): the closed form and the pure address of
  * the preparation of one deep step — the addressed part of it, not a
@@ -66,4 +75,94 @@ export function projectDeepPreparation(value: unknown):
   { kind: typeof DISCOVERY_DEEP_PREPARATION_KIND; id: string; revision: 1; value: DeepPreparation } {
   const decoded = decodeDeepPreparation(value);
   return { kind: DISCOVERY_DEEP_PREPARATION_KIND, id: deepPreparationId(decoded), revision: 1, value: decoded };
+}
+
+export interface ProvenDeepPreparation {
+  verification: 'proven'; preparation: Revision<DeepPreparation>;
+  scope: ProvenVariantScope; draft: Revision<DiscoveryDraft>; question: V7PlanQuestion;
+}
+export interface CurrentDeepPreparation extends ProvenDeepPreparation { guards: TransactionGuard[] }
+
+function requireStore(store: Store, project: string): void {
+  if (!(store instanceof Store) || typeof project !== 'string' || !project.length)
+    invalid('store', 'A deep preparation requires its Store and project');
+}
+function stale(field: string): never {
+  throw new EngineError('discovery_deep_preparation_stale', 'The deep preparation no longer names the current admission', { field });
+}
+
+/** Common historical proof for both creation and reading; no current head decides its subject. */
+function provePreparation(store: Store, project: string, value: DeepPreparation): Omit<ProvenDeepPreparation, 'preparation'> {
+  if (value.cell.projectId !== project) invalid('cell.projectId', 'The cell belongs to this project');
+  const scope = readVariantScope(store, project, value.scope), selected = scope.scope.value;
+  if (!variantSame(value.cell.variant.set, selected.set)) invalid('cell.variant.set', 'The cell names the scope\'s exact set');
+  if (!variantSame(value.cell.variant.member, selected.member)) invalid('cell.variant.member', 'The cell names the scope\'s chosen exact member');
+  const draft = readExact<DiscoveryDraft>(store, selected.draft);
+  if (!draft || draft.kind !== 'discovery-draft' || draft.value.projectId !== project || hashJson(draft.value) !== draft.hash)
+    invalid('scope.draft', 'The scope retains its exact project draft');
+  const subject = scope.generation.session.value.variantSubject;
+  if (subject.kind !== 'proposal') invalid('scope', 'The selected set comes from a generation');
+  const snapshot = readVariantSnapshot(store, project, subject.snapshot);
+  if (!variantSame(snapshot.value.draft, selected.draft)) invalid('scope.draft', 'Scope and generation share their exact draft');
+  if (!variantSame(snapshot.value.plan, value.cell.subject.planAnswer))
+    invalid('cell.subject.planAnswer', 'The cell names the exact plan of the selected generation');
+  const questions = provePlanQuestions(store, draft, value.cell.subject.planAnswer);
+  const matches = questions.filter(item => item.planQuestionId === value.cell.subject.planQuestionId);
+  if (matches.length !== 1) invalid('cell.subject.planQuestionId', 'The exact accepted plan proves this one question');
+  const question = matches[0]!, body = question.question as Record<string, Json>;
+  for (const field of ['requiredDepth', 'criterion'] as const)
+    if (body[field] !== value.cell[field]) invalid(`cell.${field}`, 'The cell keeps the proven question text verbatim');
+  return { verification: 'proven', scope, draft, question };
+}
+
+/** Exact historical reader. A proven saved preparation never authorizes a new dispatch or reactivates its selection. */
+export function readDeepPreparation(store: Store, project: string, ref: Ref): ProvenDeepPreparation {
+  requireStore(store, project);
+  if (!isRef(ref)) invalid('preparation', 'An exact deep preparation Ref is required');
+  const record = readExact<DeepPreparation>(store, ref);
+  if (!record || record.kind !== DISCOVERY_DEEP_PREPARATION_KIND || record.revision !== 1 || hashJson(record.value) !== record.hash)
+    invalid('preparation', 'The exact immutable deep preparation is missing or substituted');
+  const value = decodeDeepPreparation(record.value);
+  if (record.id !== deepPreparationId(value)) invalid('preparation.id', 'The address is derived from the whole cell and scope');
+  return { ...provePreparation(store, project, value), preparation: record };
+}
+
+function currentGuards(store: Store, project: string, value: DeepPreparation,
+  proof: Omit<ProvenDeepPreparation, 'preparation'>): TransactionGuard[] {
+  const plan = currentPlan(store, project), selected = proof.scope.scope.value;
+  if (!variantSame(reference(plan.draft), reference(proof.draft))) stale('draft');
+  if (!variantSame(plan.planAnswer, value.cell.subject.planAnswer)) stale('plan');
+  const scope = readCurrentVariantScope(store, project, reference(plan.draft));
+  if (!variantSame(reference(scope.scope), value.scope)) stale('scope');
+  const mode = readProjectMode(store, project);
+  if (!variantSame(mode.ref, selected.mode)) stale('mode');
+  const guards = uniqueTransactionGuards([reference(plan.draft), reference(plan.question), plan.planAnswer,
+    value.scope, selected.set, selected.member, selected.decision, reference(scope.state), mode.ref]);
+  if (!transactionGuardsCurrent(store, guards)) stale('guards');
+  return guards;
+}
+
+/** Admission for 5.3: callers supply only the exact Ref, never a trusted body or a substitute guard list.
+ * These mandatory guards must join the managed dispatch transaction. Historical reads alone are insufficient. */
+export function requireCurrentDeepPreparation(store: Store, project: string, ref: Ref): CurrentDeepPreparation {
+  const proof = readDeepPreparation(store, project, ref);
+  const guards = uniqueTransactionGuards([...currentGuards(store, project, proof.preparation.value, proof), ref]);
+  if (!transactionGuardsCurrent(store, guards)) stale('guards');
+  return { ...proof, guards };
+}
+
+/** One immutable preparation of the current exact subject. It neither asserts missing coverage nor buys work.
+ * A repeat checks current admission again; only the separate exact reader can read an old, inactive preparation. */
+export function produceDeepPreparation(store: Store, project: string, input: unknown):
+  { record: Revision<DeepPreparation>; repeated: boolean } {
+  requireStore(store, project);
+  const projected = projectDeepPreparation(input), existing = store.get(projected.id);
+  if (existing) {
+    const proof = requireCurrentDeepPreparation(store, project, reference(existing));
+    return { record: proof.preparation, repeated: true };
+  }
+  const proof = provePreparation(store, project, projected.value);
+  const guards = currentGuards(store, project, projected.value, proof);
+  const record = store.writeMany<DeepPreparation>([{ id: projected.id, kind: projected.kind, expected: 0, value: projected.value }], guards)[0]!;
+  return { record, repeated: false };
 }
