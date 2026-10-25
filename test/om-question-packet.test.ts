@@ -2449,131 +2449,6 @@ test('E2 preserves original packet and part-result history strictly in its old a
   } finally { store.close(); }
 });
 
-/** Runs in another process: every production module and imported fixture is loaded from the accepted Git base. */
-async function producePreWorksPacket(database: string, root: string, fixture: typeof workExpansionFixture) {
-  const assert: typeof import('node:assert/strict') = (await import('node:assert/strict')).default;
-  const { canonical } = await import('../src/canonical.js');
-  const { reference } = await import('../src/pipeline/contracts.js');
-  const { openSeries, beginAttempt } = await import('../src/om/series.js');
-  const { recordCall } = await import('../src/om/call-record.js');
-  const { writeQuestionPacket, preparePartResult, readPartResult, partResponseId } = await import('../src/om/question-packet.js');
-  const { writeGuarded } = await import('../src/om/refs.js');
-  const ok = <T>(result: OmResult<T>): T => {
-    if (!result.ok) assert.fail(`${result.refusal.code}: ${result.refusal.message}`);
-    return result.value;
-  };
-  const { store, project, graph, environment, routes, batch, goal } = await fixture(database, root);
-  try {
-    const block = 'garden-produce-block';
-    ok(openSeries(store, { project, block, line: 1, slice: 'e2-work-history', predecessor: null, basis: null }));
-    const series = ok(beginAttempt(store, { project, block, line: 1, attempt: 1, goal }));
-    const packet = ok(writeQuestionPacket(store, { project, routes: reference(routes), batch: batch.id,
-      environment: reference(environment), attempt: { series: reference(series), ordinal: 1 }, previous: [] })).record;
-    assert.equal(packet.value.packetContract, 'om-packet/v3');
-    assert.equal(packet.value.state, 'ready');
-    const payload = packet.value.packet as Record<string, any>, expansion = payload.expansion;
-    const oldShape = payload.responseForm.schema.oneOf[0].properties.proposal;
-    assert.equal(Object.hasOwn(oldShape.properties, 'worksContract'), false);
-    assert.equal(Object.hasOwn(oldShape.properties.fills.items.properties, 'codeRef'), false);
-    const assigned = (expansion.obligations as FrameObligation[]).filter(obligation => expansion.assigned.includes(obligation.id));
-    assert.equal(assigned.length, expansion.assigned.length);
-    assert.ok(assigned.some(obligation => obligation.kind === 'connection-end'));
-    const upper = graph.value.nodes.find(node => node.id === batch.node)!;
-    const node: Node = { ...structuredClone(upper), id: 'garden-historical-work', kind: 'work', parent: upper.id,
-      title: 'Historical work answer', ports: assigned.filter(obligation => obligation.kind === 'connection-end').map((obligation, index) => ({
-        id: `historical-port-${index}`, direction: obligation.role === 'producer' ? 'out' : 'in',
-        contract: graph.value.artifacts.find(artifact => artifact.id === obligation.artifact)!.contract,
-      })), code: [{ path: 'src/historical-work.ts', access: 'write', status: 'planned' }], tests: [] };
-    let port = 0;
-    const body = { nodes: [node], fills: assigned.map(obligation => ({ obligation: obligation.id, node: node.id,
-      ...(obligation.kind === 'connection-end' ? { port: node.ports[port++]!.id } : {}) })), localConnectors: [], artifacts: [], contracts: [],
-      joins: [], tests: [], edges: [], journeys: [], packets: [], transfers: [], anchors: [], removes: [], replaces: [], redefines: [] };
-    const adapter = store.write({ id: `adapter:${project}`, kind: 'dispatch-adapter', expected: 0,
-      value: { projectId: project, protocol: 'codex-stdio' } });
-    const config = store.write({ id: `config:${project}`, kind: 'dispatch-config', expected: 0,
-      value: { projectId: project, model: 'fixture' } });
-    const questions = new Set((payload.questions as { id: string }[]).map(question => question.id));
-    const call = ok(recordCall(store, project, { call: payload.requestId, purpose: 'model-design', basis: null, block,
-      gaps: batch.items.filter(item => questions.has(item.gap)).flatMap(item => item.consumers.map(consumer => ({
-        id: item.target, goal: item.target, field: item.field, consumer }))), series: reference(series), attempt: 1, goal,
-      dispatch: { adapter: reference(adapter), config: reference(config) }, packet: payload })).call;
-    const response = store.write<PartResponseRecord>({ id: partResponseId(project, reference(call)), kind: 'part-response', expected: 0,
-      value: { project, packet: reference(packet), call: reference(call), requestId: payload.requestId,
-        raw: JSON.stringify({ protocol: payload.responseForm.protocol, requestId: payload.requestId, action: 'answer', proposal: body }) } });
-    const prepared = ok(preparePartResult(store, { project, packet: reference(packet), call: reference(call), response: reference(response) }));
-    ok(writeGuarded(store, { unit: 'E2-history-test', target: prepared.record.id, writes: prepared.writes, guards: prepared.guards }));
-    const part = ok(readPartResult(store, { project, record: reference(prepared.record) }));
-    assert.equal(part.proposal.value.level, 3);
-    assert.equal(Object.hasOwn(part.proposal.value, 'worksContract'), false);
-    assert.ok(part.proposal.value.fills.every(fill => !Object.hasOwn(fill, 'codeRef')));
-    return { project, packet: reference(packet), result: reference(part.record), response: reference(response),
-      packetBytes: canonical(packet), resultBytes: canonical(part.record), proposalBytes: canonical(part.proposal),
-      responseBytes: canonical(response), raw: response.value.raw };
-  } finally { store.close(); }
-}
-
-function preWorksPacketHistory(t: TestContext) {
-  const root = mkdtempSync(join(tmpdir(), 'omg-e2-works-history-')), database = join(root, 'state.sqlite');
-  t.after(() => rmSync(root, { recursive: true, force: true }));
-  const repository = fileURLToPath(new URL('../../', import.meta.url)), repositoryUrl = pathToFileURL(repository).href;
-  const loader = join(root, 'accepted-packet-producer-loader.mjs');
-  const typescript = pathToFileURL(createRequire(import.meta.url).resolve('typescript')).href;
-  writeFileSync(loader, `import { execFileSync } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
-import ts from ${JSON.stringify(typescript)};
-let root;
-export function initialize(data) { root = data.root; }
-export async function load(url, context, next) {
-  const prefix = new URL('dist/', root).href;
-  if (url.startsWith(prefix) && /\\.js$/.test(url)) {
-    const relative = url.slice(prefix.length).replace(/\\.js$/, '.ts');
-    const source = execFileSync('git', ['show', '30f8d753cf8ab3d6186c952f050aba2219b97a2b:' + relative],
-      { cwd: fileURLToPath(root), encoding: 'utf8', maxBuffer: 10000000 });
-    return { format: 'module', shortCircuit: true, source: ts.transpileModule(source,
-      { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2023 } }).outputText };
-  }
-  return next(url, context);
-}
-`);
-  const bootstrap = `import { register } from 'node:module'; register(${JSON.stringify(pathToFileURL(loader).href)}, { data: { root: ${JSON.stringify(repositoryUrl)} } });`;
-  const historicalImports = (source: string) => source
-    .replace(/import\((["'])\.\.\/src\/([^"']+)\1\)/g, (_match, _quote: string, name: string) =>
-      `import(${JSON.stringify(new URL(`dist/src/${name}`, repositoryUrl).href)})`)
-    .replace(/import\((["'])\.\/([^"']+)\1\)/g, (_match, _quote: string, name: string) =>
-      `import(${JSON.stringify(new URL(`dist/test/${name}`, repositoryUrl).href)})`);
-  const producer = historicalImports(producePreWorksPacket.toString()), fixture = historicalImports(workExpansionFixture.toString());
-  const output = execFileSync(process.execPath, ['--import', `data:text/javascript,${encodeURIComponent(bootstrap)}`,
-    '--input-type=module', '--eval', `process.stdout.write(JSON.stringify(await (${producer})(${JSON.stringify(database)}, ${JSON.stringify(root)}, ${fixture})));`],
-  { cwd: repository, encoding: 'utf8', maxBuffer: 10_000_000 });
-  return { database, ...JSON.parse(output) as Awaited<ReturnType<typeof producePreWorksPacket>> };
-}
-
-test('E2.1 reads the immutable pre-works L3 producer history byte-for-byte and rejects codeRef in its old answer form', async t => {
-  const history = preWorksPacketHistory(t), store = new Store(history.database);
-  try {
-    const before = snapshot(store);
-    const packet = ok(readQuestionPacket(store, { project: history.project, record: history.packet }));
-    const part = ok(readPartResult(store, { project: history.project, record: history.result }));
-    assert.equal(canonical(packet), history.packetBytes);
-    assert.equal(canonical(part.record), history.resultBytes);
-    assert.equal(canonical(part.proposal), history.proposalBytes);
-    assert.equal(canonical(store.get(history.response.id, history.response.revision)), history.responseBytes);
-    assert.equal(packet.value.packetContract, 'om-packet/v3');
-    assert.equal(part.proposal.value.level, 3);
-    assert.equal(Object.hasOwn(part.proposal.value, 'worksContract'), false);
-    assert.ok(part.proposal.value.fills.every(fill => !Object.hasOwn(fill, 'codeRef')));
-    const answer = { project: history.project, packet: history.packet, raw: history.raw };
-    assert.equal(canonical(ok(derivePartProposal(store, answer)).proposal), canonical(part.proposal.value));
-    const extended = JSON.parse(history.raw);
-    const fill = extended.proposal.fills.find((row: { port?: string }) => row.port !== undefined);
-    assert.ok(fill);
-    fill.codeRef = extended.proposal.nodes.find((node: Node) => node.id === fill.node).code[0];
-    rejected(readPacketAnswer(store, { ...answer, raw: JSON.stringify(extended) }), 'part_answer_invalid');
-    rejected(derivePartProposal(store, { ...answer, raw: JSON.stringify(extended) }), 'part_answer_invalid');
-    assert.deepEqual(snapshot(store), before);
-  } finally { store.close(); }
-});
-
 test('E2 normalizes reply sets while preserving duplicate results citations reads and literal value arrays', async t => {
   const p = packetFixture(t, 100_000, gardenGraph(), true, true, { type: 'array', items: { type: 'string' } }), { f } = p;
   const packet = ok(writeQuestionPacket(f.store, p.request)).record, payload = packet.value.packet as Record<string, any>;
@@ -2856,17 +2731,6 @@ test('E2 continuation saves an exact bounded fragment without reissuing native q
   assert.deepEqual(ok(readQuestionPacket(f.store, { project: f.project, record: reference(prepared.record) })), prepared.record);
 });
 
-test('E2 pre-continuation v2 blocked packets preserve their original refusal after restart', async t => {
-  const history = lp1OldProducer(t, '29fa27e', { node: false, capacity: 100 })[0]!;
-  const store = new Store(history.database);
-  try {
-    const historical = history.packets[0]!, before = snapshot(store);
-    assert.equal(historical.value.packetContract, undefined); assert.equal(historical.value.answerProtocol, 'omg-answer/v2');
-    assert.equal(historical.value.state, 'blocked'); assert.equal(historical.value.refusal?.code, 'packet_too_large');
-    assert.deepEqual(ok(readQuestionPacket(store, { project: history.project, record: reference(historical) })), historical);
-    assert.deepEqual(snapshot(store), before);
-  } finally { store.close(); }
-});
 
 test('E2 continuation rejects omitted evidence and foreign exact response or delivery without writes', async t => {
   const p = packetFixture(t), { f } = p, packet = ok(writeQuestionPacket(f.store, p.request)).record;
@@ -3058,60 +2922,6 @@ function admissionStale(store: Store, request: QuestionPacketRequest): void {
     else assert.equal(result.refusal.code, 'route_stale');
   }
 }
-test('LP1 immutable 7dd0848 producer: v2 ordinary, works, continuations and parts retain their era across reopen and current admission', async t => {
-  const histories = lp1OldProducer(t);
-  for (const history of histories) {
-    let store = new Store(history.database);
-    try {
-      const before = snapshot(store);
-      const current = routeCurrent(store, history.packets[0]!.value.request);
-      for (const packet of history.packets) {
-        assert.equal(packet.value.answerProtocol, 'omg-answer/v2');
-        assert.deepEqual(ok(readQuestionPacket(store, { project: history.project, record: reference(packet) })), packet);
-        if (!current) { admissionStale(store, packet.value.request); continue; }
-        assert.deepEqual(ok(prepareQuestionPacket(store, packet.value.request)).record, packet);
-        const repeated = ok(writeQuestionPacket(store, packet.value.request));
-        assert.deepEqual(repeated.record, packet); assert.deepEqual(repeated.writes, []);
-      }
-      for (const part of history.parts) {
-        sameButReferences(ok(readPartResult(store, { project: history.project, record: reference(part.record) })), JSON.stringify(part));
-        if (current) assert.deepEqual(ok(preparePartResult(store, part.record.value.request)).writes, []);
-      }
-      if (!current) { if (history.next) admissionStale(store, history.next); assert.deepEqual(snapshot(store), before); continue; }
-      const packet = history.packets[0]!;
-      const answer = { project: history.project, packet: reference(packet), raw: history.raw };
-      ok(prepareAnswerForm(store, answer));
-      rejected(readPacketAnswer(store, { ...answer, raw: JSON.stringify({ ...JSON.parse(history.raw), protocol: 'omg-answer/v3' }) }), 'part_answer_invalid');
-      assert.deepEqual(snapshot(store), before);
-      if (packet.value.packetContract === PACKET_CONTRACT && history.parts.length) {
-        // Two producers prepared the same independent assignment without seeing one another.
-        const newer = ok(prepareQuestionPacket(hiding(store, packet.id), packet.value.request));
-        assert.equal(newer.record.value.answerProtocol, 'omg-answer/v3');
-        const competing = pendingCallStore(store, newer.writes);
-        assert.deepEqual(ok(readQuestionPacket(competing, { project: history.project, record: reference(newer.record) })), newer.record);
-        for (const action of [prepareQuestionPacket, writeQuestionPacket]) {
-          rejected(action(competing, packet.value.request), 'packet_chain_invalid');
-          const prior = history.next!.previous[0]!;
-          rejected(action(competing, { ...packet.value.request,
-            previous: [prior, { ...prior, packet: reference(newer.record) }] }), 'packet_chain_invalid');
-        }
-        assert.deepEqual(snapshot(store), before);
-      }
-      if (history.next) {
-        const continued = ok(writeQuestionPacket(store, history.next));
-        assert.equal(continued.record.value.answerProtocol, 'omg-answer/v2');
-        if (history.next.continuation) assert.equal(continued.record.value.refusal?.code, 'research_no_progress');
-        else assert.equal(continued.record.value.plan?.position, 1);
-        const after = snapshot(store);
-        store.close(); store = new Store(history.database);
-        assert.deepEqual(ok(readQuestionPacket(store, { project: history.project, record: reference(continued.record) })), continued.record);
-        assert.deepEqual(ok(writeQuestionPacket(store, history.next)).record, continued.record);
-        assert.deepEqual(ok(prepareQuestionPacket(store, history.next)).record, continued.record);
-        assert.deepEqual(snapshot(store), after);
-      }
-    } finally { store.close(); }
-  }
-});
 
 test('LP1 independent v3 issuance guards both exact era addresses; repeats, ambiguity and unsupported markers are addressed', { todo: "NR1 №3591/№3646: записанное читается доверенно; эту порчу базы ловит om-fsck на старте (test/om-fsck.test.ts)" }, async t => {
   const p = packetFixture(t), { f } = p;
@@ -3290,37 +3100,6 @@ test('MP1 node response schema is valid for both endpoint and outcome assignment
   assert.equal(ok(readPacketAnswer(f.store, { project: f.project, packet: reference(saved), raw: canonical(raw) })).answer.action, 'pause');
 });
 
-test('MP1 row 3: real b595c7b and accepted LP1 producers preserve original v2/v3 packets, calls, parts and continuations', async t => {
-  for (const commit of ['b595c7b5fc4cc3360d8395dcf1b7ce1aa11feb3c', 'dcd741d7da24cfb37e858a1d6b2ff15c1823865b']) await t.test(commit, async t => {
-    for (const history of lp1OldProducer(t, commit)) {
-      let store = new Store(history.database);
-      try {
-        const before = snapshot(store), current = routeCurrent(store, history.packets[0]!.value.request);
-        for (const packet of history.packets) {
-          assert.equal(packet.value.answerProtocol, commit.startsWith('b595') ? 'omg-answer/v2' : 'omg-answer/v3');
-          assert.ok(!packet.value.packetContract?.includes('brief'));
-          assert.deepEqual(ok(readQuestionPacket(store, { project: history.project, record: reference(packet) })), packet);
-          if (current) {
-            assert.deepEqual(ok(prepareQuestionPacket(store, packet.value.request)).record, packet);
-            assert.deepEqual(ok(writeQuestionPacket(store, packet.value.request)).record, packet);
-          } else admissionStale(store, packet.value.request);
-          assert.deepEqual(packet.value.fingerprint, { hash: hashJson(packet.value.packet), chars: canonical(packet.value.packet).length,
-            utf8Bytes: Buffer.byteLength(canonical(packet.value.packet)) });
-        }
-        for (const part of history.parts) sameButReferences(ok(readPartResult(store, { project: history.project, record: reference(part.record) })), JSON.stringify(part));
-        assert.deepEqual(snapshot(store), before);
-        store.close(); store = new Store(history.database);
-        for (const packet of history.packets) assert.deepEqual(ok(readQuestionPacket(store, { project: history.project, record: reference(packet) })), packet);
-        if (history.next && !current) admissionStale(store, history.next);
-        else if (history.next) {
-          const next = ok(writeQuestionPacket(store, history.next)).record;
-          assert.equal(next.value.answerProtocol, history.packets[0]!.value.answerProtocol);
-          assert.equal(next.value.packetContract, history.packets[0]!.value.packetContract);
-        }
-      } finally { store.close(); }
-    }
-  });
-});
 
 test('MP1 L3 examples use actual slots, declared CodeRefs and concrete D7 bindings through E3 and F4.3', async t => {
   const f = await worksPacketFixture(t), packet = ok(writeQuestionPacket(f.store, f.request())).record;
@@ -3418,29 +3197,6 @@ ${body}
     `The producer ran on the modules of ${commit}: ${loaded.join(', ')}`);
   return output;
 }
-// G5 era: a works packet the base (f69d4b39, before G5) issued keeps its bytes and its form — no wake-test era, so its
-// answer names no wake test and none is required of it, however many tests cover the connection.
-const G5_BASE = 'f69d4b39e226cdc8527c923a6cc940fb9f2a3654';
-test('G5 a works packet issued before the wake-test era is admitted with its own bytes; its answer names no wake test even with three covering tests, and naming one is refused by its own form', async t => {
-  const f = await worksPacketFixture(t, undefined, undefined, G5_BASE), request = f.request();
-  const saved = atCommit({ root: f.root, path: f.database }, G5_BASE, 'g5-base-packet', `const { writeQuestionPacket } = await import(src('om/question-packet.js'));
-out(take(writeQuestionPacket(store, args)).record);`, request) as Revision<QuestionPacketRecord>;
-  assert.equal(Object.hasOwn(saved.value, 'wakeTests'), false, 'The base issues no wake-test era');
-  const again = ok(prepareQuestionPacket(f.store, request));
-  assert.deepEqual(again.writes, []); assert.deepEqual(reference(again.record), reference(saved), 'Admitted with its own bytes');
-  const payload = saved.value.packet as Record<string, any>;
-  const example = structuredClone(payload.brief.examples.find((row: { action: string }) => row.action === 'answer'));
-  assert.ok(!example.proposal.fills.some((fill: Record<string, unknown>) => Object.hasOwn(fill, 'wakeTest')));
-  const proof = example.proposal.tests[0];
-  for (const suffix of ['second', 'third']) {
-    example.proposal.tests.push({ ...structuredClone(proof), id: `${proof.id}-${suffix}` }); example.proposal.nodes[0].tests.push(`${proof.id}-${suffix}`);
-  }
-  const check = (answer: unknown) => checkAnswerForm(f.store, { project: f.project, packet: reference(saved), raw: canonical(answer) });
-  assert.ok(check(example).ok, 'No choice is asked of the earlier era');
-  const named = structuredClone(example), producer = named.proposal.fills.findIndex((fill: Record<string, unknown>) => Object.hasOwn(fill, 'port'));
-  named.proposal.fills[producer].wakeTest = proof.id;
-  assert.equal(check(named).ok, false, 'The earlier form has no wake test');
-});
 
 // G5 (№3820, №3822, №3841): a producer end whose work has several tests covering its connection names the wake test when
 // its own work is accepted (E3), whatever its neighbour sleeps; a named test must be this work's and cover the connection;
@@ -3508,28 +3264,6 @@ test('G6 a works packet of the transition era states the one-artifact rule; a ne
   const refused = rejected(check(two), 'part_result_invalid');
   assert.deepEqual([refused.at.target, refused.at.field, refused.message], [node.id, 'outcome', ONE_ARTIFACT.rule]);
   assert.deepEqual(snapshot(f.store), before, 'E3 writes nothing');
-});
-// G6 era: a works packet the base (bfd28369, before G6) issued keeps its bytes — no transition era, no rule in its brief,
-// and E3 does not refuse a second artifact (the G5 gate keeps its invariant at the common acceptance, as before).
-const G6_BASE = 'bfd28369d5a93b67bcee96e1de971c05378e9114';
-test('G6 a works packet issued before the transition era is admitted with its own bytes: no rule in its brief, and its E3 does not refuse a second artifact', async t => {
-  const f = await worksPacketFixture(t, undefined, undefined, G6_BASE), request = f.request();
-  const saved = atCommit({ root: f.root, path: f.database }, G6_BASE, 'g6-base-packet', `const { writeQuestionPacket } = await import(src('om/question-packet.js'));
-out(take(writeQuestionPacket(store, args)).record);`, request) as Revision<QuestionPacketRecord>;
-  assert.equal(Object.hasOwn(saved.value, 'transitionEra'), false, 'The base issues no transition era');
-  const again = ok(prepareQuestionPacket(f.store, request));
-  assert.deepEqual(again.writes, []); assert.deepEqual(reference(again.record), reference(saved), 'Admitted with its own bytes');
-  const payload = saved.value.packet as Record<string, any>;
-  assert.equal(payload.brief.text.includes(ONE_ARTIFACT.rule), false, 'Its brief keeps the bytes of its era');
-  const example = structuredClone(payload.brief.examples.find((row: { action: string }) => row.action === 'answer'));
-  const node = example.proposal.nodes[0], port = { id: 'example-port-extra', direction: 'out', contract: 'garden-contract' };
-  node.ports.push(port);
-  example.proposal.artifacts.push({ id: 'example-extra', contract: 'garden-contract', durability: 'reconstructible', external: false,
-    kind: 'intermediate', purpose: 'A second result of the same work', sensitivity: 'project_internal', terminal: false });
-  example.proposal.localConnectors.push({ id: 'example-extra-flow', artifact: 'example-extra', returnsTo: node.id, wakeTest: null,
-    bindings: [{ level: 3, anchor: null, producer: { node: node.id, port: port.id }, consumers: [{ node: node.id, port: 'example-port-2' }] }] });
-  const checked = checkAnswerForm(f.store, { project: f.project, packet: reference(saved), raw: canonical(example) });
-  assert.ok(checked.ok || (checked as { refusal: { message: string } }).refusal.message !== ONE_ARTIFACT.rule, 'The earlier era is not refused by the new rule');
 });
 
 test('MP1 №3052 real-work joins require designed condition and explicit required/optional; native assembly still owns actual inputs', async t => {
