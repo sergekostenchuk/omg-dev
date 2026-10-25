@@ -35,7 +35,8 @@ import { normalizeOwnerGapAssignment, OM_OWNER_ASSIGNMENT_CONTRACT, OM_OWNER_ASS
 import { writeQuestionPacket, type PartProposalBody } from '../src/om/question-packet.js';
 import type { OmResult } from '../src/om/refusal.js';
 import { writeRoutes } from '../src/om/routes.js';
-import { openSeries, beginAttempt } from '../src/om/series.js';
+import { openSeries, readCompletionBinding } from '../src/om/series.js';
+import { openAttempt } from '../src/om/repeat-gate.js';
 import { readWorksFrame } from '../src/om/works-frame.js';
 
 const clone = structuredClone;
@@ -149,13 +150,18 @@ async function lateObligationsFixture(t: TestContext) {
     value: { projectId: project, protocol: 'codex-stdio' } });
   const block = 'garden-consume-block'; assert.ok(batch.items.every(item => item.consumers.includes(block)));
   ok(openSeries(store, { project, block, line: 1, slice: 'g2-work', predecessor: null, basis: null }));
-  const series = ok(beginAttempt(store, { project, block, line: 1, attempt: 1,
+  // The attempt is the current managed opening on the exact plan of this fixture's own routes and node-expansion batch.
+  const completion = { routes: reference(routes), batches: [batch.id] };
+  const series = ok(openAttempt(store, { project, block, line: 1, attempt: 1,
     goal: { key: 'g2-work', questions: batch.items.map(item => gapLineKey(project, item.target, item.field)),
-      result: gapLineExpectedResult(project, batch.items[0]!.target, batch.items[0]!.field) } }));
+      result: gapLineExpectedResult(project, batch.items[0]!.target, batch.items[0]!.field) }, completion }));
+  const binding = ok(readCompletionBinding(store, project, reference(series), 1));
+  assert.ok(binding); assert.deepEqual(binding.value.plan, completion);
   const packet = ok(writeQuestionPacket(store, { project, routes: reference(routes), batch: batch.id, environment: reference(environment),
     attempt: { series: reference(series), ordinal: 1 }, previous: [],
     works: { producer: reference(initialHandoff.producer), ledger: reference(initialHandoff.record) } })).record;
   assert.equal(packet.value.state, 'ready'); assert.equal(packet.value.plan!.mode, 'whole');
+  assert.deepEqual(packet.value.request.attempt, { series: reference(series), ordinal: 1 });
   const payload = packet.value.packet as unknown as { expansion: { assigned: string[];
     obligations: { id: string; kind: string; upper: { port?: string } }[] }; works: { assigned: string[] } };
   assert.deepEqual([...payload.works.assigned].sort(), initialObligations.map(taskBindingId).sort());
