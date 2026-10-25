@@ -1,5 +1,5 @@
 import { assessmentRolePrompt } from './assessment-session.js';
-import { packetAssessmentSubject, packetPlanSubject, assessmentQuestionContract, assessmentTransportPrompt, assessmentResponseContract, type AssessmentTransportSubject } from './continuation-packet.js';
+import { DOSSIER_TRANSPORT_DELIVERY, packetDossierSubject, requireDossierSubjectBinding, requireDossierTransportContext, packetAssessmentSubject, packetPlanSubject, assessmentQuestionContract, assessmentTransportPrompt, assessmentResponseContract, type AssessmentTransportSubject } from './continuation-packet.js';
 import { buildResearchResultCapacity, requireResearchResultCapacity, measureResearchResult,
   type ResearchResultCapacity, type ResearchResultCapacityInput } from './research-delivery.js';
 import type { Environment, RoleBinding } from '../runtime/environment.js';
@@ -215,6 +215,23 @@ export function researchCapacityInput(input: {
   cursor?: Record<string, unknown>;
 }): ResearchResultCapacityInput {
   const c = input.context;
+  const dossierSubject = requireDossierTransportContext(c, input.purpose === 'dossier-assessor');
+  if (dossierSubject) {
+    requireDossierSubjectBinding(input.bindings, dossierSubject);
+    requireCondition(input.role === 'assessor' && input.purpose === 'dossier-assessor'
+      && dossierSubject.projectId === input.draft.projectId,
+    'discovery_dossier_transport_invalid', 'Capacity must bind this separate exact dossier subject');
+    return { operation: input.operation, generation: input.generation, bindings: input.bindings,
+      role: input.role, purpose: input.purpose, actionMode: 'dossier-preflight', envelopeLimitChars: input.limit,
+      mandatoryEnvelope: { protocol:'omg-agent/v1', mode:'research', model:input.binding.model,
+        effort:input.binding.effort, prompt:input.prompt,
+        subject: { dossierSubject, purpose:input.purpose,
+          assessmentDelivery: DOSSIER_TRANSPORT_DELIVERY,
+          responseOutputLimit: researchResponseOutputLimit(input.physicalReplyLimit ?? null) } },
+      forms: [{kind:'read_context'}] };
+  }
+  requireCondition(!packetDossierSubject(input.bindings), 'discovery_dossier_transport_invalid',
+    'Capacity cannot drop its dossier subject');
   const assessmentSubject = packetAssessmentSubject(c);
   if (assessmentSubject) {
     requireCondition(input.role === 'assessor' && input.purpose === 'assessor'

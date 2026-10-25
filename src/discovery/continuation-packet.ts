@@ -1,3 +1,5 @@
+import { requireDossierAssessmentSubject, requireDossierAssessmentPacket } from './dossier-assessment.js';
+import { DOSSIER_ASSESSMENT_SUBJECT_CONTRACT, type DossierAssessmentSubject } from './research-model.js';
 import { deepIdentityCalls } from './invocation-progress.js';
 import { ASSESSMENT_METHODOLOGY_CONTRACT, ASSESSMENT_METHODOLOGY_POLICY, ASSESSMENT_METHODOLOGY_POLICY_V2, type MethodologyPolicy } from './assessment-methodology.js';
 import { DISCOVERY_ASSESSMENT_CONTRACT_V2, DISCOVERY_ASSESSMENT_CONTRACT_V3 } from './research-model.js';
@@ -79,6 +81,78 @@ export function assessmentSubjectKey(subject: AssessmentTransportSubject | null)
 }
 export function sameAssessmentSubject(a: unknown, b: unknown): boolean {
   return canonical(packetAssessmentSubject(a)) === canonical(packetAssessmentSubject(b));
+}
+
+/** Dossier is a separate, versioned subject. Decoding selects a branch; only
+ * the async accepted reader below proves its complete historical material. */
+export const DOSSIER_TRANSPORT_DELIVERY = { contract:'dossier-assessment-transport/v1', dispatch:'unavailable',
+  instruction:'Read the complete exact dossier before assessment; managed dossier assessment is not connected.' } as const;
+export function packetDossierSubject(container: unknown): DossierAssessmentSubject | null {
+  if (!container || typeof container !== 'object') return null;
+  const body = container as Record<string, any>;
+  if (!Object.hasOwn(body, 'dossierSubject')) {
+    requireCondition(!Object.hasOwn(body, 'dossierPacket'), 'discovery_dossier_transport_invalid',
+      'Dossier material cannot lose its explicit subject');
+    return null;
+  }
+  const subject = body.dossierSubject;
+  requireCondition(subject && typeof subject === 'object' && !Array.isArray(subject)
+    && subject.contract === DOSSIER_ASSESSMENT_SUBJECT_CONTRACT && subject.kind === 'dossier'
+    && typeof subject.identity === 'string' && typeof subject.projectId === 'string'
+    && subject.root && ['selected','partial'].includes(subject.root.kind)
+    && isRef(subject.root.ref) && isRef(subject.manifest),
+  'discovery_dossier_transport_invalid', 'A dossier needs its complete known subject');
+  return subject;
+}
+export function requireDossierTransportContext(container: unknown, required = false) {
+  const subject = packetDossierSubject(container);
+  requireCondition(!required || subject, 'discovery_dossier_transport_invalid', 'The dossier subject is required');
+  if (subject) {
+    const body = container as Record<string, unknown>;
+    requireCondition((!Object.hasOwn(body,'purpose') || body.purpose === 'dossier-assessor')
+      && (!Object.hasOwn(body,'role') || body.role === 'assessor' || body.role === 'dossier-assessor'),
+    'discovery_dossier_transport_invalid', 'Dossier context cannot declare another transport role');
+    requireCondition(!Object.hasOwn(body,'assessmentDelivery')
+      || canonical(body.assessmentDelivery) === canonical(DOSSIER_TRANSPORT_DELIVERY),
+    'discovery_dossier_transport_invalid', 'The dossier delivery contract cannot be substituted');
+    requireCondition(!['subject','assessmentSubject','variantSubject','deepPreparation','deepCell','deepScope',
+      'assessmentSession','assessmentState','question','questions','responseContract','dispatchMode',
+      'contextControls','synthesisSession'].some(key => Object.hasOwn(body, key)),
+    'discovery_dossier_transport_invalid', 'A dossier cannot mix another subject or its response contract');
+  }
+  return subject;
+}
+export function requireDossierSubjectBinding(bindings: unknown, subject: DossierAssessmentSubject) {
+  requireCondition(canonical(packetDossierSubject(bindings)) === canonical(subject)
+    && !['subject','assessmentSubject','variantSubject','deepPreparation','deepCell','deepScope'].some(key =>
+      Object.hasOwn(bindings as object ?? {},key)),
+  'discovery_dossier_transport_invalid', 'Capacity must bind this separate exact dossier subject');
+}
+export async function proveDossierTransportContext(store: Store, project: string, container: unknown) {
+  const subject = requireDossierTransportContext(container, true)!;
+  const packet = Object.hasOwn(container as object, 'dossierPacket')
+    ? await requireDossierAssessmentPacket(store, project, (container as any).dossierPacket)
+    : await requireDossierAssessmentSubject(store, project, subject);
+  requireCondition(canonical(packet.subject) === canonical(subject), 'discovery_dossier_transport_invalid',
+    'Dossier subject and material must name the same exact snapshot');
+  return packet;
+}
+
+/** Rebuild the complete dossier proof before accepting a serialized archive. */
+export async function requireDossierTransportArchive(store: Store, project: string, ref: Ref, subject: unknown) {
+  const row = isRef(ref) ? store.get<any>(ref.id, ref.revision) : null;
+  requireCondition(row?.kind === 'research-context' && row.revision === 1
+    && row.hash === ref.hash && hashJson(row.value) === ref.hash && row.id === `research-context:${row.hash}`
+    && row.value.projectId === project, 'discovery_dossier_transport_invalid', 'The exact dossier archive is missing or substituted');
+  const body = readArchiveBody(store, row).body;
+  const packet = await proveDossierTransportContext(store, project, body);
+  requireDossierSubjectBinding((body.resultCapacity as any)?.bindings, packet.subject);
+  requireCondition(canonical(packet.subject) === canonical(subject)
+    && row.value.draft?.id === packet.basis.draft.ref.id
+    && (body.resultCapacity as any)?.purpose === 'dossier-assessor'
+    && (body.resultCapacity as any)?.operation === packet.subject.identity,
+  'discovery_dossier_transport_invalid', 'The archive and capacity must bind this exact dossier');
+  return packet;
 }
 
 /** 4T.2-T transports identity only. These checks do not prove a snapshot,

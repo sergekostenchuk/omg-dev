@@ -1,3 +1,6 @@
+import { packetDossierSubject, requireDossierTransportContext } from './continuation-packet.js';
+import { prepareDossierContextPacker } from './working-context.js';
+import { researchCapacityInput, resultCapacityFrom, requireResultCapacity, researchResultEnvelopeLimit } from './early-research-outcome.js';
 import { baselineGuards } from './v7-attempt-assessment.js';
 import { planSubjectOf, sameSubject, type V7PlanSubject } from './v7-managed-attempt.js';
 import { assessmentRolePrompt, readAssessmentDispatchAdmission } from './assessment-session.js';
@@ -210,6 +213,45 @@ export function prepareResearchEnvelope(role: RoleBinding, environment: Environm
   context: unknown, audit?: Pick<ResearchCallAudit, 'store' | 'draftId' | 'questionId' | 'purpose' | 'pilot' | 'contextContract'>,
   capacity?: Record<string, any>, requestId = '00000000-0000-0000-0000-000000000000',
   requestContract?: string) {
+  requireCondition(!packetDossierSubject(context) && !packetDossierSubject(capacity?.bindings)
+    && audit?.purpose !== 'dossier-assessor', 'discovery_dossier_transport_invalid',
+  'A dossier needs the asynchronous envelope preflight');
+  return buildResearchEnvelope(role, environment, prompt, context, audit, capacity, requestId, requestContract);
+}
+
+/** Callable dossier preflight: accepted async proof, ordinary capacity arithmetic,
+ * and the same measured wire builder and addressed material delivery. */
+export async function prepareDossierResearchEnvelope(role: RoleBinding, environment: Environment, prompt: string,
+  context: unknown, audit: Pick<ResearchCallAudit, 'store' | 'draftId' | 'questionId' | 'purpose'>,
+  capacity?: Record<string, any>, requestId = '00000000-0000-0000-0000-000000000000') {
+  requireCondition(audit?.store && audit.purpose === 'dossier-assessor' && audit.questionId,
+    'discovery_dossier_transport_invalid', 'Dossier preflight needs its explicitly separate audited purpose');
+  const prepared = await prepareDossierContextPacker(audit.store, environment.projectId, context);
+  const draft = audit.store.get<DiscoveryDraft>(audit.draftId), question = audit.store.get<Question>(audit.questionId);
+  requireCondition(draft?.kind === 'discovery-draft' && question?.kind === 'question'
+    && draft.value.projectId === environment.projectId && question.value.projectId === environment.projectId
+    && question.value.draftId === draft.id && draft.value.questions.includes(question.id)
+    && prepared.packet.basis.draft.ref.id === draft.id,
+  'discovery_dossier_transport_invalid', 'Dossier preflight must retain its project and draft basis');
+  const input = researchCapacityInput({ operation:prepared.packet.subject.identity, generation:0,
+    bindings: { projectId:environment.projectId, draft:reference(draft), question:reference(question),
+      dossierSubject:prepared.packet.subject }, role:'assessor', purpose:'dossier-assessor', actionMode:'dossier-preflight',
+    limit:researchResultEnvelopeLimit(environment), prompt, binding:role, draft:draft.value,
+    question, context:prepared.context });
+  const admitted = capacity === undefined ? resultCapacityFrom(input) : requireResultCapacity(capacity, input, audit.store);
+  requireCondition(!Object.hasOwn(context as object, 'resultCapacity')
+    || canonical((context as any).resultCapacity) === canonical(admitted),
+  'discovery_dossier_transport_invalid', 'Caller context cannot substitute the exact dossier capacity');
+  const built = buildResearchEnvelope(role, environment, prompt, prepared.context, audit, admitted, requestId, undefined, prepared);
+  requireCondition(recordValue(built.subject), 'discovery_dossier_transport_invalid', 'Dossier envelope needs a structured subject');
+  prepared.commit();
+  return { ...built, subject:built.subject };
+}
+
+function buildResearchEnvelope(role: RoleBinding, environment: Environment, prompt: string,
+  context: unknown, audit?: Pick<ResearchCallAudit, 'store' | 'draftId' | 'questionId' | 'purpose' | 'pilot' | 'contextContract'>,
+  capacity?: Record<string, any>, requestId = '00000000-0000-0000-0000-000000000000',
+  requestContract?: string, dossier?: Awaited<ReturnType<typeof prepareDossierContextPacker>>) {
   const draft = audit?.store.get<DiscoveryDraft>(audit.draftId);
   const planSubject = packetPlanSubject(capacity?.bindings ?? {});
   const assessmentSubject = packetAssessmentSubject(context);
@@ -242,7 +284,7 @@ export function prepareResearchEnvelope(role: RoleBinding, environment: Environm
   const deepPreparation = packetDeepPreparation(context);
   if (deepPreparation && capacity !== undefined) requireCondition(canonical(packetDeepPreparation(capacity.bindings ?? {})) === canonical(deepPreparation),
     'research_deep_subject_invalid', 'The saved capacity must bind its exact deep preparation');
-  const packetState = audit?.questionId && draft ? continuationState(audit.store, environment.projectId, audit.draftId,
+  const packetState = !dossier && audit?.questionId && draft ? continuationState(audit.store, environment.projectId, audit.draftId,
     audit.questionId, audit.purpose, role.actor, planSubject, assessmentSubject, variantSubject, deepPreparation) : null;
   const consolidating = (context as any)?.dispatchMode === 'consolidation';
   const controls = (context as any)?.contextControls;
@@ -257,7 +299,8 @@ export function prepareResearchEnvelope(role: RoleBinding, environment: Environm
   const overhead = JSON.stringify(outputLimit).length + 32 + Math.max(JSON.stringify({ ...envelope, subject: {} }).length,
     controls && !consolidating ? JSON.stringify({...envelope,prompt:finalInstruction,subject:{}}).length : 0) + (packetState ? 4000 : 0);
   const subjectFor = (limit: number) => {
-    const packed = packetState ? workingContext(audit!.store, environment.projectId, audit!.draftId, audit!.questionId!, packingContext,
+    const packed = dossier ? dossier.pack(audit!.draftId, audit!.questionId!, packingContext, limit,
+      { common:true, purpose:audit!.purpose }) : packetState ? workingContext(audit!.store, environment.projectId, audit!.draftId, audit!.questionId!, packingContext,
       limit, { common: true, purpose: audit!.purpose, ...(planSubject?{subject:planSubject}:{}), ...(assessmentSubject?{assessmentSubject}:{}),
         ...(variantSubject?{variantSubject,actor:role.actor}:{}), ...(deepPreparation?{deepPreparation}:{}), continuation: !packetState.initial,
         ...(packetState.latest ? { previous: packetState.latest } : {}),
@@ -281,7 +324,7 @@ export function prepareResearchEnvelope(role: RoleBinding, environment: Environm
   }
   // Keep RD2b's measured transport adjustment in the single real builder used
   // by both preflight and dispatch; the result marker is already in subject.
-  for (let attempt = 0; packetState && input.length > physicalLimit && attempt < 4; attempt += 1) {
+  for (let attempt = 0; (packetState || dossier) && input.length > physicalLimit && attempt < 4; attempt += 1) {
     subjectLimit -= input.length - physicalLimit + 128;
     subject = subjectFor(subjectLimit);
     if (!consolidating && (subject as any)?.contextControls?.mode === 'finalization') envelope.prompt = finalInstruction;
@@ -339,6 +382,12 @@ export async function researchCall(role: RoleBinding, environment: Environment, 
 async function dispatchResearchCall(role: RoleBinding, environment: Environment, prompt: string, context: unknown, signal?: AbortSignal,
   audit?: ResearchCallAudit): Promise<unknown> {
   recoveryDispatchBoundary();
+  const dossier = requireDossierTransportContext(context, audit?.purpose === 'dossier-assessor');
+  const capacityDossier = packetDossierSubject((context as any)?.resultCapacity?.bindings);
+  requireCondition(!capacityDossier, 'discovery_dossier_dispatch_unavailable',
+    'Dossier result admission cannot authorize a raw physical call');
+  requireCondition(!dossier, 'discovery_dossier_dispatch_unavailable',
+    'Dossier transport preflight does not authorize a physical call before managed dossier session/application');
   requireCondition(!packetAssessmentSubject(context) || !audit?.consumerIntent,
     'discovery_assessment_subject_invalid', 'An analyst intent cannot authorize or replay an attempts assessment');
   const roleName = role.actor === environment.implementer.actor ? 'implementer'

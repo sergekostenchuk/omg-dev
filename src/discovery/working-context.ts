@@ -1,3 +1,5 @@
+import type { DossierAssessmentPacket } from './research-model.js';
+import { DOSSIER_TRANSPORT_DELIVERY, packetDossierSubject, requireDossierSubjectBinding, proveDossierTransportContext } from './continuation-packet.js';
 import { withHistoricalReads } from '../history/proofs.js';
 import type { VariantSubject } from './discovery-variants.js';
 import { sameSubject, type V7PlanSubject } from './v7-managed-attempt.js';
@@ -7,7 +9,7 @@ import { activeSynthesisNotes, consolidationInput, consolidationPage, consolidat
 import { variantTransportSubject, requireVariantContext, variantTransportFields, variantTransportGuards, requireVariantArchive, proveAssessmentTransportSubject, sameAssessmentSubject, assessmentQuestionContract, type AssessmentTransportSubject, FOUNDATION_FIELDS, contextSections, selectedQuestion, packetPlanSubject, planQuestionContract, replaceFoundationCopies, candidateDelta, originalIndex, compactConclusions, CONCLUSION_ENCODING, correctionIndex,
   packetDeepPreparation, deepTransportSubject, requireDeepContext, deepTransportFields, requireDeepArchive } from "./continuation-packet.js";
 import { requireCurrentDeepPreparation } from "./deep-research.js";
-import type { Store, Revision, TransactionGuard } from "../storage/store.js";
+import type { Store, Revision, Write, TransactionGuard } from "../storage/store.js";
 import type { DiscoveryDraft, Question } from "./discovery.js";
 import { canonical, hashJson, type Json } from "../canonical.js";
 import { isRef, reference, stageId, type Ref } from "../pipeline/contracts.js";
@@ -116,16 +118,64 @@ function conclusionSources(body: Record<string, any>, archive: Ref, questionId: 
       ? [{ record: archive, pointer: `/body/history/${index}/action`, value: turn.action }] : []);
 }
 
-export function workingContext(store: Store, projectId: string, draftId: string, questionId: string,
-  context: unknown, maxChars: number, options: { continuation?: boolean; common?: boolean; previous?: Ref; contextChars?: number; extractedChars?:number; purpose?: string; subject?: V7PlanSubject | null; assessmentSubject?: AssessmentTransportSubject | null; variantSubject?: VariantSubject | null; actor?: string;
+type WorkingOptions = { continuation?: boolean; common?: boolean; previous?: Ref; contextChars?: number; extractedChars?:number; purpose?: string; subject?: V7PlanSubject | null; assessmentSubject?: AssessmentTransportSubject | null; variantSubject?: VariantSubject | null; actor?: string;
     /** 5.3: the exact saved deep preparation of this analyst step; the packer proves it through the shared 5.2 admission. */
     deepPreparation?: Ref | null;
     /** DRS1a2: set only by trusted code for a compact analyst call. */
-    contextContract?: typeof ARCHIVE_PARTS_CONTRACT } = {}): Record<string, any> {
+    contextContract?: typeof ARCHIVE_PARTS_CONTRACT };
+type ArchiveWriter = typeof saveArchive;
+
+export function workingContext(store: Store, projectId: string, draftId: string, questionId: string,
+  context: unknown, maxChars: number, options: WorkingOptions = {}): Record<string, any> {
+  requireCondition(!packetDossierSubject(context) && options.purpose !== 'dossier-assessor',
+    'discovery_dossier_transport_invalid', 'Dossier packing requires the asynchronous common proof before serialization');
+  return packWorkingContext(store, projectId, draftId, questionId, context, maxChars, options);
+}
+
+/** One operation-scoped proof feeds the existing packer. Archives are staged
+ * until the final measured envelope fits; a capacity refusal has no writes. */
+export async function prepareDossierContextPacker(store: Store, projectId: string, context: unknown) {
+  const packet = await proveDossierTransportContext(store, projectId, context);
+  const normalized = { ...(context as Record<string, unknown>), dossierSubject: packet.subject, dossierPacket: packet, purpose:'dossier-assessor',
+    assessmentDelivery: DOSSIER_TRANSPORT_DELIVERY };
+  const writes = new Map<string, Write>(), records = new Map<string, Revision<any>>();
+  const guards: TransactionGuard[] = [];
+  const stage: ArchiveWriter = (_store, compact, metadata, body, required) => {
+    requireCondition(!compact, 'discovery_dossier_transport_invalid', 'Dossier preflight uses the full exact context archive');
+    const value = { ...metadata, body }, hash = hashJson(value), id = `research-context:${hash}`;
+    const existing = store.get(id);
+    if (existing) {
+      requireCondition(existing.kind === 'research-context' && existing.revision === 1 && existing.hash === hash
+        && canonical(existing.value) === canonical(value), 'discovery_dossier_transport_invalid', 'The exact dossier archive was substituted');
+      return existing;
+    }
+    const row = { id, kind:'research-context', revision:1, hash, value };
+    records.set(id, row); writes.set(id, { id, kind:row.kind, expected:0, value }); guards.push(...required);
+    return row;
+  };
+  return { packet: structuredClone(packet), context: structuredClone(normalized),
+    pack: (draftId: string, questionId: string, body: unknown, limit: number, options: WorkingOptions) =>
+      packWorkingContext(store, projectId, draftId, questionId, body, limit, options, packet, stage, records),
+    commit: () => { if (writes.size) store.writeMany([...writes.values()], guards); } };
+}
+
+function packWorkingContext(store: Store, projectId: string, draftId: string, questionId: string,
+  context: unknown, maxChars: number, options: WorkingOptions = {}, dossier: DossierAssessmentPacket | null = null,
+  archiveWriter: ArchiveWriter = saveArchive, staged = new Map<string, Revision<any>>()): Record<string, any> {
   const draft = store.get<DiscoveryDraft>(draftId), question = store.get<Question>(questionId);
   requireCondition(draft?.kind === "discovery-draft" && question?.kind === "question" && draft.value.projectId === projectId
     && question.value.draftId === draftId && draft.value.questions.includes(questionId), "context_basis_missing", "A working set needs its exact question and draft");
   let body = JSON.parse(JSON.stringify(context)) as Record<string, any>;
+  if (dossier) requireCondition(dossier.basis.draft.ref.id === draft.id && options.purpose === 'dossier-assessor'
+    && canonical(packetDossierSubject(context)) === canonical(dossier.subject)
+    && canonical((context as any).dossierPacket) === canonical(dossier),
+  'discovery_dossier_transport_invalid', 'The packer must retain the proven dossier and its draft');
+  if (dossier) {
+    requireDossierSubjectBinding(body.resultCapacity?.bindings, dossier.subject);
+    requireCondition(body.resultCapacity?.purpose === 'dossier-assessor'
+      && body.resultCapacity?.operation === dossier.subject.identity,
+    'discovery_dossier_transport_invalid', 'The dossier packer requires its exact capacity admission');
+  }
   requireCondition(options.contextContract === undefined
     || options.contextContract === ARCHIVE_PARTS_CONTRACT && options.purpose === 'analyst',
   'context_contract_invalid', 'The compact archive contract belongs only to an analyst call');
@@ -250,14 +300,14 @@ export function workingContext(store: Store, projectId: string, draftId: string,
   body['unresolvedEvidence'] = (Array.isArray(body['readings']) ? body['readings'] : []).flatMap((entry: any) =>
     Array.isArray(entry.unresolved) && entry.unresolved.length ? [{ reading: entry.ref ?? null, purpose: entry.purpose ?? null, unresolved: entry.unresolved }] : []);
   const metadata: Omit<Archive, 'body'> = { projectId, draft: reference(draft), question: reference(question), ...(planSubject?{subject:planSubject}:{}),...(variantSubject?{variantSubject,purpose:options.purpose!,actor:options.actor!}:{}) };
-  let archive = saveArchive(store, compact, metadata, body, archiveGuards);
+  let archive = archiveWriter(store, compact, metadata, body, archiveGuards);
   let archivedBody = body;
   const exactArchivedFields = (packet: Record<string, any>, fields: string[]) => fields.filter(field =>
     Object.hasOwn(packet, field) && packet[field] !== undefined
       && Object.hasOwn(archivedBody, field)
       && canonical(packet[field]) === canonical(archivedBody[field]));
   const materialRecord = (field: string, material: unknown): Ref => {
-    const saved = saveArchive(store, compact, metadata, { [field]: material as Json },
+    const saved = archiveWriter(store, compact, metadata, { [field]: material as Json },
       archiveGuards);
     return reference(saved);
   };
@@ -272,7 +322,7 @@ export function workingContext(store: Store, projectId: string, draftId: string,
     archivedBody = { ...body,
       ...(sourceNavigation ? { sourceCatalogue: sourceNavigation } : {}),
       ...(plannerCorrections?.length ? { corrections: plannerCorrections } : {}) };
-    archive = saveArchive(store, compact, metadata, archivedBody,
+    archive = archiveWriter(store, compact, metadata, archivedBody,
       [reference(draft), reference(question), ...draft.value.inputs, first]);
     body = archivedBody;
   }
@@ -282,7 +332,7 @@ export function workingContext(store: Store, projectId: string, draftId: string,
     ? { assessmentContextContract: STAGE_NEIGHBOR_CONTEXT, stageNeighbors: body['stageNeighbors'] } : null;
   if (neighborMaterial) requireCondition(neighborMaterial.stageNeighbors?.contract === 'stage-neighbors/v1',
     'context_stage_neighbors_incomplete', `[${question.id}] The assessor needs its declared stage material`);
-  const hasQuestion = Object.hasOwn(body, 'question') || Object.hasOwn(body, 'questions') || (options.purpose ?? body['role']) !== 'reader';
+  const hasQuestion = !dossier && (Object.hasOwn(body, 'question') || Object.hasOwn(body, 'questions') || (options.purpose ?? body['role']) !== 'reader');
   const responseContract = assessmentContract ?? planContract;
   const selected = responseContract ? {question:responseContract,schemaPointer:'/body/question/schema'} : hasQuestion ? selectedQuestion(question, archivedBody) : null;
   const contract = responseContract ?? (selected ? { id: question.id, ...question.value.spec } : null);
@@ -292,6 +342,9 @@ export function workingContext(store: Store, projectId: string, draftId: string,
   if (projectedQuestion) body = { ...body, question: projectedQuestion,
     ...(Object.hasOwn(body, 'questions') ? { questions: [projectedQuestion] } : {}) };
   const finish = (packet: Record<string, any>) => {
+    if (dossier) requireCondition(canonical(packetDossierSubject(packet)) === canonical(dossier.subject)
+      && !Object.hasOwn(packet,'question') && !Object.hasOwn(packet,'questions'),
+    'discovery_dossier_transport_invalid', 'Every dossier packet must retain its identity without another response schema');
     if (variantFields) Object.assign(packet,variantFields);
     if (deepFields) Object.assign(packet,deepFields);
     if (deep) requireCondition(canonical(packetDeepPreparation(packet)) === canonical(deep)
@@ -304,7 +357,7 @@ export function workingContext(store: Store, projectId: string, draftId: string,
       'Every initial or continuation packet must preserve packet and baseline');
     if (planSubject) packet.subject = planSubject;
     requirePacketMaterialDelivery(packet, reference(archive), (record, pointer) =>
-      contextValue(archivedContext(store, draft, record), pointer));
+      contextValue(staged.get(record.id)?.value ?? archivedContext(store, draft, record), pointer));
     requirePlanningNavigation(packet, reference(archive), archivedBody);
     if (variantFields) requireCondition(JSON.stringify(packet).length <= maxChars,
       "pilot_core_limit", "The complete variant transport identity exceeds its declared envelope bound");
@@ -438,7 +491,7 @@ export function workingContext(store: Store, projectId: string, draftId: string,
     const fullHistory = Object.hasOwn(initial, 'history') ? initial.history : undefined;
     if (fullHistory !== undefined) delete initial.history;
     const addressed = addressArchivedMaterials(initial, reference(archive),
-      exactArchivedFields(initial, ['fields', 'discoveryContext', 'discoveryBasisCatalogue',
+      exactArchivedFields(initial, ['dossierPacket', 'fields', 'discoveryContext', 'discoveryBasisCatalogue',
         'prerequisites', 'operationMap', 'inventory', 'consumerFeedback', 'request', 'sourceCatalogue']),
       maxChars, materialRecord);
     packContextWorkspace(initial,maxChars,options.contextChars,undefined,
@@ -551,7 +604,7 @@ export function workingContext(store: Store, projectId: string, draftId: string,
     if (!packet.materialDelivery) serveArchivedMaterial(packet, addressed, maxChars);
     return finish(packet);
   }
-  const mandatory = [...(variantFields?Object.keys(variantFields):[]),"deepPreparation","deepCell","deepScope","variantSubject", "assessmentSubject", "resultCapacity", "assessmentContextContract", "stageNeighbors", "discoveryContext", "discoveryBasisCatalogue", "webResearch", "answerContext", "contextWorkspace", "savedEvidence", "conclusions", "conclusionCitations", "conclusionRefs", "conclusionUnresolved", "conclusionEncoding", "contextControls", "contextCorrection", "currentRead", "originals", "corrections", "request", "candidate", "proposalChanges", "purpose", "sources", "questions", "prerequisites", "operationMap", "researchMissing", "fields", "mapStatusFindings", "mapStatus", "researchScope", "role", "stage", "level", "consumer", "contextEncoding", "allowedConsumers", "gapFields", "graphBase",
+  const mandatory = [...(variantFields?Object.keys(variantFields):[]),"dossierSubject","dossierPacket","assessmentDelivery","deepPreparation","deepCell","deepScope","variantSubject", "assessmentSubject", "resultCapacity", "assessmentContextContract", "stageNeighbors", "discoveryContext", "discoveryBasisCatalogue", "webResearch", "answerContext", "contextWorkspace", "savedEvidence", "conclusions", "conclusionCitations", "conclusionRefs", "conclusionUnresolved", "conclusionEncoding", "contextControls", "contextCorrection", "currentRead", "originals", "corrections", "request", "candidate", "proposalChanges", "purpose", "sources", "questions", "prerequisites", "operationMap", "researchMissing", "fields", "mapStatusFindings", "mapStatus", "researchScope", "role", "stage", "level", "consumer", "contextEncoding", "allowedConsumers", "gapFields", "graphBase",
     "core", "map", "draft", "question", "value", "representation", "consumerFeedback", "assessmentState", "openGaps", "failures", "unresolvedEvidence", "dispatchMode", "readPlanStatus", "sourceCatalogue", "sourceLocations", "bases", "runtimeProofs", "synthesisState", "synthesisNotes", "previousProposalRef"];
   if(body['assessmentState']) mandatory.splice(mandatory.indexOf("value"),1);
   const ordered = options.common && !options.continuation
@@ -566,7 +619,7 @@ export function workingContext(store: Store, projectId: string, draftId: string,
   // Defaults preserve the action protocol's collection shapes, not completeness.
   Object.assign(packet, { readings: [], directReadings: [], history: [], observations: [], checkpoints: [] });
   const addressedCore = addressArchivedMaterials(packet, reference(archive),
-    exactArchivedFields(packet, ['fields', 'discoveryContext', 'discoveryBasisCatalogue', 'stageNeighbors',
+    exactArchivedFields(packet, ['dossierPacket', 'fields', 'discoveryContext', 'discoveryBasisCatalogue', 'stageNeighbors',
       'prerequisites', 'operationMap', 'inventory', 'request', 'consumerFeedback',
       'answerContext', 'currentRead', 'originals', 'corrections', 'researchScope',
       'mapStatus', 'mapStatusFindings', 'readPlanStatus', 'openGaps', 'failures', 'sourceCatalogue',
