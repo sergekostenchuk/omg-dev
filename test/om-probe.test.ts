@@ -24,7 +24,8 @@ import { writeHorizon } from '../src/om/horizon.js';
 import { writeGaps, type GapRequest } from '../src/om/gaps.js';
 import { prepareQuestionTasks, writeQuestionPacket, type PartProposalBody, type QuestionPacketRecord, type QuestionPacketRequest } from '../src/om/question-packet.js';
 import { writeRoutes } from '../src/om/routes.js';
-import { beginAttempt, completeAttempt, openSeries } from '../src/om/series.js';
+import { beginAttempt, completeAttempt, openSeries, readCompletionBinding } from '../src/om/series.js';
+import { openAttempt } from '../src/om/repeat-gate.js';
 import { gapLineExpectedResult, gapLineKey, writeGapLines } from '../src/om/gap-lines.js';
 import { prepareFrameProposals, type LayerProposal } from '../src/om/frame-proposals.js';
 import { prepareFrame, type FrameRequest, type FrameScope } from '../src/om/frame-obligations.js';
@@ -334,8 +335,12 @@ const works = () => once('works', async (): Promise<WorksData> => {
     const batch = routes.value.batches.find(item => item.level === 3 && item.node === 'garden-produce-operation')!;
     const address = { project, block: 'garden-produce-block', line: 1 };
     ok(openSeries(store, { ...address, slice: 'pr1-work', predecessor: null, basis: null }));
-    const series = ok(beginAttempt(store, { ...address, attempt: 1, goal: { key: 'pr1-work', questions: batch.items.map(item => gapLineKey(project, item.target, item.field)),
-      result: gapLineExpectedResult(project, batch.items[0]!.target, batch.items[0]!.field) } }));
+    // The attempt is the current managed opening on the exact plan of this fixture's own routes and batch.
+    const completion = { routes: reference(routes), batches: [batch.id] };
+    const series = ok(openAttempt(store, { ...address, attempt: 1, goal: { key: 'pr1-work', questions: batch.items.map(item => gapLineKey(project, item.target, item.field)),
+      result: gapLineExpectedResult(project, batch.items[0]!.target, batch.items[0]!.field) }, completion }));
+    const binding = ok(readCompletionBinding(store, project, reference(series), 1));
+    assert.ok(binding); assert.deepEqual(binding.value.plan, completion);
     const stubPath = join(root, 'stub.mjs'), stubDir = join(root, 'stub');
     mkdirSync(stubDir); writeFileSync(stubPath, STUB);
     const command = { executable: process.execPath, args: [stubPath, stubDir] };
@@ -346,6 +351,8 @@ const works = () => once('works', async (): Promise<WorksData> => {
     const packetRequest: QuestionPacketRequest = { project, routes: reference(routes), batch: batch.id, environment: reference(configured),
       attempt: { series: reference(series), ordinal: 1 }, previous: [], works: { producer: reference(ledger.producer), ledger: reference(ledger.record) } };
     const packet = ok(writeQuestionPacket(store, packetRequest)).record as Revision<QuestionPacketRecord>;
+    assert.equal(packet.value.state, 'ready');
+    assert.deepEqual(packet.value.request.attempt, { series: reference(series), ordinal: 1 });
     const work = structuredClone(desired.nodes.find(node => node.id === 'garden-produce-work')!);
     const tests = structuredClone(desired.tests.filter(item => work.tests.includes(item.id)));
     const worksSource = gapRead.sources.works; if ('state' in worksSource) throw new Error('No works frame');
