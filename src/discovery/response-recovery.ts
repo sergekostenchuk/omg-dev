@@ -28,7 +28,7 @@ import { constants as systemConstants } from 'node:os';
 import type { Store, Revision, Write, TransactionGuard } from '../storage/store.js';
 import type { ModelCall } from '../runtime/model-usage.js';
 import type { Environment, RoleBinding } from '../runtime/environment.js';
-import { Environments, uniqueTransactionGuards, transactionGuardsCurrent } from '../runtime/environment.js';
+import { Environments, readEnvironmentAt, uniqueTransactionGuards, transactionGuardsCurrent } from '../runtime/environment.js';
 import type { DiscoveryDraft, Question } from './discovery.js';
 import type { Graph } from '../graph/model.js';
 import { composeLayer } from '../graph/layer-design.js';
@@ -4385,6 +4385,7 @@ export function readProvenVariantSet(store:Store,project:string,ref:Ref):ProvenV
 export function staleUnpaidDeepAdmission(store: Store, intent: Revision<ResearchConsumerIntent>): boolean {
   const proof = requireDeepConsumerBinding(store, intent);
   if (!proof || intent.value.state !== 'prepared') return false;
+  const environmentChanged = changedDeepEnvironment(store, intent);
   try { requireCurrentDeepPreparation(store, intent.value.projectId, reference(proof.preparation)); }
   catch (error) {
     if (error instanceof EngineError && error.code === 'discovery_deep_preparation_stale') return true;
@@ -4399,7 +4400,38 @@ export function staleUnpaidDeepAdmission(store: Store, intent: Revision<Research
     }
     throw error;
   }
-  return false;
+  return environmentChanged;
+}
+/** A changed guard is not itself permission to replace an admission. Both
+ * environments must be exact saved contracts, and the old dispatch/role must
+ * still be the immutable admission's own. Paid recovery never reads today's
+ * environment through this unpaid-only path. */
+function changedDeepEnvironment(store: Store, intent: Revision<ResearchConsumerIntent>): boolean {
+  try {
+    const origin = store.get<ResearchConsumerIntent>(intent.id, 1);
+    requireCondition(origin, 'environment_invalid', 'The deep admission lost its original environment binding');
+    const original = readResearchConsumerIntent(store, reference(origin));
+    const environmentRef = (value: ResearchConsumerIntent): Ref => {
+      const refs = value.guards.filter(guard => guard.id === `environment:${value.projectId}`);
+      requireCondition(refs.length === 1 && isRef(refs[0]), 'environment_invalid',
+        'A deep admission needs one exact saved environment guard');
+      return refs[0];
+    };
+    const ref = environmentRef(original.value), saved = readEnvironmentAt(store, intent.value.projectId, ref);
+    requireCondition(variantSame(ref, environmentRef(intent.value))
+      && canonical(original.value.dispatch) === canonical(intent.value.dispatch)
+      && canonical(original.value.role) === canonical(intent.value.role)
+      && canonical(saved.value) === canonical(intent.value.dispatch)
+      && [saved.value.implementer, saved.value.reviewer].some(role => canonical(role) === canonical(intent.value.role)),
+      'environment_invalid', 'The deep admission lost or substituted its original environment and dispatch');
+    const head = new Environments(store).get(intent.value.projectId);
+    const current = readEnvironmentAt(store, intent.value.projectId, reference(head));
+    requireCondition(current.revision >= saved.revision, 'environment_invalid', 'The current environment cannot precede the admitted revision');
+    return !variantSame(reference(current), ref);
+  } catch (error) {
+    if (!(error instanceof EngineError)) throw error;
+    throw new EngineError('discovery_deep_environment_invalid', error.message, { cause: error.code, intent: reference(intent) });
+  }
 }
 export function requireDeepConsumerBinding(store: Store, intent: Revision<ResearchConsumerIntent>): ProvenDeepPreparation | null {
   const savedOrigin = store.get<ResearchConsumerIntent>(intent.id, 1);

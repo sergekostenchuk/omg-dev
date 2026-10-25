@@ -21,7 +21,7 @@ import { discoveryInspection, readVariantHandoff } from '../src/discovery/discov
 import { EngineError } from '../src/errors.js';
 import { canonical } from '../src/canonical.js';
 import { deepPlanSelection } from '../src/discovery/v7-plan-questions.js';
-import { readDeepResearchResult, runDeepResearch } from '../src/discovery/deep-research-execution.js';
+import { readDeepResearchResult, runDeepResearch, resumeDeepResearch } from '../src/discovery/deep-research-execution.js';
 import { readDeepPreparation } from '../src/discovery/deep-research.js';
 import { projectAttemptPacket } from '../src/discovery/v7-attempt-assessment.js';
 import { applyDiscoveryAssessment, v7ProgressBaseline } from '../src/discovery/v7-progress.js';
@@ -42,11 +42,11 @@ function history(store: Store): string {
 // surface. Intercept only writes to this connection; all reads stay real and the
 // second Store still commits independently inside the tested reservation window.
 function interceptWrites(t:test.TestContext, target:Store,
-  action:(writes:Write[],commit:()=>Revision<unknown>[])=>Revision<unknown>[]) {
+  action:(writes:Write[],commit:()=>Revision<unknown>[],guards:TransactionGuard[])=>Revision<unknown>[]) {
   const original=Store.prototype.writeMany;
   const method=t.mock.method(Store.prototype,'writeMany',function<T>(this:Store,writes:Write[],guards:TransactionGuard[]=[]):Revision<T>[] {
     const commit=()=>original.call(this,writes,guards);
-    return (this===target?action(writes,commit):commit()) as Revision<T>[];
+    return (this===target?action(writes,commit,guards):commit()) as Revision<T>[];
   });
   return ()=>method.mock.restore();
 }
@@ -310,6 +310,104 @@ test(`5.6-01: ${cold?'cold':'hot'} prepared cut at deep position ${position} res
   assert.deepEqual(added.map(row=>row.value.requestId).sort(),f.wires().slice(savedWire.length).map(row=>row.requestId).sort());
   assert.equal(deepPlanSelection(store,'p',f.scope).coverage.cells[position-1]!.covered,true);
   for(const again of [store,f.open()])await inert(f,again,async()=>assert.deepEqual(await f.run(2,again,true),result));
+});
+
+async function unpaidDeep(t:test.TestContext, dedicatedEnvironment=false) {
+  const f=await ready(t);let cut=false;
+  // Isolate a missing deep environment from the earlier paid snapshot's own
+  // environment, so that negative reaches the unpaid admission proof.
+  if(dedicatedEnvironment){
+    const current=f.store.get<typeof f.environment.value>(f.environment.id)!;
+    f.engine.environments.configure('p',{...current.value,timeoutMs:current.value.timeoutMs+1},current.revision);
+  }
+  const restore=interceptWrites(t,f.store,(writes,commit)=>{
+    const preparing=writes.some(row=>row.kind==='research-consumer-intent'&&row.expected===0
+      &&Object.hasOwn((row.value as ResearchConsumerIntent).cursor,'deepPreparation'));
+    const result=commit();
+    if(preparing&&!cut){cut=true;throw new Error('5.6-02 unpaid preparation cut');}
+    return result;
+  });
+  try{await f.run(1);}finally{restore();}
+  assert.ok(cut);assert.equal(deepCalls(f).length,0);
+  const intent=deepIntents(f.store)[0]!;assert.equal(intent.value.state,'prepared');
+  return {...f,intent};
+}
+for(const cold of [false,true])test(`5.6-02: ${cold?'cold':'hot'} timeout-only revision replaces the unpaid generation exactly once`,async t=>{
+  const f=await unpaidDeep(t), old=f.intent, oldHistory=f.store.history(old.id);
+  const beforeEnvironment=f.store.get<typeof f.environment.value>(f.environment.id)!;
+  const next=f.engine.environments.configure('p',{...beforeEnvironment.value,timeoutMs:beforeEnvironment.value.timeoutMs+1},beforeEnvironment.revision);
+  const store=cold?f.open():f.store;
+  await inert(f,store,()=>f.run(1,store,true));
+  const sent=f.wires(), paid=money(store), result=await f.run(1,store);
+  assert.equal(result.value.pauseCode,'research_deep_frontier_pending',result.value.error!);
+  const current=deepIntents(store).find(row=>row.id!==old.id)!;
+  assert.ok(current);assert.equal(current.value.generation,old.value.generation+1);
+  assert.deepEqual(current.value.previous,reference(old));assert.equal(current.value.rootKey,old.value.rootKey);
+  assert.deepEqual(current.value.owner,old.value.owner);
+  for(const key of ['run','turn','subject','deepPreparation'] as const)assert.deepEqual(current.value.cursor[key],old.value.cursor[key]);
+  assert.deepEqual(current.value.role,old.value.role);assert.deepEqual(current.value.dispatch,next.value);
+  assert.ok(current.value.guards.some(guard=>canonical(guard)===canonical(reference(next))));
+  assert.deepEqual(store.history(old.id),oldHistory);assert.equal(deepCalls(f).length,1);
+  assert.equal(deepIntents(store).length,2);assert.equal(readDeepResearchResult(store,'p',reference(current)).verification,'proven');
+  assert.equal(f.wires().length,sent.length+2);assert.deepEqual(f.wires().slice(0,sent.length),sent);
+  const oldCalls=new Set(paid.filter(row=>row.kind==='model-call').map(row=>row.id));
+  assert.equal(store.list('model-call').filter(row=>!oldCalls.has(row.id)).length,2);
+  for(const again of [store,f.open()])await inert(f,again,async()=>assert.deepEqual(await f.run(2,again,true),result));
+});
+for(const damage of ['missing-current','missing-original','substituted-current','substituted-dispatch'] as const)
+test(`5.6-02: ${damage} environment is not permission to replace unpaid work hot or cold`,async t=>{
+  const f=await unpaidDeep(t,damage==='missing-original'), saved=f.store.get<typeof f.environment.value>(f.environment.id)!;
+  f.engine.environments.configure('p',{...saved.value,timeoutMs:saved.value.timeoutMs+1},saved.revision);
+  if(damage==='substituted-dispatch')f.store.write({id:f.intent.id,kind:f.intent.kind,expected:f.intent.revision,
+    value:{...f.intent.value,dispatch:{...f.intent.value.dispatch,timeoutMs:f.intent.value.dispatch.timeoutMs+1}}});
+  for(const store of [f.store,f.open()]){
+    const get=store.get.bind(store);
+    const mock=t.mock.method(store,'get',((id:string,revision?:number)=>{
+      if(id===saved.id){
+        if(damage==='missing-current'&&revision===undefined||damage==='missing-original'&&revision===saved.revision)return null;
+        const record=get(id,revision);
+        if(damage==='substituted-current'&&revision!==saved.revision&&record)
+          return {...record,value:{...(record.value as object),projectId:'foreign'}};
+      }
+      return get(id,revision);
+    }) as Store['get']);
+    try{await inert(f,store,()=>assert.rejects(()=>f.run(1,store),{code:'discovery_deep_environment_invalid'}));}
+    finally{mock.mock.restore();}
+  }
+  assert.equal(deepCalls(f).length,0);assert.equal(deepIntents(f.store).length,1);
+});
+test('5.6-02: a competing old reservation cannot survive timeout-only replacement',async t=>{
+  const f=await unpaidDeep(t), old=f.intent, other=f.open();
+  let reservation:{writes:Write[];guards:TransactionGuard[]}|undefined;
+  const capture=interceptWrites(t,other,(writes,commit,guards)=>{
+    if(writes.some(row=>row.kind==='model-call'&&row.expected===0)){
+      reservation={writes:structuredClone(writes),guards:structuredClone(guards)};
+      throw new Error('5.6-02 cut before old physical reservation');
+    }
+    return commit();
+  });
+  try{await assert.rejects(()=>resumeDeepResearch(other,'p',reference(old)),/cut before old physical reservation/);}
+  finally{capture();}
+  assert.ok(reservation);assert.equal(deepCalls(f).length,0);
+  const env=f.store.get<typeof f.environment.value>(f.environment.id)!;
+  f.engine.environments.configure('p',{...env.value,timeoutMs:env.value.timeoutMs+1},env.revision);
+  let raced=false;
+  const restore=interceptWrites(t,f.store,(writes,commit,guards)=>{
+    if(writes.some(row=>row.kind==='research-consumer-intent'&&row.expected===0&&(row.value as ResearchConsumerIntent).generation===old.value.generation+1)){
+      assert.ok(guards.some(guard=>canonical(guard)===canonical(reference(old))));
+      const before=history(other), paid=money(other), wire=f.wires();
+      assert.throws(()=>other.writeMany(reservation!.writes,reservation!.guards),{code:'input_stale'});
+      assert.equal(history(other),before);assert.deepEqual(money(other),paid);assert.deepEqual(f.wires(),wire);raced=true;
+    }
+    return commit();
+  });
+  let result:Revision<ResearchRun>;
+  try{result=await f.run(1);}finally{restore();}
+  assert.ok(raced);assert.equal(deepCalls(f).length,1);assert.equal(deepIntents(f.store).length,2);
+  assert.deepEqual(f.store.get(old.id),old);
+  const active=deepIntents(f.store).find(row=>row.id!==old.id)!;
+  assert.deepEqual(active.value.previous,reference(old));readDeepResearchResult(other,'p',reference(active));
+  for(const store of [f.store,f.open()])await inert(f,store,async()=>assert.deepEqual(await f.run(2,store,true),result));
 });
 
 for(const cold of [false,true])test(`5.6: ${cold?'cold':'hot'} owner revise replaces only the stale unpaid deep admission at the same run position`,async t=>{

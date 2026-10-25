@@ -2273,6 +2273,7 @@ export class Researcher {
       }
     } catch (error) {
       if (partialPending) throw error;
+      if (error instanceof EngineError && error.code === 'discovery_deep_environment_invalid') throw error;
       const current = this.store.get<ResearchRun>(id) ?? run;
       // Before reservation the saved pause is the prepared intent's exact
       // owner. A diagnostic revision would invalidate that unpaid admission.

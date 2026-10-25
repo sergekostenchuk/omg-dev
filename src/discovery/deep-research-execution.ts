@@ -3,7 +3,7 @@ import { withHistoricalReads } from '../history/proofs.js';
 import { canonical, hashJson } from '../canonical.js';
 import { EngineError, requireCondition } from '../errors.js';
 import { isRef, reference, uniqueRefs, type Ref } from '../pipeline/contracts.js';
-import { uniqueTransactionGuards, type Environment, type RoleBinding } from '../runtime/environment.js';
+import { readEnvironmentAt, uniqueTransactionGuards, type Environment, type RoleBinding } from '../runtime/environment.js';
 import { processStart } from '../runtime/process-identity.js';
 import type { Revision, Store, TransactionGuard } from '../storage/store.js';
 import { requireCurrentDeepPreparation } from './deep-research.js';
@@ -48,10 +48,12 @@ function savedPosition(store: Store, input: DeepResearchInput, actor: string, dr
   const checked = readResearchConsumerIntent(store, reference(previous));
   const proof = requireDeepConsumerBinding(store, checked);
   if (!proof) invalid('This run position does not belong to a proven deep admission');
+  // Timeout-only revisions keep preparation/actor/owner unchanged, but still
+  // invalidate the old environment guard. Use the common replacement proof.
+  if (checked.value.state === 'prepared' && staleUnpaidDeepAdmission(store, checked)) return { ...at, previous: null };
   if (canonical(reference(proof.preparation)) !== canonical(input.deepPreparation)
     || checked.value.role.actor !== actor || checked.value.cursor.turn !== at.turn
     || (input.owner && canonical(checked.value.owner) !== canonical(input.owner))) {
-    if (staleUnpaidDeepAdmission(store, checked)) return { ...at, previous: null };
     // This position has already begun its physical operation. Recover that
     // exact paid subject first, even when today's requested scope differs.
     if (checked.value.state !== 'prepared' && checked.value.role.actor === actor
@@ -76,8 +78,8 @@ function prepareDeepResearchAt(store: Store, input: DeepResearchInput): Revision
   if (previous) return previous;
   deepIdentityCalls(store, input.deepPreparation, 'analyst', role.actor);
   const admitted = requireCurrentDeepPreparation(store, input.projectId, input.deepPreparation);
-  const environment = store.get<Environment>(input.environment.id, input.environment.revision);
-  if (!environment || environment.kind !== 'environment' || canonical(environment) !== canonical(input.environment)
+  const environment = readEnvironmentAt(store, input.projectId, reference(input.environment));
+  if (canonical(environment) !== canonical(input.environment)
     || environment.value.projectId !== input.projectId
     || ![environment.value.implementer, environment.value.reviewer].some(saved => canonical(saved) === canonical(role)))
     invalid('Deep research needs the exact project environment and one of its roles');
