@@ -221,3 +221,29 @@ export interface DossierAssessmentPacket {
     grounds: DossierAssessmentRecord[] }[];
   grounds: DossierAssessmentRecord[];
 }
+
+/** 6.5: terminal judgement of a saved dossier; it asserts neither payment nor Discovery acceptance. */
+export const DOSSIER_ASSESSMENT_RESULT_CONTRACT = 'dossier-assessment-result/v1' as const;
+export const DOSSIER_ASSESSMENT_PROJECTION_CONTRACT = 'dossier-assessment-projection/v1' as const;
+export const DOSSIER_QUALITY_DIMENSIONS = Object.freeze(['domains', 'roles', 'sources', 'alternatives', 'scale'] as const);
+export type DossierAssessmentBasis = { claim: ClaimAddress } | { record: Ref };
+export type DossierAssessmentReturnTarget = { claim: ClaimAddress } | { axis: import('./v7-contracts.js').V7Axis }
+  | { unknown: ClaimAddress } | { contradiction: string } | { partialReason: number };
+export interface DossierAssessmentResult {
+  contract: typeof DOSSIER_ASSESSMENT_RESULT_CONTRACT;
+  subject: DossierAssessmentSubject;
+  verdict: 'supported' | 'return'; reasons: string[];
+  quality: Record<typeof DOSSIER_QUALITY_DIMENSIONS[number], {
+    judgement: 'adequate' | 'gap'; reason: string; bases: DossierAssessmentBasis[];
+  }>;
+  /** Exact ordered inventory acknowledged by the assessor, including counterarguments and unresolved unknowns. */
+  inventory: { materials: ClaimAddress[]; unknowns: ClaimAddress[];
+    contradictions: { id: string; sides: [ClaimAddress, ClaimAddress]; grounds: Ref[] }[] };
+  return: { targets: DossierAssessmentReturnTarget[]; reason: string; bases: DossierAssessmentBasis[] } | null;
+}
+export interface DossierAssessmentProjection {
+  contract: typeof DOSSIER_ASSESSMENT_PROJECTION_CONTRACT; identity: string;
+  subject: DossierAssessmentSubject; completeness: 'complete' | 'partial';
+  blockingContradictions: string[];
+  packet: DossierAssessmentPacket; result: DossierAssessmentResult;
+}

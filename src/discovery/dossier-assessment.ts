@@ -6,10 +6,12 @@ import { readSelectedDossier, SELECTED_DOSSIER_KIND } from './selected-dossier.j
 import { readPartialDossier, DOSSIER_MANIFEST_KIND } from './dossier-manifest.js';
 import { resolveClaimAddress, type ClaimAddress } from './claim-address.js';
 import type { VariantSet } from './discovery-variants.js';
+import { projectDossierAssessment } from './research-consumer-transition.js';
 import {
   DOSSIER_ASSESSMENT_SUBJECT_CONTRACT, DOSSIER_ASSESSMENT_PACKET_CONTRACT,
   type DossierAssessmentSubject, type DossierAssessmentPacket, type DossierAssessmentRecord,
   type DossierAssessmentMaterial,
+  type DossierAssessmentProjection,
 } from './research-model.js';
 
 function invalid(field: string, message: string): never {
@@ -126,4 +128,14 @@ export async function requireDossierAssessmentPacket(store: Store, project: stri
   const packet = await requireDossierAssessmentSubject(store, project, input.subject);
   if (!same(packet, input)) invalid('packet', 'The packet omits or substitutes saved dossier content');
   return packet;
+}
+
+/** Read-only terminal-result door. A presented packet is a candidate to re-prove, never caller authority.
+ * All current and future applications/readers share projectDossierAssessment's single projection body. */
+export async function checkDossierAssessmentResult(store: Store, project: string, subject: unknown, result: unknown,
+  candidatePacket?: unknown): Promise<DossierAssessmentProjection> {
+  const packet = candidatePacket === undefined ? await requireDossierAssessmentSubject(store, project, subject)
+    : await requireDossierAssessmentPacket(store, project, candidatePacket);
+  if (!same(subject, packet.subject)) invalid('subject', 'The presented packet belongs to another exact subject');
+  return projectDossierAssessment({ packet, result });
 }

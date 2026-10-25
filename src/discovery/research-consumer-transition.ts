@@ -35,6 +35,20 @@ import type { DeepPreparation } from './deep-research.js';
 import { ATTEMPT_BINDING_CONTRACT, addressedQuestionId, attemptBindingId, attemptEndOfAction, planSubjectOf, sameSubject,
   type ResearchAttemptBinding, type V7PlanSubject } from './v7-managed-attempt.js';
 import type { Json } from '../canonical.js';
+import { decodeDossierAssessmentResult } from './dossier-assessment-result.js';
+import { DOSSIER_ASSESSMENT_PROJECTION_CONTRACT, type DossierAssessmentPacket, type DossierAssessmentProjection } from './research-model.js';
+
+/** Pure shared dossier projection. Proven inputs come from the read-only dossier door (and future paid readers).
+ * This is neither a paid assessment nor an application; no mutable head or Store is consulted. */
+export function projectDossierAssessment(input: { packet: DossierAssessmentPacket; result: unknown }): DossierAssessmentProjection {
+  const result = decodeDossierAssessmentResult(input.result, input.packet);
+  const value = { contract: DOSSIER_ASSESSMENT_PROJECTION_CONTRACT, subject: input.packet.subject,
+    completeness: input.packet.manifest.value.completeness,
+    blockingContradictions: input.packet.contradictions.filter(item => item.contradiction.blocking
+      && item.contradiction.resolution.state === 'open').map(item => item.contradiction.id),
+    packet: input.packet, result };
+  return structuredClone({ ...value, identity: `dossier-projection:${hashJson(value)}` });
+}
 
 /* This module is the dependency leaf for paid consumer transitions. Its inputs
  * are exact records already checked by their respective historical readers;
