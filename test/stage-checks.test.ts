@@ -68,8 +68,18 @@ const same = (left: () => unknown, right: () => unknown) => {
   assert.deepEqual(read(left), read(right));
 };
 
-test("R2 №2419-4 rows 1–2: the lower kit inspects every stage and gates every layer and phase exactly as ProductEngine — states, findings, guards, admissionGuards — writing nothing; an absent project and a stale basis give the same answer", t => {
-  const { directory, store } = legacyBase(t);
+test("R2 №2419-4 rows 1–2: the lower kit inspects every stage and gates every layer and phase exactly as ProductEngine — states, findings, guards, admissionGuards — writing nothing; an absent project and a stale basis give the same answer", async t => {
+  const f = await m8Fixture(t), store = f.store, project = f.project;
+  const saved = writeFeasibility(store, f.feasibility);
+  if (!saved.ok) assert.fail(`${saved.refusal.code}: ${saved.refusal.message}`);
+  const producer = new ProductEngine(store);
+  const drafted = producer.execute({ type: "draft-om", project, feasibility: reference(saved.value), expected: 0 }) as Revision<unknown>;
+  producer.execute({ type: "accept-stage", project, stage: "om-g2", expected: drafted.revision });
+  // The base both kits start from stands on the current producers: B1, no research phase, no feasibility of the old route, om-g2 accepted on the real M8.
+  assert.ok(store.get(`om-input:${project}`), "B1 exists");
+  assert.deepEqual(store.list("phase"), []);
+  assert.equal(store.get(`feasibility:${project}`), null);
+  assert.deepEqual(store.get<{ content: { feasibility: Ref } }>(`stage:${project}:om-g2`)!.value.content.feasibility, reference(saved.value));
   const second = new Store(store.path); t.after(() => second.close());
   const compare = () => {
     const checks = new StageChecks(store), engine = new ProductEngine(store);
@@ -92,7 +102,6 @@ test("R2 №2419-4 rows 1–2: the lower kit inspects every stage and gates ever
   compare();
   assert.deepEqual(heads(store).filter(row => !row.includes(`environment:${project}`)), before.filter(row => !row.includes(`environment:${project}`)),
     "Inspection and gates write nothing");
-  void directory;
 });
 
 test("R2 №2419-4 rows 3–4 (legacy): compile by the lower kit equals ProductEngine.compile — the same plan, pointer and stages with the same guards on every write, the absent first B1 among them; after a restart the repeat writes nothing", t => {
