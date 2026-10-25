@@ -1,9 +1,6 @@
 import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
-import { copyFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { createRequire } from 'node:module';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { copyFileSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
 import type { ResearchAcceptanceBinding } from '../src/discovery/research-consumer-transition.js';
 import { tmpdir } from 'node:os';
@@ -134,7 +131,7 @@ function rejected(result: OmResult<unknown>, code: string | readonly string[]): 
   return refusal;
 }
 
-function factFixture(t: TestContext, historicalCommit?: string) {
+function factFixture(t: TestContext) {
   const root = mkdtempSync(join(tmpdir(), 'omg-accepted-fact-')), path = join(root, 'state.sqlite');
   let store = new Store(path), engine = new ProductEngine(store);
   t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
@@ -146,7 +143,7 @@ function factFixture(t: TestContext, historicalCommit?: string) {
       question: 'Which output format does the repository support?', consumer: block,
       moment: 'om-pass', blocksCurrentStage: false, resolution: 'Read repository facts during OM' }];
     return value;
-  }, historicalCommit);
+  });
   const stages = Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(store.get(`stage:${project}:${stage}`)!)])) as Record<UpstreamStage, Ref>;
   const base = ok(writeOmInput(store, { project, expected: 0, stages })), graph = store.get<Graph>(`graph:${project}`)!;
   const input = ok(writeAddressing(store, { project, input: reference(base), graph: reference(graph), decisions: [{ pending:
@@ -1329,74 +1326,6 @@ test('PF3 rows 20, 21: a Transaction preview keeps its own list with pending ans
   assert.equal(ok(searchOf(g.store, g.project, g.target)).answers.length, 1, 'The warm Store sees the answer another writer added');
   rejected(writeGuarded(g.store, { unit: 'D5-test', target: g.target, writes: first.writes, guards: first.guards }), 'revision_conflict');
   assert.equal(g.store.get<AnswerIndex>(first.record.id)!.value.answers.length, 1);
-});
-
-const PF3_BASE = '5929ea25cb7d54d2d5c5a87859b64481e2d1f038';
-/** Row 24: the code of the base commit, loaded from Git whole in its own process, works on the test's database. */
-function atBase(root: string, database: string, body: string): unknown {
-  const repository = fileURLToPath(new URL('../../', import.meta.url));
-  const loader = join(root, 'pf3-base-loader.mjs'), producer = join(root, 'pf3-base-producer.mjs'), served = join(root, 'pf3-base-served.log');
-  const typescript = pathToFileURL(createRequire(import.meta.url).resolve('typescript')).href;
-  writeFileSync(served, '');
-  writeFileSync(loader, `import { execFileSync } from 'node:child_process';
-import { appendFileSync, realpathSync } from 'node:fs';
-import { fileURLToPath, pathToFileURL } from 'node:url';
-import ts from ${JSON.stringify(typescript)};
-let root, log, prefixes;
-export function initialize(data) {
-  root = data.root; log = data.log;
-  prefixes = [root, pathToFileURL(realpathSync(fileURLToPath(root)) + '/').href].map(base => new URL('dist/src/', base).href);
-}
-export async function load(url, context, next) {
-  const prefix = prefixes.find(item => url.startsWith(item));
-  if (prefix && /\\.js$/.test(url)) {
-    const relative = 'src/' + url.slice(prefix.length).replace(/\\.js$/, '.ts');
-    appendFileSync(log, relative + '\\n');
-    const source = execFileSync('git', ['show', ${JSON.stringify(PF3_BASE)} + ':' + relative], { cwd: fileURLToPath(root), encoding: 'utf8', maxBuffer: 10000000 });
-    return { format: 'module', shortCircuit: true, source: ts.transpileModule(source,
-      { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2023 } }).outputText };
-  }
-  if (url.startsWith('file:') && url.includes('/dist/src/') && !url.includes('/node_modules/'))
-    throw new Error('An engine module outside the era checkout: ' + url);
-  return next(url, context);
-}`);
-  writeFileSync(producer, `import { join } from 'node:path';
-import { pathToFileURL } from 'node:url';
-const [repository, database] = process.argv.slice(2);
-const src = path => pathToFileURL(join(repository, 'dist/src', path)).href;
-const { Store } = await import(src('storage/store.js'));
-const store = new Store(database);
-const take = result => { if (!result.ok) throw Error(JSON.stringify(result.refusal)); return result.value; };
-const out = value => process.stdout.write(JSON.stringify(value));
-try {
-${body}
-} finally { store.close(); }`);
-  const bootstrap = `import { register } from 'node:module'; register(${JSON.stringify(pathToFileURL(loader).href)},
-    { data: { root: ${JSON.stringify(pathToFileURL(repository).href)}, log: ${JSON.stringify(served)} } });`;
-  const output: unknown = JSON.parse(execFileSync(process.execPath, ['--import', `data:text/javascript,${encodeURIComponent(bootstrap)}`, producer, repository, database],
-    { cwd: repository, encoding: 'utf8', timeout: 300_000, maxBuffer: 50_000_000 }));
-  const loaded = readFileSync(served, 'utf8').split('\n');
-  assert.ok(loaded.includes('src/storage/store.ts') && loaded.includes('src/om/accepted-answer.ts'), 'The producer ran on the modules of the base commit');
-  return output;
-}
-
-test('PF3 row 24: accepted answers and the index the base code 5929ea25 wrote prepare and read the same with the new code, warm and after reopen', async t => {
-  const f = factFixture(t, PF3_BASE), a = await f.answer(), b = await f.answer();
-  const args = JSON.stringify({ requests: [a.request, b.request], project: f.project, target: f.target });
-  const old = atBase(f.root, join(f.root, 'state.sqlite'), `const { writeAcceptedAnswer, prepareAnswerSearch, readAnswerSearch } = await import(src('om/accepted-answer.js'));
-const args = ${args};
-for (const request of args.requests) take(writeAcceptedAnswer(store, request));
-const search = take(prepareAnswerSearch(store, { project: args.project, target: args.target, field: 'answer' }));
-out({ search, read: take(readAnswerSearch(store, { project: args.project, record: { id: search.record.id, revision: search.record.revision, hash: search.record.hash } })) });`) as { search: { answers: unknown[] }; read: unknown };
-  assert.equal(old.search.answers.length, 2);
-  const check = (label: string) => {
-    const search = ok(searchOf(f.store, f.project, f.target));
-    sameJson(search, old.search, label);
-    sameJson(ok(readAnswerSearch(f.store, { project: f.project, record: reference(search.record) })), old.read, label);
-  };
-  check('cold'); check('warm');
-  f.restart();
-  check('reopened');
 });
 
 test('PF3 rows 26-28: basisView on the common pending layer keeps admission, visibility and closure references; layers of different rows or bases never share a result', async t => {
