@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { DatabaseSync } from 'node:sqlite';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { canonical, canonicalSorted, hashJson } from '../src/canonical.js';
 import { checkedPlanDerivation, planDerivation, type ArtifactReceipt, type MachinePlan, type TaskInput, receiptId } from '../src/compiler/model.js';
 import { resolveArtifact, resolvePlanExternalSource, resolveExternalSource } from '../src/compiler/inputs.js';
@@ -695,14 +695,104 @@ test('the G5 contract does not admit the native multiple-artifact supplier fixtu
 
 
 
-test('without an exact legacy v2 record nonexternal compilation creates only the new era', t => {
-  const f = executionFixture(t, "normal", { route: "om" });
-  const { derivation: _derivation, hash: _hash, ...body } = f.plan.value;
-  assert.ok(f.plan.value.tasks.every(task => task.inputs.every(input => !f.plan.value.graphSnapshot.artifacts.find(artifact => artifact.id === input.artifact)!.external)));
-  assert.equal(f.plan.value.derivation, 'external-inputs/v1');
-  assert.equal(f.store.get(`plan:p:${hashJson(body)}`), null);
-  assert.deepEqual(f.store.list('plan'), [f.plan]);
-  assert.deepEqual(f.store.get('current-plan:p')!.value, reference(f.plan));
+const compilationSnapshot = (store: Store) => canonical(store.list().map(head => ({ head, history: store.history(head.id) })));
+
+/** Stop the current fixture at its first plan transaction, keeping the real M8 and the actual
+ * compiler's pending value. No plan is written/deleted and no compilation algorithm is copied. */
+function uncompiledNonexternalFixture(t: TestContext) {
+  let engine!: ProductEngine, planned!: Write, before!: string, restore!: () => void;
+  const captured = new Error('Test captured the first plan transaction before any write');
+  assert.throws(() => executionFixture(t, 'normal', { route: 'om', beforeRoute(current) {
+    engine = current;
+    const store = engine.store, write = store.writeMany.bind(store);
+    restore = () => { store.writeMany = write; };
+    store.writeMany = ((writes, guards) => {
+      const plan = writes.find(row => row.kind === 'plan');
+      if (plan) {
+        assert.equal(store.list('plan').length, 0); assert.equal(store.get('current-plan:p'), null);
+        assert.deepEqual(writes.map(row => row.kind), ['plan', 'current-plan']);
+        planned = structuredClone(plan); before = compilationSnapshot(store);
+        throw captured;
+      }
+      return write(writes, guards);
+    }) as typeof store.writeMany;
+  } }), error => error === captured);
+  restore();
+  assert.equal(compilationSnapshot(engine.store), before);
+  const value = planned.value as unknown as MachinePlan;
+  assert.equal(value.derivation, 'external-inputs/v1');
+  assert.equal(planned.id, `plan:p:external-inputs-v1:${value.hash}`);
+  assert.ok(value.tasks.length > 0);
+  assert.ok(value.tasks.every(task => task.inputs.every(input => !value.graphSnapshot.artifacts.find(artifact => artifact.id === input.artifact)!.external)));
+  assert.equal(value.feasibility.id, 'om-feasibility:p');
+  const m8 = externalOk(readFeasibility(engine.store, { project: 'p', record: value.feasibility }));
+  assert.deepEqual(reference(m8), value.feasibility); assert.equal(m8.value.ready, true);
+  const journal = join(dirname(engine.store.path), 'calls.jsonl');
+  const calls = () => {
+    try { return readFileSync(journal, 'utf8').trim().split('\n').filter(Boolean); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return []; throw error; }
+  };
+  assert.deepEqual(calls(), []);
+  return { get store() { return engine.store; }, get engine() { return engine; }, planned, value, calls,
+    reopen() { const store = new Store(engine.store.path); t.after(() => store.close()); engine = new ProductEngine(store); } };
+}
+
+/** Negative address impersonation only, not output from a historical producer. The compiler
+ * supplies the pending current body; stripping its marker calculates the address being retired. */
+function imitatePreExternalPlan(f: ReturnType<typeof uncompiledNonexternalFixture>, mismatch = false) {
+  const { derivation: _derivation, hash: _hash, ...body } = f.value;
+  const hash = hashJson(body), id = `plan:p:${hash}`;
+  assert.equal(f.store.get(id), null); assert.equal(f.store.get(f.planned.id), null);
+  return f.store.write({ id, kind: 'plan', expected: 0,
+    value: { ...body, hash: mismatch ? hashJson('explicit negative imitation') : hash } });
+}
+
+for (const imitation of ['absent', 'matching-body', 'mismatched-body'] as const)
+test(`current nonexternal M8 compilation first creates only the external-inputs-v1 plan despite ${imitation} old-address imitation and repeats inertly hot/cold`, t => {
+  const f = uncompiledNonexternalFixture(t);
+  const fake = imitation === 'absent' ? null : imitatePreExternalPlan(f, imitation === 'mismatched-body');
+  assert.equal(f.store.get(f.planned.id), null); assert.equal(f.store.get('current-plan:p'), null);
+  const plan = f.engine.compiler.compile('p');
+  assert.equal(plan.id, f.planned.id); assert.deepEqual(plan.value, f.value);
+  assert.equal(plan.value.derivation, 'external-inputs/v1');
+  assert.deepEqual(f.store.get<Ref>('current-plan:p')!.value, reference(plan));
+  assert.deepEqual(f.store.list('plan').map(reference).sort((a, b) => a.id.localeCompare(b.id)),
+    [reference(plan), ...(fake ? [reference(fake)] : [])].sort((a, b) => a.id.localeCompare(b.id)));
+  const afterCompile = compilationSnapshot(f.store), calls = f.calls();
+  assert.deepEqual(calls, []);
+  for (const cold of [false, true]) {
+    if (cold) f.reopen();
+    assert.deepEqual(f.engine.compiler.read(plan.id), plan);
+    assert.equal(compilationSnapshot(f.store), afterCompile); assert.deepEqual(f.calls(), calls);
+    assert.deepEqual(f.engine.compiler.compile('p'), plan);
+    assert.equal(compilationSnapshot(f.store), afterCompile); assert.deepEqual(f.calls(), calls);
+  }
+});
+
+test('old-address imitation cannot bypass the Environment guard of the first current nonexternal plan transaction', t => {
+  const f = uncompiledNonexternalFixture(t), fake = imitatePreExternalPlan(f);
+  const second = new Store(f.store.path); t.after(() => second.close());
+  const other = new ProductEngine(second), environment = other.environments.get('p');
+  assert.deepEqual(reference(environment), f.value.environment);
+  const write = f.store.writeMany.bind(f.store);
+  let raced = false, afterCompetitor!: string, calls!: string[];
+  f.store.writeMany = ((writes, guards) => {
+    if (!raced && writes.some(row => row.kind === 'plan')) {
+      assert.deepEqual(writes.map(row => row.id), [f.planned.id, 'current-plan:p']);
+      assert.ok(guards?.some(guard => canonical(guard) === canonical(reference(environment))), 'The real Environment guard reaches the atomic write');
+      const { projectId: _projectId, ...value } = environment.value;
+      const changed = other.environments.configure('p', { ...value, timeoutMs: value.timeoutMs + 1 }, environment.revision);
+      assert.ok(changed.revision > environment.revision);
+      raced = true; afterCompetitor = compilationSnapshot(f.store); calls = f.calls();
+    }
+    return write(writes, guards);
+  }) as typeof f.store.writeMany;
+  try { assert.throws(() => f.engine.compiler.compile('p'), { code: 'input_stale' }); }
+  finally { f.store.writeMany = write; }
+  assert.ok(raced);
+  assert.equal(compilationSnapshot(f.store), afterCompetitor); assert.deepEqual(f.calls(), calls);
+  assert.deepEqual(f.store.list('plan'), [fake]);
+  assert.equal(f.store.get(f.planned.id), null); assert.equal(f.store.get('current-plan:p'), null);
 });
 
 

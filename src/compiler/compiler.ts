@@ -60,24 +60,6 @@ export class Compiler {
       requireCondition(transactionGuardsCurrent(this.store, admissionGuards), "plan_stale", "Plan admission changed while compiling");
       return existing;
     }
-    // Equal task bytes do not imply equal execution rules for external inputs.
-    // Only a nonexternal exact v2 result can be a completed legacy repetition.
-    const hasExternalInput = derived.tasks.some(task => task.inputs.some(input =>
-      graph.artifacts.some(artifact => artifact.id === input.artifact && artifact.external)));
-    if (!hasExternalInput) {
-      const { derivation: _derivation, ...legacyBody } = body;
-      const legacyValue = { ...legacyBody, hash: hashJson(legacyBody) };
-      const legacyId = `plan:${project}:${legacyValue.hash}`;
-      const completed = this.store.get<MachinePlan>(legacyId);
-      if (completed) {
-        if (completed.kind !== 'plan' || completed.value?.projectId !== project || completed.value.version !== 2
-          || completed.hash !== hashJson(completed.value) || completed.hash !== hashJson(legacyValue)
-          || completed.value.hash !== legacyValue.hash) throw new EngineError('plan_corrupt',
-          'Completed legacy plan must equal its exact derived result', { unit: 'compiler/compiler', target: legacyId });
-        requireCondition(transactionGuardsCurrent(this.store, admissionGuards), "plan_stale", "Plan admission changed while compiling");
-        return completed;
-      }
-    }
     const pointer = this.store.get<Ref>(`current-plan:${project}`);
     return this.store.writeMany<MachinePlan>([
       { id, kind: "plan", expected: 0, value },
