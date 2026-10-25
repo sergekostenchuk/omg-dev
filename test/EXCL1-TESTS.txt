@@ -3,16 +3,7 @@
 # npm test гоняет всё; неизвестный, дублирующийся или вне-прогоновый ключ останавливает check:backend до запуска.
 # Реестр: ~/REPORTS/review/omg-excl1-design_191026.md (описи omg-legacy-inv-{A,B,C,D,D2-cw}_191026.md).
 
-om-model-call-part-06.test.ts :: E4 direct continuation refuses repeated knowledge atomically before a third dispatch and replays after restart # вид 1: эра 7c7d3cc
-om-model-call-part-06.test.ts :: 1 H1.0a standalone physical history retains its original completion and never acquires an owner # вид 1: эра 7c7d3cc
-om-model-call-part-06.test.ts :: 4 H1.0a an existing standalone opening cannot be adopted even before any physical call # вид 1: эра 7c7d3cc
-om-model-call-part-06.test.ts :: C03 H1.0a completion threshold preserves old ordinals and an exact managed opening ignores later M6 heads # вид 1: эра 7c7d3cc
-om-model-call-part-06.test.ts :: C06 H1.0a successor inherits original completion proofs but starts its own independent ordinal threshold # вид 1: эра 7c7d3cc
-om-model-call-part-06.test.ts :: 16 H1.0b a genuine H1.0a application-refused replays its exact exchange without another settlement # вид 1: эра 7aa19cc, 7c7d3cc
-om-question-packet.test.ts :: E2 preserves original packet and part-result history strictly in its old answer era after restart # вид 1: эра ff25519
-om-question-packet.test.ts :: MP3 rows 7, 19 (era): packets, deliveries, continuations and parts of the MP1 and pre-MP1 producers keep their form and outcomes under the new code, including №57; their descendants never acquire readings # вид 1: эра 08be75a, 5ccc463, bed6664
 om-question-packet.test.ts :: MP1.1 row 10: two individually proved parts from different brief versions cannot form one producer request or a saved chain # вид 1: эра e88b4ed4
-om-model-call-part-06.test.ts :: LP3 legacy reads-invalid: a context Ref admitted by the old E3 resumes after call or diagnostic without another send # вид 1: старый E3 допускал context Ref в search; только два reads-invalid окна (№6978)
 om-achievements.test.ts :: LP7 rows 23, 24: one answer to the joined input fields proves exactly the LP6 keys the split routing proves by parts, state components included; an answer of some proves only theirs, and their rest is joined again on the next B1 # вид 1, найден GUARD1
 om-spend-report.test.ts :: E6 reads unchanged E1 bytes from the complete 0da9006 producer after restart # вид 1, найден GUARD1
 
