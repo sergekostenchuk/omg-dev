@@ -1119,13 +1119,9 @@ async function regatedHold(f: Fixture, options: { files?: Record<string, string>
       drive(secondAnswer, local.analyze ?? options.analyze, local.pause ?? options.pause) };
 }
 /** A managed attempt of `block` planned on exactly this batch — the plan an earlier pass saved (the reviewer's helper, №2221). */
-function openPlanned(f: Fixture, bases: RunBases, block: string, batches: readonly RouteBatch[], slice = "before-h15", seriesCommit?: string) {
+function openPlanned(f: Fixture, bases: RunBases, block: string, batches: readonly RouteBatch[], slice = "before-h15") {
   const opening = { project, block, line: 1, slice, predecessor: null, basis: null };
-  // Q3 (№2573-1, №2580): a line an earlier commit continues is opened by that commit's own producer; every other scenario
-  // opens it with the current code, in the new era.
-  if (seriesCommit) atCommit(f, seriesCommit, "era-series", `const { openSeries } = await import(src('om/series.js'));
-out(reference(take(openSeries(store, args))));`, opening);
-  else ok(openSeries(f.store, opening));
+  ok(openSeries(f.store, opening));
   const goal = { key: `${slice}:${block}`, questions: [...new Set(batches.flatMap(batch => batch.items.map(item => gapLineKey(project, item.target, item.field))))].sort(),
     result: gapLineExpectedResult(project, batches[0]!.items[0]!.target, batches[0]!.items[0]!.field) };
   return ok(openAttempt(f.store, { project, block, line: 1, attempt: 1, goal, completion: { routes: bases.routes, batches: batches.map(batch => batch.id).sort() } }));
