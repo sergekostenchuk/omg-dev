@@ -1277,9 +1277,15 @@ function mc1Exchange(f: ReturnType<typeof fixture>, slice: string, reviewer = 'a
   return { batch, series, scenario, config, configure, packet, answer,
     dispatch: { adapter: reference(adapter), config: reference(config) } };
 }
-/** Row 9: the process stops right after the durable MC1 receipt, so the call stays unfinished. */
+/** Row 9: the process stops right after the durable MC1 receipt of a managed attempt, so the call stays unfinished. */
 async function receivedMc1(f: ReturnType<typeof fixture>) {
-  const exchange = mc1Exchange(f, 'received');
+  const exchange = mc1Exchange(f, 'received', 'answers-independent', true);
+  const binding = ok(readCompletionBinding(f.store, f.project, reference(exchange.series), 1));
+  assert.ok(binding, 'The managed opening writes its binding');
+  assert.deepEqual(binding.value.plan, { routes: reference(f.route), batches: [exchange.batch.id] });
+  assert.equal(exchange.packet.value.state, 'ready');
+  assert.deepEqual(exchange.packet.value.request.attempt, { series: reference(exchange.series), ordinal: 1 });
+  assert.deepEqual(f.store.list('model-call'), [], 'Nothing is paid before the first call');
   writeFileSync(exchange.scenario, JSON.stringify({ database: f.path, steps: [exchange.answer] }));
   const writeMany = f.store.writeMany.bind(f.store);
   let stopped = false;
@@ -1302,11 +1308,17 @@ async function receivedMc1(f: ReturnType<typeof fixture>) {
   return record;
 }
 /**
- * One E5 terminal of the fixture fact. With ended, the assessor binding is lawfully replaced between the paid
+ * One E5 terminal of the fixture fact on a managed attempt. With ended, the assessor binding is lawfully replaced between the paid
  * assessor transport and its application, so H1.0b terminates the application with its checked cause.
  */
 async function e5Terminal(f: ReturnType<typeof fixture>, assessor: Json, ended = false) {
-  const exchange = mc1Exchange(f, ended ? 'e5-ended' : 'e5-terminal', 'answers-independent', ended);
+  const exchange = mc1Exchange(f, ended ? 'e5-ended' : 'e5-terminal', 'answers-independent', true);
+  const binding = ok(readCompletionBinding(f.store, f.project, reference(exchange.series), 1));
+  assert.ok(binding, 'The managed opening writes its binding');
+  assert.deepEqual(binding.value.plan, { routes: reference(f.route), batches: [exchange.batch.id] });
+  assert.equal(exchange.packet.value.state, 'ready');
+  assert.deepEqual(exchange.packet.value.request.attempt, { series: reference(exchange.series), ordinal: 1 });
+  assert.deepEqual(f.store.list('model-call'), [], 'Nothing is paid before the first call');
   writeFileSync(exchange.scenario, JSON.stringify({ database: f.path, steps: [exchange.answer, assessor] }));
   const original = ok(await runModelCall(f.store, { project: f.project, packet: reference(exchange.packet),
     dispatch: exchange.dispatch, role: 'implementer' }));
