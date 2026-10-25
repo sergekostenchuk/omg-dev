@@ -477,6 +477,8 @@ test("LP8.1 start and continue of an unable pass whose grounds no longer stand d
 });
 test("AT1 door: an unresolved transition refused by G5 is asked in B1 once, researched, applied, and the next works decide what it reaches and pass G5 on the same snapshot", async t => {
   const f = worksFixture(t), work = f.desired.nodes.find(node => node.id === "garden-produce-work")!;
+  // LG24 (№12218): the full Store — every record's head and all its saved revisions — proves a check wrote nothing.
+  const snapshot = () => f.store.list().map(head => ({ head: reference(head), history: f.store.history(head.id).map(reference) }));
   const written = work.code.find(code => code.access === "write")!.path;
   // The workspace is a repository whose test loads a file by a computed URL — the file the producing work writes.
   mkdirSync(join(f.root, "test"), { recursive: true });
@@ -498,13 +500,13 @@ test("AT1 door: an unresolved transition refused by G5 is asked in B1 once, rese
         .find(item => item.value.result.findings.some(finding => finding.code === "work_impact_unresolved"));
       if (row) {
         seenPending = true;
-        const heads = f.store.list().map(reference);
+        const before = snapshot();
         const other = new Store(f.database);
         try {
           const cold = readinessPending(other, project, reference(row));
           assert.ok(cold.ok && cold.value === true, "a saved refused G5 has its transition pending — read cold on a second Store");
         } finally { other.close(); }
-        assert.deepEqual(f.store.list().map(reference), heads, "the pending check read but never wrote");
+        assert.deepEqual(snapshot(), before, "the pending check read but never wrote");
       }
     }
     // A crash right after the B1 transition: the pass goes on from the store, asking nothing twice.
@@ -559,16 +561,20 @@ test("AT1 door: an unresolved transition refused by G5 is asked in B1 once, rese
   assert.deepEqual(passed.value.impact!.works.find(row => row.work === "garden-produce-work")!.coverage, [{ test: "test/loader.test.ts", by: "file" }]);
   assert.deepEqual(worksAcceptance(f.store).frame, true, "Layer 3 is written");
   // The repeat: the gate's question is answered — nothing is pending and the same transition writes no new B1.
+  const before = snapshot();
   assert.equal(ok(readinessPending(f.store, project, reference(refused!))), false);
+  assert.deepEqual(snapshot(), before, "the hot pending read wrote nothing");
   // LG24 (№12218): the same on a second Store — the held question is not pending on a cold read either.
   const cold = new Store(f.database);
   try {
     const held = readinessPending(cold, project, reference(refused!));
     assert.ok(held.ok && held.value === false, "cold: the held question is not pending on a new Store");
   } finally { cold.close(); }
+  assert.deepEqual(snapshot(), before, "the cold pending read wrote nothing");
   const derivation = f.store.history(input.id).map(row => (row.value as unknown as OmInputRecord).derivation).find(row => row && "kind" in row && row.kind === "readiness")!;
   assert.deepEqual(ok(writeReadinessInput(f.store, { project, input: (derivation as { previous: Ref }).previous, gate: reference(refused!) })).value.derivation, derivation);
   assert.equal(f.store.get(input.id)!.revision, input.revision);
+  assert.deepEqual(snapshot(), before, "the exact repeat wrote nothing");
   // LG24: a copy of this saved gate forged to the earlier or an unknown contract, or losing its contract or its impact,
   // is refused record_forged at its own address by the common readiness source — never silently false.
   const copied = () => structuredClone(refused!.value) as Record<string, Json>;
@@ -578,12 +584,12 @@ test("AT1 door: an unresolved transition refused by G5 is asked in B1 once, rese
     ["absent-impact", (() => { const value = copied(); delete value.impact; return value; })()]];
   const copies = forged.map(([name, value]) => [name,
     reference(f.store.write({ id: `om-atomic-gate:${project}:lg24-${name}`, kind: "om-atomic-gate", expected: 0, value }))] as const);
-  const untouched = f.store.list().map(reference);
+  const untouched = snapshot();
   for (const [name, copy] of copies) {
     const result = readinessPending(f.store, project, copy);
     assert.ok(!result.ok, `${name}: ${JSON.stringify(result)}`);
     assert.deepEqual([result.refusal.code, result.refusal.at], ["record_forged", { unit: "G1", target: copy.id, field: "impact", ref: copy }], name);
+    assert.deepEqual(snapshot(), untouched, `${name}: the forged check read but never wrote`);
   }
-  assert.deepEqual(f.store.list().map(reference), untouched, "the forged checks read but never wrote");
 });
 test("AT1 policy: a durable work's state policy is asked once at its producer and decided by the model in the bypass; the works refer to it and pass G5", async t => policyDoor(t, false));
