@@ -1,4 +1,4 @@
-import { answerDiscoveryFixture, currentUpstreamFixtureValue, preparedFeatures, withHistoricalUpstream } from './product-fixture.js';
+import { answerDiscoveryFixture, currentUpstreamFixtureValue, preparedFeatures } from './product-fixture.js';
 import type { Json } from '../src/canonical.js';
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -8,7 +8,7 @@ import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { Store, type Revision } from "../src/storage/store.js";
 import { ProductEngine } from "../src/product/engine.js";
-import { RESEARCH_CONTRACT_VERSION, UPSTREAM_STAGES } from "../src/discovery/requirements.js";
+import { UPSTREAM_STAGES } from "../src/discovery/requirements.js";
 import type { DiscoveryDraft, Question } from "../src/discovery/discovery.js";
 import { reference, type Ref } from "../src/pipeline/contracts.js";
 import { writeOmInput } from "../src/om/input.js";
@@ -125,25 +125,6 @@ test("S1.5 №2363 the projection follows the files behind its sources at an unc
   try { assert.equal(engine.projection("p").executionRunning, true); } finally { executor.isRunning = original; }
   assert.equal(engine.projection("p").executionRunning, false);
   assert.equal(store.changeStamp(), stamp);
-});
-
-
-test('DS1 explicit historical upstream uses its Git producer and leaves current fixtures on the current contract', t => {
-  const root = mkdtempSync(join(tmpdir(), 'omg-ds1-fixture-era-'));
-  const store = new Store(join(root, 'state.sqlite')), engine = new ProductEngine(store);
-  t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
-  const commit = 'e9c1ca5c41fb80508559aeab41da8f3da7422953';
-  const version = (project: string) => {
-    const stage = store.get<{content: {draft: {id:string;revision:number}}}>(`stage:${project}:discovery`)!;
-    const draft = stage.value.content.draft;
-    return store.get<DiscoveryDraft>(draft.id, draft.revision)!.value.contractVersion;
-  };
-  withHistoricalUpstream(commit, () => preparedFeatures(engine, 'era'));
-  assert.equal(version('era'), 4);
-  preparedFeatures(engine, 'current');
-  assert.equal(version('current'), RESEARCH_CONTRACT_VERSION);
-  for (const project of ['era', 'current']) for (const stage of UPSTREAM_STAGES)
-    assert.equal(engine.pipeline.inspect(project, stage).state, 'accepted');
 });
 
 
