@@ -1,8 +1,9 @@
+import { readVariantHandoff, discoveryInspection } from '../discovery/discovery-outcome.js';
 import { canonical, digest, type Json } from "../canonical.js";
 import { Discovery } from "../discovery/discovery.js";
 import {
-  executionAdmission, listDrafts, orderedQuestions, readAnswer, readDraft,
-  readQuestion, readStageArtifact, type Decision, type DiscoveryDraft, type Fact,
+  executionAdmission, isCurrentEra, listDrafts, orderedQuestions, readAnswer, readDraft,
+  readQuestion, readStageArtifact, readResearchRun, type Decision, type DiscoveryDraft, type Fact,
   type UpstreamStage, UPSTREAM_STAGES,
 } from "../discovery/projection-reader.js";
 import { withInvocationAllowanceReport } from "../discovery/invocation-progress.js";
@@ -24,7 +25,7 @@ export type EarlyStageEnd = "stage_paused" | "needs_owner" | "conditional" | "no
   | "om_waiting" | "om_stopped" | "om_busy" | "om_refused";
 
 /** DRY6-01: a stage paused on a refused original assessment carries its exact machine door (reopen of the assessed question). */
-export interface EarlyStageReason { code: string; target: string; message: string; field?: string; door?: AssessmentRefusalDoor }
+export interface EarlyStageReason { code: string; target: string; message: string; field?: string; door?: AssessmentRefusalDoor; handoff?: Ref; next?: 'deep' | 'dossier' }
 export interface EarlyStageBudget {
   maxTurns: number; turnsUsed: number; turnsRemaining: number;
   maxCalls: number; callsMade: number; callsRemaining: number;
@@ -424,7 +425,18 @@ export class EarlyStageDriver {
       }
       let stageResult: StageResearchResult;
       try {
-        stageResult = await this.engine.stageResearch.run(request.project, draft.id, request.maxTurns - turnsUsed);
+        const restoreOnly = current.stage === 'discovery' && isCurrentEra('discovery', draft.value.contractVersion, { discovery: 7 })
+          && !executionAdmission(this.engine.store, draft, 'new-research').admitted;
+        stageResult = await this.engine.stageResearch.run(request.project, draft.id, request.maxTurns - turnsUsed,
+          restoreOnly ? { restoreOnly: true } : {});
+        if (restoreOnly) {
+          admitRunControl(this.engine.store, request.project, execution.hold);
+          const restored = readResearchRun(this.engine.store, request.project, draft.id);
+          const pause = restored?.value.pauseCode
+            ? { code: restored.value.pauseCode, target: draft.id, message: restored.value.error ?? 'Saved v7 research is paused' }
+            : { code: 'research_contract_upgrade_required', target: draft.id, message: 'New v7 work requires its explicit producer policy' };
+          stageResult = { ...stageResult, status: 'paused', findings: [pause], reason: pause };
+        }
       } catch (error) {
         if (error instanceof RunControlLost) return this.#controlOutcome(request.project, error, turnsUsed);
         if (error instanceof EngineError) return { ...this.#base(request.project, "blocked", current.stage, reference(draft), [], null,
@@ -433,8 +445,8 @@ export class EarlyStageDriver {
       }
       turnsUsed += stageResult.turnsUsed ?? 0;
       if (stageResult.status === "accepted") continue;
-      const outcome = this.#stageOutcome(request.project, current.stage, reference(draft), stageResult);
-      if (turnsUsed >= request.maxTurns && outcome.end === "stage_paused" && stageResult.feedback)
+      const outcome = await this.#stageOutcome(request.project, current.stage, reference(draft), stageResult);
+      if (turnsUsed >= request.maxTurns && outcome.end === "stage_paused" && stageResult.feedback && !outcome.reason?.handoff)
         outcome.reason = reason("research_turns_exhausted", current.stage,
           "The shared early research turn allowance is exhausted; consumer feedback is preserved");
       return { ...outcome, turnsUsed, handoff: false };
@@ -589,6 +601,10 @@ export class EarlyStageDriver {
     if (canonical(draft.value.inputs) !== canonical(required))
       return reason("early_draft_stale", draft.id, "The saved draft does not name the current prerequisite basis", "inputs");
     const admission = executionAdmission(this.engine.store, draft, 'early-drive');
+    // Let a started v7 history reach StageResearch's free restore path. Its own admission
+    // still forbids a new v7 purchase under the default producer policy.
+    if (!admission.admitted && stage === 'discovery' && isCurrentEra('discovery', draft.value.contractVersion, { discovery: 7 })
+      && readResearchRun(this.engine.store, project, draft.id)) return null;
     if (!admission.admitted)
       return reason("research_contract_upgrade_required", draft.id, "This unfinished draft has no supported research contract", "contractVersion");
     if (admission.form === "lost")
@@ -598,7 +614,7 @@ export class EarlyStageDriver {
     return null;
   }
 
-  #stageOutcome(project: string, stage: UpstreamStage, draft: Ref, result: StageResearchResult): EarlyResult {
+  async #stageOutcome(project: string, stage: UpstreamStage, draft: Ref, result: StageResearchResult): Promise<EarlyResult> {
     const state = result.discovery?.state;
     const end: EarlyStageEnd = result.status === "stopped" ? "stopped"
       : state === "no_go" ? "no_go"
@@ -607,6 +623,23 @@ export class EarlyStageDriver {
       : result.status === "needs_owner" ? "needs_owner"
       : result.status === "blocked" ? "blocked" : "stage_paused";
     const finding = result.reason;
+    if (stage === 'discovery' && result.status === 'paused' && result.research) {
+      const run = this.engine.store.get<import('../discovery/research-model.js').ResearchRun>(result.research.id, result.research.revision);
+      let address: unknown;
+      try { address = JSON.parse(run?.value.error ?? 'null')?.handoff; } catch { /* A diagnostic pause carries no authority. */ }
+      if (run?.value.pauseCode === 'research_variant_handoff_unavailable')
+        requireCondition(isRef(address), 'discovery_variant_handoff_invalid', 'The saved handoff pause lost its exact address');
+      if (isRef(address)) {
+        const handoff = (await readVariantHandoff(this.engine.store, project, address)).record;
+        requireCondition(canonical(handoff.value.draft) === canonical(draft), 'discovery_variant_handoff_invalid', 'The stage paused on another draft handoff');
+        const { guards: _guards, findings: _findings, ...discovery } = discoveryInspection(this.engine.store,
+          this.engine.store.get<DiscoveryDraft>(draft.id, draft.revision)!).outcome;
+        return { ...this.#base(project, 'stage_paused', stage, draft, [], { ...result, discovery },
+          { code: 'research_variant_handoff_unavailable', target: handoff.value.next,
+            message: `The saved Discovery handoff awaits ${handoff.value.next}`, handoff: reference(handoff), next: handoff.value.next }),
+          turnsUsed: result.turnsUsed ?? 0, handoff: false };
+      }
+    }
     return { ...this.#base(project, end, stage, draft, [], result, finding
       ? { ...reason(finding.code, finding.target, finding.message, finding.field), ...(finding.door ? { door: finding.door } : {}) } : null),
       turnsUsed: result.turnsUsed ?? 0, handoff: false };

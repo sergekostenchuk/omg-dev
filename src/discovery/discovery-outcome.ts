@@ -1,4 +1,4 @@
-import { proveAttempt, provePlanQuestions } from "./v7-plan-questions.js";
+import { currentPlan, proveAttempt, provePlanQuestions } from "./v7-plan-questions.js";
 import type { ResearchAssessment, ResearchRun, PaidDiscoveryAttemptsAssessment, V7ProgressApplication, V7ProgressState,
   V7ProgressSubject, V7ProgressSummary } from './research-model.js';
 import { readV7ProgressStateAt } from './v7-progress.js';
@@ -7,6 +7,16 @@ import { DISCOVERY_ASSESSMENT_KIND, v7ProgressStateId } from './v7-attempt-asses
 import { V7_ATTEMPT_KIND } from './v7-contracts.js';
 import { stageBudgetPlan } from './stage-token-budget.js';
 import { budgetUsage } from '../runtime/research-budget.js';
+import { readVariantSnapshot, variantSnapshotReadiness } from './variant-snapshot.js';
+import { readVariantGeneration, readVariantModelDecision } from './variant-session.js';
+import { readProjectMode } from '../product/project-mode.js';
+import { VARIANT_HANDOFF_CONTRACT, decodeVariantHandoff, readVariantHandoffStructural, variantStateId, type VariantHandoff } from './variant-decision.js';
+import { variantRecordId, type VariantReason } from './discovery-variants.js';
+import { readResearchConsumerExecution, type ResearchConsumerIntent } from './response-recovery.js';
+import { readAssessmentSessionOutcomeAt } from './assessment-session.js';
+import type { ModelCall } from '../runtime/model-usage.js';
+import { storeView } from '../storage/store-view.js';
+import type { TransactionGuard } from '../storage/store.js';
 import { researchRunId } from './projection-reader.js';
 import { Ajv } from 'ajv';
 import { canonical, hashJson, type Json } from '../canonical.js';
@@ -643,4 +653,171 @@ export function discoveryReuseAdmission(store: Store, draft: Revision<DiscoveryD
   if(field==='researchReport'&&!same((value as any).researchPlan,current.researchPlan!.answer)
     ||field==='verdict'&&!same((value as any).researchReport,current.researchReport!.answer)) return {allowed:false,guards:[]};
   return {allowed:true,guards:uniqueRefs([...read.guards,...outcome.guards,...history.guards])};
+}
+
+
+export interface ProvenVariantHandoff {
+  verification: 'proven'; record: Revision<VariantHandoff>;
+}
+export interface VariantHandoffRequest {
+  draft: Ref; result: Ref | null; decision: Ref | null; scope: Ref | null;
+  /** The reason is derived from the stage's saved budget, never supplied by a caller. */
+  earlyLimit?: boolean;
+}
+function handoffRequire(ok: unknown, message: string): asserts ok {
+  requireCondition(ok, 'discovery_variant_handoff_invalid', message);
+}
+function handoffExact<T>(store: Store, ref: Ref, kind: string): Revision<T> {
+  const row = isRef(ref) ? store.get<T>(ref.id, ref.revision) : null;
+  handoffRequire(row && row.kind === kind && same(reference(row), ref) && row.hash === hashJson(row.value),
+    `Handoff lost its exact ${kind} basis`);
+  return row;
+}
+/** Reuse the common budget computation over just the saved accounting revisions. Later heads are irrelevant.
+ * Every assignment must be represented; omitted calls cannot turn unknown accounting into a limit. */
+function handoffLimit(store: Store, draft: Revision<DiscoveryDraft>, grounds?: Ref[]): VariantReason {
+  const rows = new Map<string, Revision>();
+  for (const ref of grounds ?? []) {
+    handoffRequire(isRef(ref), 'A budget ground needs its full exact Ref');
+    const row = store.get(ref.id, ref.revision);
+    handoffRequire(row && same(reference(row), ref) && row.hash === hashJson(row.value), 'A saved budget ground is missing');
+    handoffRequire(!rows.has(row.id), 'Budget grounds must not select several heads of one record');
+    rows.set(row.id, row);
+  }
+  const view = grounds ? storeView(store, {
+    get: (id, revision) => revision === undefined ? rows.get(id) ?? null : undefined,
+    write: () => { throw new EngineError('discovery_variant_handoff_invalid', 'Historical limit proof is read-only'); },
+  }) : store;
+  const budget = traversalBudget(view, draft);
+  handoffRequire(budget?.exhausted && budget.reserved === 0, 'Only measured exhaustion of a saved stage budget proves early_limit');
+  const ledger = handoffExact<{ projectId: string; segment: string; assignments: { call: string; groups: string[]; estimate: unknown }[] }>(store, budget.ledger, 'research-budget-ledger');
+  handoffRequire(ledger.value.projectId === draft.value.projectId && ledger.value.segment === budget.segment.id
+    && new Set(budget.calls.map(ref => ref.id)).size === budget.calls.length, 'The stage ledger must account for each own call exactly once');
+  // Accounting rows alone cannot manufacture paid usage. Reuse each call's managed physical proof.
+  for (const ref of budget.calls) {
+    const call = handoffExact<ModelCall>(store, ref, 'model-call');
+    handoffRequire(call.value.projectId === draft.value.projectId && call.value.budget?.segment.id === budget.segment.id,
+      'Budget accounting names a foreign call or segment');
+    const assignment = ledger.value.assignments.find(row => row.call === call.id);
+    handoffRequire(assignment && same(assignment.groups, call.value.budget.groups) && same(assignment.estimate, call.value.budget.estimate),
+      'The saved ledger assignment differs from its physical reservation');
+    if (call.value.consumerIntent) {
+      const intent = store.history<ResearchConsumerIntent>(call.value.consumerIntent.id)
+        .find(row => row.value.call?.id === call.id && ['applied', 'refused'].includes(row.value.state));
+      handoffRequire(intent, 'Budget usage needs its saved terminal consumer');
+      const physicalView = storeView(store, { get: (id, revision) => revision === undefined && id === intent.id ? intent as unknown as Revision : undefined,
+        write: () => { throw new EngineError('discovery_variant_handoff_invalid', 'Paid budget proof is read-only'); } });
+      const proof = readResearchConsumerExecution(physicalView, draft.value.projectId, reference(intent));
+      handoffRequire(proof.call.id === call.id && same(proof.call.value.usage, call.value.usage), 'Budget usage differs from the paid physical receipt');
+    } else if (call.value.assessmentApplication) {
+      const app = store.history<{ state: string; call: Ref | null; after: Ref | null }>(call.value.assessmentApplication.id)
+        .find(row => row.value.state === 'applied' && row.value.call?.id === call.id && row.value.after);
+      handoffRequire(app?.value.after, 'Budget usage needs its saved assessment terminal');
+      const proof = readAssessmentSessionOutcomeAt(store, draft.value.projectId, app.value.after, reference(app));
+      const receipt = handoffExact<ModelCall>(store, proof.received, 'model-call');
+      handoffRequire(receipt.id === call.id && same(receipt.value.usage, call.value.usage), 'Budget usage differs from the paid assessment receipt');
+    } else handoffRequire(false, 'A structural call cannot prove a paid stage limit');
+  }
+  const exactGrounds = [budget.segment, budget.ledger, ...budget.calls];
+  handoffRequire(!grounds || same(grounds, exactGrounds), 'The limit must retain the entire exact accounting basis');
+  return { code: 'research_budget_exhausted', message: `Stage budget ${budget.segment.id} admits no new paid research`, grounds: exactGrounds };
+}
+async function handoffBasis(store: Store, project: string, value: VariantHandoff): Promise<{ selection: Ref | null }> {
+  const draft = handoffExact<DiscoveryDraft>(store, value.draft, 'discovery-draft');
+  handoffRequire(draft.value.projectId === project && draft.value.contractVersion === 7 && draft.value.stage === 'discovery',
+    'The handoff belongs to another project or draft');
+  provePlanQuestions(store, draft, value.plan);
+  const plan = handoffExact<import('./research-model.js').ResearchAnswer>(store, value.plan, 'research-answer');
+  handoffRequire(same((plan.value.value as Record<string, Json>).frame, value.frame), 'The handoff frame is not the accepted plan frame');
+  let selection: Ref | null = null;
+  if (value.result) {
+    const generation = readVariantGeneration(store, project, value.result), result = generation.publication.result;
+    const snapshot = readVariantSnapshot(store, project, result.value.snapshot);
+    handoffRequire(generation.state && same(reference(snapshot), value.snapshot) && same(snapshot.value.draft, value.draft)
+      && same(snapshot.value.frame, value.frame) && same(snapshot.value.plan, value.plan), 'Handoff needs the original proven generation and snapshot');
+    selection = generation.state;
+    handoffRequire(same(value.set, result.kind === 'discovery-variant-set' ? result.ref : null), 'The exact generation result/set differs');
+    if (value.reason === 'no_variants') handoffRequire(result.kind === 'discovery-variant-none', 'no_variants needs the paid negative producer');
+    else handoffRequire(result.kind === 'discovery-variant-set', 'A choice needs the proven paid set');
+  } else handoffRequire(value.reason === 'early_limit' && value.snapshot === null && value.set === null,
+    'Only a pre-generation limit may omit a paid result');
+  if (value.decision) {
+    const kind = store.get(value.decision.id, value.decision.revision)?.kind;
+    handoffRequire(kind === 'discovery-variant-model-decision' || kind === 'discovery-variant-owner-decision', 'Unknown choice discriminator');
+    const proof = kind === 'discovery-variant-model-decision' ? readVariantModelDecision(store, project, value.decision)
+      : (await import('./discovery-decision.js')).readVariantOwnerDecision(store, project, value.decision);
+    selection = 'grant' in proof ? reference(proof.state) : proof.state;
+    handoffRequire(selection && same(proof.decision.value.draft, value.draft) && same(proof.decision.value.set, value.set)
+      && proof.decision.value.outcome.kind === value.reason, 'The choice must have a proven applied state for this exact set');
+    if (value.reason === 'choose') {
+      const scope = (await import('./variant-scope.js')).readVariantScope(store, project, value.scope!);
+      handoffRequire(same(scope.choice.ref, value.decision) && same(scope.scope.value.member, value.choice)
+        && same(scope.choice.state, selection), 'Handoff scope/member must belong to this exact applied choice');
+    }
+  }
+  if (value.reason === 'early_limit') handoffRequire(same(value.stop, handoffLimit(store, draft, value.stop!.grounds)),
+    'The claimed stop is not the saved stage-budget limit');
+  return { selection };
+}
+/** Exact historical proof. Structural shape, a run pause and today's similar heads never establish a route. */
+export async function readVariantHandoff(store: Store, project: string, ref: Ref): Promise<ProvenVariantHandoff> {
+  const record = readVariantHandoffStructural(store, project, ref).record;
+  handoffRequire(record.revision === 1 && record.id === variantRecordId('discovery-variant-handoff', record.value)
+    && record.hash === hashJson(record.value), 'Handoff must be its immutable deterministic record');
+  await handoffBasis(store, project, record.value);
+  return { verification: 'proven', record };
+}
+/** The only effectful handoff door. A replay returns history and cannot reactivate an old selection or scope. */
+export async function publishVariantHandoff(store: Store, project: string, request: VariantHandoffRequest): Promise<ProvenVariantHandoff & { repeated: boolean }> {
+  handoffRequire(request !== null && typeof request === 'object' && !Array.isArray(request), 'Handoff needs an explicit request');
+  handoffRequire(isRef(request.draft) && (request.result === null || isRef(request.result))
+    && (request.decision === null || isRef(request.decision)) && (request.scope === null || isRef(request.scope)), 'Handoff input needs explicit exact or null references');
+  const draft = handoffExact<DiscoveryDraft>(store, request.draft, 'discovery-draft');
+  let snapshot: Ref | null = null, set: Ref | null = null, frame: Ref, plan: Ref;
+  if (request.result) {
+    const generation = readVariantGeneration(store, project, request.result), result = generation.publication.result;
+    const basis = readVariantSnapshot(store, project, result.value.snapshot);
+    snapshot = reference(basis); set = result.kind === 'discovery-variant-set' ? result.ref : null;
+    frame = basis.value.frame; plan = basis.value.plan;
+  } else {
+    const current = currentPlan(store, project);
+    plan = current.planAnswer;
+    const planValue = handoffExact<import('./research-model.js').ResearchAnswer>(store, plan, 'research-answer').value.value as Record<string, Json>;
+    handoffRequire(isRef(planValue.frame), 'The accepted plan must retain its exact frame');
+    frame = planValue.frame;
+  }
+  let why: VariantHandoff['reason'], choice: Ref | null = null;
+  if (request.earlyLimit) why = 'early_limit';
+  else if (request.decision) {
+    const kind = store.get(request.decision.id, request.decision.revision)?.kind;
+    handoffRequire(kind === 'discovery-variant-model-decision' || kind === 'discovery-variant-owner-decision', 'Unknown choice discriminator');
+    const proof = kind === 'discovery-variant-model-decision' ? readVariantModelDecision(store, project, request.decision)
+      : (await import('./discovery-decision.js')).readVariantOwnerDecision(store, project, request.decision);
+    why = proof.decision.value.outcome.kind;
+    if (proof.decision.value.outcome.kind === 'choose') choice = proof.decision.value.outcome.member;
+  } else why = 'no_variants';
+  const value: VariantHandoff = { contract: VARIANT_HANDOFF_CONTRACT, projectId: project, draft: request.draft,
+    frame, plan, snapshot, result: request.result, set, decision: request.decision, scope: request.scope, choice,
+    reason: why, next: why === 'choose' ? 'deep' : 'dossier', stop: why === 'early_limit' ? handoffLimit(store, draft) : null };
+  decodeVariantHandoff(value);
+  // Decode and prove before any writes, including a replay of a malformed/foreign request.
+  const id = variantRecordId('discovery-variant-handoff', value), existing = store.get<VariantHandoff>(id);
+  if (existing) return { ...(await readVariantHandoff(store, project, reference(existing))), repeated: true };
+  const basis = await handoffBasis(store, project, value), current = currentPlan(store, project);
+  handoffRequire(same(reference(current.draft), value.draft) && same(current.planAnswer, value.plan), 'The handoff plan/draft is no longer current');
+  const readiness = variantSnapshotReadiness(store, project);
+  const frameQuestion = current.draft.value.questions.map(id => store.get<Question>(id))
+    .find(row => row?.value.spec.field === 'frame');
+  handoffRequire(frameQuestion?.value.status === 'answered' && same(frameQuestion.value.answer, value.frame), 'The frame is no longer the current accepted frame');
+  const state = store.get(variantStateId(project, draft.id));
+  const mode = store.get(`project-mode:${project}`) ? readProjectMode(store, project) : null;
+  handoffRequire(basis.selection ? state && same(reference(state), basis.selection) : !state,
+    'The handoff no longer owns the current selection');
+  const guards: TransactionGuard[] = [reference(current.draft), reference(current.question), reference(frameQuestion), value.frame, value.plan,
+    mode ? mode.ref : { id: `project-mode:${project}`, absent: true }, state ? reference(state) : { id: variantStateId(project, draft.id), absent: true }];
+  if (readiness.status === 'ready') guards.push(...readiness.guards);
+  if (value.stop) guards.push(...value.stop.grounds);
+  for (const ref of [value.snapshot, value.result, value.decision, value.scope, value.choice]) if (ref) guards.push(ref);
+  const record = store.writeMany<VariantHandoff>([{ id, kind: 'discovery-variant-handoff', expected: 0, value }], guards)[0]!;
+  return { ...(await readVariantHandoff(store, project, reference(record))), repeated: false };
 }

@@ -115,7 +115,7 @@ for (const kind of ['choose', 'reject_all'] as const) test(`4R.1 choice: public 
   assert.deepEqual(pause.result, decision.value.set); assert.deepEqual(pause.selection, proof.state);
   if (kind === 'choose') assert.deepEqual(pause.scope, reference(readCurrentVariantScope(f.store, 'p', decision.value.draft).scope));
   else { assert.equal(pause.scope, null); assert.equal(f.store.list('discovery-variant-scope').length, 0); }
-  assert.equal(f.store.list('discovery-variant-handoff').length, 0); await fixed(f, result);
+  assert.equal(f.store.list('discovery-variant-handoff').length, 1); await fixed(f, result);
 });
 for (const kind of ['choose', 'reject_all'] as const) test(`4R.1 choice: questions stops without a model choice, then accepts a real owner ${kind} on cold continuation`, async t => {
   const f = await setup(t), door = await f.run(3);
@@ -290,10 +290,11 @@ test('4R.1 choice: a real model -> owner override -> owner revise stays current 
   assert.deepEqual(f.wires(), sent); assert.deepEqual(money(f.store), paid); await fixed(f, chosen);
 });
 
-test('4R.1 choice: actual paid generation can exhaust the research reserve; the common B.2 reservation cannot buy the next choice', async t => {
+test('4R.1 choice: actual paid generation exhausts the research reserve and saves early_limit without buying the next choice', async t => {
   const f = await setup(t, undefined, 'bypass'); f.configure({ proposalTokens: V7_STAGE_TOKEN_CEILING - V7_COMPLETION_RESERVE - 23 });
   const result = await f.run(3);
-  assert.equal(result.value.pauseCode, 'discovery_budget_reserve', JSON.stringify(result.value));
+  assert.equal(result.value.pauseCode, 'research_variant_handoff_unavailable', JSON.stringify(result.value));
+  assert.equal(JSON.parse(result.value.error!).reason, 'early_limit');
   assert.equal(subjectCalls(f, 'proposal').length, 1); assert.equal(subjectCalls(f, 'decision').length, 0);
   const set = f.store.list<VariantSet>('discovery-variant-set')[0]!; assert.ok(readVariantGeneration(f.store, 'p', reference(set)));
   const paid = money(f.store), sent = f.wires(), restored = await f.run(1, f.open(), true);

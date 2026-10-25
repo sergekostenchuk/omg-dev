@@ -113,7 +113,7 @@ test('4R.1: ordinary runner restores MR/P, covers the whole sweep including appl
   assert.deepEqual(history(f.store), before); assert.equal(f.wires().length, sent);
 });
 
-test('4R.1: bypass buys a separate model choice after generation and pauses at the exact scope before handoff', async t => {
+test('4R.1: bypass buys a separate model choice after generation and pauses at the exact saved handoff', async t => {
   const f = await setup(t, undefined, 'bypass'); const result = await f.run(3);
   assert.equal(result.value.pauseCode, 'research_variant_handoff_unavailable', JSON.stringify(result.value));
   assert.equal(f.generationCalls().filter(row => row.subject.variantSubject.kind === 'proposal').length, 1);
@@ -200,7 +200,8 @@ test('4R.1: a new accepted edition of the same Question restores old paid genera
 test('4R.1: common research budget stops new generation after actual paid assessment usage consumes the research reserve', async t => {
   const f = await setup(t); f.configure({ assessorTokens: V7_STAGE_TOKEN_CEILING - 1000 });
   const result = await f.run(2);
-  assert.equal(result.value.pauseCode, 'research_budget_exhausted', JSON.stringify(result.value));
+  assert.equal(result.value.pauseCode, 'research_variant_handoff_unavailable', JSON.stringify(result.value));
+  assert.equal(JSON.parse(result.value.error!).reason, 'early_limit');
   assert.equal(f.generationCalls().length, 0); const ready = variantSnapshotReadiness(f.store, 'p');
   assert.equal(ready.status, 'ready'); if (ready.status === 'ready') assert.equal(ready.generationAllowed, false);
 });

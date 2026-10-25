@@ -17,7 +17,7 @@ import { stageNeighbors, usesStageNeighbors, STAGE_NEIGHBOR_CONTEXT, STAGE_NEIGH
 import { earlyResearchStage, earlyResearchFailure, earlyResearchCorrection, deliveredConceptSections, RESULT_CAPACITY_REFUSAL,
   requireEscalationReply, EARLY_RESEARCH_OUTCOME } from './early-research-outcome.js';
 import { producerContractEra, type ProducerPolicy, type UpstreamStage } from './requirements.js';
-import { discoveryContext, discoveryInspection, type DiscoveryOutcome } from './discovery-outcome.js';
+import { discoveryContext, discoveryInspection, publishVariantHandoff, type DiscoveryOutcome } from './discovery-outcome.js';
 import { savedSynthesisMaterials, savedV7SynthesisMaterials } from "./saved-synthesis.js";
 import { readResearchContext, researchContextReadEra } from "./research-limits.js";
 import { planningForQuestion, planningForPlanSubject } from "./research-routing.js";
@@ -1626,7 +1626,8 @@ export class Researcher {
     if (result.kind === "discovery-variant-none") {
       requireCondition(generation.state && canonical(reference(state)) === canonical(generation.state),
         "research_variant_context_stale", "The no_variants publication does not own today's selection");
-      pause("research_no_variants", "The paid generation published no_variants", { reason: "no_variants", next: "dossier" });
+      const handoff = await publishVariantHandoff(this.store, project, { draft: session.value.draft, result: result.ref, decision: null, scope: null });
+      pause("research_no_variants", "The paid negative result awaits its dossier consumer", { reason: "no_variants", next: "dossier", handoff: reference(handoff.record) });
     }
     if (state.value.decision) {
       const ref = state.value.decision, kind = this.store.get(ref.id, ref.revision)?.kind;
@@ -1648,12 +1649,18 @@ export class Researcher {
           "The selected owner/model act moved before its scope was read");
         scope = reference(current.scope);
       }
-      pause("research_variant_handoff_unavailable", "The proven choice is retained; its handoff consumer is not connected",
+      const handoff = await publishVariantHandoff(this.store, project, { draft: session.value.draft, result: result.ref, decision: ref, scope });
+      pause("research_variant_handoff_unavailable", "The saved handoff awaits its addressed consumer",
         { draft: session.value.draft, set: result.ref, mode: choice.decision.value.mode,
-          decision: ref, selection: applied, scope, reason: outcome.kind, next: outcome.kind === "choose" ? "deep" : "dossier" });
+          decision: ref, selection: applied, scope, handoff: reference(handoff.record), reason: outcome.kind, next: outcome.kind === "choose" ? "deep" : "dossier" });
     }
     requireCondition(generation.state && canonical(reference(state)) === canonical(generation.state),
       "research_variant_context_stale", "The generation lost its proven undecided selection");
+    if (variantSnapshotReadiness(this.store, project).budget?.exhausted) {
+      const handoff = await publishVariantHandoff(this.store, project, { draft: session.value.draft, result: result.ref, decision: null, scope: null, earlyLimit: true });
+      pause("research_variant_handoff_unavailable", "The saved stage-budget limit awaits its dossier consumer",
+        { reason: "early_limit", next: "dossier", handoff: reference(handoff.record) });
+    }
     const previous = variants.decisions.filter(choice => canonical(choice.decision.value.set) === canonical(result.ref));
     if (mode.mode === "questions") pause("research_variant_owner_required", "An explicit owner choice of this exact set is required",
       { door: "discovery-variant-choice", draft: session.value.draft, set: result.ref, mode: mode.ref, expectedSelection: reference(state),
@@ -1989,6 +1996,18 @@ export class Researcher {
         });
         if (generations.length && run) { await advanceChoice(); continue; }
         const readiness = variantSnapshotReadiness(this.store, project);
+        if (readiness.budget?.exhausted) {
+          if (!run) {
+            const effective = this.environments.effective(project);
+            run = this.store.writeMany<ResearchRun>([{ id, kind: "research-run", expected: 0,
+              value: { projectId: project, draftId, environment: reference(effective.environment), status: "paused", turns: 0,
+                limit, inputs: plan.draft.value.inputs, ownerQuestion: null, error: null, pauseCode: null, owner, requestChars: 0 } }],
+              [reference(plan.draft), reference(plan.question)])[0]!;
+          }
+          const handoff = await publishVariantHandoff(this.store, project, { draft: reference(plan.draft), result: null, decision: null, scope: null, earlyLimit: true });
+          throw new EngineError("research_variant_handoff_unavailable", canonical({ code: "research_variant_handoff_unavailable",
+            handoff: reference(handoff.record), reason: "early_limit", next: "dossier", message: "The saved stage-budget limit awaits its dossier consumer" }));
+        }
         // Prove saved operations and readiness first. A cold refusal preserves the exact
         // addressed pause even if other questions remain uncovered; it claims no readiness.
         const lastSubject = turns.length ? planSubjectOf(turns[turns.length - 1]!.value) : null;
