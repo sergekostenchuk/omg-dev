@@ -335,9 +335,13 @@ test('G1.1 Compiler read and current gate reject incomplete M8 provenance by the
 
 function acceptM8(f: BoundaryFixture) {
   const saved = ok(writeFeasibility(f.store, f.feasibility)), engine = new ProductEngine(f.store);
-  const draft = engine.refinement.publish(f.project, reference(saved), 0);
+  const draft = engine.execute({ type: 'draft-om', project: f.project, feasibility: reference(saved), expected: 0 }) as Revision<StageArtifact>;
   const stage = engine.pipeline.accept(f.project, 'om-g2', draft.revision);
   assert.equal(stage.value.status, 'accepted');
+  // The stage stands on the current public door and the real M8: its content is exactly that M8, with no feasibility of the old route and no research phase.
+  assert.deepEqual(stage.value.content, { feasibility: reference(saved) });
+  assert.equal(f.store.get(`feasibility:${f.project}`), null);
+  assert.deepEqual(f.store.list('phase'), []);
   return { saved, engine, stage };
 }
 
