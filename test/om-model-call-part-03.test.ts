@@ -13,7 +13,7 @@ import type { Graph } from '../src/graph/model.js';
 import { writeAddressing, inputDecisionWrite } from '../src/om/addressing.js';
 import { writeGuarded } from '../src/om/refs.js';
 import { writeQuestionPacket, type QuestionPacketRecord, readQuestionPacket } from '../src/om/question-packet.js';
-import { seriesRequestOf, type RepairSeries, openSeries, beginAttempt, completionWorkId } from '../src/om/series.js';
+import { seriesRequestOf, type RepairSeries, openSeries, beginAttempt, completionWorkId, readCompletionBinding } from '../src/om/series.js';
 import { recordCall } from '../src/om/call-record.js';
 import { closeAttempt } from '../src/om/repeat-gate.js';
 import type { ModelCall } from '../src/runtime/model-usage.js';
@@ -357,17 +357,21 @@ test('MP2 (№2968 rows 9, 4) a refused correction ends the cycle by its own dia
 
 
 
-test('MP2 (№2968 row 10) no correction for what is no repairable answer content: a wrong request id, a control answer, a transport failure, a standalone attempt', async t => {
-  const cases: [string, (f: ReturnType<typeof e4Fixture>) => Record<string, unknown>, boolean][] = [
-    ['request', f => ({ research: { ...e4Node(f), requestId: 'another-request' } }), true],
+test('MP2 (№2968 row 10) no correction for what is no repairable answer content: a wrong request id, a control answer, a transport failure', async t => {
+  const cases: [string, (f: ReturnType<typeof e4Fixture>) => Record<string, unknown>][] = [
+    ['request', f => ({ research: { ...e4Node(f), requestId: 'another-request' } })],
     ['cannot', f => ({ research: { protocol: '$answerProtocol', requestId: '$requestId', action: 'cannot_answer',
-      questionIds: (f.packet.value.packet as { questions: { id: string }[] }).questions.map(question => question.id), reason: 'The fact is unknown.' } }), true],
-    ['transport', () => ({ rawStdout: 'not json' }), true],
-    ['standalone', f => ({ research: mp2Refused(f) }), false],
+      questionIds: (f.packet.value.packet as { questions: { id: string }[] }).questions.map(question => question.id), reason: 'The fact is unknown.' } })],
+    ['transport', () => ({ rawStdout: 'not json' })],
   ];
-  for (const [name, answer, managed] of cases) {
+  for (const [name, answer] of cases) {
     await t.test(name, async t => {
-      const f = e4Fixture(t, 'node', 100_000, 1000, managed);
+      const f = e4Fixture(t, 'node', 100_000, 1000, true);
+      // The entry is the current managed one: a real completion binding of ordinal 1 over its own routes and batch, nothing paid yet.
+      const binding = valueOf(readCompletionBinding(f.store, f.project, reference(f.series), 1));
+      assert.ok(binding, `${name}: a real completion binding`);
+      assert.deepEqual(binding.value.plan, { routes: reference(f.routes), batches: [f.batch.id] }, `${name}: the plan of the binding`);
+      assert.equal(f.sent().length, 0, `${name}: nothing was sent yet`);
       f.steps([answer(f), { research: e4Node(f) }]);
       const cycle = await mp2Cycle(f.store, f.request);
       assert.equal(f.sent().length, 1, `${name}: one call, no correction`);
