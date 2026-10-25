@@ -3,7 +3,7 @@ import { packetPrompt } from '../src/om/packet-brief.js';
 import assert from 'node:assert/strict';
 import { writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { type Json, canonical } from '../src/canonical.js';
+import { type Json, canonical, hashJson } from '../src/canonical.js';
 import { runModelCall, runModelCycle, readModelCycle, readPartAssembly, assembleModelParts, readModelCall, runModelCycle as mp2Cycle, correctionGround as mp2Ground, readModelCycle as mp2ReadCycle } from '../src/om/model-call.js';
 import { type ProcessResult } from '../src/runtime/process.js';
 import { type Revision, Store, type Write } from '../src/storage/store.js';
@@ -13,9 +13,10 @@ import type { Graph } from '../src/graph/model.js';
 import { writeAddressing, inputDecisionWrite } from '../src/om/addressing.js';
 import { writeGuarded } from '../src/om/refs.js';
 import { writeQuestionPacket, type QuestionPacketRecord, readQuestionPacket } from '../src/om/question-packet.js';
-import { seriesRequestOf, type RepairSeries, openSeries, beginAttempt, completionWorkId, readCompletionBinding } from '../src/om/series.js';
-import { recordCall } from '../src/om/call-record.js';
-import { closeAttempt } from '../src/om/repeat-gate.js';
+import { seriesRequestOf, type RepairSeries, openSeries, completionWorkId, readCompletionBinding } from '../src/om/series.js';
+import { gapLineKey, gapLineExpectedResult } from '../src/om/gap-lines.js';
+import { recordCall, type CallRecord } from '../src/om/call-record.js';
+import { closeAttempt, openAttempt } from '../src/om/repeat-gate.js';
 import type { ModelCall } from '../src/runtime/model-usage.js';
 import { prepareLateModelReceipt } from '../src/discovery/model-call-recovery.js';
 import { MP3_NOTES, MP3_SCOPES, completionSnapshot, currentPacketWire, e4CannotAnswer, e4Fact, e4Fixture, e4NeedSource, e4Node, ensureFixtureProject, fixtureCheckpoint, fixtureDriver, killFixtureDriver, lp4CeasedStep, lp4Need, lp4Root, mp2Managed, mp2Refused, mp2Step, mp3Carried, mp3Close, mp3Cycle, mp3DecisionOf, mp3Decisions, mp3Open, mp3Origins, mp3Readings, mp3ScopeAttempt, publicRecovery, refusesLiveRecovery, usage, valueOf } from './om-model-call-fixture.js';
@@ -214,13 +215,33 @@ test('C10 H1.0a E1 ledger races protect G7 and a closed owner invalidates its ea
     const f=e4Fixture(child,'fact',100_000,1000,true);f.steps([{research:{wrong:true},usage}]);
     valueOf(await runModelCall(f.store,f.request));const work=completionSnapshot(f);
     const address={project:f.project,block:'garden-produce-block',line:1};
+    const batches=f.routes.value.batches.filter(batch=>batch.task==='node-expansion'&&batch.level===2&&batch.node===address.block);
+    assert.equal(batches.length,1,'Exactly one whole level-2 node-expansion batch for the competing block');
+    const batch=batches[0]!;
+    assert.ok(batch.items.length>0&&batch.items.every(item=>item.consumers.includes(address.block)),
+      'Every routed item of the competing batch belongs to its block');
     valueOf(openSeries(f.store,{...address,slice:'independent-call',predecessor:null,basis:null}));
-    const goal={key:'independent',questions:['another-question'],result:'another-result'};
-    const other=valueOf(beginAttempt(f.store,{...address,attempt:1,goal}));
-    const request={call:'concurrent-unmanaged-call',purpose:'model-research' as const,basis:null,block:address.block,
-      series:reference(other),attempt:1,goal,dispatch:f.request.dispatch,packet:{question:'independent'},
-      gaps:[{id:'another-question',goal:'another-question',field:'value',consumer:address.block}]};
+    const goal={key:'independent',questions:batch.items.map(item=>gapLineKey(f.project,item.target,item.field)),
+      result:gapLineExpectedResult(f.project,batch.items[0]!.target,batch.items[0]!.field)};
+    const plan={routes:reference(f.routes),batches:[batch.id]};
+    const other=valueOf(openAttempt(f.store,{...address,attempt:1,goal,completion:plan}));
+    const binding=valueOf(readCompletionBinding(f.store,f.project,reference(other),1));
+    assert.ok(binding?.value,'A managed competing attempt holds its completion binding');
+    assert.deepEqual(binding!.value!.plan,plan,'The binding holds the exact completion plan');
+    const packet=valueOf(writeQuestionPacket(f.store,{project:f.project,routes:reference(f.routes),batch:batch.id,
+      environment:reference(f.configured),attempt:{series:reference(other),ordinal:1},previous:[]})).record;
+    assert.equal(packet.value.state,'ready');assert.equal(packet.value.plan?.mode,'whole');
+    assert.equal(packet.value.request.attempt?.ordinal,1);assert.equal(packet.value.request.attempt?.series.id,other.id);
+    const payload=packet.value.packet as Record<string,Json>&{requestId:string;purpose:'model-design';questions:{id:string}[]};
+    assert.equal(payload.purpose,'model-design','An MC2 expansion packet is issued for model design');
+    const assigned=new Set(payload.questions.map(question=>question.id));
+    const request={call:payload.requestId,purpose:payload.purpose,basis:null,block:address.block,
+      series:reference(other),attempt:1,goal,dispatch:f.request.dispatch,packet:payload as Json,
+      gaps:batch.items.filter(item=>assigned.has(item.gap)).flatMap(item=>item.consumers
+        .map(consumer=>({id:item.target,goal:item.target,field:item.field,consumer})))};
     const claim={...seriesRequestOf(f.series.value),attempt:1,outcome:{reason:'off-form' as const,accepting:[],cancelling:[],refusals:work.refusals}};
+    assert.equal(f.store.list('call-record').length,1,'Only the paid consumer call exists before the race window');
+    assert.equal(f.sent().length,1,'Only the paid consumer was dispatched');
     if(first==='E1'){
       const prepared=valueOf(prepareCloseAttempt(f.store,claim));
       const second=new Store(f.database);try{valueOf(recordCall(second,f.project,request));}finally{second.close();}
@@ -250,6 +271,14 @@ test('C10 H1.0a E1 ledger races protect G7 and a closed owner invalidates its ea
     }
     const saved=f.store.list();f.restart();valueOf(closeAttempt(f.store,claim));valueOf(recordCall(f.store,f.project,request));
     assert.deepEqual(f.store.list(),saved);assert.equal(f.store.list('call-record').length,2);assert.equal(f.sent().length,1);
+    const calls=f.store.list<CallRecord>('call-record').map(record=>record.value);
+    const own=calls.find(row=>row.series.id===f.series.id)!,competing=calls.find(row=>row.series.id===other.id)!;
+    assert.ok(own&&competing&&own.series.id!==competing.series.id,'Two calls of two different own attempts');
+    assert.equal(competing.call,payload.requestId);assert.equal(competing.purpose,payload.purpose);
+    assert.equal(competing.packet.hash,hashJson(payload),'The competing E1 carries the fingerprint of exactly its issued E2');
+    assert.ok(valueOf(readCompletionBinding(f.store,f.project,own.series,1))?.value,'The paid consumer attempt is managed');
+    assert.equal(valueOf(readCompletionBinding(f.store,f.project,competing.series,1))?.value?.plan.batches[0],batch.id,
+      'The competing E1 belongs to the managed attempt of its own E2 batch');
   });
 });
 
