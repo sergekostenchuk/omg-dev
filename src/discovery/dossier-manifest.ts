@@ -1,14 +1,29 @@
-import { withHistoricalReads } from '../history/proofs.js';
-import type { DiscoveryDraft } from './discovery.js';
-import type { ResearchAnswer } from './research-model.js';
-import { provePlanQuestions } from './v7-plan-questions.js';
-import { canonical, hashJson } from '../canonical.js';
+import { withHistoricalReads, pendingSnapshotView } from '../history/proofs.js';
+import { type DiscoveryDraft, type Question } from './discovery.js';
+import type { ResearchAnswer, PaidDiscoveryAttemptsAssessment, V7ProgressApplication } from './research-model.js';
+import { currentPlan, proveAttempt, provePlanQuestions } from './v7-plan-questions.js';
+import { canonical, hashJson, type Json } from '../canonical.js';
 import { EngineError } from '../errors.js';
 import { isRef, reference, type Ref } from '../pipeline/contracts.js';
-import type { Store, Revision } from '../storage/store.js';
-import type { ClaimAddress } from './claim-address.js';
+import type { Store, Revision, TransactionGuard } from '../storage/store.js';
+import { resolveClaimAddress, type ClaimAddress } from './claim-address.js';
 import { decodeDossierContradictions, checkDossierContradictionEvidence, type DossierClassificationGrounds, type ProvenDossierContradiction, type DossierContradiction } from './dossier-contradictions.js';
-import { V7_ATTEMPT_KIND, V7_AXES, V7_DEPTHS, V7_UNKNOWN_MOMENTS, V7_CLAIM_POINTER, type V7Axis } from './v7-contracts.js';
+import { V7_ATTEMPT_KIND, V7_AXES, V7_DEPTHS, V7_UNKNOWN_MOMENTS, V7_CLAIM_POINTER, discoveryAcceptanceActId, provenAcceptance, type DiscoveryAcceptanceAct, type V7Axis } from './v7-contracts.js';
+import { readVariantHandoff } from './discovery-outcome.js';
+import { readVariantSnapshot } from './variant-snapshot.js';
+import { readVariantGeneration, readVariantModelDecision } from './variant-session.js';
+import { readVariantOwnerDecision } from './discovery-decision.js';
+import { variantStateId, type VariantHandoff } from './variant-decision.js';
+import { readDiscoveryAssessment } from './research-assessment.js';
+import { proveAppliedAttemptClassification } from './v7-progress.js';
+import { readProjectMode } from '../product/project-mode.js';
+import { uniqueTransactionGuards, transactionGuardsCurrent } from '../runtime/environment.js';
+import { readResearchConsumerExecution, readResearchAttemptBinding, type ResearchConsumerIntent } from './response-recovery.js';
+import { readAssessmentSessionOutcomeAt } from './assessment-session.js';
+import { discoveryAssessmentId } from './research-consumer-transition.js';
+import type { ModelCall } from '../runtime/model-usage.js';
+import { attemptBindingId, type ResearchAttemptBinding } from './v7-managed-attempt.js';
+import { proveIssuedAnswer, savedAcceptanceAct } from './projection-reader.js';
 
 /** DR6 6.1 (codex-omg №9189, раздел DR6): the closed structural form of the
  * exact dossier snapshot of one v7 Discovery draft (D6, «манифест досье»). The
@@ -205,4 +220,235 @@ export function readDossierContradictionsAt(store: Store, project: string, manif
     const contradictions = checkDossierContradictionEvidence(store,value,questions.map(q=>q.planQuestionId),grounds);
     return {verification:'contradictions',manifestRef:{...manifestRef},assessments:structuredClone(grounds.assessments),record,contradictions};
   });
+}
+
+
+/** 6.3-partial: proof of the three negative 4R.2 routes. This is neither a
+ * completeness proof of a selected variant nor a dossier acceptance. */
+export interface ProvenPartialDossier {
+  verification: 'partial'; record: Revision<DossierManifest>; handoff: Revision<VariantHandoff>;
+  materials: { claim: ClaimAddress; status: 'accepted' | 'rejected' | 'unassessed'; assessment: Ref | null }[];
+  assessments: Ref[]; contradictions: ProvenDossierContradiction[];
+}
+
+const dossierSame = (a: unknown, b: unknown) => canonical(a) === canonical(b);
+function dossierExact<T>(store: Store, at: Ref, kind?: string): Revision<T> {
+  ref(at, 'grounds');
+  const row = store.get<T>(at.id, at.revision);
+  if (!row || kind && row.kind !== kind || !dossierSame(reference(row), at) || hashJson(row.value as never) !== row.hash)
+    invalid('grounds', 'An exact dossier ground is missing or changed', 'discovery_dossier_invalid', at);
+  return row;
+}
+
+/** The inventory is anchored in the saved snapshot applications, or the
+ * exhausted ledger's paid calls before generation. No global current-head
+ * scan can supply or remove material from this historical derivation. */
+async function partialProjection(store: Store, project: string, handoffRef: Ref) {
+  ref(handoffRef, 'handoff');
+  const handoff = (await readVariantHandoff(store, project, handoffRef)).record, route = handoff.value;
+  if (route.next !== 'dossier' || route.scope !== null || route.choice !== null
+    || !['reject_all', 'no_variants', 'early_limit'].includes(route.reason)
+    || route.reason === 'early_limit' && route.decision !== null)
+    invalid('handoff', 'Only negative pre-choice dossier routes belong to this producer');
+  const draft = dossierExact<DiscoveryDraft>(store, route.draft, 'discovery-draft');
+  const questions = provePlanQuestions(store, draft, route.plan);
+  const frame = dossierExact<ResearchAnswer>(store, route.frame, 'research-answer');
+  const acceptance = store.get<DiscoveryAcceptanceAct>(discoveryAcceptanceActId(project, draft.id, 'frame', route.frame), 1);
+  if (!acceptance || !isRef(acceptance.value.questionAfter)) invalid('frame', 'The exact frame has no saved acceptance');
+  const question = dossierExact<Question>(store, acceptance.value.questionAfter, 'question');
+  if (!savedAcceptanceAct(store, draft, question, 'frame', route.frame, frame.value.value))
+    invalid('frame', 'The frame does not belong to this exact draft');
+  const issued = proveIssuedAnswer(store, draft, { question, foreign: false, answered: true, answerRef: route.frame, field: 'frame' },
+    frame as unknown as Revision<Record<string, Json>>, { verifyIssuedQuestion: true });
+  if (!issued.ok || !provenAcceptance(issued.proof.provenance)) invalid('frame', 'The frame has no proven accepted origin');
+  const grounds = new Map<string, Ref>([[canonical(handoffRef), handoffRef]]);
+  const keep = (link: Ref) => { grounds.set(canonical(link), link); };
+  const attempts = new Map<string, ReturnType<typeof proveAttempt>>();
+  const assessments = new Map<string, Revision<PaidDiscoveryAttemptsAssessment>>();
+  function attempt(link: Ref) {
+    const proof = proveAttempt(store, link), value = proof.attempt.value;
+    if (value.project !== project || value.draft.id !== draft.id || !dossierSame(value.planAnswer, route.plan)
+      || !questions.some(q => q.planQuestionId === value.planQuestionId)) invalid('materials', 'Material belongs to another draft or exact plan');
+    attempts.set(canonical(link), proof); keep(link);
+  }
+  function assessment(link: Ref) {
+    if (assessments.has(canonical(link))) return;
+    const paid = readDiscoveryAssessment(store, project, link), packet = paid.value.subject.packet;
+    if (!dossierSame(packet.planAnswer, route.plan) || !questions.some(q => q.planQuestionId === packet.planQuestionId))
+      invalid('assessments', 'The paid classification belongs to another exact plan');
+    assessments.set(canonical(link), paid); keep(link);
+    for (const entry of packet.entries) { attempt(entry.attempt); keep(entry.binding); }
+  }
+  if (route.snapshot) {
+    const snapshot = readVariantSnapshot(store, project, route.snapshot); keep(route.snapshot);
+    for (const question of snapshot.value.questions) {
+      if (question.progress) keep(question.progress);
+      for (const link of question.applications) {
+        const application = dossierExact<V7ProgressApplication>(store, link, 'v7-progress-application');
+        keep(link); assessment(application.value.assessment);
+      }
+    }
+  }
+  if (route.stop) {
+    for (const link of route.stop.grounds) {
+      keep(link);
+      const row = dossierExact<ModelCall>(store, link);
+      if (row.kind !== 'model-call') continue;
+      if (row.value.consumerIntent) {
+        const terminal = store.history<ResearchConsumerIntent>(row.value.consumerIntent.id)
+          .find(r => r.value.call?.id === row.id && ['applied', 'refused'].includes(r.value.state));
+        if (!terminal) invalid('budget', 'The paid call lost its terminal consumer');
+        const view = pendingSnapshotView(store, [terminal]);
+        readResearchConsumerExecution(view, project, reference(terminal)); keep(reference(terminal));
+        for (const output of terminal.value.outputs ?? []) {
+          const saved = dossierExact(store, output);
+          if (saved.kind === V7_ATTEMPT_KIND) attempt(output);
+          if (saved.kind === 'research-turn') {
+            const bindingId = attemptBindingId(project, saved.id), binding = store.get<ResearchAttemptBinding>(bindingId, 1);
+            if (binding) {
+              const bound = readResearchAttemptBinding(pendingSnapshotView(store, [binding]), project, saved.id);
+              if (!bound) invalid('materials', 'The paid turn lost its attempt binding');
+              if (dossierSame(bound.attempt.value.planAnswer, route.plan)) { attempt(reference(bound.attempt)); keep(reference(binding)); }
+            }
+          }
+        }
+      } else if (row.value.assessmentApplication) {
+        const application = store.history<{ state: string; call: Ref | null; after: Ref | null }>(row.value.assessmentApplication.id)
+          .find(r => r.value.state === 'applied' && r.value.call?.id === row.id && r.value.after);
+        if (!application?.value.after) invalid('budget', 'The paid assessor lost its terminal application');
+        const proof = readAssessmentSessionOutcomeAt(store, project, application.value.after, reference(application));
+        keep(reference(application)); keep(application.value.after);
+        const subject = proof.context.assessmentSubject;
+        if (subject?.packet && dossierSame(subject.packet.planAnswer, route.plan)) {
+          const id = discoveryAssessmentId({ projectId: project, contract: subject.assessment.contract,
+            session: proof.session, application: proof.application });
+          const paid = store.get<PaidDiscoveryAttemptsAssessment>(id, 1);
+          if (!paid) invalid('assessments', 'The paid packet result has not been published');
+          assessment(reference(paid));
+        }
+      }
+    }
+  }
+  const materials: ProvenPartialDossier['materials'] = [];
+  // Preserve every submitted claim, including rejected and unassessed ones.
+  // Explicit cross-container links retain their other side as well.
+  const claimMap = new Map<string, { address: ClaimAddress; value: Record<string, unknown> }>();
+  const addClaim = (address: ClaimAddress) => {
+    if (claimMap.has(canonical(address))) return;
+    if (address.project !== project || address.containerKind !== V7_ATTEMPT_KIND) invalid('materials', 'This partial route retains its own v7 attempt claims');
+    attempt(address.container);
+    const value = resolveClaimAddress(store, address).claim;
+    if (!object(value)) invalid('materials', 'The submitted material is not a claim');
+    claimMap.set(canonical(address), { address, value });
+  };
+  for (const proof of attempts.values()) for (const [index, claim] of (proof.claims ?? []).entries())
+    addClaim({ project, container: reference(proof.attempt), containerKind: V7_ATTEMPT_KIND,
+      pointer: `/claims/${index}`, claimId: (claim as Record<string, Json>).id as string });
+  for (const item of claimMap.values()) for (const key of ['contradicts', 'refutedBy'] as const)
+    for (const target of (item.value[key] ?? []) as ClaimAddress[]) addClaim(target);
+  for (const { address } of claimMap.values()) {
+    const classified = [...assessments.values()].some(paid => [...paid.value.novelty.accepted, ...paid.value.novelty.rejected]
+      .some(entry => dossierSame(entry.claim, address)));
+    if (!classified) materials.push({ claim: address, status: 'unassessed', assessment: null });
+    else {
+      const proof = proveAppliedAttemptClassification(store, address), exact = reference(proof.assessment);
+      if (!assessments.has(canonical(exact))) invalid('assessments', 'The original classification is absent from the saved route');
+      keep(reference(proof.application));
+      materials.push({ claim: address, status: proof.status, assessment: exact });
+    }
+  }
+  materials.sort((a,b) => canonical(a.claim).localeCompare(canonical(b.claim)));
+  const axes = Object.fromEntries(V7_AXES.map(axis => {
+    const entry = (frame.value.value as Record<string, any>).axes[axis];
+    // These are the frame's requested depths, not an assertion of sufficient coverage.
+    return [axis, { depth: entry.depth, reason: entry.depth === 'inapplicable' ? entry.reason : null,
+      claims: materials.filter(m => claimMap.get(canonical(m.claim))!.value.axis === axis).map(m => m.claim) }];
+  })) as DossierManifest['axes'];
+  const unknowns = materials.flatMap(m => {
+    const value = claimMap.get(canonical(m.claim))!.value;
+    if (value.kind !== 'unknown') return [];
+    const basis = value.basis as Omit<DossierUnknown, 'claim'>;
+    return [{ claim: m.claim, unknownId: basis.unknownId, consumer: basis.consumer, moment: basis.moment, blocksCurrentStage: basis.blocksCurrentStage }];
+  });
+  const pairs = new Map<string, DossierContradiction>();
+  for (const m of materials) for (const link of ['contradicts', 'refutedBy'] as const) {
+    const value = claimMap.get(canonical(m.claim))!.value;
+    for (const target of (value[link] ?? []) as ClaimAddress[]) {
+      const other = materials.find(c => dossierSame(c.claim, target));
+      if (!other) invalid('contradictions', 'The exact other side is missing');
+      const relation = link === 'contradicts' ? 'contradicts' : 'refutes';
+      const sides = (link === 'refutedBy' ? [other, m] : [m, other].sort((a,b) => canonical(a.claim).localeCompare(canonical(b.claim)))) as DossierContradiction['sides'];
+      const key = canonical([relation, ...sides.map(s => s.claim)]);
+      const ids = [...new Set(sides.flatMap(s => (claimMap.get(canonical(s.claim))!.value.planQuestions as { planQuestionId: string }[]).map(q => q.planQuestionId)))].sort();
+      pairs.set(key, { id: `contradiction:${hashJson(key)}`, relation, sides,
+        reason: `Saved explicit ${link} relation; no semantic resolution is inferred`, planQuestionIds: ids,
+        blocking: questions.some(q => ids.includes(q.planQuestionId) && (q.question as Record<string, Json>).class === 'blocking'), resolution: { state: 'open' } });
+    }
+  }
+  const code = route.reason === 'early_limit' ? 'budget' : route.reason as 'reject_all' | 'no_variants';
+  const value = decodeDossierManifest({ contract: DOSSIER_MANIFEST_CONTRACT, projectId: project, draft: route.draft,
+    frame: route.frame, plan: route.plan, completeness: 'partial', reasons: [{ code,
+      message: route.stop?.message ?? `The proven variant handoff ends with ${code}`,
+      grounds: [handoffRef, ...[...grounds.values()].filter(r => !dossierSame(r, handoffRef)).sort((a,b) => canonical(a).localeCompare(canonical(b)))] }],
+    axes, unknowns, contradictions: [...pairs.values()].sort((a,b) => a.id.localeCompare(b.id)) });
+  const refs = [...assessments.values()].map(reference).sort((a,b) => canonical(a).localeCompare(canonical(b)));
+  const contradictions = checkDossierContradictionEvidence(store, value, questions.map(q => q.planQuestionId), { assessments: refs });
+  return { value, handoff, materials, assessments: refs, contradictions };
+}
+
+export async function readPartialDossier(store: Store, project: string, at: Ref): Promise<ProvenPartialDossier> {
+  const record = readDossierManifestStructural(store, project, at).record;
+  const link = record.value.reasons[0]?.grounds[0];
+  if (!link) invalid('handoff', 'A partial dossier fixes its exact proven handoff');
+  const proof = await partialProjection(store, project, link);
+  if (!dossierSame(record.value, proof.value)) invalid('manifest', 'The saved partial dossier differs from its exact route and complete material inventory');
+  return { verification: 'partial', record, handoff: proof.handoff, materials: proof.materials,
+    assessments: proof.assessments, contradictions: proof.contradictions };
+}
+
+function partialCurrentGuards(store: Store, project: string, proof: Awaited<ReturnType<typeof partialProjection>>): TransactionGuard[] {
+  const value = proof.handoff.value, plan = currentPlan(store, project);
+  const stale = (field: string): never => invalid(field, 'The partial dossier route is no longer current', 'discovery_dossier_stale');
+  if (!dossierSame(reference(plan.draft), value.draft) || !dossierSame(plan.planAnswer, value.plan)) stale('plan');
+  const frame = dossierExact<ResearchAnswer>(store, value.frame, 'research-answer');
+  const question = store.get<Question>(frame.value.question);
+  if (!question || question.kind !== 'question' || question.value.draftId !== plan.draft.id || question.value.projectId !== project
+    || !plan.draft.value.questions.includes(question.id) || question.value.spec.field !== 'frame' || question.value.status !== 'answered'
+    || !dossierSame(question.value.answer, value.frame)) stale('frame');
+  let selection: Ref | null = null, modeRef: Ref | null = null;
+  if (value.result) {
+    const generation = readVariantGeneration(store, project, value.result);
+    selection = generation.state; modeRef = generation.session.value.variantSubject.mode;
+  }
+  if (value.decision) {
+    if (store.get(value.decision.id, value.decision.revision)?.kind === 'discovery-variant-owner-decision') {
+      const choice = readVariantOwnerDecision(store, project, value.decision);
+      selection = reference(choice.state); modeRef = choice.decision.value.mode;
+    } else {
+      const choice = readVariantModelDecision(store, project, value.decision);
+      selection = choice.state; modeRef = choice.decision.value.mode;
+    }
+  }
+  const modeId = `project-mode:${project}`, beforeFirstMode = value.reason === 'early_limit' && value.result === null
+    && store.history(modeId).length === 0;
+  const mode = beforeFirstMode ? null : readProjectMode(store, project);
+  if (modeRef && (!mode || !dossierSame(mode.ref, modeRef))) stale('mode');
+  const stateId = variantStateId(project, plan.draft.id), state = store.get(stateId);
+  if (selection ? !state || !dossierSame(reference(state), selection) : state || store.history(stateId).length) stale('selection');
+  const guards: TransactionGuard[] = [reference(proof.handoff), reference(plan.draft), reference(plan.question), reference(question!), value.frame, value.plan,
+    mode ? mode.ref : { id: modeId, absent: true }, state ? reference(state) : { id: stateId, absent: true }];
+  if (value.stop) guards.push(...value.stop.grounds);
+  for (const link of [value.snapshot, value.result, value.decision]) if (link) guards.push(link);
+  if (!transactionGuardsCurrent(store, guards)) stale('guards');
+  return uniqueTransactionGuards(guards);
+}
+
+/** Replay is a historical fixed point, never a new admission or payment. */
+export async function producePartialDossier(store: Store, project: string, handoff: Ref): Promise<ProvenPartialDossier & { repeated: boolean }> {
+  const proof = await partialProjection(store, project, handoff), id = dossierManifestId(proof.value), existing = store.get(id, 1);
+  if (existing) return { ...(await readPartialDossier(store, project, reference(existing))), repeated: true };
+  const guards = partialCurrentGuards(store, project, proof);
+  const record = store.writeMany<DossierManifest>([{ id, kind: DOSSIER_MANIFEST_KIND, expected: 0, value: proof.value }], guards)[0]!;
+  return { verification: 'partial', record, handoff: proof.handoff, materials: proof.materials,
+    assessments: proof.assessments, contradictions: proof.contradictions, repeated: false };
 }
