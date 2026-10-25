@@ -84,7 +84,7 @@ function refusal<T>(result: OmResult<T>): Refusal { if (result.ok) assert.fail("
  */
 type RunFixtureMode = "stages" | "n2" | "executed";
 function runFixture(t: test.TestContext, questions = ["encoding", "spare"], refine: boolean | RunFixtureMode = true, addressed: boolean | string[] = false, later = false, cold = false,
-  unknowns: Readonly<Record<string, { consumer?: string; moment?: string }>> = {}, historicalCommit?: string) {
+  unknowns: Readonly<Record<string, { consumer?: string; moment?: string }>> = {}) {
   const root = mkdtempSync(join(tmpdir(), "omg-h1-run-")), database = join(root, "state.sqlite"), workspace = join(root, "repo");
   mkdirSync(workspace); git(workspace, ["init", "-b", "main"]); writeFileSync(join(workspace, "README.md"), "H1 pass repository\n");
   writeFileSync(join(workspace, "h1-source.txt"), "UTF-8 is the supported encoding.\n");
@@ -129,7 +129,7 @@ function runFixture(t: test.TestContext, questions = ["encoding", "spare"], refi
         ...(field === "featurePreparation" ? { requirements: ["garden-R2"], behaviorContracts: ["garden-B2"] } : {}) });
     }
     return value;
-  }, mode ? "" : historicalCommit);
+  }, mode ? "" : undefined);
   const scenario = join(root, "scenario.json"), trace = join(root, "trace.jsonl");
   const command = { executable: process.execPath, args: [adapterFixture, "--scenario", scenario, "--trace", trace] };
   const environment = (amount = 100_000) => engine.environments.configure(project, { workspace,
