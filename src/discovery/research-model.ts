@@ -192,3 +192,32 @@ export interface V7ProgressEvent {
   basis: { claim: ClaimAddress } | { constraint: Ref }
     | { transition: { from: V7ProgressSummary['outcome']; to: string; bases: V7TransitionBasis[] } };
 }
+
+/** 6.4: a dossier is a separate assessment subject. Attempts v1–v3 keep their own contracts. */
+export const DOSSIER_ASSESSMENT_SUBJECT_CONTRACT = 'dossier-assessment-subject/v1' as const;
+export const DOSSIER_ASSESSMENT_PACKET_CONTRACT = 'dossier-assessment-packet/v1' as const;
+export interface DossierAssessmentSubject {
+  contract: typeof DOSSIER_ASSESSMENT_SUBJECT_CONTRACT; kind: 'dossier'; identity: string; projectId: string;
+  root: { kind: 'selected' | 'partial'; ref: Ref }; manifest: Ref;
+}
+export interface DossierAssessmentRecord<T = Json> { ref: Ref; kind: string; value: T }
+export interface DossierAssessmentMaterial {
+  address: ClaimAddress; value: Json; container: DossierAssessmentRecord;
+  status: 'accepted' | 'rejected' | 'unassessed'; assessment: DossierAssessmentRecord | null;
+}
+/** Complete input content, with historical classifications; no verdict or acceptance is implied. */
+export interface DossierAssessmentPacket {
+  contract: typeof DOSSIER_ASSESSMENT_PACKET_CONTRACT; subject: DossierAssessmentSubject;
+  root: DossierAssessmentRecord; manifest: DossierAssessmentRecord<import('./dossier-manifest.js').DossierManifest>;
+  basis: { draft: DossierAssessmentRecord; frame: DossierAssessmentRecord; plan: DossierAssessmentRecord };
+  route: { handoff: DossierAssessmentRecord | null; snapshot: DossierAssessmentRecord | null;
+    result: DossierAssessmentRecord | null; scope: DossierAssessmentRecord | null; set: DossierAssessmentRecord | null;
+    member: DossierAssessmentRecord | null; decision: DossierAssessmentRecord | null };
+  coverage: import('./coverage.js').CoverageComputation | null;
+  materials: DossierAssessmentMaterial[];
+  unknowns: { unknown: import('./dossier-manifest.js').DossierUnknown; material: DossierAssessmentMaterial }[];
+  contradictions: { contradiction: import('./dossier-contradictions.js').DossierContradiction;
+    sides: [DossierAssessmentMaterial & { application: Ref | null }, DossierAssessmentMaterial & { application: Ref | null }];
+    grounds: DossierAssessmentRecord[] }[];
+  grounds: DossierAssessmentRecord[];
+}
