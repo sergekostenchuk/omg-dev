@@ -3656,6 +3656,50 @@ test("RL3 (№4217): the owner's reopening asks its door's unresolved transition
   assert.equal(prepareReadinessInput(f.store, { project, input: reference(asked.value), gate: reference(elsewhere) }).ok, false);
 });
 
+/**
+ * LG24 (№11905 п.1): readinessPending no longer spares a G5 of the era before the impact — the common readiness source
+ * proves the record, and a copy of the saved gate forged to v1, to an unknown or absent contract or without the door's
+ * impact is refused record_forged instead of silently answering false.
+ */
+test("LG24 readiness: pending comes only from a saved G5 of the impact era — unresolved is asked once and held; a cold repeat answers the same; a copy forged to v1, to an unknown or absent contract or without impact is refused record_forged and nothing is written", async t => {
+  const f = await createOmFixture(t, "standard", "garden", { mode: "executed" }), project = f.project;
+  const root = f.store.get<OmInputRecord>(`om-input:${project}`)!;
+  const accepted = f.graphRevision.value as Graph, work = accepted.nodes.find(node => node.kind === "work")!;
+  const snapshot = { commit: "c".repeat(40), tree: "b".repeat(40) };
+  const unknown = { file: "test/loader.test.ts", line: 2, kind: "dynamic-import", text: "import(process.env.M!)", site: { start: 60, end: 82, hash: "a".repeat(64) }, candidates: ["src/garden.ts"] };
+  const candidate = reference(f.store.write({ id: `om-candidate:${project}:ready`, kind: "frame-candidate", expected: 0,
+    value: { graph: accepted } as unknown as Json }));
+  const real = { contract: "om-atomic-gate/v2", project,
+    request: { candidate, gaps: { sources: { input: reference(root), graph: reference(f.graphRevision) } } },
+    result: { findings: [{ code: "work_impact_unresolved", target: work.id, field: transitionField(unknown), message: "An unresolved transition" }] },
+    impact: { snapshot, works: [{ work: work.id, affected: [], entries: [], consumers: [], unknowns: [unknown] }] } };
+  const gate = (name: string, value: unknown) =>
+    reference(f.store.write({ id: `om-atomic-gate:${project}:${name}`, kind: "om-atomic-gate", expected: 0, value: value as Json }));
+  const refused = gate("real", real);
+  const first = readinessPending(f.store, project, refused);
+  assert.ok(first.ok && first.value === true, "an unresolved transition of a saved G5 is pending");
+  const second = readinessPending(f.store, project, refused);
+  assert.ok(second.ok && second.value === true, "a cold repeat answers the same");
+  const asked = writeReadinessInput(f.store, { project, input: reference(root), gate: refused });
+  assert.ok(asked.ok);
+  const after = readinessPending(f.store, project, refused);
+  assert.ok(after.ok && after.value === false, "the question is held: nothing is pending");
+  const again = prepareReadinessInput(f.store, { project, input: reference(asked.value), gate: refused });
+  assert.ok(again.ok && again.value.writes.length === 0, "the exact repeat writes nothing");
+  assert.equal(f.store.get(`om-input:${project}`)!.revision, asked.value.revision);
+  const copies: [string, unknown][] = [["earlier-v1", { ...real, contract: "om-atomic-gate/v1" }],
+    ["unknown-contract", { ...real, contract: "om-atomic-gate/v9" }],
+    ["absent-contract", (({ contract: _c, ...rest }) => rest)(real)],
+    ["absent-impact", (({ impact: _i, ...rest }) => rest)(real)]];
+  const forged = copies.map(([name, value]) => [name, gate(name, value)] as const);
+  const untouched = f.store.list().map(reference);
+  for (const [name, ref] of forged) {
+    const result = readinessPending(f.store, project, ref);
+    assert.ok(!result.ok && result.refusal.code === "record_forged", `${name}: ${JSON.stringify(result)}`);
+  }
+  assert.deepEqual(f.store.list().map(reference), untouched, "forged checks read but never wrote");
+});
+
 test("quick path in prepareOmInput bypasses deriveInputRecord and stage proofs loading when current sources match", async t => {
   const root = mkdtempSync(join(tmpdir(), "omg-quick-path-")), path = join(root, "state.sqlite");
   const store = new Store(path), engine = new ProductEngine(store);

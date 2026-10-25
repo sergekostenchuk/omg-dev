@@ -1186,17 +1186,11 @@ function readinessQuestions(store: Store, project: string, previous: Revision<Om
   return delivered(asked);
 }
 /**
- * Whether a saved G5 still has a readiness question the current B1 neither holds nor has answered. A G5 of the era before
- * the impact (om-atomic-gate/v1) has none: its group goes the way it always did (return №4124 P2-6).
+ * Whether a saved G5 still has a readiness question the current B1 neither holds nor has answered. Questions come only
+ * from a saved G5 of the impact era or the owner's L3 reopening; anything else is refused as forged by the common source.
  */
 export function readinessPending(store: Store, project: string, gate: Ref): InputResult<Sealed<boolean>> {
   return withHistoricalReads(() => {
-    // A G5 of the era before the impact asks nothing; RL3: the owner's reopening asks its door's questions like a G5 of the impact era.
-    if (gate.id !== `om-l3-reopen:${project}`) {
-      const read = readRecord<{ contract?: unknown; project?: unknown }>(store, gate, { unit: "G1", target: gate.id, idPrefix: `om-atomic-gate:${project}:`, kind: "om-atomic-gate" });
-      if (!read.ok) return transfer("refs", read);
-      if (read.value.value.project === project && read.value.value.contract === "om-atomic-gate/v1") return delivered(false);
-    }
     const current = store.get<OmInputRecord>(`om-input:${project}`);
     if (!current) return refuse("input_stale", "Readiness questions are asked on an existing B1", at(`om-input:${project}`, "head"), "producer");
     const asked = readinessQuestions(store, project, current, gate);
