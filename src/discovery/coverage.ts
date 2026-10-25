@@ -4,9 +4,12 @@ import { isRef, reference, type Ref } from '../pipeline/contracts.js';
 import { Store } from '../storage/store.js';
 import { V7_PLAN_SUBJECT_CONTRACT, type V7PlanSubject } from './v7-managed-attempt.js';
 import { proveClaimAddress, type ClaimAddress } from './claim-address.js';
-import { claimContentKey } from './v7-attempt-assessment.js';
+import { claimContentKey, v7ProgressStateId } from './v7-attempt-assessment.js';
 import { readVariantScope } from './variant-scope.js';
 import { proveAttempt, provePlanQuestions, type V7PlanQuestion } from './v7-plan-questions.js';
+import { readV7ProgressStateAt } from './v7-progress.js';
+import { readDiscoveryAssessment } from './research-assessment.js';
+import type { V7ProgressApplication, V7QuestionTransition } from './research-model.js';
 import { V7_ATTEMPT_CONTRACT, V7_ATTEMPT_KIND } from './v7-contracts.js';
 import type { V7Attempt } from './v7-plan-questions.js';
 import type { DiscoveryDraft } from './discovery.js';
@@ -94,15 +97,18 @@ export interface AppliedCoverageGround {
 /** The addressed reason a cell is not covered. */
 export type CoverageMissing =
   | { code: 'coverage_no_applied_grounds'; message: string }
-  | { code: 'coverage_no_variant_ground'; message: string };
-// The third addressed shape — applied grounds that serve the question but none scoped to this
-// exact member — shares coverage_no_variant_ground: its message names the member.
+  | { code: 'coverage_no_variant_ground'; message: string }
+  | { code: 'coverage_no_sufficiency'; message: string };
+/** The proven applied sufficiency that closed a cell: the exact applied assessment and its saved transition. */
+export interface AppliedSufficiency { assessment: Ref; transition: V7QuestionTransition }
 export interface CellCoverage {
   cell: CoverageCell; key: string; covered: boolean;
-  /** The variant-specific applied grounds of this exact cell. */
+  /** The variant-specific applied grounds of this exact cell — material until a proven sufficiency closes on them. */
   grounds: AppliedCoverageGround[];
   /** The applied common material — kept for provenance, never closing a variant cell. */
   common: AppliedCoverageGround[];
+  /** The proven applied closed sufficiency standing on this member's own ground, when the cell is covered. */
+  sufficiency: AppliedSufficiency | null;
   missing: CoverageMissing | null;
 }
 export interface CoverageComputation {
@@ -171,8 +177,10 @@ export function computeMissingCoverage(store: Store, project: string, scope: Ref
         let resolved: ReturnType<typeof proveClaimAddress>;
         try { resolved = proveClaimAddress(store, address); }
         catch (error) {
-          // Rejected or not-yet-applied acceptance is the lawful negative answer, never coverage.
-          if (error instanceof EngineError && error.code === 'claim_attempt_not_accepted') continue;
+          // Rejected or not-yet-applied acceptance is the lawful negative answer, never coverage: the applied
+          // classification is absent (discovery_progress_conflict) or the exact pointer was not accepted.
+          if (error instanceof EngineError
+            && (error.code === 'claim_attempt_not_accepted' || error.code === 'discovery_progress_conflict')) continue;
           throw error;
         }
         const claim = resolved.claim as Record<string, unknown>;
@@ -186,12 +194,52 @@ export function computeMissingCoverage(store: Store, project: string, scope: Ref
         if (ground.variants.some(item => canonical(item) === canonical(variant.member))) grounds.push(ground);
       }
     }
-    const covered = grounds.length > 0;
-    return { cell, key: coverageCellKey(cell), covered, grounds, common,
-      missing: covered ? null : serving > 0
-        ? { code: 'coverage_no_variant_ground', message: 'The applied grounds serve the question but none is scoped to this exact member; common material and a foreign member never close it' }
-        : { code: 'coverage_no_applied_grounds', message: 'No claim of this question was accepted by the first application of a paid assessment' } };
+    // Acceptance alone is material, never sufficiency: a cell closes only on a proven applied transition to closed
+    // whose saved sufficiency names this plan question's own criterion and depth, and whose bases stand on this
+    // member's own variant ground — the applied chain is proven by the MR/P door, the paid assessment by its own.
+    const sufficiency = provenSufficiency(store, project, planAnswer, question, grounds);
+    const covered = sufficiency !== null;
+    return { cell, key: coverageCellKey(cell), covered, grounds, common, sufficiency,
+      missing: covered ? null : grounds.length > 0
+        ? { code: 'coverage_no_sufficiency', message: 'The applied variant grounds are material; no proven applied closed sufficiency of this exact depth and criterion stands on this member' }
+        : serving > 0
+          ? { code: 'coverage_no_variant_ground', message: 'The applied grounds serve the question but none is scoped to this exact member; common material and a foreign member never close it' }
+          : { code: 'coverage_no_applied_grounds', message: 'No claim of this question was accepted by the first application of a paid assessment' } };
   });
   return { verification: 'proven', project, scope, planAnswer, draft: value.draft,
     set: value.set, member: value.member, cells, missing: cells.filter(cell => !cell.covered) };
+}
+
+/** Walks the proven applied progress chain of the subject and returns the proven closed sufficiency that stands on
+ * one of the member's own grounds. The head state is proven by readV7ProgressStateAt — which re-derives the whole
+ * application, its prior chain and every account and event from the paid assessment — and each applied assessment is
+ * proven paid by its own reader. An open, unknown or absent transition, a sufficiency of another criterion or depth,
+ * and a closing without this member's own ground all leave the cell uncovered. */
+function provenSufficiency(store: Store, project: string, planAnswer: Ref, question: V7PlanQuestion,
+  grounds: AppliedCoverageGround[]): AppliedSufficiency | null {
+  if (grounds.length === 0) return null;
+  const groundAddresses = new Set(grounds.map(ground => canonical(ground.claim)));
+  const stateId = v7ProgressStateId({ project, planAnswer, planQuestionId: question.planQuestionId });
+  const head = store.get(stateId);
+  if (head === null) return null;
+  let state: Ref = reference(readV7ProgressStateAt(store, reference(head)));
+  while (true) {
+    // The state record's bytes are proven by the chain; its application names the applied paid assessment.
+    const record = store.get<{ application: Ref }>(state.id, state.revision);
+    if (record === null || !isRef(record.value.application))
+      invalid('state', 'The proven progress state names its exact application');
+    const application = store.get<V7ProgressApplication>(record.value.application.id, record.value.application.revision);
+    if (application === null || !isRef(application.value.assessment))
+      invalid('state', 'The proven application names its exact paid assessment');
+    const paid = readDiscoveryAssessment(store, project, application.value.assessment);
+    const transition: V7QuestionTransition | null = paid.value.novelty?.transition ?? null;
+    const own = question.question as Record<string, Json>;
+    if (transition !== null && transition.outcome === 'closed' && transition.sufficiency !== undefined
+      && typeof own['criterion'] === 'string' && typeof own['requiredDepth'] === 'string'
+      && transition.bases.some(basis => 'claim' in basis && groundAddresses.has(canonical(basis.claim))))
+      return { assessment: application.value.assessment, transition };
+    const previous = application.value.previous;
+    if (previous === null || !isRef(previous)) return null;
+    state = reference(readV7ProgressStateAt(store, previous));
+  }
 }
