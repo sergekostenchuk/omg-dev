@@ -5,7 +5,8 @@ import { Store, type Revision, type TransactionGuard } from '../storage/store.js
 import { transactionGuardsCurrent, uniqueTransactionGuards } from '../runtime/environment.js';
 import { readProjectMode } from '../product/project-mode.js';
 import { decodeCoverageCell, type CoverageCell } from './coverage.js';
-import type { DiscoveryDraft } from './discovery.js';
+import type { DiscoveryDraft, Question } from './discovery.js';
+import type { ResearchAnswer } from './research-model.js';
 import { readExact } from './projection-reader.js';
 import { readVariantScope, readCurrentVariantScope, type ProvenVariantScope } from './variant-scope.js';
 import { readVariantSnapshot } from './variant-snapshot.js';
@@ -79,7 +80,7 @@ export function projectDeepPreparation(value: unknown):
 
 export interface ProvenDeepPreparation {
   verification: 'proven'; preparation: Revision<DeepPreparation>;
-  scope: ProvenVariantScope; draft: Revision<DiscoveryDraft>; question: V7PlanQuestion;
+  scope: ProvenVariantScope; draft: Revision<DiscoveryDraft>; question: V7PlanQuestion; frame: Ref;
 }
 export interface CurrentDeepPreparation extends ProvenDeepPreparation { guards: TransactionGuard[] }
 
@@ -112,7 +113,7 @@ function provePreparation(store: Store, project: string, value: DeepPreparation)
   const question = matches[0]!, body = question.question as Record<string, Json>;
   for (const field of ['requiredDepth', 'criterion'] as const)
     if (body[field] !== value.cell[field]) invalid(`cell.${field}`, 'The cell keeps the proven question text verbatim');
-  return { verification: 'proven', scope, draft, question };
+  return { verification: 'proven', scope, draft, question, frame: snapshot.value.frame };
 }
 
 /** Exact historical reader. A proven saved preparation never authorizes a new dispatch or reactivates its selection. */
@@ -132,11 +133,20 @@ function currentGuards(store: Store, project: string, value: DeepPreparation,
   const plan = currentPlan(store, project), selected = proof.scope.scope.value;
   if (!variantSame(reference(plan.draft), reference(proof.draft))) stale('draft');
   if (!variantSame(plan.planAnswer, value.cell.subject.planAnswer)) stale('plan');
+  // The immutable plan/snapshot proves the old frame; dispatch also needs its own Question to remain answered now.
+  const frame = readExact<ResearchAnswer>(store, proof.frame);
+  if (!frame || frame.kind !== 'research-answer' || frame.value.projectId !== project
+    || !plan.draft.value.questions.includes(frame.value.question)) stale('frame');
+  const frameQuestion = store.get<Question>(frame.value.question);
+  if (!frameQuestion || frameQuestion.kind !== 'question' || !object(frameQuestion.value)
+    || frameQuestion.value.projectId !== project || frameQuestion.value.draftId !== plan.draft.id
+    || frameQuestion.value.spec?.field !== 'frame' || frameQuestion.value.status !== 'answered'
+    || !variantSame(frameQuestion.value.answer, proof.frame) || hashJson(frameQuestion.value) !== frameQuestion.hash) stale('frame');
   const scope = readCurrentVariantScope(store, project, reference(plan.draft));
   if (!variantSame(reference(scope.scope), value.scope)) stale('scope');
   const mode = readProjectMode(store, project);
   if (!variantSame(mode.ref, selected.mode)) stale('mode');
-  const guards = uniqueTransactionGuards([reference(plan.draft), reference(plan.question), plan.planAnswer,
+  const guards = uniqueTransactionGuards([reference(plan.draft), reference(plan.question), plan.planAnswer, reference(frameQuestion), proof.frame,
     value.scope, selected.set, selected.member, selected.decision, reference(scope.state), mode.ref]);
   if (!transactionGuardsCurrent(store, guards)) stale('guards');
   return guards;

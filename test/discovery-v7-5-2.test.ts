@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { writeFileSync } from 'node:fs';
+import { DatabaseSync } from 'node:sqlite';
 import { canonical, hashJson, type Json } from '../src/canonical.js';
 import { reference, type Ref } from '../src/pipeline/contracts.js';
 import { EngineError } from '../src/errors.js';
@@ -26,7 +27,7 @@ import { variantStateId, VARIANT_OWNER_DECISION_CONTRACT, VARIANT_OWNER_ACTION,
 import { publishVariantScope, readCurrentVariantScope, VARIANT_SCOPE_KIND } from '../src/discovery/variant-scope.js';
 import { ProjectModeSessions, VariantChoiceSessions, issueProjectModeInvitation, issueVariantChoiceInvitation } from '../src/product/owner-authority.js';
 import { setProjectMode } from '../src/product/project-mode.js';
-import { researchSetup, produce, rand, validPlan, type PlanQuestion } from './discovery-v7-fixture.js';
+import { researchSetup, produce, rand, validPlan, validFrame, type PlanQuestion } from './discovery-v7-fixture.js';
 import type { OmResult } from '../src/om/refusal.js';
 
 // Real paid generation/selection preparation shared in shape with the accepted 4P.1 scenarios.
@@ -194,7 +195,8 @@ test(`5.2: real ${kind} choose and published P.1 scope produce the exact deep su
     const current = requireCurrentDeepPreparation(store, 'p', ref);
     const state = readCurrentVariantScope(store, 'p', scope.value.draft).state;
     const guards = [ref, reference(scope), scope.value.draft, reference(store.get<Question>(f.v.plan.id)!),
-      f.v.planAnswer, scope.value.set, scope.value.member, scope.value.decision, scope.value.mode, reference(state)];
+      f.v.planAnswer, scope.value.set, scope.value.member, scope.value.decision, scope.value.mode, reference(state),
+      f.v.frameRef, reference(frameQuestion(store, f))];
     assert.deepEqual(new Set(current.guards.map(canonical)), new Set(guards.map(canonical)), 'mandatory guards are derived, not supplied by the caller');
     assert.deepEqual(produceDeepPreparation(store, 'p', input), {record: produced.record, repeated: true});
     assert.equal(snapshot(store), before); assert.deepEqual(money(store), accounting); assert.equal(f.wires().length, sent);
@@ -370,5 +372,68 @@ test('5.2: a real paid model choose published without state cannot authorize a s
   for (const store of [f.store,f.open()]) {
     checkedRefusal(store,f,()=>produceDeepPreparation(store,'p',input),'discovery_variant_scope_invalid');
     checkedRefusal(store,f,()=>readDeepPreparation(store,'p',reference(row)),'discovery_variant_scope_invalid');
+  }
+});
+
+function frameQuestion(store: Store, f: Paid) {
+  const frame = f.v.draft.value.questions.map(id => store.get<Question>(id)).find(row => row?.value.spec.field === 'frame');
+  assert.ok(frame); return frame;
+}
+
+for (const change of ['reopened', 'missing', 'replaced'] as const)
+test(`5.2-01: a ${change} frame head refuses new preparation, producer repeat and current admission hot/cold while exact history remains readable`, async t => {
+  const f = await paid(t), {published} = selected(f), input = inputFor(f, published);
+  const saved = produceDeepPreparation(f.store, 'p', input).record, next = inputFor(f, published, 'q-market');
+  const frame = frameQuestion(f.store, f);
+  assert.deepEqual(frame.value.answer, f.v.frameRef);
+  if (change === 'missing') {
+    // Explicit negative loss of the mutable head only. Immutable frame revisions and their provenance remain saved.
+    const db = new DatabaseSync(f.store.path);
+    try { assert.equal(db.prepare('DELETE FROM heads WHERE entity_id = ?').run(frame.id).changes, 1); }
+    finally { db.close(); }
+    assert.equal(f.store.get(frame.id), null);
+  } else {
+    f.discovery.reopen(frame.id, frame.revision);
+    if (change === 'replaced') {
+      const source = f.discovery.evidence.document('p', 'new-deep-frame', 'New frame basis', 'text/plain', 0);
+      const value = {...validFrame() as Record<string, Json>, scale: 'A changed current frame'};
+      answerDiscoveryFixture(f.engine, 'p', f.store.get<DiscoveryDraft>(f.v.draft.id)!, f.store.get<Question>(frame.id)!, value, source);
+      assert.notDeepEqual(f.store.get<Question>(frame.id)!.value.answer, f.v.frameRef);
+    }
+  }
+  const before = snapshot(f.store), history = f.store.history(frame.id), accounting = money(f.store), sent = f.wires().length;
+  for (const store of [f.store, f.open()]) {
+    assert.deepEqual(readDeepPreparation(store, 'p', reference(saved)).preparation, saved);
+    assert.equal(snapshot(store), before); assert.deepEqual(store.history(frame.id), history);
+    assert.deepEqual(money(store), accounting); assert.equal(f.wires().length, sent);
+    for (const invoke of [() => produceDeepPreparation(store, 'p', next), () => produceDeepPreparation(store, 'p', input),
+      () => requireCurrentDeepPreparation(store, 'p', reference(saved))]) {
+      checkedRefusal(store, f, invoke, 'discovery_deep_preparation_stale');
+      assert.equal(snapshot(store), before); assert.deepEqual(store.history(frame.id), history);
+    }
+    assert.equal(store.get(deepPreparationId(next)), null);
+  }
+});
+
+test('5.2-01: a second Store reopening the real frame Question in the write window loses the preparation CAS with no side effects', async t => {
+  const f = await paid(t), {published} = selected(f), input = inputFor(f, published);
+  const saved = produceDeepPreparation(f.store, 'p', input).record, next = inputFor(f, published, 'q-market');
+  const frame = frameQuestion(f.store, f), other = f.open(), write = f.store.writeMany.bind(f.store);
+  let after = '', accounting: ReturnType<typeof money> | undefined, sent = 0;
+  f.store.writeMany = ((writes, guards) => {
+    if (!after && writes.some(row => row.kind === DISCOVERY_DEEP_PREPARATION_KIND)) {
+      for (const ref of [reference(frame), f.v.frameRef]) assert.ok(guards?.some(guard => canonical(guard) === canonical(ref)));
+      new Discovery(other).reopen(frame.id, frame.revision);
+      after = snapshot(other); accounting = money(other); sent = f.wires().length;
+    }
+    return write(writes, guards);
+  }) as typeof f.store.writeMany;
+  try { refuses(() => produceDeepPreparation(f.store, 'p', next), 'input_stale'); }
+  finally { f.store.writeMany = write; }
+  assert.ok(after); assert.equal(f.store.get(deepPreparationId(next)), null);
+  for (const store of [f.store, f.open()]) {
+    assert.deepEqual(readDeepPreparation(store, 'p', reference(saved)).preparation, saved);
+    checkedRefusal(store, f, () => requireCurrentDeepPreparation(store, 'p', reference(saved)), 'discovery_deep_preparation_stale', 'frame');
+    assert.equal(snapshot(store), after); assert.deepEqual(money(store), accounting); assert.equal(f.wires().length, sent);
   }
 });
