@@ -22,7 +22,7 @@ import { savedSynthesisMaterials, savedV7SynthesisMaterials } from "./saved-synt
 import { readResearchContext, researchContextReadEra } from "./research-limits.js";
 import { planningForQuestion, planningForPlanSubject } from "./research-routing.js";
 import { Store, type Revision, type Write, type TransactionGuard } from "../storage/store.js";
-import { Environments, uniqueTransactionGuards, type Environment } from "../runtime/environment.js";
+import { Environments, uniqueTransactionGuards, transactionGuardsCurrent, type Environment } from "../runtime/environment.js";
 import { isRef, reference, uniqueRefs, type Ref } from "../pipeline/contracts.js";
 import { canonical, hashJson } from "../canonical.js";
 import { EngineError, requireCondition } from "../errors.js";
@@ -1662,16 +1662,19 @@ export class Researcher {
       { decision: previous[0]!.decision.ref, stale: previous[0]!.stale });
     requireCondition(allowNew, "research_restore_complete", "Saved work is restored; a new decision needs an explicit v7 allowance");
     requireCondition(allowance, "research_turns_exhausted", "Research call allowance reached before variant choice");
-    const pending = variants.pending.filter(operation => operation.session.value.variantSubject.kind === "decision"
-      && canonical(operation.session.value.variantSubject.set) === canonical(result.ref));
-    requireCondition(pending.length <= 1, "research_variant_generation_ambiguous", "Several unpaid decision identities need an explicit resolution");
-    const operation = pending[0], effective = this.environments.effective(project);
-    const subject = operation?.session.value.variantSubject ?? { contract: VARIANT_SUBJECT_CONTRACT,
+    const effective = this.environments.effective(project), roles = [effective.environment.value.implementer, effective.environment.value.reviewer];
+    const subject = { contract: VARIANT_SUBJECT_CONTRACT,
       kind: "decision" as const, set: result.ref, mode: mode.ref, expectedSelection: reference(state) };
-    requireCondition(canonical(subject.mode) === canonical(mode.ref) && canonical(subject.expectedSelection) === canonical(reference(state)),
-      "research_consumer_context_stale", "The unpaid decision retains its original mode and selection");
-    const role = operation ? [effective.environment.value.implementer, effective.environment.value.reviewer]
-      .find(candidate => candidate.actor === operation.session.value.actor) : effective.environment.value.implementer;
+    // restoreV7Variants already proves every saved identity, including obsolete unpaid admissions.
+    // Only a still-current admission is resumed; the common B.2 door admits a fresh identity otherwise.
+    const pending = variants.pending.filter(operation => canonical(operation.session.value.variantSubject) === canonical(subject)
+      && roles.some(role => role.actor === operation.session.value.actor)
+      && (!operation.intent || canonical(operation.intent.value.dispatch) === canonical(effective.environment.value)
+        && roles.some(role => canonical(role) === canonical(operation.intent!.value.role))
+        && transactionGuardsCurrent(this.store, operation.intent.value.guards)));
+    requireCondition(pending.length <= 1, "research_variant_generation_ambiguous", "Several current unpaid decision identities need an explicit resolution");
+    const operation = pending[0];
+    const role = operation ? roles.find(candidate => candidate.actor === operation.session.value.actor) : effective.environment.value.implementer;
     requireCondition(role, "research_consumer_context_stale", "The unpaid decision lost its original actor");
     const prepared = operation?.intent ? { session: operation.session, intent: operation.intent }
       : prepareVariantSession(this.store, { projectId: project, variantSubject: subject, environment: effective.environment, role,

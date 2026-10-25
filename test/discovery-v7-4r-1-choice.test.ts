@@ -238,6 +238,17 @@ for (const shift of ['mode', 'owner-state'] as const) test(`4R.1 choice: a secon
   const resumed = await f.run(1, f.open(), true);
   assert.equal(resumed.value.pauseCode, shift === 'mode' ? 'research_variant_owner_required' : 'research_variant_handoff_unavailable', JSON.stringify(resumed.value));
   assert.deepEqual(f.wires(), sent); assert.deepEqual(money(f.store), paid); await fixed(f, resumed);
+  if (shift === 'mode') {
+    const old = [...f.store.list<VariantExecutionSession>('discovery-variant-session').filter(row => row.value.variantSubject.kind === 'decision'),
+      ...f.store.list<ResearchConsumerIntent>('research-consumer-intent').filter(row => row.value.kind === 'variant-decision')];
+    const saved = old.map(row => f.store.history(row.id)); f.mode('bypass');
+    const restored = await f.run(1, f.open(), true); assert.equal(restored.value.pauseCode, 'research_restore_complete');
+    assert.deepEqual(f.wires(), sent); assert.deepEqual(money(f.store), paid);
+    const ready = await f.run(1, f.open()); assert.equal(ready.value.pauseCode, 'research_variant_handoff_unavailable', JSON.stringify(ready.value));
+    assert.equal(subjectCalls(f, 'proposal').length, 1); assert.equal(subjectCalls(f, 'decision').length, 1);
+    assert.equal(f.store.list('discovery-variant-model-decision').length, 1);
+    assert.deepEqual(old.map(row => f.store.history(row.id)), saved); await fixed(f, ready);
+  }
 });
 
 test('4R.1 choice: a structural owner lookalike and its fabricated current state never become a ready choice', async t => {
@@ -287,4 +298,38 @@ test('4R.1 choice: actual paid generation can exhaust the research reserve; the 
   const set = f.store.list<VariantSet>('discovery-variant-set')[0]!; assert.ok(readVariantGeneration(f.store, 'p', reference(set)));
   const paid = money(f.store), sent = f.wires(), restored = await f.run(1, f.open(), true);
   assert.deepEqual(money(f.store), paid); assert.deepEqual(f.wires(), sent); assert.equal(f.store.list('discovery-variant-model-decision').length, 0); await fixed(f, restored);
+});
+
+for (const phase of ['session-only', 'prepared'] as const)
+  test(`4R.1 choice: obsolete unpaid ${phase} admissions never trap a fresh bypass or hide a second purchase`, async t => {
+    const f = await setup(t); await f.run(2);
+    // Two obsolete exact modes also exercise the former pending.length ambiguity.
+    for (let attempt = 0; attempt < 2; attempt++) {
+      f.mode('bypass'); const undo = cutDecision(f.store, phase); await f.run(1); undo(); f.mode('questions');
+    }
+    const stale = f.store.list<VariantExecutionSession>('discovery-variant-session').filter(row => row.value.variantSubject.kind === 'decision');
+    assert.equal(stale.length, 2);
+    const old = [...stale.map(row => row.id), ...f.store.list<ResearchConsumerIntent>('research-consumer-intent')
+      .filter(row => row.value.kind === 'variant-decision').map(row => row.id)];
+    const saved = old.map(id => f.store.history(id)), bypass = f.mode('bypass'), sent = f.wires(), paid = money(f.store);
+    const restored = await f.run(1, f.open(), true); assert.equal(restored.value.pauseCode, 'research_restore_complete');
+    assert.deepEqual(f.wires(), sent); assert.deepEqual(money(f.store), paid); await fixed(f, restored);
+    const ready = await f.run(1, f.open()); assert.equal(ready.value.pauseCode, 'research_variant_handoff_unavailable', JSON.stringify(ready.value));
+    assert.equal(subjectCalls(f, 'proposal').length, 1); assert.equal(subjectCalls(f, 'decision').length, 1);
+    assert.equal(f.store.list('discovery-variant-model-decision').length, 1);
+    const decision = f.store.list<VariantModelDecision>('discovery-variant-model-decision')[0]!, proof = readVariantModelDecision(f.store, 'p', reference(decision));
+    assert.deepEqual(proof.session.value.variantSubject.mode, reference(bypass)); assert.ok(!old.includes(proof.session.id));
+    assert.deepEqual(old.map(id => f.store.history(id)), saved); await fixed(f, ready);
+  });
+
+test('4R.1 choice: obsolete prepared admission still requires its original proof before a fresh mode can buy', async t => {
+  const f = await setup(t); await f.run(2); const bypass = f.mode('bypass');
+  const undo = cutDecision(f.store, 'prepared'); await f.run(1); undo(); f.mode('questions'); f.mode('bypass');
+  const intent = f.store.list<ResearchConsumerIntent>('research-consumer-intent').find(row => row.value.kind === 'variant-decision')!;
+  f.store.write({ id: intent.id, kind: intent.kind, expected: intent.revision,
+    value: { ...intent.value, cursor: { ...intent.value.cursor, variantSubject: { ...intent.value.cursor.variantSubject, set: reference(bypass) } } } });
+  const before = history(f.store).filter(row => row.kind !== 'research-run'), sent = f.wires();
+  const result = await f.run(1, f.open()); assert.equal(result.value.pauseCode, 'research_consumer_intent_invalid', JSON.stringify(result.value));
+  assert.deepEqual(history(f.store).filter(row => row.kind !== 'research-run'), before); assert.deepEqual(f.wires(), sent);
+  await fixed(f, result);
 });
