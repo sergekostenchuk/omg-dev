@@ -5,9 +5,9 @@ import {
   acceptedIssuance, contractEraOf, discoveryContext, discoveryOutcome, hasPlanQuestions, planStopSubject,
   isAdmissionEra, isSupportedEra, issuedEntry, issuedForm,
   listDrafts, outcomeSummary, proveIssuedAnswer, readConditionDecision, readDiscoveryConditionDecision, readDraft, readDiscoveryIndexAt,
-  readExact, readResearchRun, savedQuestionsMoved, UPSTREAM_STAGES, verdictConditions, variantGenerationSummary,
+  readExact, readResearchRun, savedQuestionsMoved, UPSTREAM_STAGES, verdictConditions, variantGenerationSummary, variantChoiceSummary,
   type DiscoveryChoice, type DiscoveryDraft, type DiscoveryIndexCursor, type DiscoveryIndexRead, type FormEntry, type IssuedAnswerProof,
-  type IssuedProjection, type Question, type RecordView, type ResearchRun, type UpstreamStage, type VariantGenerationSummary,
+  type IssuedProjection, type Question, type RecordView, type ResearchRun, type UpstreamStage, type VariantGenerationSummary, type VariantChoiceSummary, type VariantChoiceActSummary,
 } from "../discovery/projection-reader.js";
 import { EngineError, requireCondition } from "../errors.js";
 import type { Observation, Selector, Source } from "../evidence/evidence.js";
@@ -100,6 +100,12 @@ export interface VariantGenerationSummaryRequest { section: "variant-generation"
 export interface VariantGenerationStageSummary {
   contract: "stage-summary/variant-generation/v1"; project: string; stage: "discovery";
   generation: VariantGenerationSummary;
+}
+
+/** Choice is requested separately and never inferred from a generation or today's state. */
+export interface VariantChoiceSummaryRequest { section: "variant-choice"; decision: Ref }
+export interface VariantChoiceStageSummary {
+  contract: "stage-summary/variant-choice/v1"; project: string; stage: "discovery"; choice: VariantChoiceSummary;
 }
 
 export type SummaryStructuredStage = Exclude<UpstreamStage, "discovery">;
@@ -889,18 +895,26 @@ function selectStructuredCandidate(store: Store, project: string, stage: Summary
     : { selected: null, candidates: drafts.map(reference) };
 }
 
+export function stageSummary(store: Store, project: string, stage: "discovery", request: VariantChoiceSummaryRequest): VariantChoiceStageSummary;
 export function stageSummary(store: Store, project: string, stage: "discovery", request: VariantGenerationSummaryRequest): VariantGenerationStageSummary;
 export function stageSummary(store: Store, project: string, stage: "discovery", request: DiscoveryIndexSummaryRequest): DiscoveryIndexStageSummary;
 export function stageSummary(store: Store, project: string, stage: "discovery", draftId?: string): DiscoveryStageSummary;
 export function stageSummary(store: Store, project: string, stage: SummaryStructuredStage, draftId?: string): StructuredStageSummary;
 export function stageSummary(store: Store, project: string, stage: Stage, draftId?: string): StageSummary;
 export function stageSummary(store: Store, project: string, stage: Stage,
-  draftId?: string | DiscoveryIndexSummaryRequest | VariantGenerationSummaryRequest): StageSummary | DiscoveryIndexStageSummary | VariantGenerationStageSummary {
+  draftId?: string | DiscoveryIndexSummaryRequest | VariantGenerationSummaryRequest | VariantChoiceSummaryRequest): StageSummary | DiscoveryIndexStageSummary | VariantGenerationStageSummary | VariantChoiceStageSummary {
   if (draftId !== undefined && typeof draftId !== "string") {
+    if (object(draftId) && draftId.section === "variant-choice") {
+      requireCondition(stage === "discovery" && Object.keys(draftId).length === 2
+        && Object.hasOwn(draftId, "section") && Object.hasOwn(draftId, "decision") && isRef(draftId.decision),
+        "stage_summary_variant_request_invalid", "Expected only an exact decision Ref");
+      return { contract: "stage-summary/variant-choice/v1", project, stage: "discovery",
+        choice: variantChoiceSummary(store, project, draftId.decision) };
+    }
     if (object(draftId) && draftId.section === "variant-generation") {
       requireCondition(stage === "discovery" && Object.keys(draftId).length === 2
         && Object.hasOwn(draftId, "section") && Object.hasOwn(draftId, "result") && isRef(draftId.result),
-        "stage_summary_variant_request_invalid", "Expected only an exact generation result; decision summaries are not supported");
+        "stage_summary_variant_request_invalid", "Expected only an exact generation result");
       return { contract: "stage-summary/variant-generation/v1", project, stage: "discovery",
         generation: variantGenerationSummary(store, project, draftId.result) };
     }
@@ -1099,7 +1113,42 @@ function renderVariantGenerationSummary(summary: VariantGenerationStageSummary):
   return `${lines.join("\n").trimEnd()}\n`;
 }
 
-export function renderStageSummary(summary: StageSummary | DiscoveryIndexStageSummary | VariantGenerationStageSummary): string {
+function renderVariantChoiceSummary(summary: VariantChoiceStageSummary): string {
+  const choice = summary.choice, generation = choice.generation;
+  const refText = (ref: Ref): string => `${ref.id}@${ref.revision}#${ref.hash}`;
+  const lines = ["# Discovery", "", "## Выбор варианта", "", `Проект: ${summary.project}`,
+    `Оплаченная генерация: ${refText(generation.result)}`, `Снимок исследования: ${refText(generation.snapshot)}`,
+    `Автор генерации (модель): ${generation.author.actor}`, `Сессия генерации: ${refText(generation.author.session)}`,
+    `Intent генерации: ${refText(generation.author.intent)}`, `Вызов генерации: ${refText(generation.author.call)}`,
+    `Ответ генерации: ${refText(generation.author.response)}`,
+    `Рекомендация генерации: ${refText(generation.recommendation.member)} — ${generation.recommendation.reason}`,
+    "Рекомендация не устанавливает выбор варианта.", ""];
+  const appendAct = (act: VariantChoiceActSummary, previous: boolean): void => {
+    lines.push(previous ? "### Предыдущий акт выбора" : "### Запрошенный акт выбора", "",
+      `Решение: ${refText(act.decision)}`, `Черновик: ${refText(act.draft)}`, `Набор: ${refText(act.set)}`,
+      `Режим акта: ${refText(act.mode)}`, `Ожидавшийся выбор: ${act.expectedSelection ? refText(act.expectedSelection) : "отсутствовал"}`);
+    if (act.author.kind === "model") lines.push(`Автор выбора (модель): ${act.author.actor}`,
+      `Сессия выбора: ${refText(act.author.session)}`, `Intent: ${refText(act.author.intent)}`,
+      `Оплаченный вызов: ${refText(act.author.call)}`, `Сохранённый ответ: ${refText(act.author.response)}`);
+    else lines.push(`Полномочный акт владельца: ${act.author.operation}`,
+      `Полномочие: ${refText(act.author.grant)}`, `Открытая сессия акта: ${refText(act.author.session)}`);
+    if (act.outcome.kind === "choose") lines.push(`Выбор choose: ${act.outcome.variant.title}`,
+      `Вариант: ${refText(act.outcome.member)}`, `Предложение: ${valueText(act.outcome.variant.proposal)}`);
+    else lines.push("Выбор reject_all: отклонены все варианты набора.");
+    lines.push(`Причина: ${act.outcome.reason}`);
+    if (act.application.status === "applied") lines.push(`Историческое состояние применения: ${refText(act.application.state)}`);
+    else lines.push(`Оплаченный результат без применения к текущему выбору: ${act.application.stale.code}; ${act.application.stale.reason}`);
+    lines.push(`Previous: ${act.previous ? refText(act.previous.decision) : "отсутствует"}`, "");
+    if (act.previous) appendAct(act.previous, true);
+  };
+  appendAct(choice, false);
+  lines.push("### Пределы поиска", "", ...generation.searchLimits.map(limit => `- ${limit}`),
+    "", "### Неизвестные генерации", "", ...generation.unknowns.map(unknown => `- ${unknown}`));
+  return `${lines.join("\n").trimEnd()}\n`;
+}
+
+export function renderStageSummary(summary: StageSummary | DiscoveryIndexStageSummary | VariantGenerationStageSummary | VariantChoiceStageSummary): string {
+  if (summary.contract === "stage-summary/variant-choice/v1") return renderVariantChoiceSummary(summary);
   if (summary.contract === "stage-summary/variant-generation/v1") return renderVariantGenerationSummary(summary);
   if (summary.contract === "stage-summary/discovery-index/v1") return renderDiscoveryIndexSummary(summary);
   if (summary.stage !== "discovery") return renderStructuredStageSummary(summary);

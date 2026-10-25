@@ -1,5 +1,7 @@
 import { EngineError } from "../errors.js";
-import { readVariantGeneration } from "./variant-session.js";
+import { readVariantGeneration, readVariantModelDecision } from "./variant-session.js";
+import { readVariantOwnerDecision } from "./discovery-decision.js";
+import type { VariantOwnerOperation } from "./variant-decision.js";
 import type { DiscoveryVariant, VariantNone, VariantOrigin, VariantReason, VariantScale, VariantSet } from "./discovery-variants.js";
 import { currentPlan, planOwnerSubject, provePlanQuestions } from "./v7-plan-questions.js";
 import { readResearchConsumerTurn } from "./response-recovery.js";
@@ -86,6 +88,60 @@ export function variantGenerationSummary(store: Store, project: string, result: 
   const set = value as VariantSet;
   return { ...common, kind: "variants", members: publication.members.map(member => ({ ref: member.ref, value: member.value })),
     scale: set.scale, comparison: set.comparison, recommendation: set.recommendation };
+}
+
+/** Presentation of exact historical proofs; current selection and live authority are never consulted. */
+export type VariantChoiceAuthor = VariantGenerationAuthor | {
+  kind: "owner"; authority: "local-owner-authority"; operation: VariantOwnerOperation; session: Ref; grant: Ref;
+};
+export interface VariantChoiceActSummary {
+  verification: "proven"; decision: Ref; draft: Ref; set: Ref; mode: Ref; expectedSelection: Ref | null;
+  author: VariantChoiceAuthor;
+  outcome: { kind: "choose"; member: Ref; variant: DiscoveryVariant; reason: string }
+    | { kind: "reject_all"; reason: string };
+  application: { status: "applied"; state: Ref }
+    | { status: "not_applied"; state: null; stale: { code: "discovery_variant_stale"; reason: "mode_or_selection_changed" } };
+  previous: VariantChoiceActSummary | null;
+}
+export interface VariantChoiceSummary extends VariantChoiceActSummary {
+  generation: { result: Ref; snapshot: Ref; author: VariantGenerationAuthor;
+    recommendation: { member: Ref; reason: string }; searchLimits: string[]; unknowns: string[] };
+}
+export function variantChoiceSummary(store: Store, project: string, decision: Ref): VariantChoiceSummary {
+  const invalid = (message: string): never => { throw new EngineError("discovery_variant_decision_invalid", message); };
+  const readAct = (ref: Ref): VariantChoiceActSummary => {
+    if (!isRef(ref)) return invalid("An exact decision Ref is required");
+    // The discriminator selects a common proof reader; a structural record alone grants no proof.
+    const kind = store.get(ref.id, ref.revision)?.kind;
+    const proof = kind === "discovery-variant-model-decision" ? readVariantModelDecision(store, project, ref)
+      : kind === "discovery-variant-owner-decision" ? readVariantOwnerDecision(store, project, ref)
+      : invalid("Expected a paid model decision or an authorized owner decision");
+    const value = proof.decision.value, generation = readVariantGeneration(store, project, value.set);
+    let author: VariantChoiceAuthor, application: VariantChoiceActSummary["application"];
+    if ("grant" in proof) {
+      author = { kind: "owner", authority: "local-owner-authority", operation: proof.decision.value.operation,
+        session: reference(proof.session), grant: reference(proof.grant) };
+      application = { status: "applied", state: reference(proof.state) };
+    } else {
+      author = { kind: "model", actor: proof.session.value.actor, session: reference(proof.session), ...proof.decision.value.origin };
+      application = proof.state ? { status: "applied", state: proof.state }
+        : { status: "not_applied", state: null, stale: proof.stale! };
+    }
+    let outcome: VariantChoiceActSummary["outcome"];
+    if (value.outcome.kind === "choose") {
+      const chosen = value.outcome.member;
+      const selected = generation.publication.members.find(member => canonical(member.ref) === canonical(chosen));
+      if (!selected) return invalid("The proven decision has no exact member in its paid set");
+      outcome = { ...value.outcome, variant: selected.value };
+    } else outcome = value.outcome;
+    return { verification: proof.verification, decision: ref, draft: value.draft, set: value.set, mode: value.mode,
+      expectedSelection: value.expectedSelection, author, outcome, application,
+      previous: value.previous ? readAct(value.previous) : null };
+  };
+  const choice = readAct(decision), generation = variantGenerationSummary(store, project, choice.set);
+  if (generation.kind !== "variants") return invalid("A choice requires a proven paid set");
+  return { ...choice, generation: { result: generation.result, snapshot: generation.snapshot, author: generation.author,
+    recommendation: generation.recommendation, searchLimits: generation.searchLimits, unknowns: generation.unknowns } };
 }
 
 // Потребителям вне модуля внутренние читатели доступны только через эту границу.
