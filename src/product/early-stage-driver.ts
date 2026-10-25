@@ -125,7 +125,7 @@ export class EarlyStageDriver {
         ? this.#savedDraft(project, current.stage, current.artifact, request.draftId,
           inspected && 'binding' in inspected ? inspected.refs : []).draft : null;
       const run = draft ? readResearchRun(this.engine.store, project, draft.id) : null;
-      if (draft?.value.projectId === project && draft.value.stage === 'discovery' && draft.value.contractVersion === 7
+      if (draft?.value.projectId === project && draft.value.stage === 'discovery' && isCurrentEra('discovery', draft.value.contractVersion, { discovery: 7 })
         && (run?.value.pauseCode === 'research_dossier_assessment_unavailable' || run?.value.pauseCode === 'research_partial_dossier_pending')) {
         const control = readRunControl(this.engine.store, { project });
         const artifact = current!.artifact;
