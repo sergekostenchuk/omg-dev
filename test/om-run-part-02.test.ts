@@ -342,7 +342,7 @@ test("LP3 current context search labels fail before delivery: one correction per
 });
 
 test("LP3 current works-brief roots whose distinct lawful context pointers exceed the continuation capacity ends each cycle blocked, never sends the blocked packet and reaches the attempt's close through G7 — also after a restart between steps", async t => {
-  const f = worksFixture(t, undefined, undefined, undefined, "");
+  const f = worksFixture(t, undefined, undefined, undefined);
   const environment = f.store.get<import("../src/runtime/environment.js").Environment>(`environment:${project}`)!;
   const configured = f.engine.environments.configure(project, { ...environment.value, requestCapacityChars: 100_000 }, environment.revision);
   const request = { ...f.request, dispatch: { ...f.request.dispatch, config: reference(configured) } };

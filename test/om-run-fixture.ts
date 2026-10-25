@@ -614,7 +614,7 @@ function nodeAnswer(f: Fixture, step: { request: unknown }) {
  * the 'cross' graph, the owner's works horizon over that layer, D1 with the works frame, M6 and M3. The pass then pays one
  * MC2 works cycle per block and does everything else.
  */
-function worksFixture(t: test.TestContext, late = false, fact: boolean | number = false, shape?: (graph: Graph) => void, historicalCommit?: string) {
+function worksFixture(t: test.TestContext, late = false, fact: boolean | number = false, shape?: (graph: Graph) => void) {
   const facts = fact === true ? ["works-fact"] : Array.from({ length: Number(fact) }, (_, index) => index ? `works-fact-${index + 1}` : "works-fact");
   const root = mkdtempSync(join(tmpdir(), "omg-h1-works-")), database = join(root, "state.sqlite");
   let store = new Store(database), engine = new ProductEngine(store);
@@ -632,7 +632,7 @@ function worksFixture(t: test.TestContext, late = false, fact: boolean | number 
       ...facts.map(id => ({ id, question: `Which ${id === "works-fact" ? "encoding" : id} is supported?`,
         consumer: "garden-consume-block", moment: "om-pass", blocksCurrentStage: false, resolution: "Address this question during OM" }))];
     return value;
-  } : undefined, historicalCommit);
+  } : undefined, "");
   const stages = Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(store.get(`stage:${project}:${stage}`)!)])) as Record<UpstreamStage, Ref>;
   const base = ok(writeOmInput(store, { project, expected: 0, stages }));
   const first = reference(store.get(`graph:${project}`)!);
@@ -1374,7 +1374,7 @@ function threeArtifacts(graph: Graph) {
 // G6.2: current E3 accepts the work's shape; G5 refuses its missing write scope. Only that proposal is
 // rejected; G7 closes it on its own rows, preserves the sound member and never reuses the rejected assembly.
 async function g62Rejection(t: test.TestContext, chain: boolean, prior = false) {
-  const f = worksFixture(t, false, false, undefined, ""), scenario = join(f.root, "scenario.json"), steps: unknown[] = [], trail: string[] = [];
+  const f = worksFixture(t, false, false, undefined), scenario = join(f.root, "scenario.json"), steps: unknown[] = [], trail: string[] = [];
   const push = (research: unknown) => { steps.push({ research, usage }); writeFileSync(scenario, JSON.stringify({ database: f.database, steps })); };
   const paid = new Map<string, number>(), count = (node: string) => paid.set(node, (paid.get(node) ?? 0) + 1);
   const consumeAddress = { project, block: "garden-consume-block", line: 1 };
