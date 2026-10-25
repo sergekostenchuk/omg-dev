@@ -47,8 +47,8 @@ import { writeGuarded } from '../src/om/refs.js';
 import { runModelCall, runModelCycle, readCompletionWorkAt, writeCompletionCessation, deliverModelSources, assembleModelParts, pendingCallStore, readPartAssembly, type ReadDeliveryRecord } from '../src/om/model-call.js';
 import { gardenGraph, prepareOmFixtureStages, prepareNativeLayers } from './om-fixture.js';
 // OMMC-SPLIT: the managed-cycle helpers moved to a shared fixture module; importing it registers no tests.
-import { e4Fixture, e4Node, e4NeedSource, mp2Refused, mp2Step, mp2IssuedBy, h15AtCommit } from './om-model-call-fixture.js';
-import { preparedFeatures, withHistoricalUpstream } from './product-fixture.js';
+import { e4Fixture, e4WorksFixture, e4Node, e4NeedSource, mp2Refused, mp2Step, mp2IssuedBy, h15AtCommit } from './om-model-call-fixture.js';
+import { preparedFeatures } from './product-fixture.js';
 import { preparedField } from './preparation-fixture.js';
 
 const { fixtureAnswer }: { fixtureAnswer: (packet: unknown, answer: unknown) => any } = await import(new URL('../../test/om-adapter-fixture.mjs', import.meta.url).href);
@@ -3751,8 +3751,6 @@ import { advanceRun as rb1Advance, readRun as rb1ReadRun, regateRun as rb1Regate
 import { writeRunBases as rb1Bases } from '../src/om/run-bases.js';
 import { git as rb1Git } from '../src/runtime/environment.js';
 import { resolveSnapshot as rb1Snapshot } from '../src/om/impact.js';
-/** RB1: the engine of om/module before RB1 — the brief the live pass issued to its reopened attempts 13 and 14. */
-const RB1_BASE = 'b8c99b1b';
 let rb1Operations: Promise<{ acceptedOperationsFixture(t: TestContext, status: 'planned', count: number): {
   root: string; workspace: string; database: string; project: string; desired: Graph; readonly store: Store; readonly engine: ProductEngine } }> | undefined;
 /** The accepted-operations fixture of om-feasibility, loaded without registering its tests (as om-run does). */
@@ -3773,10 +3771,9 @@ function rb1LoadOperations() {
  * consumed work's file through two fixtures — driven to the packet step of the reopened attempt, its packet not yet written.
  * `respond` answers the saved cycle with a work, `drive` advances to a chosen state and fails on any other stand.
  */
-async function rb1Reopened(t: TestContext, extra: Record<string, string> = {}, historicalCommit?: string) {
+async function rb1Reopened(t: TestContext, extra: Record<string, string> = {}) {
   const fixtures = await rb1LoadOperations();
-  const f = historicalCommit ? withHistoricalUpstream(historicalCommit, () => fixtures.acceptedOperationsFixture(t, 'planned', 0))
-    : fixtures.acceptedOperationsFixture(t, 'planned', 0);
+  const f = fixtures.acceptedOperationsFixture(t, 'planned', 0);
   const { store, workspace, desired, project } = f;
   ok(rb1Bases(store, { project, outcomes: ['garden-result'] }));
   const scenario = join(f.root, 'scenario.json'), trace = join(f.root, 'trace.jsonl');
@@ -3897,27 +3894,55 @@ test('RB1 (№4285, №4291, №4293): the root over a reopened frame is om-brie
   assert.deepEqual(store.get<Graph>(`graph:${project}`)!.value.nodes.find(row => row.id === work)!.impact, second.impact);
 });
 
-test('RB1 (№4285 п.4) era: a root the engine before RB1 wrote over a reopened frame — the v2 brief of attempts 13 and 14 — is read and continued as written; a root that claims om-brief/v3 where nothing is reopened is refused', async t => {
-  const g = await rb1Reopened(t, {}, RB1_BASE), { f, store, project } = g;
-  const request = g.step().request as unknown as QuestionPacketRequest;
-  const base = atCommit({ root: f.root, path: f.database }, RB1_BASE, 'rb1-base-packet', `const { writeQuestionPacket } = await import(src('om/question-packet.js'));
-out(take(writeQuestionPacket(store, args)).record);`, request) as Revision<QuestionPacketRecord>;
-  assert.deepEqual([base.value.briefContract, base.value.state], [RB1_V2, 'ready']);
-  assert.equal(Object.hasOwn((base.value.packet as unknown as { expansion: object }).expansion, 'reopened'), false);
-  const again = ok(prepareQuestionPacket(store, request));
-  assert.deepEqual([again.writes, reference(again.record)], [[], reference(base)], 'Admitted with its own bytes');
-  assert.deepEqual(ok(readQuestionPacket(store, { project, record: reference(base) })), base);
-  await g.drive(g.at('cycle'));
-  assert.deepEqual((g.step().request as unknown as { packet: Ref }).packet, reference(base), 'The pass goes on with the packet it has');
-  // Masquerade: the first attempt's root (no reopened frame) rewritten to claim the reopen era.
-  const first = store.list<QuestionPacketRecord>('question-packet').filter(row => row.value.briefContract === RB1_V2 && row.id !== base.id
-    && row.value.packetContract === WORKS_BRIEF_PACKET_CONTRACT && !row.value.request.continuation && !row.value.request.correction && !row.value.request.previous.length)[0]!;
+test('RB1 current managed works root without reopening refuses forged om-brief/v3 admission while exact reads preserve both revisions after restart', t => {
+  const f = e4WorksFixture(t, true), first = f.packet;
+  const binding = ok(readCompletionBinding(f.store, f.project, f.packetRequest.attempt!.series, f.packetRequest.attempt!.ordinal));
+  assert.ok(binding);
+  assert.deepEqual(binding.value.plan, { routes: reference(f.routes), batches: [f.batch.id] });
+  assert.deepEqual(binding.value.goal, f.goal);
+  assert.deepEqual([f.batch.task, f.batch.level, first.value.state, first.value.packetContract],
+    ['node-expansion', 3, 'ready', WORKS_BRIEF_PACKET_CONTRACT]);
+  mp11Version(first, 'om-brief/v2');
+  assert.equal(first.value.briefContract, RB1_V2);
+  assert.deepEqual(first.value.request.previous, []);
+  for (const key of ['continuation', 'correction', 'recovery']) assert.equal(Object.hasOwn(first.value.request, key), false);
+  const works = f.routes.value.request.gaps.sources.works;
+  assert.ok(!('state' in works));
+  assert.equal(works.frame.level, 3);
+  assert.equal(Object.hasOwn(works.frame, 'reopen'), false);
+  assert.equal(Object.hasOwn((first.value.packet as unknown as { expansion: object }).expansion, 'reopened'), false);
+  const before = snapshot(f.store), sends = f.sent();
+  assert.deepEqual(sends, []);
+  for (const cold of [false, true]) {
+    if (cold) f.restart();
+    assert.deepEqual(ok(readQuestionPacket(f.store, { project: f.project, record: reference(first) })), first);
+    const prepared = ok(prepareQuestionPacket(f.store, f.packetRequest));
+    assert.equal(prepared.existing, true);
+    assert.deepEqual(prepared.record, first); assert.deepEqual(prepared.writes, []);
+    assert.deepEqual(ok(writeQuestionPacket(f.store, f.packetRequest)).record, first);
+    assert.deepEqual(snapshot(f.store), before); assert.deepEqual(f.sent(), sends);
+  }
+  // Deliberate negative corruption: this lawful, non-reopened root now claims the reopen contract in both markers.
   const forged = clone(first.value) as QuestionPacketRecord & { packet: { brief: { contract: string } } };
   forged.briefContract = RB1_V3; forged.packet.brief.contract = RB1_V3;
-  store.write({ id: first.id, kind: first.kind, expected: first.revision, value: forged as unknown as Json });
-  const refused = prepareQuestionPacket(store, first.value.request);
-  assert.equal(refused.ok, false);
-  assert.deepEqual(!refused.ok && [refused.refusal.code, refused.refusal.at.field], ['packet_record_invalid', 'briefContract']);
+  const corrupt = f.store.write({ id: first.id, kind: first.kind, expected: first.revision, value: forged as unknown as Json });
+  const afterCorruption = snapshot(f.store);
+  for (const cold of [false, true]) {
+    if (cold) f.restart();
+    const refusal = rejected(prepareQuestionPacket(f.store, f.packetRequest), 'packet_record_invalid');
+    assert.deepEqual([refusal.at.unit, refusal.at.target, refusal.at.field], ['E2', first.id, 'briefContract']);
+    assert.deepEqual(snapshot(f.store), afterCorruption); assert.deepEqual(f.sent(), sends);
+    // Managed write-replay returns the saved result; it does not grant prepare's current admission.
+    assert.deepEqual(ok(writeQuestionPacket(f.store, f.packetRequest)), {
+      record: corrupt, existing: true, writes: [], guards: [], references: [reference(corrupt)],
+    });
+    assert.deepEqual(snapshot(f.store), afterCorruption); assert.deepEqual(f.sent(), sends);
+    // NR1 exact reads return saved bytes, not semantic admission: the lawful revision and the corrupt new head differ.
+    for (const record of [first, corrupt]) {
+      assert.deepEqual(ok(readQuestionPacket(f.store, { project: f.project, record: reference(record) })), record);
+      assert.deepEqual(snapshot(f.store), afterCorruption); assert.deepEqual(f.sent(), sends);
+    }
+  }
 });
 
 test('RB1 (№4291 п.1) absence and overflow: reopened works come with all their material or the packet is refused at them — no repository snapshot is packet_brief_invalid, a duty that does not fit is node_unexpandable addressed to the work, never a brief with part of it', async t => {
