@@ -2,7 +2,7 @@ import { variantSnapshotReadiness, produceVariantSnapshot, readVariantSnapshot }
 import { prepareVariantSession, applyVariantSession, readVariantExecutionSession, readVariantGeneration, readVariantModelDecision,
   type ProvenVariantModelDecision, type ProvenVariantGeneration } from "./variant-session.js";
 import { VARIANT_SUBJECT_CONTRACT, type VariantExecutionSession } from "./discovery-variants.js";
-import { variantStateId, readVariantStateStructural } from "./variant-decision.js";
+import { variantStateId, readVariantStateStructural, type VariantHandoff, type VariantState } from "./variant-decision.js";
 import { readVariantOwnerDecision } from "./discovery-decision.js";
 import { publishVariantScope, readCurrentVariantScope } from "./variant-scope.js";
 import { producePartialDossier, readPartialDossier } from "./dossier-manifest.js";
@@ -1714,6 +1714,15 @@ export class Researcher {
     // The pause carries exact durable addresses. Its historical replay precedes today's
     // selection and cannot activate a new paid step after a mode or plan revision.
     let savedPartial: { handoff: Ref; [field: string]: unknown } | null = null;
+    let pendingHandoff: VariantHandoff | null = null;
+    const newPartialRoute = (handoff: VariantHandoff): boolean => {
+      if (options.restoreOnly || producerContractEra("discovery", options.producerPolicy) !== 7) return false;
+      const plan = currentPlan(this.store, project);
+      const selection = this.store.get<VariantState>(variantStateId(project, draftId));
+      return canonical(plan.planAnswer) !== canonical(handoff.plan)
+        || canonical(selection?.value.result ?? null) !== canonical(handoff.result)
+        || canonical(selection?.value.decision ?? null) !== canonical(handoff.decision);
+    };
     if (run?.value.pauseCode === "research_dossier_assessment_unavailable"
       || run?.value.pauseCode === "research_partial_dossier_pending") {
       let saved: any;
@@ -1728,16 +1737,11 @@ export class Researcher {
         requireCondition(canonical(reference(dossier.handoff)) === canonical(saved.handoff)
           && canonical(dossier.record.value.draft) === canonical(proof.record.value.draft),
           "discovery_dossier_invalid", "The partial result belongs to another handoff or draft");
-        if (options.restoreOnly || producerContractEra("discovery", options.producerPolicy) !== 7) return run;
         // An explicit new invocation may follow a newer real choice/plan. The old
         // dossier is still proved above; the ordinary loop admits the new route.
-        const plan = currentPlan(this.store, project);
-        const selection = this.store.get<import('./variant-decision.js').VariantState>(variantStateId(project, draftId));
-        if (canonical(plan.planAnswer) === canonical(proof.record.value.plan)
-          && canonical(selection?.value.result ?? null) === canonical(proof.record.value.result)
-          && canonical(selection?.value.decision ?? null) === canonical(proof.record.value.decision)) return run;
+        if (!newPartialRoute(proof.record.value)) return run;
         savedPartial = null;
-      }
+      } else pendingHandoff = proof.record.value;
     }
     let partialPending = false;
     const receivePartial = async (handoff: Ref, display: object = {}): Promise<never> => {
@@ -1763,7 +1767,18 @@ export class Researcher {
       throw new EngineError("research_dossier_assessment_unavailable", message);
     };
     try {
-      if (savedPartial) await receivePartial(savedPartial.handoff, savedPartial);
+      if (savedPartial) {
+        try { await receivePartial(savedPartial.handoff, savedPartial); }
+        catch (error) {
+          // The common producer proves the complete old inventory first and repeats
+          // any saved dossier before current admission. Only its typed stale refusal
+          // for an unpublished recipient can yield to an explicit new choice/plan.
+          // Missing or damaged historical proof must never become this exit.
+          if (!partialPending || !(error instanceof EngineError) || error.code !== "discovery_dossier_stale"
+            || !pendingHandoff || !newPartialRoute(pendingHandoff)) throw error;
+          partialPending = false;
+        }
+      }
       for (;;) {
         const variants = this.restoreV7Variants(project, draftId);
         const synthesis = this.v7SynthesisRecovery(project, draftId);

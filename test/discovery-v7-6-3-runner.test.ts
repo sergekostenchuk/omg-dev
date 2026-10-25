@@ -311,3 +311,68 @@ test(`6.3 runner: real second Store ${shift} race before dossier publication can
     await inert(f,store,async()=>{const result=await drive(f,store);assert.equal(result.end,'blocked');assert.equal(result.reason?.dossier,undefined);});
   }
 });
+
+async function rejectedAtDossierCut(t: test.TestContext, published: boolean) {
+  const f=await setup(t);await f.run(3);
+  const rejected=owner(f.store,choiceScope(f,'reject_all'));
+  const write=f.store.writeMany.bind(f.store);let cut=false;
+  f.store.writeMany=((writes,guards)=>{
+    const recipient=writes.some(w=>w.kind===DOSSIER_MANIFEST_KIND);
+    if(recipient&&!cut&&!published){cut=true;throw new EngineError('runner_pending_cut','Stop before dossier publication');}
+    const rows=write(writes,guards);
+    if(recipient&&!cut){cut=true;throw new EngineError('runner_pending_cut','Stop after dossier publication');}
+    return rows;
+  }) as typeof f.store.writeMany;
+  try{await assert.rejects(()=>f.run(1),{code:'runner_pending_cut'});}finally{f.store.writeMany=write;}
+  assert.ok(cut);
+  const pending=currentRun(f);assert.equal(pending.value.pauseCode,'research_partial_dossier_pending');
+  const pause=JSON.parse(pending.value.error!), handoff=(await readVariantHandoff(f.store,'p',pause.handoff)).record;
+  assert.deepEqual(handoff.value.decision,reference(rejected.decision));assert.equal(handoff.value.reason,'reject_all');
+  assert.equal(f.store.list(DOSSIER_MANIFEST_KIND).length,published?1:0);
+  const chosen=owner(f.store,{...choiceScope(f,'choose'),operation:'revise',previous:reference(rejected.decision),expectedSelection:reference(rejected.state)});
+  return {...f,pending,oldHandoff:handoff,chosen};
+}
+for(const cold of [false,true])for(const published of [false,true])
+test(`6.3-RUNNER-01: ${cold?'cold':'hot'} owner revise exits an unpublished recipient; ${published?'written dossier restores first':'unwritten dossier stays absent'}`,async t=>{
+  const f=await rejectedAtDossierCut(t,published),store=cold?f.open():f.store;
+  const oldHistory=f.store.history(f.oldHandoff.id), paid=money(f.store), wire=f.wires();
+  const existing=f.store.list(DOSSIER_MANIFEST_KIND)[0];
+  if(published){
+    // Even an explicit new invocation first restores this already-paid saved result.
+    const restored=await f.run(1,store), pause=JSON.parse(restored.value.error!);
+    assert.equal(restored.value.pauseCode,'research_dossier_assessment_unavailable');
+    assert.deepEqual(pause.dossier,reference(existing!));assert.deepEqual(pause.handoff,reference(f.oldHandoff));
+    await inert(f,store,async()=>assert.deepEqual(await f.run(1,store,true),restored));
+  } else {
+    await inert(f,store,()=>assert.rejects(()=>f.run(1,store,true),{code:'discovery_dossier_stale'}));
+    await inert(f,store,()=>assert.rejects(()=>new Researcher(store,new Discovery(store),new ProductEngine(store).environments)
+      .run('p',f.v.draft.id,1),{code:'discovery_dossier_stale'})); // default policy is not a new v7 admission
+    assert.deepEqual(currentRun(f,store),f.pending);
+  }
+  const next=await f.run(1,store), pause=JSON.parse(next.value.error!);
+  assert.equal(next.value.pauseCode,'research_variant_handoff_unavailable',JSON.stringify(next.value));
+  const deep=(await readVariantHandoff(store,'p',pause.handoff)).record;
+  assert.equal(deep.value.next,'deep');assert.equal(deep.value.reason,'choose');
+  assert.deepEqual(deep.value.decision,reference(f.chosen.decision));assert.deepEqual(pause.decision,reference(f.chosen.decision));
+  assert.ok(deep.value.scope);assert.notEqual(deep.id,f.oldHandoff.id);
+  assert.deepEqual(store.history(f.oldHandoff.id),oldHistory);
+  assert.deepEqual((await readVariantHandoff(store,'p',reference(f.oldHandoff))).record,f.oldHandoff);
+  assert.equal(store.list(DOSSIER_MANIFEST_KIND).length,published?1:0);
+  if(existing)assert.deepEqual((await readPartialDossier(store,'p',reference(existing))).record,existing);
+  assert.deepEqual(money(store),paid);assert.deepEqual(f.wires(),wire);
+  assert.equal(f.generationCalls().filter(c=>c.subject.variantSubject.kind==='proposal').length,1);
+  assert.equal(f.generationCalls().filter(c=>c.subject.variantSubject.kind==='decision').length,0);
+  for(const repeat of [store,f.open()])await inert(f,repeat,async()=>assert.deepEqual(await f.run(1,repeat,true),next));
+});
+for(const lost of ['handoff','snapshot'] as const)
+test(`6.3-RUNNER-01: an explicit new choice does not bypass the pending ${lost} proof fault`,async t=>{
+  const f=await rejectedAtDossierCut(t,false), target=lost==='handoff'?reference(f.oldHandoff):f.oldHandoff.value.snapshot!;
+  assert.ok(target);
+  for(const store of [f.store,f.open()]){
+    const get=store.get.bind(store);
+    store.get=((id,revision)=>id===target.id&&(revision===undefined||revision===target.revision)?null:get(id,revision)) as typeof store.get;
+    try{await inert(f,store,()=>assert.rejects(()=>f.run(1,store),error=>error instanceof EngineError&&error.code!=='discovery_dossier_stale'));}
+    finally{store.get=get;}
+    assert.deepEqual(currentRun(f,store),f.pending);assert.equal(store.list(DOSSIER_MANIFEST_KIND).length,0);
+  }
+});
