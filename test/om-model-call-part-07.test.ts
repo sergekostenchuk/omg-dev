@@ -12,13 +12,13 @@ import { ProductEngine } from '../src/product/engine.js';
 import { writeAddressing, inputDecisionWrite } from '../src/om/addressing.js';
 import { writeGuarded } from '../src/om/refs.js';
 import { writeQuestionPacket, type QuestionPacketRecord, prepareQuestionPacket, readQuestionPacket } from '../src/om/question-packet.js';
-import { readCompletionBinding, type RepairSeries, completionWorkId, completeAttempt, seriesRequestOf } from '../src/om/series.js';
+import { readCompletionBinding, type RepairSeries, completionWorkId, seriesRequestOf } from '../src/om/series.js';
 import { recordCall } from '../src/om/call-record.js';
 import { openAttempt as managedOpenAttempt } from '../src/om/repeat-gate.js';
 import { Environments } from '../src/runtime/environment.js';
 import { Evidence } from '../src/evidence/evidence.js';
 import type { ModelCall } from '../src/runtime/model-usage.js';
-import { MP3_NOTES, MP3_SCOPES, completionE1, completionSnapshot, currentPacketWire, e4CannotAnswer, e4Fact, e4Fixture, e4NeedSource, e4Node, fixtureCheckpoint, fixtureDriver, h15CannotAnswer, h15Refusal, killFixtureProvider, lp4CeasedStep, lp4Need, lp4Root, mp2Managed, mp2Refused, mp2Step, mp3Carried, mp3Close, mp3Cycle, mp3DecisionOf, mp3Decisions, mp3Delivered, mp3Open, mp3Origins, mp3Readings, mp3ScopeAttempt, signalFixtureProvider, usage, valueOf } from './om-model-call-fixture.js';
+import { MP3_NOTES, MP3_SCOPES, completionE1, completionSnapshot, confirmed, currentPacketWire, e4CannotAnswer, e4Fact, e4Fixture, e4ManagedClose, e4ManagedFixture, e4NeedSource, e4Node, fixtureCheckpoint, fixtureDriver, h15CannotAnswer, h15Refusal, killFixtureProvider, lp4CeasedStep, lp4Need, lp4Root, mp2Managed, mp2Refused, mp2Step, mp3Carried, mp3Close, mp3Cycle, mp3DecisionOf, mp3Decisions, mp3Delivered, mp3Open, mp3Origins, mp3Readings, mp3ScopeAttempt, signalFixtureProvider, usage, valueOf } from './om-model-call-fixture.js';
 
 
 
@@ -537,9 +537,14 @@ test('MP3 on merged MP2 (№3147 junction): an attempt ceased with its correctio
 test('NR1 №3674 п.2: a packet of the previous attempt is not registered in the work of the next one — the producer checks a new packet against its receiving attempt; the right packet of that attempt is then materialized', async () => {
   const t = { after: (fn: () => void) => cleanups.push(fn) }, cleanups: (() => void)[] = [];
   try {
-    const f = e4Fixture(t as unknown as TestContext, 'fact');
+    const f = await e4ManagedFixture(t as unknown as TestContext, 'fact');
     const goal = f.series.value.attempts[0]!.goal;
-    valueOf(completeAttempt(f.store, { ...seriesRequestOf(f.series.value), attempt: 1, outcome: { reason: 'result', achieved: [], cancelled: [], refusals: [] } }));
+    assert.ok(valueOf(readCompletionBinding(f.store, f.project, reference(f.series), 1)), 'The first attempt is managed: its completion binding is real');
+    f.steps([{ research: e4CannotAnswer(f), usage, confirmed }]);
+    valueOf(await runModelCycle(f.store, f.request));
+    assert.equal(f.sent().length, 1, 'One paid call');
+    e4ManagedClose(f, 'refused');
+    assert.equal(f.store.get<RepairSeries>(f.series.id)!.value.attempts[0]!.outcome?.reason, 'refused', 'G7 saved the outcome of the first ordinal');
     const second = valueOf(managedOpenAttempt(f.store, { ...seriesRequestOf(f.series.value), attempt: 2, goal,
       completion: { routes: reference(f.routes), batches: [f.batch.id] } } as never));
     const binding = valueOf(readCompletionBinding(f.store, f.project, reference(second), 2))!;
@@ -552,6 +557,7 @@ test('NR1 №3674 п.2: a packet of the previous attempt is not registered in th
     const correct = valueOf(writeQuestionPacket(f.store, { ...f.packetRequest, attempt: { series: reference(second), ordinal: 2 } })).record;
     assert.equal(correct.value.state, 'ready');
     assert.equal(correct.value.request.attempt!.ordinal, 2);
+    assert.equal(f.sent().length, 1, 'The checks and the materialization pay nothing');
   } finally { for (const fn of cleanups.reverse()) fn(); }
 });
 
