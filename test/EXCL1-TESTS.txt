@@ -3,7 +3,6 @@
 # npm test гоняет всё; неизвестный, дублирующийся или вне-прогоновый ключ останавливает check:backend до запуска.
 # Реестр: ~/REPORTS/review/omg-excl1-design_191026.md (описи omg-legacy-inv-{A,B,C,D,D2-cw}_191026.md).
 
-om-achievements.test.ts :: LP7 rows 23, 24: one answer to the joined input fields proves exactly the LP6 keys the split routing proves by parts, state components included; an answer of some proves only theirs, and their rest is joined again on the next B1 # вид 1, найден GUARD1
 om-spend-report.test.ts :: E6 reads unchanged E1 bytes from the complete 0da9006 producer after restart # вид 1, найден GUARD1
 
 # GS3a: wake-choice supplements exist only for proposals admitted before the wakeTest requirement.
