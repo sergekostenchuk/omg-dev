@@ -24,11 +24,10 @@ import { readModelCall, runModelCall, runModelCycle, type OmModelCall } from "..
 import { probeProcessIdentity, stopOwnedGroup } from "../src/runtime/process-identity.js";
 import { prepareQuestionTasks, writeQuestionPacket } from "../src/om/question-packet.js";
 import type { OmResult, Refusal } from "../src/om/refusal.js";
-import { recordRefusal, unitRefusalNamespace, UNIT_REFUSAL_KIND } from "../src/om/refusal-journal.js";
 import { writeGuarded } from "../src/om/refs.js";
-import { closeAttempt, openAttempt } from "../src/om/repeat-gate.js";
+import { openAttempt } from "../src/om/repeat-gate.js";
 import { writeRoutes } from "../src/om/routes.js";
-import { beginAttempt, openSeries, readCompletionBinding, seriesAddress, type AnyRepairSeries, type AttemptGoal } from "../src/om/series.js";
+import { openSeries, readCompletionBinding, type AttemptGoal, type RepairSeries } from "../src/om/series.js";
 import { runStopAnalysis } from "../src/om/stop-analysis.js";
 import { acquireRunExecution, admitRunControl, readRunControl, releaseRunExecution, resumeStoppedRun, runControlId, RunControlGate,
   RunControlLost, RUN_CONTROL_CODES, stopRun, type RunControlRecord, type RunExecution, RUN_CONTROL_MOVED, liftedStop } from "../src/om/run-control.js";
@@ -36,6 +35,7 @@ import { resumeStoppedPass, stopPass } from "../src/om/run-driver.js";
 import { gardenGraph } from "./om-fixture.js";
 import { preparedFeatures } from "./product-fixture.js";
 import { preparedField } from "./preparation-fixture.js";
+import { confirmed, e4ManagedClose, e4ManagedFixture } from "./om-model-call-fixture.js";
 
 const adapterFixture = fileURLToPath(new URL("../../test/om-adapter-fixture.mjs", import.meta.url));
 const controlModule = new URL("../src/om/run-control.js", import.meta.url).href;
@@ -153,40 +153,42 @@ function factFixture(t: TestContext) {
 }
 const assessorStep = { research: { verdict: "supported", reasons: [] }, usage };
 
-/** A block series stopped by three attempts without progress, and the request of its independent review (A6). */
-function analysisFixture(t: TestContext) {
-  const root = mkdtempSync(join(tmpdir(), "omg-h13-a6-")), database = join(root, "state.sqlite"), project = "analysis";
-  let store = new Store(database);
-  t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
-  const scenario = join(root, "scenario.json"), trace = join(root, "trace.jsonl");
+/**
+ * A block series stopped by three paid attempts without progress, and the request of its independent review (A6). The stop is the shared
+ * managed carrier's own: two attempts paid through the real E2/E4 cycle, the third paid here the same way with unusable replies, each
+ * closed at G7 as off-form. A6 is configured only after that preparation and has its own scenario and trace, so pause, steps and sent
+ * relate to the analysis alone; `paid` keeps the saved model calls of the preparation as they stood when it ended.
+ */
+async function analysisFixture(t: TestContext) {
+  const f = await e4ManagedFixture(t, "fact", { priorNoProgress: 2 });
+  f.steps([{ research: { invalid: "first untyped reply" }, usage, confirmed }, { research: { invalid: "second untyped reply" }, usage, confirmed }]);
+  const cycle = ok(await runModelCycle(f.store, f.request));
+  assert.equal(cycle.last.outcome, null);
+  e4ManagedClose(f, "off-form");
+  const series = f.store.get<RepairSeries>(f.series.id)!;
+  assert.deepEqual(series.value.stop?.attempts, [1, 2, 3]);
+  assert.deepEqual(series.value.attempts.map(attempt => [attempt.ordinal, attempt.outcome?.reason]), [[1, "off-form"], [2, "off-form"], [3, "off-form"]]);
+  for (const ordinal of [1, 2, 3]) assert.ok(ok(readCompletionBinding(f.store, f.project, reference(series), ordinal)), `Attempt ${ordinal} is managed`);
+  const paid = f.store.list("model-call").map(row => f.store.get(row.id)!), third = cycle.record.value.steps.map(step => step.record);
+  assert.ok(f.preparationCalls.length > 0 && third.length > 0, "Every paid attempt of the stop left saved model calls");
+  for (const ref of [...f.preparationCalls, ...third]) assert.ok(paid.some(row => row.id === ref.id), `${ref.id} is among the saved payments`);
+  const scenario = join(f.root, "a6-scenario.json"), trace = join(f.root, "a6-trace.jsonl");
   const command = { executable: process.execPath, args: [adapterFixture, "--scenario", scenario, "--trace", trace] };
-  const environment = new Environments(store).configure(project, { workspace: root,
+  const environment = new Environments(f.store).configure(f.project, { workspace: f.root,
     implementer: { actor: "analysis-author", model: "local-author", effort: "high", command },
     reviewer: { actor: "independent-reviewer", model: "local-reviewer", effort: "medium", command },
-    fullCheck: { executable: process.execPath, args: ["--version"] }, timeoutMs: 10_000, requestCapacityChars: 200_000 }, 0);
-  const adapter = store.write({ id: `adapter:${project}:analysis`, kind: "dispatch-adapter", expected: 0, value: { projectId: project, protocol: "codex-stdio" } });
-  const address = { project, block: "analysis-block", line: 1 };
-  const goal: AttemptGoal = { key: "prove-workspace", questions: ["Which declared workspace condition prevents this work?"],
-    result: "A checked workspace condition allowing the declared work" };
-  ok(openSeries(store, { ...address, slice: "workspace-v1", predecessor: null, basis: null }));
-  const source = store.write({ id: `${unitRefusalNamespace(project)}workspace`, kind: UNIT_REFUSAL_KIND, expected: 0,
-    value: { gate: "G6", refusals: [{ code: "workspace_unavailable", goal: goal.key, remedy: "Observe the declared workspace condition",
-      origin: { name: "workspace_unavailable", stage: "feasibility", subject: "workspace", sources: [{ role: "environment", ref: reference(environment) }] } }] } });
-  const row = ok(recordRefusal(store, { project, source: reference(source) })).value.rows[0]!;
-  for (let attempt = 1; attempt <= 3; attempt++) {
-    ok(beginAttempt(store, { ...address, attempt, goal }));
-    ok(closeAttempt(store, { ...address, attempt, outcome: { reason: "refused", accepting: [], cancelling: [], refusals: [{ row: row.id, name: row.code, goal: row.goal }] } }));
-  }
-  const series = store.get<AnyRepairSeries>(seriesAddress(address).id)!;
-  assert.equal(series.value.stop?.attempt, 3);
-  const request = { project, series: reference(series), hold: null, dispatch: { config: reference(environment), adapter: reference(adapter) } };
+    fullCheck: { executable: process.execPath, args: ["--version"] }, timeoutMs: 10_000, requestCapacityChars: 200_000 }, f.store.get(`environment:${f.project}`)!.revision);
+  const adapter = f.store.write({ id: `adapter:${f.project}:analysis`, kind: "dispatch-adapter", expected: 0, value: { projectId: f.project, protocol: "codex-stdio" } });
+  const request = { project: f.project, series: reference(series), hold: null, dispatch: { config: reference(environment), adapter: reference(adapter) } };
   const answer = { protocol: "omg-stop-analysis/v1",
     cause: { kind: "hypothesis", text: "The same unanswered workspace question is repeated without new observations.", sources: [] },
     change: { text: "Obtain the addressed workspace observation before repeating this goal.", addresses: [{ ref: request.series, field: "attempts" }] }, origin: null };
-  return { root, database, project, request, answer, pause: join(root, "pause.json"),
-    get store() { return store; },
+  const sent = (): unknown[] => existsSync(trace) ? readFileSync(trace, "utf8").trim().split("\n").filter(Boolean) : [];
+  assert.deepEqual(sent(), [], "Nothing of the analysis itself was sent yet");
+  return { root: f.root, database: f.database, project: f.project, request, answer, paid, pause: join(f.root, "pause.json"),
+    get store() { return f.store; },
     steps(steps: Record<string, unknown>[]) { writeFileSync(scenario, JSON.stringify({ steps })); },
-    sent(): unknown[] { return existsSync(trace) ? readFileSync(trace, "utf8").trim().split("\n").filter(Boolean) : []; } };
+    sent };
 }
 /** A store whose one write of the chosen kind runs `after` from another store right after it commits (a crash or race window). */
 function afterWrite(match: (write: Write) => boolean, after: () => void) {
@@ -299,13 +301,14 @@ test("R15 H1.3 a saved stop refuses every direct physical entry without a signal
   const repeated = ok(await runModelCall(f.store, f.request));
   assert.deepEqual(repeated.record, original.record, "The saved E4 call is read under any control: nothing is sent again");
   assert.equal(f.sent().length, sent);
-  const a = analysisFixture(t);
+  const a = await analysisFixture(t);
   a.steps([{ research: a.answer, usage }]);
   ok(stopRun(a.store, { project: a.project }));
   const kept = snapshot(a.store);
   assert.equal(refusal(await runStopAnalysis(a.store, a.request)).code, "run_stopped");
   assert.deepEqual(snapshot(a.store), kept, "A6 wrote no intent, no E1 and no claim");
   assert.equal(a.sent().length, 0);
+  assert.deepEqual(a.paid.map(row => a.store.get(row.id)), a.paid, "The paid preparation is unchanged by the refused A6");
   const e4 = factFixture(t);
   ok(stopRun(e4.store, { project: e4.project }));
   const clean = snapshot(e4.store);
@@ -356,7 +359,7 @@ test("R9 R10 H1.3 an authorization won before the stop is an existing call: a st
   assert.equal(terminal.value.verdict, "interrupted", "The cancelled assessor is its own exact physical outcome");
   assert.equal(e5.sent().length, 2);
   // A6: the reviewer holds its request when the stop arrives.
-  const a6 = analysisFixture(t);
+  const a6 = await analysisFixture(t);
   a6.steps([{ research: a6.answer, usage, pauseAfterRequest: a6.pause }]);
   const analysing = runStopAnalysis(a6.store, a6.request);
   await checkpoint(a6.pause);
@@ -364,6 +367,7 @@ test("R9 R10 H1.3 an authorization won before the stop is an existing call: a st
   const analysis = ok(await analysing);
   assert.notEqual(analysis.value.state, "decided", "A cancelled review decides nothing");
   assert.equal(a6.sent().length, 1);
+  assert.deepEqual(a6.paid.map(row => a6.store.get(row.id)), a6.paid, "The paid preparation is unchanged by the cancelled A6");
 });
 
 test("R12 R13 H1.3 a complete receipt saved before the stop is applied by the live call; the next dispatch is refused and a new store reads the same result", async t => {
