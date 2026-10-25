@@ -292,9 +292,19 @@ test('C39 H1.0a technical diagnostics retain the stop and a real independent A6 
 
 
 test('C31 H1.0b equivalent configuration preserves the next exact MC2 part before its E1', async t => {
-  const measured = e4Fixture(t, 'node', 100_000, 5000);
+  const measured = e4Fixture(t, 'node', 100_000, 5000, true);
   const f = e4Fixture(t, 'node', currentPacketWire(measured.packet.value.packet) - 1, 5000, true);
   assert.ok(f.packet.value.plan!.assignments.length > 1);
+  // The measuring and the working fixture are the same current managed carrier: a real completion binding of ordinal 1 over their own
+  // routes and batch, the whole packet against the packet in parts, and nothing sent before the model runs.
+  for (const [name, fixture] of [['measured', measured], ['working', f]] as const) {
+    const binding = valueOf(readCompletionBinding(fixture.store, fixture.project, reference(fixture.series), 1));
+    assert.ok(binding, `${name}: a real completion binding`);
+    assert.deepEqual(binding.value.plan, { routes: reference(fixture.routes), batches: [fixture.batch.id] }, `${name}: the plan of the binding`);
+    assert.equal(fixture.sent().length, 0, `${name}: nothing was sent yet`);
+  }
+  assert.equal(measured.packet.value.plan!.mode, 'whole');
+  assert.equal(f.packet.value.plan!.mode, 'parts');
   const firstBody = e4Node(f); f.steps([{ research: firstBody, usage }]);
   const first = valueOf(await runModelCall(f.store, f.request)); assert.ok(first.part);
   const nextRequest = { ...f.packetRequest, previous: [{ packet: f.request.packet, ...first.part! }] };
@@ -313,6 +323,7 @@ test('C31 H1.0b equivalent configuration preserves the next exact MC2 part befor
   f.restart(); const history = f.store.list();
   valueOf(await runModelCall(f.store, { ...f.request, packet: reference(next) }));
   assert.deepEqual(f.store.list(), history); assert.equal(f.sent().length, 2);
+  assert.equal(measured.sent().length, 0, 'The measurement pays nothing');
 });
 
 
