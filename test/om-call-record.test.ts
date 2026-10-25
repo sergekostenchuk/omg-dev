@@ -12,7 +12,7 @@ import { isRef, reference, type Ref } from "../src/pipeline/contracts.js";
 import { Store, type Revision, type Write, type ReadGuard } from "../src/storage/store.js";
 import { REFUSAL_ROUTES, type OmResult, type Refusal, type Sealed } from "../src/om/refusal.js";
 import {
-  beginAttempt, completeAttempt, openSeries, resumeSeries, escalateSeries, readSeriesAt, seriesId, stopReviewNamespace, STOP_REVIEW_KIND,
+  beginAttempt, openSeries, resumeSeries, escalateSeries, readSeriesAt, seriesId, stopReviewNamespace, STOP_REVIEW_KIND,
   prepareSeriesAdmission, readMechanismAdmission, readCompletionBinding, completionWorkId, completionOwnerId,
   COMPLETION_ASSIGNMENT_KIND,
   type AttemptGoal, type RepairSeries, type AnyRepairSeries, type MechanismAdmission,
@@ -1198,23 +1198,59 @@ test("two admitted calls share one ledger, stay distinguishable, and settle inde
 });
 
 
-test("E1 exact-series admission shares A3 validation and still requires the current owner head", { todo: "NR1 №3646: согласованная перезапись цепочки до новейшей записи — om-fsck её не видит; решение позже" }, t => {
-  const f = fixture(t, "shared-series-reader");
+/**
+ * G7 ends the attempt of an ordinary carrier that admitted no call. endUnlaunched ceases the "part" assignment an admitted call
+ * registers; before any admission the exact plan has only its root, so the D1 moves, the root is ceased as not dispatched by the
+ * same producers, and the outcome is the one the then complete work derives.
+ */
+function endUnadmitted(f: Ordinary): void {
+  moveD1(f.store);
+  const binding = deliveredOf(readCompletionBinding(f.store, PROJECT, reference(f.store.get(f.series.id)!), 1))!;
+  const workRef = (): Ref => reference(f.store.get(completionWorkId(PROJECT, binding.id))!);
+  const root = deliveredOf(readCompletionWorkAt(f.store, PROJECT, workRef())).assignments.find(row => row.value.kind === "root")!;
+  deliveredOf(writeCompletionCessation(f.store, { project: PROJECT, binding: reference(binding), assignment: reference(root) }));
+  const work = deliveredOf(readCompletionWorkAt(f.store, PROJECT, workRef()));
+  assert.equal(work.complete, true);
+  deliveredOf(closeAttempt(f.store, { project: PROJECT, block: f.block, line: 1, attempt: 1,
+    outcome: { reason: "interrupted", accepting: work.accepting, cancelling: [], refusals: work.refusals } as GateOutcome }));
+}
+
+/**
+ * The base of the exact-series E1 tests on the current route: the ordinary carrier (a managed attempt with a real completion
+ * binding), its exact original series read back, a foreign block refused, then G7 ends the unlaunched attempt and the old input
+ * is refused again. Nothing is written by hand: the completion, the cessation and the close come from their producers.
+ */
+function seriesHeadBase(t: test.TestContext) {
+  const f = ordinary(t, "shared-series-reader");
+  assert.ok(deliveredOf(readCompletionBinding(f.store, PROJECT, reference(f.series), 1)), "The attempt is managed: its completion binding is real");
   const historical = deliveredOf(readSeriesAt(f.store, PROJECT, reference(f.series)));
   assert.deepEqual(historical, f.series);
-  addressed(recordCall(f.store, PROJECT, request(f, { block: "another-block" })), "call_series_unresolved");
-  assert.equal(heldCall(f), null); assert.equal(heldLedger(f), null);
-  deliveredOf(completeAttempt(f.store, { project: PROJECT, block: BLOCK, line: 1, attempt: 1,
-    outcome: { reason: "interrupted", achieved: [], cancelled: [], refusals: [] } }));
+  addressed(recordCall(f.store, PROJECT, lawful(f, { block: "another-block" })), "call_series_unresolved");
+  assert.equal(lawfulCall(f), null); assert.equal(heldLedger(f), null);
+  endUnadmitted(f);
+  assert.equal(f.store.get<RepairSeries>(f.series.id)!.value.attempts[0]!.outcome?.reason, "interrupted");
   assert.deepEqual(deliveredOf(readSeriesAt(f.store, PROJECT, reference(f.series))), historical);
-  addressed(recordCall(f.store, PROJECT, request(f)), "call_series_unresolved");
-  assert.equal(heldCall(f), null); assert.equal(heldLedger(f), null);
+  addressed(recordCall(f.store, PROJECT, lawful(f)), "call_series_unresolved");
+  assert.equal(lawfulCall(f), null); assert.equal(heldLedger(f), null);
+  return { f, historical };
+}
+
+
+test("E1 exact-series admission shares A3 validation and still requires the current owner head", { todo: "NR1 №3646: согласованная перезапись цепочки до новейшей записи — om-fsck её не видит; решение позже" }, t => {
+  const { f } = seriesHeadBase(t);
   const current = f.store.get<RepairSeries>(f.series.id)!;
   const forged = f.store.write<RepairSeries>({ id: current.id, kind: current.kind, expected: current.revision,
     value: { ...current.value, withoutProgress: current.value.withoutProgress + 1 } });
   assert.equal(refusalOf(readSeriesAt(f.store, PROJECT, reference(forged))).code, "series_invalid");
-  addressed(recordCall(f.store, PROJECT, request(f, { series: reference(forged) })), "call_series_unresolved");
-  assert.equal(heldCall(f), null); assert.equal(heldLedger(f), null);
+  addressed(recordCall(f.store, PROJECT, lawful(f, { series: reference(forged) })), "call_series_unresolved");
+  assert.equal(lawfulCall(f), null); assert.equal(heldLedger(f), null);
+});
+
+
+test("E1 exact-series admission on the current route: G7 ends the unlaunched attempt, the old input stays refused and the original series reads back exactly after the Store is reopened", t => {
+  const { f, historical } = seriesHeadBase(t);
+  const reopened = new Store(f.path); t.after(() => reopened.close());
+  assert.deepEqual(deliveredOf(readSeriesAt(reopened, PROJECT, reference(f.series))), historical);
 });
 
 
