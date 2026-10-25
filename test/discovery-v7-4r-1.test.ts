@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { canonical, hashJson } from '../src/canonical.js';
 import { reference } from '../src/pipeline/contracts.js';
 import { Store } from '../src/storage/store.js';
@@ -525,13 +526,23 @@ for (const phase of ['session-only','paid','application'] as const) {
   });
 }
 
-for(const damage of ['kind','root','project','root-and-project','intent-call','claim-absent','claim-foreign','call-project','intent-null','call-null','foreign-head','foreign-call'] as const) {
+for(const damage of ['kind','root','project','root-and-project','intent-call','claim-absent','claim-foreign','call-project','intent-null','call-null','foreign-head','foreign-call','intent-head-absent','intent-entity-kind','call-head-absent','call-entity-kind','foreign-call-entity-kind'] as const) {
   test(`4R.1: a published variant cannot hide reader lineage ${damage} masquerade`, async t => {
     const f=await pendingReader(t);await f.run(1,f.open());
     const published=await f.run(1,f.open());assert.equal(published.value.pauseCode,'research_variant_owner_required',JSON.stringify(published.value));
     const reader=f.store.get<ResearchConsumerIntent>(f.reader.id)!,call=f.store.get<any>(reader.value.call!.id)!;
     const rootKey=reader.value.cursor.rootKey;
-    if(damage==='intent-null') {
+    if(damage==='intent-head-absent'||damage==='call-head-absent'||damage==='intent-entity-kind'||damage==='call-entity-kind') {
+      const target=damage.startsWith('intent-')?reader:call,sql=new DatabaseSync(f.store.path);
+      try {
+        if(damage.endsWith('head-absent'))sql.prepare('DELETE FROM heads WHERE entity_id=?').run(target.id);
+        else {
+          sql.prepare('INSERT INTO revisions(entity_id,revision,kind,body,sha256) SELECT entity_id,revision+1,?,body,sha256 FROM revisions WHERE entity_id=? AND revision=?')
+            .run('foreign-record',target.id,target.revision);
+          sql.prepare('UPDATE heads SET revision=? WHERE entity_id=?').run(target.revision+1,target.id);
+        }
+      } finally {sql.close();}
+    } else if(damage==='intent-null') {
       f.store.write({id:reader.id,kind:reader.kind,expected:reader.revision,value:null});
     } else if(damage==='call-null') {
       f.store.write({id:call.id,kind:call.kind,expected:call.revision,value:null});
@@ -539,11 +550,19 @@ for(const damage of ['kind','root','project','root-and-project','intent-call','c
       const variant=f.store.list<ResearchConsumerIntent>('research-consumer-intent').find(row=>row.value.kind==='variant-proposal')!;
       f.store.write({id:variant.id,kind:variant.kind,expected:variant.revision,
         value:{...variant.value,kind:'reader',cursor:{...variant.value.cursor,rootKey}}});
-    } else if(damage==='foreign-call') {
+    } else if(damage==='foreign-call'||damage==='foreign-call-entity-kind') {
       const planner=f.store.list<ResearchConsumerIntent>('research-consumer-intent').find(row=>row.value.kind==='reading-planner')!;
       const foreign=f.store.get<any>(planner.value.call!.id)!;
-      f.store.write({id:foreign.id,kind:foreign.kind,expected:foreign.revision,
+      const claimed=f.store.write({id:foreign.id,kind:foreign.kind,expected:foreign.revision,
         value:{...foreign.value,consumerIntent:reference(f.store.get(reader.id,1)!)}});
+      if(damage==='foreign-call-entity-kind') {
+        const sql=new DatabaseSync(f.store.path);
+        try {
+          sql.prepare('INSERT INTO revisions(entity_id,revision,kind,body,sha256) SELECT entity_id,revision+1,?,body,sha256 FROM revisions WHERE entity_id=? AND revision=?')
+            .run('foreign-record',claimed.id,claimed.revision);
+          sql.prepare('UPDATE heads SET revision=? WHERE entity_id=?').run(claimed.revision+1,claimed.id);
+        } finally {sql.close();}
+      }
     } else if(['kind','root','project','root-and-project','intent-call'].includes(damage)) {
       const value:any={...reader.value,cursor:{...reader.value.cursor}};
       if(damage==='kind')value.kind='variant-proposal';
@@ -563,3 +582,17 @@ for(const damage of ['kind','root','project','root-and-project','intent-call','c
     assert.deepEqual(history(f.store),before);assert.deepEqual(paidReaderState(f.store),paid);assert.equal(f.wires().length,sent);
   });
 }
+
+test('4R.1: an unpaid prepared reader cannot leave its lineage by changing entity kind', async t => {
+  const f=await pendingReader(t),reader=f.store.get<ResearchConsumerIntent>(f.reader.id)!;
+  assert.equal(reader.value.state,'prepared');assert.equal(reader.value.call,null);
+  const sql=new DatabaseSync(f.store.path);
+  try {
+    sql.prepare('INSERT INTO revisions(entity_id,revision,kind,body,sha256) SELECT entity_id,revision+1,?,body,sha256 FROM revisions WHERE entity_id=? AND revision=?')
+      .run('foreign-record',reader.id,reader.revision);
+    sql.prepare('UPDATE heads SET revision=? WHERE entity_id=?').run(reader.revision+1,reader.id);
+  } finally {sql.close();}
+  const before=history(f.store),paid=paidReaderState(f.store),sent=f.wires().length;
+  assert.throws(()=>listResearchConsumerIntentsByRoot(f.open(),'p',reader.value.cursor.rootKey),{code:'research_consumer_intent_invalid'});
+  assert.deepEqual(history(f.store),before);assert.deepEqual(paidReaderState(f.store),paid);assert.equal(f.wires().length,sent);
+});

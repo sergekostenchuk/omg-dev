@@ -1,5 +1,5 @@
 {
-  "producerDigest": "e3310089b92c5ccc396e3c6e9735bc364f4fb11dcd02ab9e4e3a683876b6d706",
+  "producerDigest": "ce267ab432ba9b80b59eb5cf113abbc98daefe2c30680b0b0569fd470deb130e",
   "inputs": [
     {
       "path": "package-lock.json",
@@ -231,7 +231,7 @@
     },
     {
       "path": "src/discovery/reader.ts",
-      "sha256": "84f063d468dff846c8e7e563cae8f1eec285a877dd037c26ce7a6498707ea530"
+      "sha256": "92d7cf3e40f4671523ba431eac61c637f5e2471728d54dbbae3b568e07bda819"
     },
     {
       "path": "src/discovery/reading-plan.ts",
@@ -299,7 +299,7 @@
     },
     {
       "path": "src/discovery/research-runner.ts",
-      "sha256": "5adf24fb32193bcfffbcaa3632a53c843102f114c7cb67ba2a37c0049a55ae2b"
+      "sha256": "e2e04a018eb5d6f308794edde8dfad1282aaa01557de03cb37556d1d8dc5e46e"
     },
     {
       "path": "src/discovery/research-sources.ts",
@@ -307,7 +307,7 @@
     },
     {
       "path": "src/discovery/response-recovery.ts",
-      "sha256": "b86920340cd6b960d7bdc933c4c9fcf7f5f1c5cb79f60615a655ca3711220c19"
+      "sha256": "86b3f34827ad8a41877db5dd5f365799ea1a620e60c03506ae44257a4aa47d4a"
     },
     {
       "path": "src/discovery/response-replay.ts",
@@ -375,7 +375,7 @@
     },
     {
       "path": "src/discovery/variant-snapshot.ts",
-      "sha256": "9351f192dc6acca7cafd867fcee8709d6ac8b71891b70c5ed5c5dc7a33a148c7"
+      "sha256": "310d21225fcef10a24d5a8a863bd4d1d572a98ec43cdf78dbc34fa6ba1948aa2"
     },
     {
       "path": "src/discovery/web-research.ts",
@@ -983,48 +983,48 @@
     "discovery": {
       "id": "stage:golden:discovery",
       "revision": 2,
-      "hash": "de7b5e755df9566a4524f72e01273af0b725696148c888ec94661ade3fe843e7"
+      "hash": "1618971bf9095d8dbb30a9b6dfb01e65bd48b680a4c786be1eddd9fb5a4cad17"
     },
     "concept": {
       "id": "stage:golden:concept",
       "revision": 2,
-      "hash": "51dc050a7efcaab94071f585517ff13d840c8934e7136c87a0dfaf74fbb0a4de"
+      "hash": "9d9465a8f9b2e13074ca80ea74c058a1b3c90f07a486ecbc2336f29a4c3c9228"
     },
     "operation-map": {
       "id": "stage:golden:operation-map",
       "revision": 2,
-      "hash": "1239178c2666b2f82963ce71bc3a2d7dfc24d4fc3b2713be0f6be5b35d8b7533"
+      "hash": "0067d4b7e70750ca262f2ee988b7a1473f1800bf849a9c0a0c60da9c3fb6dd01"
     },
     "specification": {
       "id": "stage:golden:specification",
       "revision": 2,
-      "hash": "9a5adae1577803af1f0d828d4d1a105502cdddc46263d26fa302f9ceba66ba36"
+      "hash": "16501b050e9db7e26ac94d409cf69338f4b9fa390a918e4dfbb146122aac8d24"
     },
     "features": {
       "id": "stage:golden:features",
       "revision": 2,
-      "hash": "9c95c502e6dff5c8cd7bb196caebe5d9b634b375f9aad4931d868b3a4e9ecf43"
+      "hash": "a0d2271728a416fd61af19849dc0419739618ab8d42c0ce14b652a8cada865e4"
     },
     "om-g2": {
       "id": "stage:golden:om-g2",
       "revision": 1,
-      "hash": "e9d1e4f60c687b4173a1aa2767a68367710c02ae826dfa5c85c5ec6714ecbe6d"
+      "hash": "ba1159cf58824c550b495930344b1f598217132bbe9086ccc9672e3efba8a070"
     },
     "compilation": {
       "id": "stage:golden:compilation",
       "revision": 2,
-      "hash": "9aad903c6b85f16a0eafa8e3fb01c7b0673a5abf9c1da12a0722f093c5266f2b"
+      "hash": "84c797b227e27283cc951d610c661fc261686ab5704ce7de73ea3e68bbded441"
     },
     "execution": {
       "id": "stage:golden:execution",
       "revision": 1,
-      "hash": "32c08462905d18b93e2365a271fa7af506a868afc99177991dadad5fba3f0127"
+      "hash": "2f071fd07f8328bf21eb49af21d865f538be3b067d92b4aa9e8852c750576542"
     }
   },
   "databaseId": "089133aa-dc16-4529-a3b9-be5ba223092f",
   "proofCache": "empty",
-  "externalRoot": "/Users/kostenchuksergey/omg-wt/omg-int-s19/.golden-build-KnvO7G/",
+  "externalRoot": "/Users/kostenchuksergey/omg-wt/omg-int-s19b/.golden-build-7hTlrw/",
   "format": "golden-sample/v1",
-  "sqliteFileSha256": "1df74dabc9445c5923f6887340d84f736c01d8ea3b9f8a8e2906fe950425a8bb",
-  "sqliteBytes": 14589952
+  "sqliteFileSha256": "bbfecb585f44e383eab83b74b2d6b4c125fe487a5586ed16f62280e08542b3f9",
+  "sqliteBytes": 14585856
 }

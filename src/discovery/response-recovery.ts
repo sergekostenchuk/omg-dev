@@ -1425,6 +1425,9 @@ function checkReaderClaimOrigins(store: Store, scope: ReaderClaimScope): void {
   for (const intent of scope.intents) for (const row of store.history<ResearchConsumerIntent>(intent.id))
     if (isRef(row.value?.call)) linked.add(row.value.call.id);
   const calls = new Map(store.list<ModelCall>('model-call').map(call => [call.id, call]));
+  // A changed entity kind must not remove a physical consumer call from scope.
+  for (const { id } of store.identities('prefix', 'model-call:consumer:v1:'))
+    if (!calls.has(id)) calls.set(id, store.get<ModelCall>(id)!);
   for (const id of linked) {
     const call = store.get<ModelCall>(id);
     if (!call || call.kind !== 'model-call') consumerInvalid(id, 'The reader lost its physical call');
@@ -1434,9 +1437,14 @@ function checkReaderClaimOrigins(store: Store, scope: ReaderClaimScope): void {
     const first = store.get<ModelCall>(call.id, 1);
     const originRef = (call.value as ModelCall & { consumerIntent?: Ref })?.consumerIntent;
     const initialRef = (first?.value as (ModelCall & { consumerIntent?: Ref }) | undefined)?.consumerIntent;
+    // Select by the saved physical origin even when its current intent head has
+    // disappeared. Selection reads fields only; unrelated variant proof stays out.
+    const originInScope = (ref: unknown) => isRef(ref)
+      && readerLineageMember(store.get<ResearchConsumerIntent>(ref.id, ref.revision), scope.projectId, scope.rootKey);
     if (!linked.has(call.id) && !(isRef(originRef) && ids.has(originRef.id))
-      && !(isRef(initialRef) && ids.has(initialRef.id))) continue;
-    if (!call.id.startsWith('model-call:consumer:v1:') || first?.kind !== 'model-call'
+      && !(isRef(initialRef) && ids.has(initialRef.id))
+      && !originInScope(initialRef) && !originInScope(originRef)) continue;
+    if (!call.id.startsWith('model-call:consumer:v1:') || call.kind !== 'model-call' || first?.kind !== 'model-call'
       || !isRef(originRef) || !isRef(initialRef) || canonical(originRef) !== canonical(initialRef)
       || !ids.has(initialRef.id)) consumerInvalid(call.id, 'The reader physical origin is missing or substituted');
     const origin = readResearchConsumerIntent(store, initialRef);
@@ -1537,11 +1545,17 @@ export function findPendingResearchConsumerIntentByRoot(store: Store, projectId:
 export function listResearchConsumerIntentsByRoot(store: Store, projectId: string, rootKey: string): Revision<ResearchConsumerIntent>[] {
   if (!store || typeof store.list !== 'function' || typeof projectId !== 'string' || !projectId
     || typeof rootKey !== 'string' || !rootKey) consumerInvalid('research-consumer-intent', 'Reader lineage lookup needs project and root key');
-  const candidates = store.list<ResearchConsumerIntent>('research-consumer-intent').filter(row =>
+  const heads = new Map(store.list<ResearchConsumerIntent>('research-consumer-intent').map(row => [row.id, row]));
+  // Unpaid prepared readers have no call yet: retain their immutable address
+  // when a corrupt head changes the entity kind as well as the declared kind.
+  for (const { id } of store.identities('prefix', 'research-consumer-intent:v1:'))
+    if (!heads.has(id)) heads.set(id, store.get<ResearchConsumerIntent>(id)!);
+  const candidates = [...heads.values()].filter(row =>
     readerLineageMember(row, projectId, rootKey) || readerLineageMember(store.get<ResearchConsumerIntent>(row.id, 1), projectId, rootKey));
   for (const row of candidates) {
     const first = store.get<ResearchConsumerIntent>(row.id, 1);
-    if (row.value?.kind !== 'reader' || first?.value?.kind !== 'reader'
+    if (row.kind !== 'research-consumer-intent' || first?.kind !== 'research-consumer-intent'
+      || row.value?.kind !== 'reader' || first.value?.kind !== 'reader'
       || !readerLineageMember(row, projectId, rootKey) || !readerLineageMember(first, projectId, rootKey))
       consumerInvalid(row.id, 'The original reader lineage cannot be renamed or moved by its head');
   }
