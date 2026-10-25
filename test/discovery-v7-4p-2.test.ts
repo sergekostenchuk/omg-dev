@@ -220,7 +220,7 @@ test('4P.2: the owner act keys the claim by its content — a newer lawful act o
   assert.equal(f.wires().length, sent);
 });
 
-test('4P.2: another member, set or substantive reason is another content; reject_all is a real owner act with its own key', async t => {
+test('4P.2: another member, set or substantive reason is another content — each field proven alone; reject_all is a real owner act with its own key', async t => {
   const f = await paid(t), v = claimsLine(f), m = mint(f.store, f.scope);
   const first = answerVariantChoice(f.store, f.scope, m.authority);
   const other: VariantChoiceScope = { ...revised(f.scope, first, 'choose'),
@@ -234,6 +234,20 @@ test('4P.2: another member, set or substantive reason is another content; reject
   const keys = new Set([key(0), key(1), key(2)]);
   assert.equal(keys.size, 3, 'member, reason and reject_all are distinct contents');
   assert.notEqual(key(3), key(0), 'the claim text stays part of the key');
+  // One content field at a time, each act chained from the current head: the same member with a new reason, then
+  // another member with that same reason.
+  const sameMemberNewReason: VariantChoiceScope = { ...revised(f.scope, last, 'choose'),
+    outcome: { kind: 'choose', member: f.set.value.members[0]!, reason: 'A wholly new substantive reason' } };
+  const third = answerVariantChoice(f.store, sameMemberNewReason, mint(f.store, sameMemberNewReason).authority);
+  const otherMemberSameReason: VariantChoiceScope = { ...revised(f.scope, third, 'choose'),
+    outcome: { kind: 'choose', member: f.set.value.members[1]!, reason: 'A wholly new substantive reason' } };
+  const fourth = answerVariantChoice(f.store, otherMemberSameReason, mint(f.store, otherMemberSameReason).authority);
+  const b = attempt(f, v, submitted(ownerClaim(v, reference(first.decision)), ownerClaim(v, reference(third.decision)),
+    ownerClaim(v, reference(fourth.decision))));
+  const alone = (index: number) => claimContentKey(f.store, address(f, v, b, index));
+  assert.notEqual(alone(0), alone(1), 'the same member with another substantive reason is another content');
+  assert.notEqual(alone(1), alone(2), 'another member with the same reason is another content');
+  assert.notEqual(alone(0), alone(2), 'both together are another content too');
   const g = await paid(t), gv = claimsLine(g), gm = mint(g.store, g.scope);
   const gact = answerVariantChoice(g.store, g.scope, gm.authority);
   const ga = attempt(g, gv, submitted(ownerClaim(gv, reference(gact.decision))));
@@ -285,16 +299,27 @@ test('4P.2: a paid model decision, a grant or session, a structural lookalike, a
   f.store.get = ((id: string, revision?: number) => id === hidden.id && revision === hidden.revision ? null : get(id, revision)) as typeof f.store.get;
   refuses(() => key(0), 'discovery_novelty_invalid');
   f.store.get = get;
-  // The key refuses the grant, the session, a damaged hash or revision and a foreign act record the same typed way
-  // through the standard resolver seam — a negative harness: the claim JSON is the real form, its basis Refs are the
-  // real saved records.
+  // The key refuses the grant, the session, a damaged hash or revision the same typed way through the standard
+  // resolver seam — a negative harness: the claim JSON is the real form, its basis Refs are the real saved records.
   const resolve = (authority: Ref) => (item: ClaimAddress) => ({ container: undefined as never,
     claim: { id: item.claimId, kind: 'owner-decision', text: 'The owner chose the exact variant',
       basis: { authority: asJson(authority) } } as unknown as Json }) as unknown as ResolvedClaim;
   const at0 = address(f, v, a, 0);
   for (const authority of [m.issued.grant, m.session, { ...reference(act.decision), hash: '0'.repeat(64) },
-    { ...reference(act.decision), revision: 9 }, { id: `discovery-variant-owner-decision:foreign:${rand()}`, revision: 1, hash: '0'.repeat(64) }])
+    { ...reference(act.decision), revision: 9 }])
     refuses(() => claimContentKey(f.store, at0, { resolve: resolve(authority as Ref) }), 'discovery_novelty_invalid');
+  // A real lawful act of ANOTHER claim project: the record exists and proves for its own project — the refusal is the
+  // act's project membership, not a missing record or a damaged Ref. The exact basis Ref and the proof reader's cause
+  // are pinned; the same resolver harness carries the real form.
+  const actRef = reference(act.decision);
+  const foreign: ClaimAddress = { ...at0, project: 'foreign' };
+  let caught: unknown;
+  try { claimContentKey(f.store, foreign, { resolve: resolve(actRef) }); } catch (error) { caught = error; }
+  assert.ok(caught instanceof EngineError && caught.code === 'discovery_novelty_invalid', 'the typed key refusal');
+  const membershipDetails = (caught as EngineError).details as { field?: unknown; cause?: unknown; ref?: unknown };
+  assert.equal(membershipDetails.field, 'owner-decision.authority');
+  assert.equal(membershipDetails.cause, 'discovery_variant_decision_invalid', 'the proof reader refused the foreign project');
+  assert.deepEqual(membershipDetails.ref, actRef, 'the refusal pins the exact basis Ref');
   assert.deepEqual(history(f.store), before, 'the refusals write nothing');
   assert.deepEqual(money(f.store), accounting, 'and pay nothing');
 });
@@ -314,8 +339,15 @@ test('4P.2: the key of a former lawful act survives later choices, a mode change
   const login = ok(sessions.exchange({ project: 'p', invitation: issued.invitation }));
   setProjectMode(f.store, modeScope, sessions.authority(login.bearer));
   const cold = new Store(f.store.path); t.after(() => cold.close());
+  // The full snapshot is taken after the lawful changes, right before the first historical computation; the hot and
+  // the cold reads then prove themselves against it — a write or a reactivation would move any part of it.
+  const stateId = variantStateId('p', f.scope.draft.id);
+  const snapshot = { history: history(f.store), accounting: money(f.store), sent: f.wires().length,
+    head: reference(f.store.get<VariantState>(stateId)!) };
   assert.equal(key(), original, 'the historical key stays the same in place');
   assert.equal(claimContentKey(cold, address(f, v, a, 0)), original, 'and after a restart');
-  const accounting = money(f.store), sent = f.wires().length;
-  assert.deepEqual(money(f.store), accounting); assert.equal(f.wires().length, sent);
+  assert.deepEqual(history(f.store), snapshot.history, 'the historical reads write nothing');
+  assert.deepEqual(money(f.store), snapshot.accounting, 'and pay nothing');
+  assert.equal(f.wires().length, snapshot.sent);
+  assert.deepEqual(reference(f.store.get<VariantState>(stateId)!), snapshot.head, 'the current choice head stays untouched');
 });
