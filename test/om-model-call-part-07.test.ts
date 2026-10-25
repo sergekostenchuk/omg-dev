@@ -49,7 +49,7 @@ test('E4 delivery writes guard source heads, and a repeat after restart returns 
 
 test('E4 retains terminal evidence when environment or captured file changes during the physical call before E3 preparation', async t => {
   for (const change of ['environment', 'file'] as const) {
-    const f = e4Fixture(t, 'fact', 100_000, 0, 5000, true, true, false, undefined, (store, project, root) => {
+    const f = e4Fixture(t, 'fact', 100_000, 0, 5000, true, true, false, (store, project, root) => {
       new Evidence(store).file(project, 'transport-file', root, 'e4-source.txt', 'text/plain', 0);
     }), reply = e4Fact(f);
     const file = f.store.get<import('../src/evidence/evidence.js').Source>(`source:${f.project}:transport-file`)!;

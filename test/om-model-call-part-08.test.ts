@@ -355,9 +355,9 @@ test('OBL1 №3773 five reads that each fit alone but not together: the continua
   const material = (store: Store, project: string) => {
     new Evidence(store).document(project, 'large-json', JSON.stringify(Object.fromEntries(Array.from({ length: 5 }, (_, i) => [`field${i}`, String(i).repeat(size)]))), 'application/json', 0);
   };
-  const measured = e4Fixture(t, 'fact', 100_000, 0, 5000, true, true, false, undefined, material);
+  const measured = e4Fixture(t, 'fact', 100_000, 0, 5000, true, true, false, material);
   const capacity = currentPacketWire(measured.packet.value.packet) + 2 * size;
-  const f = e4Fixture(t, 'fact', capacity, 0, 5000, true, true, false, undefined, material);
+  const f = e4Fixture(t, 'fact', capacity, 0, 5000, true, true, false, material);
   const source = f.store.get<Source>(`source:${f.project}:large-json`)!;
   const reads = Array.from({ length: 5 }, (_, i) => ({ action: 'read_source', source: reference(source), selector: { kind: 'json-pointer', pointer: `/field${i}` } }));
   f.steps([{ research: e4NeedSource(f, reads), usage }, { research: e4Fact(f), usage }]);

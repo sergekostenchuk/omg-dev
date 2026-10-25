@@ -3065,7 +3065,7 @@ test('MP1.1 rows 11–13: genuine E3 and delivered search are case-insensitive l
   for (const scope of ['path', 'source'] as const) await t.test(scope, async t => {
     const text = 'Alpha TWO Words\nA\nB\nA|B\nA.B\nA*B\nTwo separate words\n';
     let source!: Revision<any>;
-    const f = e4Fixture(t, 'node', 100_000, 0, 5000, true, true, false, undefined,
+    const f = e4Fixture(t, 'node', 100_000, 0, 5000, true, true, false,
       (store: Store, project: string, root: string) => {
         writeFileSync(join(root, 'literal.txt'), text);
         source = new Evidence(store).file(project, 'literal', root, 'literal.txt', 'text/plain', 0);

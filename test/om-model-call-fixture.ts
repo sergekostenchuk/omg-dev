@@ -166,7 +166,7 @@ export function e4Prefix(store: Store, kind: 'fact' | 'node' | 'field' | 'design
 
 
 export function e4Fixture(t: TestContext, kind: 'fact' | 'node' | 'field' | 'design' = 'fact', capacity = 100_000, priorNoProgress = 0, timeoutMs = 1000, managed = false, materialize = true, extraQuestion = false,
-  seriesCommit?: string, material?: (store: Store, project: string, root: string) => void, priorRefused = false) {
+  material?: (store: Store, project: string, root: string) => void, priorRefused = false) {
   // M5 addresses the fact for 'fact' and 'node' alike; 'field' leaves it unaddressed.
   const extra = extraQuestion || kind === 'design';
   const seeded = seedCopy(`e4:${kind === 'field' ? 'field' : kind === 'design' ? 'design' : 'addressed'}:${extra}`,
@@ -199,10 +199,7 @@ export function e4Fixture(t: TestContext, kind: 'fact' | 'node' | 'field' | 'des
   const admission = { gaps: gapRequest, routes: reference(routes), batch: batch.id };
   const firstLine = kind === 'field' ? { ...address, scope: gapRequest, predecessor: null, basis: null }
     : { ...address, slice: 'e4-fixture', predecessor: null, basis: null };
-  // Q3 (№2573-1): a historical producer continues a line of its own form, opened by its own commit when a test names one.
-  if (seriesCommit) h15AtCommit({ root, database }, seriesCommit, 'era-series', `const { openSeries } = await import(src('om/series.js'));
-out(reference(take(openSeries(store, args))));`, firstLine);
-  else valueOf(openSeries(store, firstLine as never));
+  valueOf(openSeries(store, firstLine as never));
   for (let attempt = 1; attempt <= priorNoProgress; attempt++) {
     valueOf(beginAttempt(store, kind === 'field' ? { ...address, attempt, goal, admission } as never : { ...address, attempt, goal } as never));
     valueOf(completeAttempt(store, { ...address, attempt, outcome: { reason: 'result', achieved: [], cancelled: [], refusals: [] } } as never));
@@ -229,12 +226,7 @@ out(reference(take(openSeries(store, args))));`, firstLine);
   material?.(store, project, root);
   const packetRequest: QuestionPacketRequest = { project, routes: reference(routes), batch: batch.id, environment: reference(configured),
     attempt: { series: reference(series), ordinal }, previous: [] };
-  // LP1: historical consumers receive the packet their producer issues, including its exact v2 candidate address.
-  const packet = seriesCommit ? h15AtCommit({ root, database }, seriesCommit, 'era-packet',
-    `const { ${materialize ? 'writeQuestionPacket' : 'prepareQuestionPacket'} } = await import(src('om/question-packet.js'));
-out(take(${materialize ? 'writeQuestionPacket' : 'prepareQuestionPacket'}(store, args)).record);`, packetRequest) as Revision<QuestionPacketRecord>
-    : valueOf((materialize ? writeQuestionPacket : prepareQuestionPacket)(store, packetRequest)).record;
-  if (seriesCommit) assert.equal(packet.value.answerProtocol, 'omg-answer/v2');
+  const packet = valueOf((materialize ? writeQuestionPacket : prepareQuestionPacket)(store, packetRequest)).record;
   const request: ModelCallRequest = { project, packet: reference(packet), dispatch: { adapter: reference(adapter), config: reference(configured) }, role: 'implementer' };
   const frame = valueOf(prepareFrameProposals(store, sources.operations));
   const obligations = frame.frame.result.obligations.filter(item => item.upper.node === batch.node);
@@ -298,7 +290,7 @@ export async function e4ManagedFixture(t: TestContext, kind: Parameters<typeof e
   assert.ok(Number.isSafeInteger(count) && count >= 0 && count + Number(options.priorRefused ?? false) < 3,
     'A current attempt must precede the first-rung stop');
   const f: ManagedE4Fixture = e4Fixture(t, kind, options.capacity ?? 100_000, 0, options.timeoutMs ?? 5000, true, true,
-    options.extraQuestion ?? false, undefined, options.material);
+    options.extraQuestion ?? false, options.material);
   const script: Record<string, unknown>[] = [], prefix: Ref[] = [];
   const next = () => {
     const ordinal = f.packetRequest.attempt!.ordinal + 1;
@@ -814,7 +806,7 @@ export function mp2Step(f: ReturnType<typeof e4Fixture>, step: { record: Ref }) 
 }
 
 
-export const mp2Managed = (t: TestContext, capacity = 100_000, retry = false) => e4Fixture(t, 'node', capacity, 0, 1000, true, true, false, undefined, undefined, retry);
+export const mp2Managed = (t: TestContext, capacity = 100_000, retry = false) => e4Fixture(t, 'node', capacity, 0, 1000, true, true, false, undefined, retry);
 
 
 
@@ -847,7 +839,7 @@ export const MP3_LARGE = 'Large carried line.\n'.repeat(3000);
 
 
 export function mp3Cycle(t: TestContext, kind: 'fact' | 'node' = 'fact', capacity = 100_000, managed = false) {
-  const f = e4Fixture(t, kind, capacity, 0, 5000, managed, true, false, undefined, mp3Material);
+  const f = e4Fixture(t, kind, capacity, 0, 5000, managed, true, false, mp3Material);
   return mp3Materials(f);
 }
 
