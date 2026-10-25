@@ -1,3 +1,6 @@
+import { historicalProof, withHistoricalReads } from '../history/proofs.js';
+import { readDeepPreparation as proveDeepPreparation, requireCurrentDeepPreparation, type ProvenDeepPreparation } from './deep-research.js';
+import { deepPreparationRef, projectPaidDeepResearch } from './research-consumer-transition.js';
 import { decodeVariantExecutionSession, decodeVariantSubject, readVariantNoneStructural, readVariantSetStructural,
   type VariantExecutionSession, type VariantPublication, type VariantPublicationRecord, type VariantSubject } from './discovery-variants.js';
 import { variantPublicationWrites, variantDecisionPublicationWrites, readVariantDecisionStructural, readVariantStateStructural,
@@ -77,7 +80,7 @@ import { paidOriginId, paidSessionId, limitedAssessmentRetryScope, assessmentRol
 import { readResearchAssessmentAt, assessmentBindingId } from './research-assessment.js';
 import { ATTEMPT_BINDING_CONTRACT, ATTEMPT_BINDING_FIELDS, ATTEMPT_BINDING_KIND, addressedQuestionId, attemptBindingId,
   callAddressesSubject, planSubjectOf, sameSubject, questionDispatchId, type ResearchAttemptBinding, type V7PlanSubject } from './v7-managed-attempt.js';
-import { proveAttempt, provePlanQuestions, type V7Attempt } from './v7-plan-questions.js';
+import { proveAttempt, provePlanQuestions, v7AttemptId, type V7Attempt } from './v7-plan-questions.js';
 import { V7_CONTRACT_ERA } from './v7-contracts.js';
 
 export interface ResponseRecovery {
@@ -365,6 +368,7 @@ export function readResearchConsumerIntent(store: Store, ref: Ref): Revision<Res
   if (saved.value.contract === CONSUMER_INTENT_V2)
     readPreparationRecord(store, saved.value.preparation!, preparationBinding(saved.value, saved.id));
   if(isVariantConsumer(saved.value)) requireVariantConsumerBinding(store,saved.value,saved.id);
+  requireDeepConsumerBinding(store, saved);
   return saved;
 }
 /** DRS1a2: the step a v2 preparation must be bound to — from the intent's own
@@ -1657,6 +1661,9 @@ function requireVariantConsumerBinding(store: Store, value: ResearchConsumerInte
     consumerInvalid(id,'The variant intent omitted an exact or absent dispatch dependency');
 }
 function requireIntentSubject(store: Store, value: ResearchConsumerIntent, id: string): void {
+  if (deepPreparationRef(value.cursor)) requireDeepConsumerBinding(store, {
+    id: researchConsumerIntentId(value.projectId, value.kind, value.key, value.generation),
+    kind: 'research-consumer-intent', revision: 1, hash: hashJson(value), value });
   if(isVariantConsumer(value)) { requireVariantConsumerBinding(store,value,id); return; }
   const subject = cursorSubject(value, id);
   if (!subject) return;
@@ -1715,6 +1722,8 @@ export function prepareResearchConsumerIntent(store: Store, input: ResearchConsu
   const value: ResearchConsumerIntent = { ...input, contract: 'research-consumer-intent/v1',
     rootKey: input.key, generation, previous: replacing ? reference(previous!) : previous?.value.previous ?? null,
     state: 'prepared', call: null, request: null, archive: null, outputs: null, refusal: null };
+  if (!previous || replacing || previous.value.state === 'prepared')
+    value.guards = uniqueTransactionGuards([...value.guards, ...deepConsumerAdmission(store, value)]);
   requireIntentSubject(store, value, input.key);
   if (value.kind === 'variant-decision' && (!previous || replacing || previous.value.state === 'prepared'))
     variantDecisionIntentAdmission(store, value);
@@ -1849,6 +1858,10 @@ export function prepareResearchConsumerReservation(store: Store, intentRef: Ref,
     || call.value.purpose !== (intent.value.kind === 'synthesis' || intent.value.kind === 'consolidation'
       ? 'analyst' : intent.value.kind))
     consumerInvalid(intent.id, 'The pending physical claim is not the exact admitted consumer call');
+  const deepRef = deepPreparationRef(intent.value.cursor);
+  if (Object.hasOwn(call.value, 'deepPreparation') !== (deepRef !== null)
+    || deepRef && canonical((call.value as Record<string, unknown>).deepPreparation ?? null) !== canonical(deepRef))
+    consumerInvalid(intent.id, 'The new call and admitted cursor must retain the same explicit deep identity');
   const runner = ['analyst', 'reading-planner', 'escalation-assessor'].includes(intent.value.kind);
   const expectedOwnerTurns = intent.value.kind === 'escalation-assessor'
     ? intent.value.cursor.turn : intent.value.cursor.turn - 1;
@@ -1861,7 +1874,7 @@ export function prepareResearchConsumerReservation(store: Store, intentRef: Ref,
     consumerInvalid(intent.id, 'The resumed run no longer owns the exact admitted turn');
   const write: Write = { id: intent.id, kind: 'research-consumer-intent', expected: intent.revision,
     value: { ...intent.value, state: 'running', call: pendingRef(call), request, archive } satisfies ResearchConsumerIntent };
-  return { writes: [write], guards: uniqueTransactionGuards([reference(intent), reference(owner),
+  return { writes: [write], guards: uniqueTransactionGuards([...deepConsumerAdmission(store, intent.value), reference(intent), reference(owner),
     ...intent.value.guards.filter(guard => !runner || guard.id !== intent.value.owner.id), ...decisionGuards]) };
 }
 
@@ -1888,6 +1901,10 @@ interface AssessmentFileSnapshot { source: Ref; observation: AssessmentFileObser
 export interface AssessmentReadProof {
   contract: 'assessment-read/v1'; reads: AssessmentReadEntry[]; files: AssessmentFileSnapshot[];
 }
+
+// Only views created below may pin the inputs of a deep historical proof.
+// A caller-provided Store/Proxy cannot claim this snapshot behaviour.
+const deepAssessmentInputs = new WeakMap<Store, { source: Store; active: () => void }>();
 
 /** One evaluation's semantic input view. The local owner-document projection
  * substitutes a captured filesystem observation for Evidence's live probe; it
@@ -2058,6 +2075,25 @@ export function assessmentReadView(store: Store, savedProof?: AssessmentReadProo
     if (typeof value === 'function') return () => fail('Assessment input views support only captured get reads');
     return value;
   } });
+  const deepReads = new Map<string, Revision<unknown> | null>();
+  const active = () => {
+    if (invalid) throw invalid;
+    if (finished) fail('An assessment read view cannot escape its finished evaluation');
+  };
+  const deepSource = new Proxy(view, { get(target, key) {
+    if (key === 'get') return <T = unknown>(id: string, revision?: number): Revision<T> | null => {
+      active();
+      const selector = canonical([id, revision ?? null]);
+      if (!deepReads.has(selector)) deepReads.set(selector, get(id, revision));
+      // Heads are the captured evaluation inputs, guarded by get/finish just
+      // like the other reads. Cache validation must not consume a second
+      // semantic input or let today's head replace that saved input on replay.
+      return structuredClone(deepReads.get(selector)) as Revision<T> | null;
+    };
+    const value = Reflect.get(target, key, target);
+    return typeof value === 'function' ? value.bind(target) : value;
+  } });
+  deepAssessmentInputs.set(view, { source: deepSource, active });
   return { store: view, proof, guards, get position() { return position; }, finish() {
     if (invalid) throw invalid;
     validate(proof);
@@ -2588,6 +2624,7 @@ function readResearchConsumerExecutionFromIntent(store: Store, projectId: string
     || canonical(call.value.requested) !== canonical(intent.value.role)
     || canonical(call.value.profile ?? null) !== canonical(intent.value.profile))
     consumerInvalid(intent.id, 'The terminal model call is missing or belongs to another consumer');
+  requireDeepCallBinding(store, intent, call);
   if(isVariantConsumer(intent.value) && canonical(call.value.variantSubject)!==canonical(intent.value.cursor.variantSubject))
     consumerInvalid(intent.id,'The paid call lost its exact variant subject');
   const purpose = intent.value.kind === 'synthesis' || intent.value.kind === 'consolidation' ? 'analyst' : intent.value.kind;
@@ -2735,6 +2772,14 @@ function readResearchConsumerExecutionFromIntent(store: Store, projectId: string
     || (envelope.speed ?? 'inherited') !== (intent.value.role.speed ?? 'inherited')
     || canonical(envelope.subject.working?.archive ?? null) !== canonical(archiveRef))
     consumerInvalid(intent.id, 'The saved request belongs to another physical consumer');
+  const deepProof = requireDeepConsumerBinding(store, intent);
+  if (deepProof) {
+    const fields = { deepPreparation: reference(deepProof.preparation), deepCell: deepProof.preparation.value.cell,
+      deepScope: deepProof.scope.scope.value };
+    if (!Object.entries(fields).every(([key, value]) => canonical(archiveBody[key] ?? null) === canonical(value)
+      && canonical(envelope.subject[key] ?? null) === canonical(value)))
+      consumerInvalid(intent.id, 'The paid wire and archive lost or substituted their exact deep preparation, cell or scope');
+  }
   requirePacketMaterialDelivery(envelope.subject, archiveRef,
     (record, pointer) => {
       const saved = store.get<Record<string, any>>(record.id, record.revision);
@@ -3286,6 +3331,13 @@ export function subjectRecordFormHolds(record: Revision<Record<string, any>>, su
  * marker existed is the earlier era, never rewritten. */
 function validateConsumerApplicationWrites(store: Store, intent: Revision<ResearchConsumerIntent>, writes: Write[],
   physical?: ResearchConsumerExecution, mode: 'application' | 'historical' = 'historical'): Ref[] {
+  if (requireDeepConsumerBinding(store, intent)) {
+    const projected = deepResearchApplication(store, intent, physical, writes[0]?.expected);
+    const shape = (write: Write) => ({ id: write.id, kind: write.kind, expected: write.expected, value: write.value });
+    if (canonical(writes.map(shape)) !== canonical(projected.map(shape)))
+      consumerInvalid(intent.id, 'Deep application must publish its exact paid run, turn and attempt together');
+    return [];
+  }
   if(isVariantConsumer(intent.value)) {
     const paid=physical??readResearchConsumerExecutionFromIntent(store,intent.value.projectId,intent);
     if(paid.kind!=='response') consumerInvalid(intent.id,'A variant application needs its paid response');
@@ -3489,7 +3541,7 @@ export function prepareResearchConsumerApplication(store: Store, intentRef: Ref,
   for (const guard of guards) if (!('absent' in guard)) refreshed.add(guard.id);
   // A variant receipt is an immutable historical result. Current mode/selection admit a NEW dispatch,
   // not free application of an already paid answer; product publication supplies its own CAS in 4B.
-  const original = isVariantConsumer(intent.value) ? []
+  const original = isVariantConsumer(intent.value) || requireDeepConsumerBinding(store, intent) ? []
     : intent.value.guards.filter(guard => guard.id !== intent.value.owner.id && !refreshed.has(guard.id));
   const required = uniqueTransactionGuards([...original, ...currentReaderGuards, ...guards, ...derivedGuards, reference(intent), reference(paid.call),
     paid.request, paid.response, paid.archive]);
@@ -4326,4 +4378,158 @@ export function readProvenVariantSet(store:Store,project:string,ref:Ref):ProvenV
   if(proven.publication.result.kind!=='discovery-variant-set')
     throw new EngineError('discovery_variant_set_not_ready','A model decision needs a proven set, not no_variants');
   return proven;
+}
+
+// 5.5: deep is an exact subject of the existing analyst lifecycle. The
+// immutable admission decides its era, even if a later cursor loses the field.
+export function requireDeepConsumerBinding(store: Store, intent: Revision<ResearchConsumerIntent>): ProvenDeepPreparation | null {
+  const savedOrigin = store.get<ResearchConsumerIntent>(intent.id, 1);
+  if (!savedOrigin && intent.revision !== 1 && (Object.hasOwn(intent.value.cursor, 'deepPreparation')
+    || intent.value.owner.id.startsWith('research-run:deep:'))) consumerInvalid(intent.id, 'The deep intent lost its immutable origin');
+  const original = savedOrigin ?? intent;
+  const first = deepPreparationRef(original.value.cursor), ref = deepPreparationRef(intent.value.cursor);
+  const explicit = first || ref || intent.value.owner.id.startsWith('research-run:deep:')
+    || Object.hasOwn(intent.value.cursor.context ?? {}, 'deepPreparation');
+  if (!explicit) return null;
+  if (!first || !ref || canonical(first) !== canonical(ref) || intent.value.kind !== 'analyst'
+    || canonical(original.value.owner) !== canonical(intent.value.owner))
+    consumerInvalid(intent.id, 'The deep admission lost or substituted its immutable preparation');
+  const proof = readManagedDeepPreparation(store, intent.value.projectId, ref);
+  const subject = proof.preparation.value.cell.subject;
+  const run = store.get<ResearchRun>(intent.value.owner.id, intent.value.owner.revision);
+  const turn = intent.value.cursor.turn;
+  if (!run || run.kind !== 'research-run' || canonical(reference(run)) !== canonical(intent.value.owner)
+    || run.value.projectId !== intent.value.projectId || run.value.draftId !== intent.value.draft.id
+    || !Number.isSafeInteger(turn) || turn < 1 || run.value.turns !== turn - 1
+    || intent.value.key !== hashJson([run.id, turn, 'analyst']) || intent.value.rootKey !== intent.value.key
+    || intent.value.cursor.run !== run.id)
+    consumerInvalid(intent.id, 'The deep admission must retain its exact bounded run position');
+  const context = consumerIntentContext(store, intent.value, intent.id);
+  if (!sameSubject(cursorSubject(intent.value, intent.id), subject)
+    || canonical(context.deepPreparation ?? null) !== canonical(ref) || !sameSubject(planSubjectOf(context), subject)
+    || canonical(context.deepCell ?? null) !== canonical(proof.preparation.value.cell)
+    || canonical(context.deepScope ?? null) !== canonical(proof.scope.scope.value)
+    || canonical(reference(proof.draft)) !== canonical(intent.value.draft)
+    || !intent.value.basis.some(basis => canonical(basis) === canonical(ref)))
+    consumerInvalid(intent.id, 'Deep intent, transport and preparation must have one exact plan subject and draft');
+  return proof;
+}
+function deepConsumerAdmission(store: Store, intent: ResearchConsumerIntent): TransactionGuard[] {
+  const ref = deepPreparationRef(intent.cursor);
+  if (!ref) {
+    if (Object.hasOwn(intent.cursor.context ?? {}, 'deepPreparation') || intent.owner.id.startsWith('research-run:deep:'))
+      consumerInvalid(intent.key, 'An explicit deep operation needs its preparation on the intent cursor');
+    return [];
+  }
+  const admitted = requireCurrentDeepPreparation(store, intent.projectId, ref);
+  if (intent.kind !== 'analyst' || !sameSubject(cursorSubject(intent), admitted.preparation.value.cell.subject)
+    || canonical(intent.cursor.context?.deepPreparation ?? null) !== canonical(ref)
+    || canonical(intent.cursor.context?.deepCell ?? null) !== canonical(admitted.preparation.value.cell)
+    || canonical(intent.cursor.context?.deepScope ?? null) !== canonical(admitted.scope.scope.value))
+    consumerInvalid(intent.key, 'The current preparation cannot admit another consumer or subject');
+  return admitted.guards;
+}
+function requireDeepCallBinding(store: Store, intent: Revision<ResearchConsumerIntent>, call: Revision<ModelCall>): void {
+  const proof = requireDeepConsumerBinding(store, intent);
+  const original = store.get<ModelCall>(call.id, 1);
+  const ref = deepPreparationRef(intent.value.cursor);
+  for (const record of [original, call]) {
+    const value = record?.value as unknown as Record<string, unknown> | undefined;
+    if (proof ? !value || canonical(value.deepPreparation ?? null) !== canonical(ref)
+      : value && Object.hasOwn(value, 'deepPreparation'))
+      consumerInvalid(intent.id, 'The physical call and original intent disagree on their deep preparation');
+  }
+}
+
+/** Shared paid projector. It writes no current mode, choice or coverage. The
+ * preparation and plan are historical bases of the already purchased work. */
+export function deepResearchApplication(store: Store, intent: Revision<ResearchConsumerIntent>,
+  physical?: ResearchConsumerExecution, priorRunRevision?: number): Write[] {
+  const proof = requireDeepConsumerBinding(store, intent);
+  if (!proof) consumerInvalid(intent.id, 'Expected an explicit deep intent');
+  const paid = physical ?? readResearchConsumerExecutionFromIntent(store, intent.value.projectId, intent);
+  if (paid.kind !== 'response') consumerInvalid(intent.id, 'Deep application requires the exact paid response');
+  requireDeepCallBinding(store, intent, paid.call);
+  const publishedRun = intent.value.state === 'applied' ? intent.value.outputs?.[0] : null;
+  const revision = priorRunRevision ?? (publishedRun ? publishedRun.revision - 1 : undefined);
+  const before = store.get<ResearchRun>(intent.value.owner.id, revision);
+  const origin = store.get<ResearchConsumerIntent>(intent.id, 1);
+  if (!before || before.value.projectId !== intent.value.projectId || before.value.draftId !== intent.value.draft.id
+    || before.value.turns !== intent.value.cursor.turn - 1 || before.revision < intent.value.owner.revision
+    || before.kind !== 'research-run' || !origin) consumerInvalid(intent.id, 'The deep run or original intent is missing');
+  const projected = projectPaidDeepResearch(before.value, {
+    runId: before.id, intent: reference(origin), response: paid.payload, question: intent.value.question,
+    owner: before.value.owner, limit: before.value.limit,
+    context: consumerIntentContext(store, intent.value), subject: proof.preparation.value.cell.subject
+  }, proof.preparation.value);
+  const subject = proof.preparation.value.cell.subject;
+  const attempt: V7Attempt = { contract: 'v7-attempt/v1', project: intent.value.projectId,
+    draft: intent.value.draft, planAnswer: subject.planAnswer, planQuestionId: subject.planQuestionId,
+    call: intent.value.call!, end: projected.end };
+  const id = v7AttemptId(attempt), record: Revision<V7Attempt> = {
+    id, kind: 'research-attempt', revision: 1, hash: hashJson(attempt), value: attempt };
+  // The ordinary attempt prover validates the end and all exact evidence on
+  // a view containing this one not-yet-published attempt. No duplicate proof.
+  const view = new Proxy(store, { get(target, property) {
+    if (property === 'get') return (key: string, revision?: number) => key === id && (revision === undefined || revision === 1)
+      ? record : target.get(key, revision);
+    const value = Reflect.get(target, property); return typeof value === 'function' ? value.bind(target) : value;
+  } });
+  proveAttempt(view, reference(record));
+  return [
+    { id: before.id, kind: before.kind, expected: before.revision, value: projected.run },
+    { id: managedTurnId(before.id, intent.value.cursor.turn), kind: 'research-turn', expected: 0, value: projected.turn },
+    { id, kind: record.kind, expected: 0, value: attempt }
+  ];
+}
+
+export interface ProvenDeepResearchResult {
+  verification: 'proven'; preparation: ProvenDeepPreparation;
+  intent: Revision<ResearchConsumerIntent>; call: Revision<ModelCall>; request: Ref; response: Ref; archive: Ref;
+  attempt: Revision<V7Attempt>; turn: Revision<ManagedResearchTurn>; binding: Revision<ResearchAttemptBinding>;
+}
+/** The application and historical reader use the same paid projection and
+ * prove every named output, followed by the existing K/attempt binding. */
+export function readDeepResearchResult(store: Store, project: string, intentRef: Ref): ProvenDeepResearchResult {
+  return withHistoricalReads(() => readDeepResearchResultAt(store, project, intentRef));
+}
+function readDeepResearchResultAt(store: Store, project: string, intentRef: Ref): ProvenDeepResearchResult {
+  const intent = readResearchConsumerIntent(store, intentRef);
+  const preparation = requireDeepConsumerBinding(store, intent);
+  if (!preparation || intent.value.projectId !== project || intent.value.state !== 'applied')
+    consumerInvalid(intent.id, 'Expected this project\'s exact applied deep intent');
+  const paid = readResearchConsumerExecutionFromIntent(store, project, intent);
+  if (paid.kind !== 'response') consumerInvalid(intent.id, 'The applied deep result lost its paid response');
+  const writes = deepResearchApplication(store, intent, paid);
+  const outputs = writes.map(pendingRef);
+  if (canonical(outputs) !== canonical(intent.value.outputs)) consumerInvalid(intent.id, 'The deep application lost its complete output list');
+  for (const write of writes) {
+    const record = store.get(write.id, write.expected + 1);
+    if (!record || record.kind !== write.kind || canonical(reference(record)) !== canonical(pendingRef(write))
+      || canonical(record.value) !== canonical(write.value)) consumerInvalid(intent.id, 'A deep output differs from its paid projection');
+  }
+  const bound = readResearchAttemptBinding(store, project, writes[1]!.id);
+  if (!bound || canonical(bound.binding.value.attempt) !== canonical(outputs[2]))
+    consumerInvalid(intent.id, 'The deep attempt lost its ordinary completed K binding');
+  const completed = store.get<ManagedResearchTurn>(bound.pending.id, bound.pending.revision + 1);
+  if (!completed || completed.value.status !== 'completed'
+    || canonical(completed.value.attemptBinding ?? null) !== canonical(reference(bound.binding)))
+    consumerInvalid(intent.id, 'The deep attempt has no exact completed K turn');
+  const turn = readResearchConsumerTurn(store, reference(completed)) as Revision<ManagedResearchTurn>;
+  return { verification: 'proven', preparation, intent, call: paid.call,
+    request: paid.request, response: paid.response, archive: paid.archive,
+    attempt: proveAttempt(store, outputs[2]!).attempt, turn, binding: bound.binding };
+}
+
+/** All provenance belongs to 5.2. A semantic assessment view supplies its
+ * captured deep snapshot, so proof-cache footprint checks cannot consume or
+ * reorder its input stream. Ordinary and caller-provided views keep their own
+ * reads; none are unwrapped or declared transparent. */
+export function readManagedDeepPreparation(store: Store, project: string, ref: Ref): ProvenDeepPreparation {
+  const captured = deepAssessmentInputs.get(store);
+  captured?.active();
+  const source = captured?.source ?? store;
+  return historicalProof(source, { reader: 'discovery.managed-deep-preparation/v1', project, ref },
+    input => proveDeepPreparation(input, project, ref),
+    () => consumerInvalid(ref.id, 'A deep preparation cannot depend on its own later execution'));
 }

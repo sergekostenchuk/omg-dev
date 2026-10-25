@@ -1,6 +1,8 @@
+import { withHistoricalReads } from '../history/proofs.js';
 import { researchCapacityProjection } from './early-research-outcome.js';
 import { readResearchExecution } from './response-recovery.js';
 import type { RecoverableContextSession } from './context-recovery.js';
+import { deepIdentityCalls, readDeepPaidCall } from './invocation-progress.js';
 import { packetAssessmentSubject, sameAssessmentSubject, assessmentSubjectKey, packetVariantSubject, variantCallMatches, variantTransportFields } from './continuation-packet.js';
 import type { VariantSubject } from './discovery-variants.js';
 import type { Store, Revision } from "../storage/store.js";
@@ -129,4 +131,31 @@ export function replayVariantResponse(store: Store, projectId: string, draftId: 
     && !Object.hasOwn(sent, 'subject') && !Object.hasOwn(sent, 'assessmentSubject'),
   'research_replay_invalid', 'The saved variant request belongs to another envelope or transport identity');
   return { research: payload.research, subject: sent, call: reference(call), request: reference(request), response: reference(response) };
+}
+
+/** 5.4 (codex-omg №12595, правки №12770/№12773): the paid answer of exactly one deep
+ * preparation identity. The selection reads only the saved identity — the immutable first
+ * revisions — and the answer returns from the full saved managed chain: the intent the
+ * call's first revision carries, the exact model-request that revision bound (present,
+ * matching its audit by digest, chars and bytes, and carrying the same identity's context
+ * archive on the wire), and the saved response bound to this call. Today's choice, mode or
+ * heads never select or replace it, nothing is paid again, and an identity of another
+ * preparation or a broad call never receives this answer. A running call recovers first;
+ * several paid matches are a typed refusal, never a pick. */
+export function replayDeepResponse(store: Store, preparation: Ref, purpose: string, actor: string, intentRef?: Ref):
+  { intent: Ref; research: unknown; call: Ref; request: Ref; response: Ref } | null {
+  return withHistoricalReads(() => replayDeepResponseAt(store, preparation, purpose, actor, intentRef));
+}
+function replayDeepResponseAt(store: Store, preparation: Ref, purpose: string, actor: string, intentRef?: Ref):
+  { intent: Ref; research: unknown; call: Ref; request: Ref; response: Ref } | null {
+  const own = deepIdentityCalls(store, preparation, purpose, actor, intentRef);
+  requireCondition(!own.some(call => call.value.status === 'running'), 'continuation_call_active',
+    'This deep identity has an unfinished invocation; recover its actual outcome before another dispatch');
+  const paid = own.filter(call => call.value.status === 'succeeded');
+  if (paid.length === 0) return null;
+  requireCondition(paid.length === 1, 'research_replay_invalid', 'Several paid calls answer this exact deep identity');
+  const physical = readDeepPaidCall(store, paid[0]!);
+  requireCondition(physical.kind === 'response', 'research_replay_invalid', 'Deep replay needs its exact paid response');
+  return { intent: reference(physical.intent), research: physical.payload, call: reference(physical.call),
+    request: physical.request, response: physical.response };
 }

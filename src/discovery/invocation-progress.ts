@@ -1,13 +1,17 @@
+import { withHistoricalReads } from '../history/proofs.js';
 import type { VariantSubject } from './discovery-variants.js';
 import { variantTransportSubject, requireVariantContext, packetVariantSubject, variantTransportGuards, variantTransportFields, variantCallMatches, assessmentSubjectKey, type AssessmentTransportSubject } from './continuation-packet.js';
 import { callAddressesSubject, sameSubject, planSubjectOf, type V7PlanSubject } from './v7-managed-attempt.js';
 import { AsyncLocalStorage } from "node:async_hooks";
-import type { Store, ReadGuard, TransactionGuard } from '../storage/store.js';
+import type { Store, ReadGuard, Revision, TransactionGuard } from '../storage/store.js';
 import { canonical, hashJson } from '../canonical.js';
 import { requireCondition } from '../errors.js';
 import type { ModelCall } from '../runtime/model-usage.js';
-import { reference } from '../pipeline/contracts.js';
+import { isRef, reference, type Ref } from '../pipeline/contracts.js';
 import {contextLookupKey} from './context-workspace.js';
+import { decodeDeepPreparation, type DeepPreparation } from './deep-research.js';
+import { readArchiveBody } from './request-parts.js';
+import { readResearchConsumerExecution, readResearchConsumerIntent, readManagedDeepPreparation, requireDeepConsumerBinding } from './response-recovery.js';
 
 /** Preserve the engine-owned progress identity for accounting. Distinct calls
  * are governed by their token budget, not a fixed invocation count. Repeated
@@ -86,4 +90,132 @@ export function requireInvocationAllowance(){
 export function consumeInvocationAllowance(){
  const current=allowance.getStore();if(!current)return;
  requireInvocationAllowance();current.remaining--;current.used++;
+}
+
+// ---- 5.4 (codex-omg №12595, правки №12770): the separate identity progress of one deep step. ----
+
+/** The exact saved deep preparation through the common historical proof of the main 5.2 —
+ * its real scope, snapshot, set and member, not what the record alone claims. */
+function provenDeepPreparation(store: Store, preparation: Ref) {
+  const decoded = decodeDeepPreparation(isRef(preparation) ? (store.get<DeepPreparation>(preparation.id, preparation.revision)?.value ?? preparation) : preparation);
+  const proof = readManagedDeepPreparation(store, decoded.cell.projectId, preparation);
+  return { record: proof.preparation, decoded, proof };
+}
+
+/** The physical call and its immutable managed intent fix the deep era.
+ * A broad call has no marker in either origin. Explicit null, a lost origin
+ * or a changed identity is a typed refusal, never a broad fallback. */
+function intentDeclaresDeep(store: Store, call: ModelCall): boolean {
+  const ref = call.consumerIntent;
+  const intent = isRef(ref) ? store.get<{ cursor?: Record<string, unknown> }>(ref.id, 1) : null;
+  return Object.hasOwn(intent?.value.cursor ?? {}, 'deepPreparation');
+}
+
+export function callDeepPreparation(store: Store, call: Revision<ModelCall>): Ref | null {
+  return withHistoricalReads(() => callDeepPreparationAt(store, call));
+}
+function callDeepPreparationAt(store: Store, call: Revision<ModelCall>): Ref | null {
+  const first = store.get<ModelCall>(call.id, 1);
+  requireCondition(call.kind === 'model-call' && first?.kind === 'model-call', 'discovery_deep_identity_invalid', 'A call lost its immutable origin');
+  const origin = first.value, head = call.value;
+  const declared = Object.hasOwn(origin, 'deepPreparation') || Object.hasOwn(head, 'deepPreparation')
+    || intentDeclaresDeep(store, origin) || intentDeclaresDeep(store, head);
+  // Classify by immutable physical identity. The archive is checked as a link,
+  // never used to turn a broad call into a deep call.
+  if (!declared) return null;
+  const ref = (origin as unknown as Record<string, unknown>).deepPreparation;
+  requireCondition(isRef(ref) && canonical((head as unknown as Record<string, unknown>).deepPreparation ?? null) === canonical(ref)
+    && head.projectId === origin.projectId && head.purpose === origin.purpose
+    && canonical(head.requested) === canonical(origin.requested)
+    && canonical(head.consumerIntent ?? null) === canonical(origin.consumerIntent ?? null)
+    && canonical(head.packet) === canonical(origin.packet) && canonical(head.request) === canonical(origin.request),
+    'discovery_deep_identity_invalid', 'A deep call must keep its original preparation, actor, project, purpose, packet and request');
+  requireCondition(isRef(origin.consumerIntent), 'discovery_deep_identity_invalid', 'Deep calls require their exact managed intent');
+  const intent = readResearchConsumerIntent(store, origin.consumerIntent);
+  const proof = requireDeepConsumerBinding(store, intent);
+  requireCondition(proof && canonical(reference(proof.preparation)) === canonical(ref)
+    && intent.value.projectId === origin.projectId && intent.value.kind === origin.purpose
+    && canonical(intent.value.role) === canonical(origin.requested),
+    'discovery_deep_identity_invalid', 'The immutable managed intent must prove this deep identity');
+  const archiveRef = origin.packet?.archive;
+  const archive = isRef(archiveRef) ? store.get<Record<string, any>>(archiveRef.id, archiveRef.revision) : null;
+  requireCondition(archive?.kind === 'research-context' && canonical(reference(archive)) === canonical(archiveRef)
+    && archive.hash === hashJson(archive.value)
+    && canonical(readArchiveBody(store, archive).body.deepPreparation ?? null) === canonical(ref),
+    'discovery_deep_identity_invalid', 'The saved archive must carry the original deep preparation');
+  if (head.status !== 'running') {
+    const paid = readResearchConsumerExecution(store, origin.projectId, origin.consumerIntent);
+    requireCondition(head.status === paid.call.value.status && head.error === paid.call.value.error
+      && canonical(head.response) === canonical(paid.call.value.response), 'discovery_deep_identity_invalid',
+      'The deep call head must retain its exact managed physical outcome');
+  }
+  return ref;
+}
+
+/** 5.4: the saved calls of exactly one deep preparation identity. Candidates are classified
+ * by their immutable first revisions — project, purpose and actor of the origin, and the
+ * exact preparation its saved context names — never by the today's head; a head that
+ * departed from its origin refuses the whole selection, including a foreign record that
+ * declared itself this identity. */
+export function deepIdentityCalls(store: Store, preparation: Ref, purpose: string, actor: string, intentRef?: Ref): Revision<ModelCall>[] {
+  return withHistoricalReads(() => deepIdentityCallsAt(store, preparation, purpose, actor, intentRef));
+}
+function deepIdentityCallsAt(store: Store, preparation: Ref, purpose: string, actor: string, intentRef?: Ref): Revision<ModelCall>[] {
+  const { record } = provenDeepPreparation(store, preparation), target = canonical(reference(record));
+  let operation: string | undefined;
+  if (intentRef !== undefined) {
+    const intent = readResearchConsumerIntent(store, intentRef), proof = requireDeepConsumerBinding(store, intent);
+    requireCondition(proof && canonical(reference(proof.preparation)) === target
+      && intent.value.projectId === record.value.cell.projectId && intent.value.kind === purpose
+      && intent.value.role.actor === actor, 'discovery_deep_identity_invalid', 'Progress needs its exact managed deep operation');
+    operation = intent.id;
+  }
+  const mentions = (call: ModelCall | undefined) => {
+    if (!call) return false;
+    if (canonical((call as unknown as Record<string, unknown>).deepPreparation ?? null) === target) return true;
+    const ref = call.consumerIntent;
+    const intent = isRef(ref) ? store.get<{ cursor?: Record<string, unknown> }>(ref.id, 1) : null;
+    return canonical(intent?.value.cursor?.deepPreparation ?? null) === target;
+  };
+  const candidates = new Map(store.list<ModelCall>('model-call').map(call => [call.id, call]));
+  for (const { id } of store.identities('prefix', 'model-call:consumer:v1:')) {
+    if (candidates.has(id)) continue;
+    const first = store.get<ModelCall>(id, 1), head = store.get<ModelCall>(id);
+    if (!mentions(first?.value) && !mentions(head?.value)) continue;
+    requireCondition(head, 'discovery_deep_identity_invalid', 'A managed deep call lost its head');
+    candidates.set(id, head);
+  }
+  return [...candidates.values()].filter(call => {
+    const first = store.get<ModelCall>(call.id, 1);
+    if (!mentions(call.value) && !mentions(first?.value)) return false;
+    const classified = callDeepPreparation(store, call);
+    return first!.value.projectId === record.value.cell.projectId && first!.value.purpose === purpose
+      && first!.value.requested?.actor === actor && canonical(classified) === target
+      && (!operation || first!.value.consumerIntent?.id === operation);
+  });
+}
+
+/** The shared managed reader proves the immutable intent and complete wire chain. */
+export function readDeepPaidCall(store: Store, call: Revision<ModelCall>) {
+  requireCondition(callDeepPreparation(store, call), 'discovery_deep_identity_invalid', 'Expected a managed deep call');
+  const first = store.get<ModelCall>(call.id, 1)!;
+  return readResearchConsumerExecution(store, first.value.projectId, first.value.consumerIntent!);
+}
+
+/** 5.4: the progress identity of one deep step. The full preparation identity — the whole
+ * cell and its scope, content-addressed by the 5.2-F form — together with the project, the
+ * plan subject of the cell, the purpose and the actor tells deep from broad and from any
+ * other cell or scope: another scope of the same cell is another preparation, another
+ * progress and never this one's answer. */
+export function deepInvocationProgress(store: Store, preparation: Ref, purpose: string, actor: string, intentRef?: Ref): { key: string; guards: ReadGuard[] } {
+  return withHistoricalReads(() => deepInvocationProgressAt(store, preparation, purpose, actor, intentRef));
+}
+function deepInvocationProgressAt(store: Store, preparation: Ref, purpose: string, actor: string, intentRef?: Ref): { key: string; guards: ReadGuard[] } {
+  const { record, decoded } = provenDeepPreparation(store, preparation);
+  const calls = deepIdentityCalls(store, preparation, purpose, actor, intentRef);
+  const ids = new Set(calls.map(call => store.get<ModelCall>(call.id, 1)!.value.consumerIntent!.id));
+  const id = intentRef?.id ?? (ids.size === 1 ? [...ids][0] : undefined);
+  const operation = id ? reference(readResearchConsumerIntent(store, reference(store.get(id, 1)!))) : null;
+  return { key: hashJson({ version: 'deep/v1', projectId: decoded.cell.projectId, preparation: reference(record),
+    subject: decoded.cell.subject, purpose, actor, operation }), guards: [reference(record), ...calls.map(reference)] };
 }

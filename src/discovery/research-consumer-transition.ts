@@ -31,6 +31,7 @@ import { archivedContext, contextPage, contextValue, type ContextPage } from './
 import type { Graph } from '../graph/model.js';
 import type { ResearchConsumerIntent } from './response-recovery.js';
 import type { V7Attempt } from './v7-plan-questions.js';
+import type { DeepPreparation } from './deep-research.js';
 import { ATTEMPT_BINDING_CONTRACT, addressedQuestionId, attemptBindingId, attemptEndOfAction, planSubjectOf, sameSubject,
   type ResearchAttemptBinding, type V7PlanSubject } from './v7-managed-attempt.js';
 import type { Json } from '../canonical.js';
@@ -1667,6 +1668,30 @@ export function projectPaidTurnAdmission(before: ResearchRun, input: PaidTurnAdm
     ...(input.mode ? { dispatchMode: input.mode } : {}),
     ...(input.subject ? { attemptContract: ATTEMPT_BINDING_CONTRACT, subject: input.subject } : {}) };
   return { run, turn };
+}
+
+/** Presence is an era declaration. A damaged explicit deep address never
+ * becomes an ordinary plan attempt, including on a saved intent's head. */
+export function deepPreparationRef(cursor: unknown): Ref | null {
+  if (cursor === null || typeof cursor !== 'object' || !Object.hasOwn(cursor, 'deepPreparation')) return null;
+  const ref = (cursor as { deepPreparation: unknown }).deepPreparation;
+  requireCondition(isRef(ref), 'discovery_deep_preparation_invalid', 'Deep research needs its exact preparation Ref');
+  return ref;
+}
+
+export function deepResearchRunId(project: string, preparation: Ref, actor: string): string {
+  return `research-run:deep:${hashJson({ project, preparation, actor, purpose: 'analyst' })}`;
+}
+
+/** One paid projection for application and historical proof. Preparation
+ * provenance is supplied by the common 5.2 reader, never by a caller body. */
+export function projectPaidDeepResearch(before: ResearchRun, input: PaidTurnAdmission,
+  preparation: DeepPreparation) {
+  requireCondition(input.subject && sameSubject(input.subject, preparation.cell.subject),
+    'discovery_deep_preparation_invalid', 'The paid deep step must retain its preparation plan subject');
+  const projected = projectPaidTurnAdmission(before, input);
+  const end = attemptEndOfAction(projected.turn.action, input.subject);
+  return { ...projected, end };
 }
 
 /** D8.4e: the synthesis handoff's original turn — the second producer of O.

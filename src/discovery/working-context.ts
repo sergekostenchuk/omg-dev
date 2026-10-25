@@ -1,9 +1,12 @@
+import { withHistoricalReads } from '../history/proofs.js';
 import type { VariantSubject } from './discovery-variants.js';
 import { sameSubject, type V7PlanSubject } from './v7-managed-attempt.js';
 import { STAGE_NEIGHBOR_CONTEXT } from './stage-neighbors.js';
 import { activeSynthesisNotes, consolidationInput, consolidationPage, consolidationFragment,
   CONSOLIDATION_DELIVERY, CONSOLIDATION_FRAGMENT } from './conclusion-consolidation.js';
-import { variantTransportSubject, requireVariantContext, variantTransportFields, variantTransportGuards, requireVariantArchive, proveAssessmentTransportSubject, sameAssessmentSubject, assessmentQuestionContract, type AssessmentTransportSubject, FOUNDATION_FIELDS, contextSections, selectedQuestion, packetPlanSubject, planQuestionContract, replaceFoundationCopies, candidateDelta, originalIndex, compactConclusions, CONCLUSION_ENCODING, correctionIndex } from "./continuation-packet.js";
+import { variantTransportSubject, requireVariantContext, variantTransportFields, variantTransportGuards, requireVariantArchive, proveAssessmentTransportSubject, sameAssessmentSubject, assessmentQuestionContract, type AssessmentTransportSubject, FOUNDATION_FIELDS, contextSections, selectedQuestion, packetPlanSubject, planQuestionContract, replaceFoundationCopies, candidateDelta, originalIndex, compactConclusions, CONCLUSION_ENCODING, correctionIndex,
+  packetDeepPreparation, deepTransportSubject, requireDeepContext, deepTransportFields, requireDeepArchive } from "./continuation-packet.js";
+import { requireCurrentDeepPreparation } from "./deep-research.js";
 import type { Store, Revision, TransactionGuard } from "../storage/store.js";
 import type { DiscoveryDraft, Question } from "./discovery.js";
 import { canonical, hashJson, type Json } from "../canonical.js";
@@ -115,6 +118,8 @@ function conclusionSources(body: Record<string, any>, archive: Ref, questionId: 
 
 export function workingContext(store: Store, projectId: string, draftId: string, questionId: string,
   context: unknown, maxChars: number, options: { continuation?: boolean; common?: boolean; previous?: Ref; contextChars?: number; extractedChars?:number; purpose?: string; subject?: V7PlanSubject | null; assessmentSubject?: AssessmentTransportSubject | null; variantSubject?: VariantSubject | null; actor?: string;
+    /** 5.3: the exact saved deep preparation of this analyst step; the packer proves it through the shared 5.2 admission. */
+    deepPreparation?: Ref | null;
     /** DRS1a2: set only by trusted code for a compact analyst call. */
     contextContract?: typeof ARCHIVE_PARTS_CONTRACT } = {}): Record<string, any> {
   const draft = store.get<DiscoveryDraft>(draftId), question = store.get<Question>(questionId);
@@ -138,6 +143,25 @@ export function workingContext(store: Store, projectId: string, draftId: string,
   const archiveGuards: TransactionGuard[] = [reference(draft),reference(question),...draft.value.inputs,
     ...(variantSubject?variantTransportGuards(projectId,draftId,variantSubject):[])];
   const assessmentSubject = proveAssessmentTransportSubject(store, body, projectId, reference(question));
+  // 5.3: the deep step proves its saved preparation through the shared 5.2 current admission — the wire
+  // content (the full cell and the proven scope) comes from that record, never from the caller, and the
+  // existing plan subject must equal the cell subject of the proven preparation.
+  const deep = deepTransportSubject(options.purpose ?? '', options.deepPreparation ?? packetDeepPreparation(body),
+    planSubject, variantSubject, assessmentSubject);
+  requireDeepContext(body, deep);
+  const deepFields = deep ? deepTransportFields(deep) : null;
+  const deepAdmission = deep ? withHistoricalReads(() => requireCurrentDeepPreparation(store, projectId, deep)) : null;
+  if (deepAdmission) archiveGuards.push(...deepAdmission.guards);
+  if (deepFields) {
+    requireCondition(deepAdmission !== null && sameSubject(planSubject, deepAdmission.preparation.value.cell.subject),
+      'research_deep_subject_invalid', 'The deep dispatch plan subject must equal the proven preparation cell subject');
+    requireCondition(Object.entries(deepFields).every(([key, value]) => !Object.hasOwn(body, key) || canonical(body[key]) === canonical(value)),
+      'research_deep_subject_invalid', 'Caller context cannot substitute the deep preparation');
+    body = { ...body, ...deepFields,
+      deepCell: deepAdmission.preparation.value.cell as unknown as Json,
+      deepScope: deepAdmission.scope.scope.value as unknown as Json };
+    if (options.previous) requireDeepArchive(store, options.previous, projectId, deep!);
+  }
   requireCondition(sameAssessmentSubject(body, options.assessmentSubject ? {assessmentSubject:options.assessmentSubject} : {}),
     'discovery_assessment_subject_invalid', 'The packer must retain its admitted assessment subject');
   requireCondition(!assessmentSubject || !planSubject && options.purpose === 'assessor',
@@ -269,6 +293,12 @@ export function workingContext(store: Store, projectId: string, draftId: string,
     ...(Object.hasOwn(body, 'questions') ? { questions: [projectedQuestion] } : {}) };
   const finish = (packet: Record<string, any>) => {
     if (variantFields) Object.assign(packet,variantFields);
+    if (deepFields) Object.assign(packet,deepFields);
+    if (deep) requireCondition(canonical(packetDeepPreparation(packet)) === canonical(deep)
+      && canonical(packetDeepPreparation(archivedBody)) === canonical(deep)
+      && canonical(packet['deepCell']) === canonical(archivedBody['deepCell'])
+      && canonical(packet['deepScope']) === canonical(archivedBody['deepScope']),
+      'research_deep_subject_invalid', 'Every deep packet must retain its proven cell and scope');
     requireVariantContext(packet,variantSubject);
     requireCondition(sameAssessmentSubject(packet, archivedBody), 'discovery_assessment_subject_invalid',
       'Every initial or continuation packet must preserve packet and baseline');
@@ -521,7 +551,7 @@ export function workingContext(store: Store, projectId: string, draftId: string,
     if (!packet.materialDelivery) serveArchivedMaterial(packet, addressed, maxChars);
     return finish(packet);
   }
-  const mandatory = [...(variantFields?Object.keys(variantFields):[]),"variantSubject", "assessmentSubject", "resultCapacity", "assessmentContextContract", "stageNeighbors", "discoveryContext", "discoveryBasisCatalogue", "webResearch", "answerContext", "contextWorkspace", "savedEvidence", "conclusions", "conclusionCitations", "conclusionRefs", "conclusionUnresolved", "conclusionEncoding", "contextControls", "contextCorrection", "currentRead", "originals", "corrections", "request", "candidate", "proposalChanges", "purpose", "sources", "questions", "prerequisites", "operationMap", "researchMissing", "fields", "mapStatusFindings", "mapStatus", "researchScope", "role", "stage", "level", "consumer", "contextEncoding", "allowedConsumers", "gapFields", "graphBase",
+  const mandatory = [...(variantFields?Object.keys(variantFields):[]),"deepPreparation","deepCell","deepScope","variantSubject", "assessmentSubject", "resultCapacity", "assessmentContextContract", "stageNeighbors", "discoveryContext", "discoveryBasisCatalogue", "webResearch", "answerContext", "contextWorkspace", "savedEvidence", "conclusions", "conclusionCitations", "conclusionRefs", "conclusionUnresolved", "conclusionEncoding", "contextControls", "contextCorrection", "currentRead", "originals", "corrections", "request", "candidate", "proposalChanges", "purpose", "sources", "questions", "prerequisites", "operationMap", "researchMissing", "fields", "mapStatusFindings", "mapStatus", "researchScope", "role", "stage", "level", "consumer", "contextEncoding", "allowedConsumers", "gapFields", "graphBase",
     "core", "map", "draft", "question", "value", "representation", "consumerFeedback", "assessmentState", "openGaps", "failures", "unresolvedEvidence", "dispatchMode", "readPlanStatus", "sourceCatalogue", "sourceLocations", "bases", "runtimeProofs", "synthesisState", "synthesisNotes", "previousProposalRef"];
   if(body['assessmentState']) mandatory.splice(mandatory.indexOf("value"),1);
   const ordered = options.common && !options.continuation

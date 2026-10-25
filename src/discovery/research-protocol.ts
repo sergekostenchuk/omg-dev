@@ -31,11 +31,12 @@ function planSubjectRole(capacityPurpose: unknown, auditPurpose: unknown, contex
 }
 import { CONSOLIDATION_INSTRUCTION, COMPACT_CHECKPOINT_INSTRUCTION, TIGHTENING_INSTRUCTION } from './conclusion-consolidation.js';
 import { physicalClaim, authorizeModelDispatch, prepareLateModelReceipt, readModelCallRecovery, executionOf } from './model-call-recovery.js';
-import { invocationProgress, consumeInvocationAllowance, requireInvocationAllowance } from "./invocation-progress.js";
+import { invocationProgress, deepInvocationProgress, consumeInvocationAllowance, requireInvocationAllowance } from "./invocation-progress.js";
 import { requireContextDelivery } from './context-workspace.js';
 import { interceptResearchPreview, isResearchPreview } from './research-preview.js';
 import type { RuntimeObservation } from '../runtime/runtime-observation-model.js';
-import { assessmentTransportPrompt, packetAssessmentSubject, sameAssessmentSubject, proveAssessmentTransportSubject, assessmentSubjectKey, continuationState, continuationDispatch, continuationMetadata, continuationPrompt, packetPlanSubject, packetVariantSubject, requireVariantContext, variantTransportSubject } from "./continuation-packet.js";
+import { assessmentTransportPrompt, packetAssessmentSubject, sameAssessmentSubject, proveAssessmentTransportSubject, assessmentSubjectKey, continuationState, continuationDispatch, continuationMetadata, continuationPrompt, packetPlanSubject, packetVariantSubject, requireVariantContext, variantTransportSubject, packetDeepPreparation } from "./continuation-packet.js";
+import { requireCurrentDeepPreparation } from "./deep-research.js";
 import { estimateCliCall } from "../adapters/codex-estimate.js";
 import { assertPilotBoundary } from "./reader-pilot.js";
 import { phasePolicy } from "./phase-policy.js";
@@ -236,8 +237,13 @@ export function prepareResearchEnvelope(role: RoleBinding, environment: Environm
     'A plan subject requires the common saved-question packet');
   // 4T.3: the variant subject travels on its own transport branch of the common packer (4T.2-T).
   const variantSubject = packetVariantSubject(context);
+  // 5.3: the deep step carries one exact saved preparation on the analyst plan-subject branch; the
+  // saved capacity must bind the same Ref, and the packer proves the record through the shared 5.2 admission.
+  const deepPreparation = packetDeepPreparation(context);
+  if (deepPreparation && capacity !== undefined) requireCondition(canonical(packetDeepPreparation(capacity.bindings ?? {})) === canonical(deepPreparation),
+    'research_deep_subject_invalid', 'The saved capacity must bind its exact deep preparation');
   const packetState = audit?.questionId && draft ? continuationState(audit.store, environment.projectId, audit.draftId,
-    audit.questionId, audit.purpose, role.actor, planSubject, assessmentSubject, variantSubject) : null;
+    audit.questionId, audit.purpose, role.actor, planSubject, assessmentSubject, variantSubject, deepPreparation) : null;
   const consolidating = (context as any)?.dispatchMode === 'consolidation';
   const controls = (context as any)?.contextControls;
   const finalizing = !consolidating && controls?.mode === 'finalization';
@@ -253,7 +259,7 @@ export function prepareResearchEnvelope(role: RoleBinding, environment: Environm
   const subjectFor = (limit: number) => {
     const packed = packetState ? workingContext(audit!.store, environment.projectId, audit!.draftId, audit!.questionId!, packingContext,
       limit, { common: true, purpose: audit!.purpose, ...(planSubject?{subject:planSubject}:{}), ...(assessmentSubject?{assessmentSubject}:{}),
-        ...(variantSubject?{variantSubject,actor:role.actor}:{}), continuation: !packetState.initial,
+        ...(variantSubject?{variantSubject,actor:role.actor}:{}), ...(deepPreparation?{deepPreparation}:{}), continuation: !packetState.initial,
         ...(packetState.latest ? { previous: packetState.latest } : {}),
         ...(audit!.pilot ? { contextChars: audit!.pilot.value.maxRequestChars } : {}),
         ...(audit!.pilot ? { extractedChars: audit!.pilot.value.maxRequestChars } : {}),
@@ -342,6 +348,10 @@ async function dispatchResearchCall(role: RoleBinding, environment: Environment,
   // intent, a paid assessment application and a paid variant replay alike. The checks are pure: a free replay of a
   // historical identity needs no head of today's mode or state.
   const contextVariant = packetVariantSubject(context);
+  // 5.3: the deep step is its own analyst branch — no assessment reservation, no virtual producer, no variant mixing.
+  const contextDeep = packetDeepPreparation(context);
+  if (contextDeep) requireCondition(audit && !audit.previewIntent && !audit.application && !audit.prepareCall,
+    'research_deep_subject_invalid', 'A deep call travels on its own analyst branch, without an assessment reservation');
   if (contextVariant || audit?.purpose === 'variant-proposal' || audit?.purpose === 'variant-decision') {
     requireCondition(audit && !audit.previewIntent && !audit.application && !audit.prepareCall,
       'discovery_variant_subject_invalid', 'A variant call travels on its own branch, without an assessment reservation');
@@ -384,6 +394,17 @@ async function dispatchResearchCall(role: RoleBinding, environment: Environment,
       && canonical(consumerIntent.value.dispatch) === canonical(environment)
       && canonical(consumerIntent.value.profile) === canonical(audit.pilot ? reference(audit.pilot) : null),
     'research_consumer_intent_invalid', 'The saved consumer operation differs from the selected role, project, question or environment');
+    // The paid early-return door retains the immutable deep subject too.
+    // Supplying or dropping a marker cannot replay another era's answer.
+    const savedDeep = packetDeepPreparation(consumerIntent.value.cursor);
+    requireCondition(canonical(savedDeep) === canonical(contextDeep), 'research_deep_subject_invalid',
+      'The dispatch and saved intent must declare the same deep preparation before replay');
+    if (savedDeep) {
+      const saved = consumerIntentContext(audit.store, consumerIntent.value, consumerIntent.id);
+      requireCondition(['deepPreparation', 'deepCell', 'deepScope'].every(key =>
+        recordValue(context) && Object.hasOwn(context, key) && canonical(context[key]) === canonical(saved[key])),
+        'research_deep_subject_invalid', 'Paid deep replay retains its complete saved cell and scope');
+    }
     planSubject = planSubjectOf(consumerIntent.value.cursor);
     // DR3a3-S5: a plan subject travels only with the role its intent fixed — the
     // analyst and the reading planner by their own purpose, a synthesis or
@@ -500,6 +521,20 @@ async function dispatchResearchCall(role: RoleBinding, environment: Environment,
     'research_plan_subject_invalid', 'The packet binding must equal the saved consumer subject');
   requireCondition(sameAssessmentSubject(context, capacity?.bindings ?? {}),
     'discovery_assessment_subject_invalid', 'The saved capacity must preserve its assessment subject');
+  // 5.3: the deep dispatch is admitted only by the shared 5.2 current-proof of its saved preparation — the
+  // carrier never substitutes its own guard list; the intent must carry exactly this preparation, and the
+  // existing plan subject must equal the proven cell subject.
+  let deepAdmission: ReturnType<typeof requireCurrentDeepPreparation> | null = null;
+  if (contextDeep) {
+    requireCondition(planSubject !== null && !contextVariant && !assessmentSubject && audit?.purpose === 'analyst'
+      && consumerIntent?.value.kind === 'analyst',
+      'research_deep_subject_invalid', 'A deep dispatch needs its own analyst intent and plan subject, without a variant or assessment subject');
+    requireCondition(canonical(packetDeepPreparation(consumerIntentContext(audit!.store, consumerIntent!.value, consumerIntent!.id))) === canonical(contextDeep),
+      'research_deep_subject_invalid', 'The saved intent must carry the exact deep preparation of this dispatch');
+    deepAdmission = requireCurrentDeepPreparation(audit!.store, environment.projectId, contextDeep);
+    requireCondition(sameSubject(planSubject, deepAdmission.preparation.value.cell.subject),
+      'research_deep_subject_invalid', 'The deep dispatch plan subject must equal the proven preparation cell subject');
+  }
   // DRS1a2: the archive contract follows the saved intent only — a v2 analyst
   // call packs the compact archive; every other call keeps the whole body.
   let packAudit = audit;
@@ -553,7 +588,8 @@ async function dispatchResearchCall(role: RoleBinding, environment: Environment,
     throw error;
   }
   const progressContext = (subject as any)?.contextControls ? {...context as Record<string,any>,contextControls:(subject as any).contextControls} : context;
-  const progress=packetState?invocationProgress(audit!.store,audit!.questionId!,audit!.purpose,progressContext as Record<string,any>,planSubject,role.actor,assessmentSubject,variantSubject):null;
+  const progress=packetState?(contextDeep?deepInvocationProgress(audit!.store,contextDeep,audit!.purpose,role.actor,reference(consumerIntent!))
+    :invocationProgress(audit!.store,audit!.questionId!,audit!.purpose,progressContext as Record<string,any>,planSubject,role.actor,assessmentSubject,variantSubject)):null;
   const reservation: { writes: Write[]; guards: TransactionGuard[] } = !stagePlan && audit?.pilot
     ? pilotDispatch(audit.store, audit.pilot, callId, input.length) : { writes: [], guards: [] };
   if (stagePlan && stageEstimate && audit && draft) {
@@ -601,18 +637,20 @@ async function dispatchResearchCall(role: RoleBinding, environment: Environment,
     reservation.guards.push(...manifestReservationResult.guards);
   }
   if (packetState) {
-    const questionCounterId=`question-dispatch:${hashJson(variantSubject ? ['variant/v1',environment.projectId,audit!.draftId,audit!.questionId!,variantSubject,audit!.purpose,role.actor] : assessmentSubject ? [environment.projectId,assessmentSubject] : planSubject ? [environment.projectId,planSubject] : audit!.questionId!)}`;
+    const questionCounterId=`question-dispatch:${hashJson(variantSubject ? ['variant/v1',environment.projectId,audit!.draftId,audit!.questionId!,variantSubject,audit!.purpose,role.actor] : assessmentSubject ? [environment.projectId,assessmentSubject] : planSubject ? (contextDeep ? [environment.projectId,planSubject,'deep/v1',contextDeep] : [environment.projectId,planSubject]) : audit!.questionId!)}`;
     const questionCounter=audit!.store.get<{projectId:string;question:string;serial:number;subject?:V7PlanSubject;assessmentKey?:string}>(questionCounterId);
     requireCondition(!questionCounter||(questionCounter.kind==='question-dispatch'&&questionCounter.value.projectId===environment.projectId
       &&questionCounter.value.question===audit!.questionId&&(questionCounter.value.assessmentKey??null)===assessmentSubjectKey(assessmentSubject)&&sameSubject(packetPlanSubject(questionCounter.value),planSubject)
-      &&canonical(packetVariantSubject(questionCounter.value))===canonical(variantSubject)&&Number.isSafeInteger(questionCounter.value.serial)&&questionCounter.value.serial>=0),
+      &&canonical(packetVariantSubject(questionCounter.value))===canonical(variantSubject)
+      &&canonical(packetDeepPreparation(questionCounter.value))===canonical(contextDeep)&&Number.isSafeInteger(questionCounter.value.serial)&&questionCounter.value.serial>=0),
     'research_dispatch_invalid','Invalid question dispatch counter');
     reservation.writes.push({id:questionCounterId,kind:'question-dispatch',expected:questionCounter?.revision??0,
-      value:{projectId:environment.projectId,question:audit!.questionId,...(assessmentSubject?{assessmentKey:assessmentSubjectKey(assessmentSubject)}:{}),...(planSubject?{subject:planSubject}:{}),...(variantSubject?{variantSubject}:{}),serial:(questionCounter?.value.serial??0)+1}});
+      value:{projectId:environment.projectId,question:audit!.questionId,...(assessmentSubject?{assessmentKey:assessmentSubjectKey(assessmentSubject)}:{}),...(planSubject?{subject:planSubject}:{}),...(variantSubject?{variantSubject}:{}),...(contextDeep?{deepPreparation:contextDeep}:{}),serial:(questionCounter?.value.serial??0)+1}});
     if(questionCounter) reservation.guards.push(reference(questionCounter));
     if(audit!.session) reservation.guards.push(audit!.session);
     const dispatch = continuationDispatch(packetState, callId);
-    reservation.writes.push(...dispatch.writes); reservation.guards.push(...dispatch.guards,...(progress?.guards??[]));
+    reservation.writes.push(...dispatch.writes); reservation.guards.push(...dispatch.guards,...(progress?.guards??[]),
+      ...(deepAdmission?deepAdmission.guards:[]));
     if (!useWireManifest) {
       reservation.writes.push({id:`model-request:${requestId}`,kind:"model-request",expected:0,
         value:{projectId:environment.projectId,draftId:audit!.draftId,text:input}});
@@ -626,6 +664,7 @@ async function dispatchResearchCall(role: RoleBinding, environment: Environment,
       ...(progress?{progressKey:progress.key}:{}),
       ...(assessmentSubject?{assessmentKey:assessmentSubjectKey(assessmentSubject)}:{}),
       ...(variantSubject?{variantSubject}:{}),
+      ...(contextDeep?{deepPreparation:contextDeep}:{}),
       ...(ownership ?? {}),
       ...(audit?.application ? { assessmentApplication: audit.application } : {}),
       ...(consumerIntent ? { consumerIntent: reference(consumerIntent) } : {}),

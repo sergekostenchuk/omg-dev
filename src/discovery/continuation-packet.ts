@@ -1,3 +1,4 @@
+import { deepIdentityCalls } from './invocation-progress.js';
 import { ASSESSMENT_METHODOLOGY_CONTRACT, ASSESSMENT_METHODOLOGY_POLICY, ASSESSMENT_METHODOLOGY_POLICY_V2, type MethodologyPolicy } from './assessment-methodology.js';
 import { DISCOVERY_ASSESSMENT_CONTRACT_V2, DISCOVERY_ASSESSMENT_CONTRACT_V3 } from './research-model.js';
 import { proveAttemptPacket, checkProgressBaseline } from './v7-attempt-assessment.js';
@@ -124,6 +125,41 @@ export function requireVariantArchive(store: Store, ref: Ref, projectId: string,
   requireCondition(Object.entries(fields).every(([key,value]) => Object.hasOwn(body,key)
     && canonical(body[key]) === canonical(value)) && !Object.hasOwn(body,'subject') && !Object.hasOwn(body,'assessmentSubject'),
   'continuation_foreign', 'A variant archive body must retain its exact transport identity');
+}
+
+/** 5.3 (codex-omg №12594): the deep step travels on the plan-subject branch with one exact
+ * deepPreparation — the Ref of the saved discovery-deep-preparation of 5.2. The carrier proves
+ * nothing itself: the wire content comes only from the proven record through the shared 5.2
+ * admission; a null, incomplete or foreign value is a typed refusal, never a broad fallback. */
+export function packetDeepPreparation(container: unknown): Ref | null {
+  if (!container || typeof container !== 'object' || !Object.hasOwn(container, 'deepPreparation')) return null;
+  const ref = (container as Record<string, unknown>).deepPreparation;
+  if (!isRef(ref)) throw new EngineError('research_deep_subject_invalid',
+    'A deep preparation travels only as its exact saved Ref, never as null, a value or an incomplete form',
+    { field: 'deepPreparation' });
+  return ref;
+}
+export function deepTransportSubject(purpose: string, deep: Ref | null, planSubject: V7PlanSubject | null,
+  variant: VariantSubject | null, assessment: AssessmentTransportSubject | null): Ref | null {
+  requireCondition(deep === null || planSubject !== null && purpose === 'analyst' && variant === null && assessment === null,
+    'research_deep_subject_invalid',
+    'A deep step travels only on its own analyst plan-subject branch, without a variant or assessment subject');
+  return deep;
+}
+export function requireDeepContext(container: unknown, deep: Ref | null) {
+  requireCondition(canonical(packetDeepPreparation(container)) === canonical(deep),
+    'research_deep_subject_invalid', 'The context must retain its exact deep preparation without mixing transport branches');
+}
+export function deepTransportFields(deepPreparation: Ref) {
+  return { deepPreparation };
+}
+/** The archive of a deep step retains the exact preparation in its body — whole or parts restore the same Ref. */
+export function requireDeepArchive(store: Store, ref: Ref, projectId: string, deep: Ref) {
+  const archive = store.get<any>(ref.id, ref.revision);
+  requireCondition(archive?.kind === 'research-context' && archive.hash === ref.hash
+    && archive.value.projectId === projectId, 'continuation_foreign', 'A deep archive is missing or foreign');
+  requireCondition(canonical(packetDeepPreparation(readArchiveBody(store, archive).body)) === canonical(deep),
+    'continuation_foreign', 'A deep archive body must retain its exact saved preparation');
 }
 
 /** A call's first saved packet fixes its transport identity. A later head
@@ -322,33 +358,35 @@ export const FOUNDATION_FIELDS = ['core','map','researchScope','mapStatus','allo
   'fields','sourceCatalogue','inventory','catalogue','prerequisites','operationMap','objective','problem','actors',
   'constraints','specificationConstraints','concept','requirements','nodes','files','records','value','previousProposal','currentProposal'] as const;
 // This row serializes attempts; successful model-call records establish delivery.
-interface ContinuationState { projectId: string; question: string; purpose: string; actor: string; activeCall: string; attempts: number; subject?: V7PlanSubject; assessmentKey?: string; variantSubject?: VariantSubject; draft?: Ref; questionRef?: Ref }
+interface ContinuationState { projectId: string; question: string; purpose: string; actor: string; activeCall: string; attempts: number; subject?: V7PlanSubject; assessmentKey?: string; variantSubject?: VariantSubject; draft?: Ref; questionRef?: Ref; deepPreparation?: Ref }
 export interface ContinuationPacketState {
   initial: boolean; state: Revision<ContinuationState> | null; id: string; priorCalls: number;
   basis: Ref | null; latest: Ref | null; callGuards: ReadGuard[]; attempts: number;
-  projectId: string; question: Revision<Question>; draft: Revision<DiscoveryDraft>; purpose: string; actor: string; subject: V7PlanSubject | null; assessmentSubject: AssessmentTransportSubject | null; variantSubject?: VariantSubject | null;
+  projectId: string; question: Revision<Question>; draft: Revision<DiscoveryDraft>; purpose: string; actor: string; subject: V7PlanSubject | null; assessmentSubject: AssessmentTransportSubject | null; variantSubject?: VariantSubject | null; deepPreparation?: Ref | null;
 }
 type LegacyContinuationPacketState = Omit<ContinuationPacketState, 'variantSubject'> & {variantSubject?: null};
 export function continuationState(store: Store, projectId: string, draftId: string, questionId: string, purpose: string,
   actor: string, subject?: V7PlanSubject | null, assessmentSubject?: AssessmentTransportSubject | null,
-  variantSubject?: null): LegacyContinuationPacketState;
+  variantSubject?: null, deepPreparation?: null): LegacyContinuationPacketState;
 export function continuationState(store: Store, projectId: string, draftId: string, questionId: string, purpose: string,
   actor: string, subject: V7PlanSubject | null, assessmentSubject: AssessmentTransportSubject | null,
-  variantSubject: VariantSubject | null): ContinuationPacketState;
-export function continuationState(store: Store, projectId: string, draftId: string, questionId: string, purpose: string, actor: string, subject: V7PlanSubject | null = null, assessmentSubject: AssessmentTransportSubject | null = null, variantSubject: VariantSubject | null = null): ContinuationPacketState {
+  variantSubject: VariantSubject | null, deepPreparation?: Ref | null): ContinuationPacketState;
+export function continuationState(store: Store, projectId: string, draftId: string, questionId: string, purpose: string, actor: string, subject: V7PlanSubject | null = null, assessmentSubject: AssessmentTransportSubject | null = null, variantSubject: VariantSubject | null = null, deepPreparation: Ref | null = null): ContinuationPacketState {
   const draft=store.get<DiscoveryDraft>(draftId),question=store.get<Question>(questionId);
   requireCondition(draft?.kind==='discovery-draft' && question?.kind==='question' && draft.value.projectId===projectId
     && question.value.projectId===projectId && question.value.draftId===draftId && draft.value.questions.includes(questionId),
     'continuation_question_missing','Every role invocation requires its exact question and draft');
   variantSubject = variantTransportSubject(purpose, actor, variantSubject, subject, assessmentSubject);
   if (variantSubject) variantTransportGuards(projectId, draftId, variantSubject);
+  const deep = deepTransportSubject(purpose, deepPreparation, subject, variantSubject, assessmentSubject);
   const assessmentKey = assessmentSubjectKey(assessmentSubject);
-  const id=`continuation-state:${hashJson(variantSubject ? ['variant/v1',projectId,reference(draft),reference(question),variantSubject,purpose,actor] : assessmentSubject ? [projectId,assessmentSubject,purpose,actor] : subject ? [projectId,subject,purpose,actor] : [projectId,questionId,purpose,actor])}`;
+  const id=`continuation-state:${hashJson(variantSubject ? ['variant/v1',projectId,reference(draft),reference(question),variantSubject,purpose,actor] : assessmentSubject ? [projectId,assessmentSubject,purpose,actor] : subject ? (deep ? [projectId,subject,purpose,actor,'deep/v1',deep] : [projectId,subject,purpose,actor]) : [projectId,questionId,purpose,actor])}`;
   const state=store.get<ContinuationState>(id);
-  const calls=store.list<ModelCall>('model-call').filter(c=>c.value.projectId===projectId
+  const calls=(deep ? deepIdentityCalls(store,deep,purpose,actor) : store.list<ModelCall>('model-call')).filter(c=>c.value.projectId===projectId
     && ((c.value as unknown as {assessmentKey?:string}).assessmentKey ?? null) === assessmentKey
     && callAddressesSubject(c.value as unknown as Record<string,unknown>, reference(question), subject) && c.value.purpose===purpose && c.value.requested.actor===actor
     && canonical(packetVariantSubject(c.value)) === canonical(variantSubject)
+    && canonical(packetDeepPreparation(c.value)) === canonical(deep)
     && (!variantSubject || !Object.hasOwn(c.value,'subject') && !Object.hasOwn(c.value,'assessmentSubject')
       && c.value.draftId === draftId && variantCallMatches(store,c,projectId,reference(draft),reference(question),purpose,actor,variantSubject)))
     .sort((a,b)=>a.value.startedAt-b.value.startedAt||a.id.localeCompare(b.id));
@@ -356,6 +394,7 @@ export function continuationState(store: Store, projectId: string, draftId: stri
     'This question/role has an unfinished invocation; recover its actual outcome before another dispatch');
   if(state) requireCondition((state.value.assessmentKey ?? null) === assessmentKey && state.kind==='continuation-state' && state.value.question===questionId
     && canonical(packetVariantSubject(state.value)) === canonical(variantSubject)
+    && canonical(packetDeepPreparation(state.value)) === canonical(deep)
     && (!variantSubject || isRef(state.value.draft) && isRef(state.value.questionRef) && canonical(state.value.draft) === canonical(reference(draft)) && canonical(state.value.questionRef) === canonical(reference(question)))
     && sameSubject(packetPlanSubject(state.value),subject) && state.value.projectId===projectId && state.value.purpose===purpose && state.value.actor===actor,
     'continuation_foreign','Continuation state belongs to another role/question');
@@ -371,18 +410,20 @@ export function continuationState(store: Store, projectId: string, draftId: stri
     requireCondition(original?.kind==='research-context'&&original.hash===ref.hash&&original.value?.projectId===projectId
       &&isRef(original.value.question)&&original.value.question.id===questionId
       &&sameAssessmentSubject(readArchiveBody(store, original).body, assessmentSubject ? {assessmentSubject} : {})
-      &&sameSubject(packetPlanSubject(original.value),subject),'continuation_foreign','Delivered foundation belongs to another question');
+      &&sameSubject(packetPlanSubject(original.value),subject)
+      &&canonical(packetDeepPreparation(readArchiveBody(store, original).body))===canonical(deep),'continuation_foreign','Delivered foundation belongs to another question');
   }
   return {initial:delivered.length===0,state,id,priorCalls:delivered.length,attempts:calls.length,
-    basis:archives[0]??null,latest:archives.at(-1)??null,callGuards:calls.map(reference),projectId,question,draft,purpose,actor,subject,assessmentSubject,...(variantSubject?{variantSubject}:{})};
+    basis:archives[0]??null,latest:archives.at(-1)??null,callGuards:calls.map(reference),projectId,question,draft,purpose,actor,subject,assessmentSubject,...(variantSubject?{variantSubject}:{}) ,...(deep?{deepPreparation:deep}:{})};
 }
 export function continuationDispatch(state: LegacyContinuationPacketState, callId: string): {writes: Write[]; guards: ReadGuard[]};
 export function continuationDispatch(state: ContinuationPacketState, callId: string): {writes: Write[]; guards: TransactionGuard[]};
 export function continuationDispatch(state: ContinuationPacketState, callId: string): { writes: Write[]; guards: TransactionGuard[] } {
   return {writes:[{id:state.id,kind:'continuation-state',expected:state.state?.revision??0,
     value:{projectId:state.projectId,question:state.question.id,purpose:state.purpose,actor:state.actor,
-      activeCall:callId,attempts:state.attempts+1,...(state.variantSubject?{variantSubject:state.variantSubject,draft:reference(state.draft),questionRef:reference(state.question)}:{}),...(state.assessmentSubject?{assessmentKey:assessmentSubjectKey(state.assessmentSubject)}:{}),...(state.subject?{subject:state.subject}:{})}}],guards:[reference(state.question),reference(state.draft),...state.draft.value.inputs,...state.callGuards,
-      ...(state.variantSubject?variantTransportGuards(state.projectId,state.draft.id,state.variantSubject):[])]};
+      activeCall:callId,attempts:state.attempts+1,...(state.variantSubject?{variantSubject:state.variantSubject,draft:reference(state.draft),questionRef:reference(state.question)}:{}),...(state.deepPreparation?{deepPreparation:state.deepPreparation}:{}),...(state.assessmentSubject?{assessmentKey:assessmentSubjectKey(state.assessmentSubject)}:{}),...(state.subject?{subject:state.subject}:{})}}],guards:[reference(state.question),reference(state.draft),...state.draft.value.inputs,...state.callGuards,
+      ...(state.variantSubject?variantTransportGuards(state.projectId,state.draft.id,state.variantSubject):[]),
+      ...(state.deepPreparation?[state.deepPreparation]:[])]};
 }
 
 export const CONTINUATION_INSTRUCTION = 'This is an independent stateless continuation, not a remembered conversation. The question field MUST equal subject.question.id, never the prompt text. Use the supplied question contract, saved conclusions, current piece and exact original addresses. Never infer omitted context to be empty or irrelevant. The complete project foundation was transported earlier and is not repeated. If a specific condition is missing, request a small child pointer via read_context; never request the entire foundation again. Saved conclusions/checkpoints are unassessed proposals, not evidence. Preserve exceptions, conflicting findings and source citations. Follow the current phase protocol and advance only the supplied cursor. Do not reread already paid files or request a reader to extract them again.';
@@ -453,6 +494,8 @@ export function continuationMetadata(state: ContinuationPacketState, archive: Re
   const foundation = state.basis ?? archive;
   if (state.variantSubject) for (const ref of [foundation, archive])
     requireVariantArchive(store,ref,state.projectId,reference(state.draft),reference(state.question),state.purpose,state.actor,state.variantSubject);
+  if (state.deepPreparation) for (const ref of [foundation, archive])
+    requireDeepArchive(store,ref,state.projectId,state.deepPreparation);
   const original = store.get<{ projectId: string; draft: Ref; question: Ref; subject?:V7PlanSubject }>(foundation.id, foundation.revision);
   // DRS1a2: the saved foundation record and its restored body are separate —
   // the record proves the address and metadata, the body comes by its contract.
@@ -464,7 +507,7 @@ export function continuationMetadata(state: ContinuationPacketState, archive: Re
     && isRef(original.value.question) && original.value.question.id === state.question.id
     && body !== null && sameAssessmentSubject(body,state.assessmentSubject?{assessmentSubject:state.assessmentSubject}:{}) && sameSubject(packetPlanSubject(original.value),state.subject),
   'continuation_foreign', `[${foundation.id}] The exact foundation archive is unavailable`);
-  return {...(state.variantSubject?variantTransportFields(state.projectId,reference(state.draft),reference(state.question),state.purpose,state.actor,state.variantSubject):{}),...(state.assessmentSubject?{assessmentKey:assessmentSubjectKey(state.assessmentSubject)}:{}),kind:state.initial?'initial':'continuation',role:state.purpose,question:state.subject?.planQuestionId??state.question.id,...(state.subject?{subject:state.subject}:{}),
+  return {...(state.variantSubject?variantTransportFields(state.projectId,reference(state.draft),reference(state.question),state.purpose,state.actor,state.variantSubject):{}),...(state.deepPreparation?deepTransportFields(state.deepPreparation):{}),...(state.assessmentSubject?{assessmentKey:assessmentSubjectKey(state.assessmentSubject)}:{}),kind:state.initial?'initial':'continuation',role:state.purpose,question:state.subject?.planQuestionId??state.question.id,...(state.subject?{subject:state.subject}:{}),
     foundation,current:archive,previousCalls:state.priorCalls,
     foundationPointers:contextSections(body!, [...FOUNDATION_FIELDS]).map(section => section.pointer)};
 }
