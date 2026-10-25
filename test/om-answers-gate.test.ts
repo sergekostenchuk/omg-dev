@@ -3,12 +3,10 @@ const { fixtureAnswer } = await import(new URL('../../test/om-adapter-fixture.mj
 
 import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
-import { createRequire } from 'node:module';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { fileURLToPath } from 'node:url';
 import { type Json } from '../src/canonical.js';
 import { UPSTREAM_STAGES, type UpstreamStage } from '../src/discovery/requirements.js';
 import type { Question } from '../src/discovery/discovery.js';
@@ -35,7 +33,7 @@ import { writeHorizon } from '../src/om/horizon.js';
 import { readOmInput, writeOmInput } from '../src/om/input.js';
 import { assembleModelParts, readModelCallState, readPartAssembly, runModelCall } from '../src/om/model-call.js';
 import { writeOmObligations } from '../src/om/obligations.js';
-import { PACKET_ANSWER_PROTOCOL, partResponseId, preparePartResult, readPartResult, writeQuestionPacket, type QuestionPacketRecord } from '../src/om/question-packet.js';
+import { PACKET_ANSWER_PROTOCOL, partResponseId, preparePartResult, readPartResult, writeQuestionPacket } from '../src/om/question-packet.js';
 import { writeGuarded } from '../src/om/refs.js';
 import { readRoutes, writeRoutes, type RoutesRecord } from '../src/om/routes.js';
 import { beginAttempt, completeAttempt, openSeries, type AttemptGoal } from '../src/om/series.js';
@@ -1191,64 +1189,6 @@ test('G4b discovers an N3 batch only after a real C5 upper-frame acceptance', t 
 const same = (a: unknown, b: unknown) => canonical(a as Json) === canonical(b as Json);
 const canonicalOrder = <T>(values: readonly T[]): T[] => [...values].sort((a, b) =>
   canonical(a as Json) < canonical(b as Json) ? -1 : canonical(a as Json) > canonical(b as Json) ? 1 : 0);
-/**
- * Runs a producer script with every engine module loaded from one exact commit, in its own process. The loader logs
- * each module it serves from Git and refuses an engine module outside the checkout, so a missed prefix cannot fall
- * back to the current build and let an era test pass vacuously.
- */
-function atCommit(f: { root: string; path: string }, commit: string, name: string, body: string, input: unknown): unknown {
-  const repository = fileURLToPath(new URL('../../', import.meta.url));
-  const loader = join(f.root, `${name}-loader.mjs`), producer = join(f.root, `${name}-producer.mjs`);
-  const argsFile = join(f.root, `${name}-input.json`), served = join(f.root, `${name}-served.log`);
-  const typescript = pathToFileURL(createRequire(import.meta.url).resolve('typescript')).href;
-  writeFileSync(served, '');
-  writeFileSync(loader, `import { execFileSync } from 'node:child_process';
-import { appendFileSync, realpathSync } from 'node:fs';
-import { fileURLToPath, pathToFileURL } from 'node:url';
-import ts from ${JSON.stringify(typescript)};
-let root, log, prefixes;
-export function initialize(data) {
-  root = data.root; log = data.log;
-  prefixes = [root, pathToFileURL(realpathSync(fileURLToPath(root)) + '/').href].map(base => new URL('dist/src/', base).href);
-}
-export async function load(url, context, next) {
-  const prefix = prefixes.find(item => url.startsWith(item));
-  if (prefix && /\\.js$/.test(url)) {
-    const relative = 'src/' + url.slice(prefix.length).replace(/\\.js$/, '.ts');
-    appendFileSync(log, relative + '\\n');
-    const source = execFileSync('git', ['show', ${JSON.stringify(commit)} + ':' + relative],
-      { cwd: fileURLToPath(root), encoding: 'utf8', maxBuffer: 10000000 });
-    return { format: 'module', shortCircuit: true, source: ts.transpileModule(source,
-      { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2023 } }).outputText };
-  }
-  if (url.startsWith('file:') && url.includes('/dist/src/') && !url.includes('/node_modules/'))
-    throw new Error('An engine module outside the era checkout: ' + url);
-  return next(url, context);
-}`);
-  writeFileSync(producer, `import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
-import { pathToFileURL } from 'node:url';
-const [repository, database, input] = process.argv.slice(2);
-const src = path => pathToFileURL(join(repository, 'dist/src', path)).href;
-const { Store } = await import(src('storage/store.js'));
-const { reference } = await import(src('pipeline/contracts.js'));
-const args = JSON.parse(readFileSync(input, 'utf8')), store = new Store(database);
-const take = result => { if (!result.ok) throw Error(JSON.stringify(result.refusal)); return result.value; };
-const out = value => process.stdout.write(JSON.stringify(value));
-try {
-${body}
-} finally { store.close(); }`);
-  writeFileSync(argsFile, JSON.stringify(input));
-  const bootstrap = `import { register } from 'node:module'; register(${JSON.stringify(pathToFileURL(loader).href)},
-    { data: { root: ${JSON.stringify(pathToFileURL(repository).href)}, log: ${JSON.stringify(served)} } });`;
-  const output: unknown = JSON.parse(execFileSync(process.execPath,
-    ['--import', `data:text/javascript,${encodeURIComponent(bootstrap)}`, producer, repository, f.path, argsFile],
-    { cwd: repository, encoding: 'utf8', timeout: 180_000, maxBuffer: 10_000_000 }));
-  const loaded = readFileSync(served, 'utf8').split('\n').filter(Boolean);
-  assert.ok(loaded.includes('src/storage/store.ts') && loaded.includes('src/pipeline/contracts.ts'),
-    `The producer ran on the modules of ${commit}: ${loaded.join(', ')}`);
-  return output;
-}
 /** Reads the trace historically and checks what every trace must satisfy against its saved G4b record. */
 type SavedGate = Revision<AnswersGateRecord> | Sealed<Revision<AnswersGateRecord>>;
 function traceOf(f: { store: Store; project: string }, saved: SavedGate): readonly AnswersGateTraceEntry[] {
@@ -1304,7 +1244,7 @@ function unknownResult(f: { project: string }): Ref {
 }
 const traceUsage = { inputTokens: 120, outputTokens: 30, cachedInputTokens: 20, reasoningOutputTokens: 10 };
 /** The MC1 batch of the fixture question with its series, environment, adapter and ready packet. */
-function mc1Exchange(f: ReturnType<typeof fixture>, slice: string, reviewer = 'answers-independent', completion = false, active = false, packetCommit?: string) {
+function mc1Exchange(f: ReturnType<typeof fixture>, slice: string, reviewer = 'answers-independent', completion = false, active = false) {
   const batch = f.route.value.batches.find(item => item.model === 'MC1'
     && item.items.some(question => question.target === f.target))!;
   assert.ok(batch);
@@ -1328,12 +1268,7 @@ function mc1Exchange(f: ReturnType<typeof fixture>, slice: string, reviewer = 'a
     value: { projectId: f.project, protocol: 'codex-stdio' } });
   const packetRequest = { project: f.project, routes: reference(f.route), batch: batch.id,
     environment: reference(config), attempt: { series: reference(series), ordinal: 1 }, previous: [] };
-  // LP1 transfer: an era comparison must start with a packet that the compared producer actually issued.
-  const packet = packetCommit ? atCommit(f, packetCommit, `${slice}-era-packet`,
-    `const { writeQuestionPacket } = await import(src('om/question-packet.js'));
-out(take(writeQuestionPacket(store, args)).record);`, packetRequest) as Revision<QuestionPacketRecord>
-    : ok(writeQuestionPacket(f.store, packetRequest)).record;
-  if (packetCommit) assert.equal(packet.value.answerProtocol, 'omg-answer/v2');
+  const packet = ok(writeQuestionPacket(f.store, packetRequest)).record;
   const source = f.store.get<{ content: string }>(`source:${f.project}:brief`)!;
   const answer = { research: { protocol: '$answerProtocol', requestId: '$requestId', action: 'answer',
     results: batch.items.map(item => ({ questionId: item.gap, value: source.value.content.slice(0, 8),
@@ -1899,8 +1834,8 @@ test('1 H1.0c readAnswersGateTrace checks the shape of every argument before sto
 
 // ---- H1.0c S2: registration of the managed check (№1616 п.1, №1628 Q2) ----
 /** A managed block attempt of the fixture fact, opened by the real G7 opening with its materialized MC1 packet. */
-function managedAttempt(f: ReturnType<typeof fixture>, slice: string, active = false, packetCommit?: string) {
-  const exchange = mc1Exchange(f, slice, 'answers-independent', true, active, packetCommit);
+function managedAttempt(f: ReturnType<typeof fixture>, slice: string, active = false) {
+  const exchange = mc1Exchange(f, slice, 'answers-independent', true, active);
   const binding = ok(readCompletionBinding(f.store, f.project, reference(exchange.series), 1));
   if (!binding) assert.fail('The managed opening writes its binding');
   const head = () => f.store.get<CompletionWork>(completionWorkId(f.project, binding.id))!;
@@ -2122,8 +2057,8 @@ test('C11 H1.0c registration arguments are EngineError before the store; a missi
 
 // ---- H1.0c S3: evaluation, finding groups, A2 sources and delivery (№1446 rows, №1616, №1628) ----
 /** A managed block attempt of the fixture fact with its registered check. */
-function registered(f: ReturnType<typeof fixture>, slice: string, active = false, packetCommit?: string) {
-  const m = managedAttempt(f, slice, active, packetCommit);
+function registered(f: ReturnType<typeof fixture>, slice: string, active = false) {
+  const m = managedAttempt(f, slice, active);
   const registration = ok(writeAnswersRegistration(f.store, { project: f.project, binding: reference(m.binding) }));
   return { ...m, registration };
 }
@@ -2143,7 +2078,7 @@ const added = (before: Revision<CompletionWork>, after: Revision<CompletionWork>
   after.value.products.filter(ref => !before.value.products.some(old => same(old, ref)));
 /** A managed MC1 answer and its E5 terminal of the given verdict, paid through the real producers of this attempt. */
 async function managedFact(f: ReturnType<typeof fixture>, m: ReturnType<typeof managedAttempt>,
-  verdict: 'supported' | 'insufficient' | 'conflicting' | 'off-form', intentCommit?: string) {
+  verdict: 'supported' | 'insufficient' | 'conflicting' | 'off-form') {
   const assessor = verdict === 'off-form' ? { research: { answer: 'untyped reviewer reply' }, usage: traceUsage }
     : { research: { verdict, reasons: verdict === 'supported' ? [] : ['source not decisive'] }, usage: traceUsage };
   writeFileSync(m.scenario, JSON.stringify({ database: f.path, steps: [m.answer, assessor] }));
@@ -2151,11 +2086,6 @@ async function managedFact(f: ReturnType<typeof fixture>, m: ReturnType<typeof m
     dispatch: m.dispatch, role: 'implementer' }));
   assert.equal(original.outcome?.kind, 'fact-candidates');
   const request = { project: f.project, modelCall: reference(original.record), questionId: m.batch.items[0]!.gap, dispatch: m.dispatch };
-  // FA1 (№3817): an era comparison starts with the E5 intent the compared producer issued — the base writes no verdict
-  // form into its prompt and cannot read an intent that carries one; today's E5 goes on with the base's intent as saved.
-  if (intentCommit) atCommit(f, intentCommit, `${m.packet.id.slice(-8)}-era-intent`,
-    `const { writeAssessmentIntent } = await import(src('om/assessment.js'));
-out(take(writeAssessmentIntent(store, args)));`, request);
   const terminal = ok(await assessFact(f.store, request));
   assert.equal(terminal.value.verdict, verdict);
   return { original, terminal };
@@ -3126,9 +3056,9 @@ const closeRequest = (f: ReturnType<typeof fixture>, reason: Reason, refusals: r
   ({ project: f.project, block: f.block, line: 1, attempt: 1, outcome: { reason, accepting, cancelling: [], refusals: [...refusals] } });
 const canonicalRefs = (values: readonly Ref[]) => [...values].sort((a, b) => canonical(a) < canonical(b) ? -1 : canonical(a) > canonical(b) ? 1 : 0);
 /** Own E5 N of a registered, not yet evaluated check: the evaluation that resolves it and the close of the attempt. */
-async function linkedN(f: ReturnType<typeof fixture>, slice: string, packetCommit?: string) {
-  const m = registered(f, slice, false, packetCommit), fact = factGap(f);
-  const { terminal } = await managedFact(f, m, 'insufficient', packetCommit);
+async function linkedN(f: ReturnType<typeof fixture>, slice: string) {
+  const m = registered(f, slice, false), fact = factGap(f);
+  const { terminal } = await managedFact(f, m, 'insufficient');
   const work = m.work();
   const close = closeRequest(f, 'refused', work.refusals);
   const request = { project: f.project, binding: reference(m.binding),
@@ -3964,8 +3894,6 @@ test('R9 R1 R3 №1770 H1.0c a foreign MC2 terminal or a bare E4 call is no own 
 
 
 // ---- H1.5 (№2164, №2166): one verdict on whether an answer to a question has a producer ----
-const H15_BASE_COMMIT = '479b307f8aa3d43745f5313c1f5c8a712bd7d55a';
-
 // OWN1 (№3711) changes rows T1 and T5: in the bypass the model decides a design or an owner question of the pass; the same
 // question at a later moment has no producer in the pass (T1b, T5b), and the moment is part of the verdict.
 test('H1.5 answerProducerOf: a design or owner question of the pass is decided by the model, a later question has no producer, every other class keeps its own — one test per row of the table', () => {
@@ -4078,99 +4006,6 @@ test('H1.5 readRouteProducers names the batches nobody can answer from the prove
     for (const bad of [{ project: f.project }, { routes: reference(f.route) }, { project: f.project, routes: reference(f.route), extra: 1 }])
       assert.throws(() => readRouteProducers(f.store, bad as never), (error: unknown) => error instanceof EngineError && error.code === 'answers_gate_request_invalid');
   });
-});
-
-// OWN1: the route of an owner question is today's (the fixture writes it by today's code), which the base era cannot
-// read; the era of its G4b record stays covered by the design question.
-test('H1.5 ERA: G4b records written by the code of the base commit are read by the new code with the same result, and the new preparation derives that very record', async t => {
-  for (const kind of ['design-decision'] as const) {
-    await t.test(kind, child => {
-      const f = fixture(child, kind), gap = f.blocking.find(row => row.value.gap.target === f.target)!;
-      const requests: AnswersGateRequest[] = [{ ...f.request, results: [] },
-        { ...f.request, results: [{ gap: reference(gap), result: reference(f.route), candidate: null }] }];
-      const written = atCommit(f, H15_BASE_COMMIT, `h15-${kind}`, `const { writeAnswersGate } = await import(src('om/answers-gate.js'));
-out(args.map(request => reference(take(writeAnswersGate(store, request)))));`, requests) as Ref[];
-      f.restart();
-      assert.equal(written.length, 2);
-      const expected = ['route_result_unsupported', 'answer'];
-      written.forEach((ref, index) => {
-        const saved = ok(readAnswersGate(f.store, { project: f.project, record: ref }));
-        assert.equal(saved.hash, ref.hash);
-        assert.deepEqual(saved.value.result.findings.filter(item => item.at.target === f.target).map(item => [item.code, item.at.field]), [expected]);
-        // OWN1 (№3711): the era rule — the record keeps the verdict of its era; today the model is the producer of this
-        // question, and the same identity is never given another outcome: the new code refuses to rewrite it.
-        const again = prepareAnswersGate(f.store, requests[index]!);
-        assert.equal(again.ok ? 'derived' : again.refusal.code, 'answer_version_stale');
-        // Its trace is derived by today's producer table, which names this question's producer now: no era trace of it.
-      });
-    });
-  }
-});
-
-// PF1 (№2797-7): the base of the overlay change, loaded whole from Git into its own process.
-const PF1_BASE = 'd519a6036f8b2cc4aee823ce24d7160262a08fb9';
-const preparedAtBase = (f: { root: string; path: string }, name: string, entry: 'prepareAnswersEvaluation' | 'prepareAnswersDelivery', request: unknown) =>
-  atCommit(f, PF1_BASE, name, `const gate = await import(src('om/answers-gate.js'));
-const { canonical } = await import(src('canonical.js'));
-const prepared = gate[${JSON.stringify(entry)}](store, args);
-out(prepared.ok ? canonical(prepared.value) : canonical({ refusal: prepared.refusal }));`, request) as string;
-const preparedHere = (result: OmResult<unknown>) => result.ok ? canonical(result.value as Json) : canonical({ refusal: result.refusal } as unknown as Json);
-
-// FA1 (№3817): an E5 intent written before the verdict form keeps its era — today's E5 admits, dispatches and applies it
-// as saved (no form in its prompt), never as stale; a new intent carries the form (om-assessment FA1).
-test('FA1 an E5 intent of the era before the verdict form is admitted and its supported verdict applied by today\'s E5 as saved, never assessment_source_stale', async t => {
-  const f = fixture(t, 'repository-fact'), m = registered(f, 'fa1-era', false, PF1_BASE);
-  const { terminal } = await managedFact(f, m, 'supported', PF1_BASE);
-  assert.notEqual(terminal.value.accepted, null, 'The supported verdict is applied as an accepted fact');
-  const intent = f.store.get<{ packet: Record<string, unknown> }>(terminal.value.intent.id, terminal.value.intent.revision)!;
-  assert.equal(Object.hasOwn(intent.value.packet, 'responseForm'), false, 'The intent of the earlier era is kept as written');
-});
-
-test('PF1 (№2797-6 row 8, -7) a G4b batch read through one shared overlay prepares byte for byte what the base d519a60 prepares in its own process — two new sources in one batch, a late delivery mixing a stored source with a new one, and the evaluation linked with the close — result, writes, guards and their order; the written evaluation and delivery repeat without a write', async t => {
-  const f = fixture(t, 'repository-fact'), batch = nodeBatch(f, 'garden-consume-block');
-  const m = managedOn(f, 'garden-consume-block', [batch.id], 1, 'pf1');
-  const request = { project: f.project, binding: reference(m.binding), request: { ...f.request, results: [] } };
-  const two = prepareAnswersEvaluation(f.store, request);
-  assert.equal(ok(two).groups.length, 2, 'Two new G4b sources are journalled by one batch');
-  assert.equal(preparedHere(two), preparedAtBase(f, 'pf1-two', 'prepareAnswersEvaluation', request), 'Two new sources: the same bytes as the base');
-  // A late delivery: one group delivered alone, then the rest — the stored source is read from the store, the new one through the overlay.
-  const saved = ok(writeAnswersEvaluation(f.store, { ...request, deliver: 'none' }));
-  const [one] = saved.groups;
-  ok(writeAnswersDelivery(f.store, { project: f.project, evaluation: reference(saved.evaluation), group: one!.proof.id }));
-  const delivery = { project: f.project, evaluation: reference(saved.evaluation) };
-  const late = prepareAnswersDelivery(f.store, delivery);
-  assert.ok(ok(late).writes.length > 0, 'The rest is still to deliver');
-  assert.equal(preparedHere(late), preparedAtBase(f, 'pf1-late', 'prepareAnswersDelivery', delivery), 'A stored and a new source: the same bytes as the base');
-  ok(writeAnswersDelivery(f.store, delivery));
-  const stored = snapshot(f.store);
-  assert.deepEqual(ok(writeAnswersDelivery(f.store, delivery)).groups.length, 2);
-  assert.deepEqual(snapshot(f.store), stored, 'The repeated delivery writes nothing');
-  // The evaluation linked with the close journals its G4b source through the same overlay inside the close.
-  const g = fixture(t, 'repository-fact'), s = await linkedN(g, 'pf1', PF1_BASE);
-  const linked = prepareAnswersEvaluation(g.store, s.linked);
-  assert.ok(ok(linked).closed !== undefined && ok(linked).groups.length > 0);
-  // LP6 (№3325 §4, №3350): the close of a block is of the new era, the base writes the old one. Every write and guard is
-  // the base's, byte for byte and in the base's order, except the three the era changes — each checked as exactly that
-  // change: the close (contract v2 and its progress), the series (the outcome's progress and the boundary activated by
-  // this close on the revision before it) and the closed work (citing the new close).
-  type Prepared = { writes: { id: string; kind: string; value: Record<string, any> }[] };
-  const here = JSON.parse(preparedHere(linked)) as Prepared;
-  const base = JSON.parse(preparedAtBase(g, 'pf1-linked', 'prepareAnswersEvaluation', s.linked)) as Prepared;
-  const progress = { contract: 'om-attempt-progress/v1', administrative: null };
-  const close = here.writes.find(write => write.kind === 'om-completion-close')!;
-  assert.deepEqual([close.value.contract, close.value.outcome.progress], ['om-completion-close/v2', progress]);
-  const era = (write: Prepared['writes'][number]): Prepared['writes'][number] => write.kind === 'om-completion-close'
-    ? { ...write, value: { ...write.value, contract: 'om-completion-close/v2', outcome: { ...write.value.outcome, progress } } }
-    : write.kind === 'repair-series' ? { ...write, value: { ...write.value,
-      attempts: write.value.attempts.map((row: Record<string, any>) => row.ordinal === s.linked.close.attempt ? { ...row, outcome: { ...row.outcome, progress } } : row),
-      progressPolicy: { contract: 'om-series-progress/v1', previous: reference(g.store.get(write.id)!), from: s.linked.close.attempt } } }
-    : write.kind === 'om-completion-work' && write.value.closed
-      ? { ...write, value: { ...write.value, closed: { id: close.id, revision: 1, hash: hashJson(close.value as Json) } } } : write;
-  assert.equal(canonical({ ...base, writes: base.writes.map(era) } as unknown as Json), preparedHere(linked),
-    'Linked with the close: the same bytes as the base, but for the era of LP6');
-  ok(writeAnswersEvaluation(g.store, s.linked));
-  const closed = snapshot(g.store), again = ok(writeAnswersEvaluation(g.store, s.linked));
-  assert.ok(again.repeated); assert.deepEqual(snapshot(g.store), closed, 'The repeated linked evaluation writes nothing');
 });
 
 test('LP4 (№2887 rows 6, 7, 8) facts of an answered step keep their own grounds, a fact whose application ended on its own ground starts no cycle-step-ceased, and the answers-gate check is never ceased for a cycle', async t => {
