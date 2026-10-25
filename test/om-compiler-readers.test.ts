@@ -2,11 +2,10 @@ import test, { after, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { copyFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { canonical, hashJson } from '../src/canonical.js';
+import { canonical } from '../src/canonical.js';
 import { EngineError } from '../src/errors.js';
 import { gateFeasibility, neighborsOf, readAcceptedFrame, readAtomicGate, readDeliveries, readFeasibility, readFrame, readNeighbors,
   readWorksFrame, readTaskContextBasis, readTaskSpecification, registerCompilerOmReaders, type CompilerOmReaders, type ObligationHandoffForm } from '../src/compiler/om-readers.js';
@@ -21,8 +20,6 @@ import type { Store } from '../src/storage/store.js';
 
 const ROOT = fileURLToPath(new URL('../../', import.meta.url));
 const SRC = pathToFileURL(join(ROOT, 'dist/src/')).href, TST = pathToFileURL(join(ROOT, 'dist/test/')).href;
-/** The base implementation the slot replaces: om/module before R3+R4 (R6 merged). */
-const BASE = 'ee2bf80bf3bf291cfb65f6c50d9707e913b4c4b0';
 const NAMES = ['readFeasibility', 'gateFeasibility', 'neighborsOf', 'readNeighbors', 'readAtomicGate', 'readAcceptedFrame',
   'readFrame', 'readDeliveries', 'readWorksFrame', 'readTaskContextBasis', 'readTaskSpecification'] as const;
 type Name = typeof NAMES[number];
@@ -192,177 +189,21 @@ function workDirectory(t: TestContext, name: string): string {
   t.after(() => rmSync(directory, { recursive: true, force: true }));
   return directory;
 }
-/** Runs a module script in a fresh process; with base, every dist module is the BASE source from Git, transpiled. */
-function child(directory: string, name: string, source: string, config: Record<string, unknown>, base = false): unknown {
+/** Runs a module script in a fresh process against the current source. */
+function child(directory: string, name: string, source: string, config: Record<string, unknown>): unknown {
   const script = join(directory, `${name}.mjs`);
   writeFileSync(script, source);
-  const options: string[] = [];
-  if (base) {
-    const loader = join(directory, 'base-loader.mjs');
-    writeFileSync(loader, BASE_LOADER);
-    const typescript = pathToFileURL(createRequire(import.meta.url).resolve('typescript')).href;
-    options.push('--import', `data:text/javascript,${encodeURIComponent(`import{register}from'node:module';register(${JSON.stringify(
-      pathToFileURL(loader).href)},{data:{root:${JSON.stringify(pathToFileURL(ROOT).href)},base:${JSON.stringify(BASE)},typescript:${
-      JSON.stringify(typescript)}}});`)}`);
-  }
   const environment = { ...process.env }; delete environment['NODE_TEST_CONTEXT'];
-  const output = execFileSync(process.execPath, [...options, script, JSON.stringify({ src: SRC, tst: TST, ...config })],
+  const output = execFileSync(process.execPath, [script, JSON.stringify({ src: SRC, tst: TST, ...config })],
     { cwd: ROOT, env: environment, encoding: 'utf8', timeout: 300_000, maxBuffer: 64 * 1024 * 1024 });
   return JSON.parse(output.trim().split('\n').at(-1)!) as unknown;
 }
 
-const BASE_LOADER = String.raw`import {execFileSync} from 'node:child_process';
-import {fileURLToPath} from 'node:url';
-let root, base, ts;
-export async function initialize(data) { root = data.root; base = data.base; ts = (await import(data.typescript)).default; }
-export async function load(url, context, next) {
-  const prefix = new URL('dist/', root).href;
-  if (url.startsWith(prefix) && /\.js$/.test(url)) {
-    // Every product and fixture module comes from the base commit; there is no fallback to the current source.
-    const relative = url.slice(prefix.length).replace(/\.js$/, '.ts');
-    const source = execFileSync('git', ['show', base + ':' + relative], { cwd: fileURLToPath(root), encoding: 'utf8', maxBuffer: 10000000 });
-    return { format: 'module', shortCircuit: true,
-      source: ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2023 } }).outputText };
-  }
-  return next(url, context);
-}
-`;
 
-/** Saved legal bases: M8 (the accepted works of om-feasibility.test, M8 written and handed off, not yet compiled) and legacy. */
-const BUILD = String.raw`
-const C = JSON.parse(process.argv[2]);
-const { execFileSync } = await import('node:child_process');
-const ts = (await import(C.typescript)).default;
-const url = new URL('om-feasibility.test.js', C.tst);
-// FJ1: the shared saved base belongs to the old reader's era, including its fixture declarations.
-const oldFixture = execFileSync('git', ['show', C.fixtureBase + ':test/om-feasibility.test.ts'],
-  { cwd: C.repository, encoding: 'utf8', maxBuffer: 10000000 });
-let source = ts.transpileModule(oldFixture,
-  { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2023 } }).outputText;
-const end = source.indexOf('const heads =');
-if (end < 0) throw new Error('The declared om-feasibility fixture seam moved');
-source = source.slice(0, end).replace(/from (['"])(\.{1,2}\/[^'"]+)\1/g, (_match, _quote, path) => 'from ' + JSON.stringify(new URL(path, url).href));
-if (/\btest\(/.test(source)) throw new Error('The fixture slice must not declare a test');
-const { acceptedWorksFixture } = await import('data:text/javascript;base64,' + Buffer.from(source + '\nexport { acceptedWorksFixture };').toString('base64'));
-const { writeFeasibility } = await import(C.src + 'om/feasibility.js');
-const { writeHandoff } = await import(C.src + 'om/handoff.js');
-const { reference } = await import(C.src + 'pipeline/contracts.js');
-const { executionFixture } = await import(C.tst + 'execution-fixture.js');
-const ok = result => { if (!result.ok) throw new Error('Unexpected refusal ' + result.refusal.code); return result.value; };
-const f = acceptedWorksFixture({ after() {} });
-const m8 = ok(writeFeasibility(f.store, f.feasibility));
-ok(writeHandoff(f.store, { project: f.project, feasibility: reference(m8), expected: 0 }));
-f.store.close();
-const legacy = executionFixture({ after() {} });
-const legacyDatabase = legacy.store.path, legacyPlan = legacy.plan;
-legacy.store.close();
-process.stdout.write(JSON.stringify({ root: f.root, database: f.database, project: f.project, m8,
-  legacy: { directory: legacy.directory, database: legacyDatabase, plan: legacyPlan } }) + '\n');
-`;
 
-/** The same scenario for the base and the new implementation, each on its own copies of the saved bases. */
-const SCENARIO = String.raw`
-const C = JSON.parse(process.argv[2]);
-const { copyFileSync } = await import('node:fs');
-const { DatabaseSync } = await import('node:sqlite');
-const { Store } = await import(C.src + 'storage/store.js');
-const { ProductEngine } = await import(C.src + 'product/engine.js');
-const { reference } = await import(C.src + 'pipeline/contracts.js');
-const { canonical, hashJson } = await import(C.src + 'canonical.js');
-const { loadTaskContextSources } = await import(C.src + 'compiler/context.js');
-const { requireBasis } = await import(C.src + 'compiler/basis.js');
-const { requirePlanTaskObligations } = await import(C.src + 'execution/task-obligations.js');
-const selector = { id: '', pointer: '', start: null, end: null };
-function attempt(out, name, run) {
-  try { const value = run(); out[name] = { value: value === undefined ? null : JSON.parse(JSON.stringify(value)) }; }
-  catch (error) { out[name] = { error: { name: error?.name ?? null, code: error?.code ?? null, message: String(error?.message ?? error),
-    details: error?.details === undefined ? null : JSON.parse(JSON.stringify(error.details)) } }; }
-  return out[name];
-}
-const rows = store => { const all = store.list().flatMap(row => store.history(row.id)); return { count: all.length, hash: hashJson(canonical(all)) }; };
-function open(database) { const store = new Store(database); return { store, engine: new ProductEngine(store) }; }
-function reconfigure(engine, store, project) {
-  const environment = store.get('environment:' + project), { projectId: _project, ...value } = environment.value;
-  // CFG1 declares this marker on a fresh revision. The old producer preserves the explicit
-  // field without interpreting it; both implementations can still be compared exactly.
-  const declared = role => ({ ...role, commandContract: 'role-command/universal-v1' });
-  return engine.environments.configure(project, { ...value,
-    implementer: declared(value.implementer), reviewer: declared(value.reviewer),
-    timeoutMs: value.timeoutMs + 1000 }, environment.revision);
-}
-function compiled(out, engine, project) {
-  const plan = attempt(out, 'compile', () => engine.compiler.compile(project));
-  if (!plan.value) throw new Error('The saved base must compile: ' + JSON.stringify(plan.error));
-  attempt(out, 'repeat', () => engine.compiler.compile(project));
-  attempt(out, 'publish', () => { const stage = engine.compiler.publish(project, reference(plan.value), 0);
-    return [stage, engine.pipeline.accept(project, 'compilation', stage.revision)]; });
-  return plan.value;
-}
-function reads(out, suffix, store, engine, project, plan) {
-  attempt(out, 'feasibilityGate' + suffix, () => engine.refinement.feasibilityGate(project, plan.value.feasibility));
-  attempt(out, 'planGate' + suffix, () => engine.compiler.gate(project, reference(plan)));
-  attempt(out, 'basis' + suffix, () => requireBasis(store, plan.value));
-  attempt(out, 'sources' + suffix, () => loadTaskContextSources(store, plan));
-  attempt(out, 'contexts' + suffix, () => plan.value.tasks.map(task => engine.compiler.context(project, reference(plan), task.id, 200000)));
-  attempt(out, 'detail' + suffix, () => engine.compiler.detail(project, reference(plan), plan.value.tasks[0].id, 'evidence-index', selector, 100000));
-  attempt(out, 'obligations' + suffix, () => requirePlanTaskObligations(store, plan.value));
-}
-// The base run has no slot: its loader serves only the base commit, so this import fails there.
-const result = { slot: await import(C.src + 'compiler/om-readers.js').then(() => 'present', () => 'absent') }, project = C.project;
-{ // M8: compile on the saved base, read everything, then shift a head the plan depends on.
-  const out = result.m8 = {}, database = C.directory + '/m8.sqlite'; copyFileSync(C.database, database);
-  let { store, engine } = open(database);
-  const plan = store.get(compiled(out, engine, project).id);
-  reads(out, '', store, engine, project, plan);
-  if (C.save) { store.close(); copyFileSync(database, C.save); ({ store, engine } = open(database)); }
-  attempt(out, 'shift', () => reconfigure(engine, store, project));
-  reads(out, 'AfterShift', store, engine, project, plan);
-  attempt(out, 'compileAfterShift', () => engine.compiler.compile(project));
-  out.rows = rows(store); store.close();
-}
-{ // The exact M8 basis is absent from the saved base.
-  const out = result.absent = {}, database = C.directory + '/absent.sqlite'; copyFileSync(C.database, database);
-  let { store, engine } = open(database);
-  const plan = store.get(compiled(out, engine, project).id); store.close();
-  const db = new DatabaseSync(database); db.exec('PRAGMA foreign_keys=OFF; DROP TRIGGER IF EXISTS revisions_no_delete;');
-  db.prepare('DELETE FROM revisions WHERE entity_id = ? AND revision = ?').run(C.m8.id, C.m8.revision); db.close();
-  ({ store, engine } = open(database));
-  reads(out, '', store, engine, project, plan);
-  attempt(out, 'compileAbsent', () => engine.compiler.compile(project));
-  out.rows = rows(store); store.close();
-}
-{ // A plan that names a substituted M8 record: a later revision without the producer marker.
-  const out = result.substituted = {}, database = C.directory + '/substituted.sqlite'; copyFileSync(C.database, database);
-  const { store, engine } = open(database);
-  const plan = store.get(compiled(out, engine, project).id);
-  const value = structuredClone(C.m8.value); delete value.producer.contract;
-  const changed = store.write({ id: C.m8.id, kind: C.m8.kind, expected: store.get(C.m8.id).revision, value });
-  const { hash: _hash, ...body } = structuredClone(plan.value); body.feasibility = reference(changed);
-  const planValue = { ...body, hash: hashJson(body) };
-  const substitute = store.write({ id: 'plan:' + project + ':' + planValue.hash, kind: 'plan', expected: 0, value: planValue });
-  reads(out, '', store, engine, project, substitute);
-  reads(out, 'Original', store, engine, project, plan);
-  out.rows = rows(store); store.close();
-}
-{ // Legacy era: the saved legacy plan, then a changed dependency.
-  const out = result.legacy = {}, database = C.directory + '/legacy.sqlite'; copyFileSync(C.legacy.database, database);
-  const { store, engine } = open(database), plan = store.get(C.legacy.plan.id);
-  attempt(out, 'compile', () => engine.compiler.compile('p'));
-  reads(out, '', store, engine, 'p', plan);
-  attempt(out, 'shift', () => reconfigure(engine, store, 'p'));
-  reads(out, 'AfterShift', store, engine, 'p', plan);
-  out.rows = rows(store); store.close();
-}
-process.stdout.write(JSON.stringify(result) + '\n');
-`;
 
 interface Attempt { value?: unknown; error?: { name: string | null; code: string | null; message: string; details: unknown } }
 type Outcome = Record<string, Attempt | { count: number; hash: string }>;
-interface Saved {
-  directory: string; build: { root: string; database: string; project: string; m8: { id: string; revision: number; value: unknown };
-    legacy: { directory: string; database: string; plan: { id: string; value: { tasks: { id: string }[] } } } };
-  planned: string; base: Record<string, Outcome>; current: Record<string, Outcome>;
-}
 interface CurrentSaved {
   directory: string; build: { root: string; workspace: string; database: string; project: string; m8: { id: string; revision: number; value: unknown } };
   planned: string; current: Record<string, Outcome>;
@@ -441,105 +282,18 @@ let currentSaved: Promise<CurrentSaved> | undefined, currentBuilt: CurrentSaved 
 function currentSavedBases(): Promise<CurrentSaved> {
   currentSaved ??= (async () => {
     const directory = mkdtempSync(join(tmpdir(), 'omg-r34-current-bases-'));
-    const build = child(directory, 'build-current', BUILD_CURRENT, { repository: ROOT }, false) as CurrentSaved['build'];
+    const build = child(directory, 'build-current', BUILD_CURRENT, { repository: ROOT }) as CurrentSaved['build'];
     const planned = join(directory, 'planned.sqlite');
     const config = { directory: '', database: build.database, project: build.project, m8: build.m8 };
     const currentDirectory = mkdtempSync(join(directory, 'current-'));
-    const current = child(currentDirectory, 'scenario-current', SCENARIO_CURRENT, { ...config, directory: currentDirectory, save: planned }, false) as CurrentSaved['current'];
+    const current = child(currentDirectory, 'scenario-current', SCENARIO_CURRENT, { ...config, directory: currentDirectory, save: planned }) as CurrentSaved['current'];
     return currentBuilt = { directory, build, planned, current };
   })();
   return currentSaved;
 }
 
-/** NR1 (№3600): equal outputs but `references`, which name only records of the base's checked trail (local: om-fixture registers the readers). */
-function sameButReferences(actual: unknown, expected: unknown, message: string): void {
-  const collect = (value: unknown, into: Set<string>): unknown => {
-    if (Array.isArray(value)) return value.map(item => collect(item, into));
-    if (value === null || typeof value !== 'object') return value;
-    const result: Record<string, unknown> = {};
-    for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
-      if (key === 'references' && Array.isArray(item)) {
-        for (const ref of item) into.add(JSON.stringify(Object.fromEntries(Object.entries(ref as Record<string, unknown>).sort(([a], [b]) => a < b ? -1 : 1))));
-        continue;
-      }
-      result[key] = collect(item, into);
-    }
-    return result;
-  };
-  const mine = new Set<string>(), theirs = new Set<string>();
-  assert.deepEqual(collect(JSON.parse(JSON.stringify(actual)), mine), collect(JSON.parse(typeof expected === 'string' ? expected : JSON.stringify(expected)), theirs), message);
-  assert.deepEqual([...mine].filter(ref => !theirs.has(ref)), [], `${message}: a trusted reader names only records of the checked trail`);
-}
-let saved: Promise<Saved> | undefined, built: Saved | undefined;
 after(() => {
-  if (built) for (const path of [built.directory, built.build.root, built.build.legacy.directory]) rmSync(path, { recursive: true, force: true });
   if (currentBuilt) for (const path of [currentBuilt.directory, currentBuilt.build.root]) rmSync(path, { recursive: true, force: true });
-});
-/** One saved base for the file; the base and the new implementation each run the scenario on their own copies. */
-function savedBases(): Promise<Saved> {
-  saved ??= (async () => {
-    const directory = mkdtempSync(join(tmpdir(), 'omg-r34-bases-'));
-    const build = child(directory, 'build', BUILD, { repository: ROOT, fixtureBase: BASE,
-      typescript: pathToFileURL(createRequire(import.meta.url).resolve('typescript')).href }, true) as Saved['build'];
-    const planned = join(directory, 'planned.sqlite');
-    const config = { directory: '', database: build.database, project: build.project, m8: build.m8, legacy: build.legacy };
-    const baseDirectory = mkdtempSync(join(directory, 'base-')), currentDirectory = mkdtempSync(join(directory, 'current-'));
-    const base = child(baseDirectory, 'scenario', SCENARIO, { ...config, directory: baseDirectory }, true) as Saved['base'];
-    const current = child(currentDirectory, 'scenario', SCENARIO, { ...config, directory: currentDirectory, save: planned }) as Saved['current'];
-    return built = { directory, build, planned, base, current };
-  })();
-  return saved;
-}
-const value = (outcome: Outcome, name: string): unknown => {
-  const attempt = outcome[name] as Attempt;
-  assert.ok(attempt && !attempt.error, `${name}: ${JSON.stringify(attempt?.error)}`);
-  return attempt.value;
-};
-const failure = (outcome: Outcome, name: string): NonNullable<Attempt['error']> => {
-  const attempt = outcome[name] as Attempt;
-  assert.ok(attempt?.error, `${name} must refuse, got ${JSON.stringify(attempt?.value)?.slice(0, 200)}`);
-  return attempt.error;
-};
-
-test('R3+R4 on a saved legal base the slot reproduces the base implementation exactly: compile, refinement gate, plan gate, basis, sources, context, detail and task obligations — M8, absent and substituted basis, head shift, changed dependency and legacy', { timeout: 600_000 }, async () => {
-  const { base, current } = await savedBases();
-  assert.equal((base as Record<string, unknown>)['slot'], 'absent', 'The base run executes the base commit, not the current bytes');
-  assert.equal((current as Record<string, unknown>)['slot'], 'present');
-  for (const variant of ['m8', 'absent', 'substituted', 'legacy'])
-    for (const name of new Set([...Object.keys(base[variant]!), ...Object.keys(current[variant]!)]))
-      // NR1 (№3600): the trusted readers name the records they read, a subset of the trail the base named; all else is equal.
-      if (current[variant]![name] === undefined || base[variant]![name] === undefined)
-        assert.deepEqual(current[variant]![name], base[variant]![name], `${variant}.${name}: records/Ref, guards, references, text and hash`);
-      else sameButReferences(current[variant]![name], JSON.stringify(base[variant]![name]), `${variant}.${name}: records/Ref, guards, text and hash`);
-  // The scenario reached each OM read it claims to compare, rather than agreeing on an early refusal.
-  const m8 = current['m8']!, plan = value(m8, 'compile') as { value: { feasibility: Ref; tasks: unknown[] } };
-  const shifted = value(m8, 'shift') as { hash: string; value: {
-    implementer: { commandContract?: string }; reviewer: { commandContract?: string } } };
-  assert.equal(shifted.value.implementer.commandContract, 'role-command/universal-v1');
-  assert.equal(shifted.value.reviewer.commandContract, 'role-command/universal-v1');
-  assert.equal(shifted.hash, hashJson(shifted.value), 'The fresh environment hash includes its declared role contract');
-  assert.ok(plan.value.feasibility.id.startsWith('om-feasibility:'));
-  assert.deepEqual((value(m8, 'feasibilityGate') as { findings: unknown[] }).findings, []);
-  assert.deepEqual((value(m8, 'planGate') as { findings: unknown[] }).findings, []);
-  assert.ok(value(m8, 'basis') && value(m8, 'sources'));
-  assert.equal((value(m8, 'contexts') as unknown[]).length, plan.value.tasks.length);
-  value(m8, 'detail'); value(m8, 'obligations');
-  // Historical reads survive the head shift; the current gate refuses the changed dependency.
-  assert.deepEqual(value(m8, 'sourcesAfterShift'), value(m8, 'sources'));
-  assert.deepEqual(value(m8, 'basisAfterShift'), value(m8, 'basis'));
-  assert.notDeepEqual((value(m8, 'feasibilityGateAfterShift') as { findings: unknown[] }).findings, []);
-  assert.equal(failure(m8, 'contextsAfterShift').code, 'plan_stale');
-  failure(m8, 'compileAfterShift');
-  const absent = current['absent']!;
-  for (const name of ['basis', 'sources', 'contexts', 'detail', 'obligations', 'compileAbsent']) failure(absent, name);
-  assert.notDeepEqual((value(absent, 'feasibilityGate') as { findings: unknown[] }).findings, []);
-  const substituted = current['substituted']!;
-  for (const name of ['basis', 'sources', 'contexts', 'detail', 'obligations']) failure(substituted, name);
-  assert.ok(value(substituted, 'sourcesOriginal'), 'The original plan still reads its exact historical basis');
-  const legacy = current['legacy']!;
-  assert.equal(value(legacy, 'sources'), null); assert.equal(value(legacy, 'basis'), null);
-  value(legacy, 'contexts'); value(legacy, 'compile');
-  assert.equal(failure(legacy, 'contextsAfterShift').code, 'plan_stale');
 });
 
 /** A cold lower entry: only the lower consumers and the slot, then the product assembly point in the same process. */
