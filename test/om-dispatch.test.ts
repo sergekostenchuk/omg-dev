@@ -22,7 +22,8 @@ import { writeHorizon } from '../src/om/horizon.js';
 import { writeGaps, type GapRequest } from '../src/om/gaps.js';
 import { writeRoutes } from '../src/om/routes.js';
 import { prepareQuestionTasks, writeQuestionPacket } from '../src/om/question-packet.js';
-import { openSeries, beginAttempt, type AttemptGoal } from '../src/om/series.js';
+import { openSeries, readCompletionBinding, type AttemptGoal } from '../src/om/series.js';
+import { openAttempt } from '../src/om/repeat-gate.js';
 import { gapLineKey, gapLineExpectedResult } from '../src/om/gap-lines.js';
 import { runModelCall, readModelCall } from '../src/om/model-call.js';
 import { writeAssessmentIntent, assessFact, readAssessmentTerminalAt } from '../src/om/assessment.js';
@@ -387,7 +388,11 @@ function chain(t: TestContext, provider: 'codex' | 'devin' = 'codex') {
   const goal: AttemptGoal = { key: 'dispatch:fact', questions: batch.items.map(item => gapLineKey(project, item.target, item.field)),
     result: gapLineExpectedResult(project, batch.items[0]!.target, batch.items[0]!.field) };
   valueOf(openSeries(store, { project, block, line: 1, slice: 'dispatch-fact', predecessor: null, basis: null }));
-  const series = valueOf(beginAttempt(store, { project, block, line: 1, attempt: 1, goal }));
+  // The attempt is the current managed opening on the exact plan of this chain's own routes and batch, never a standalone begin.
+  const completion = { routes: reference(routes), batches: [batch.id] };
+  const series = valueOf(openAttempt(store, { project, block, line: 1, attempt: 1, goal, completion }));
+  const binding = valueOf(readCompletionBinding(store, project, reference(series), 1));
+  assert.ok(binding); assert.deepEqual(binding.value.plan, completion);
   const scenario = join(root, 'scenario.json'), trace = join(root, 'trace.jsonl');
   let command: { executable: string; args: string[] };
   if (provider === 'devin') {
@@ -424,11 +429,15 @@ console.log(JSON.stringify(replace(step.research)));
   const configured = configure(), dispatched = engine.execute(provider === 'devin' ? DEVIN_COMMAND : COMMAND) as OmDispatch;
   const packet = valueOf(writeQuestionPacket(store, { project, routes: reference(routes), batch: batch.id,
     environment: dispatched.dispatch.config, attempt: { series: reference(series), ordinal: 1 }, previous: [] })).record;
+  assert.equal(packet.value.state, 'ready');
+  assert.deepEqual(packet.value.request.attempt, { series: reference(series), ordinal: 1 });
   const questionId = batch.items[0]!.gap;
   const originalStep = { research: fixtureAnswer(packet.value.packet, { protocol: packet.value.answerProtocol, requestId: '$requestId', action: 'answer',
     results: batch.items.map(item => ({ questionId: item.gap, value: 'UTF-8', citations: [{ source: reference(source),
       selector: { kind: 'text-range', start: 0, end: source.value.content.length } }] })) }), usage };
   writeFileSync(scenario, JSON.stringify({ steps: [originalStep] }));
+  const sent = (): string[] => existsSync(trace) ? readFileSync(trace, 'utf8').trim().split('\n').filter(Boolean) : [];
+  assert.equal(sent().length, 0, 'The preparation sent nothing');
   return { root, project, configured, dispatched, packet, questionId, configure,
     get store() { return store; }, get engine() { return engine; },
     request: (dispatch = dispatched.dispatch, role: 'implementer' | 'reviewer' = 'implementer') =>
@@ -436,7 +445,7 @@ console.log(JSON.stringify(replace(step.research)));
     assessor() {
       writeFileSync(scenario, JSON.stringify({ steps: [originalStep, { research: { verdict: 'supported', reasons: [] }, usage }] }));
     },
-    sent: () => existsSync(trace) ? readFileSync(trace, 'utf8').trim().split('\n').filter(Boolean) : [],
+    sent,
     reopen() { store.close(); store = new Store(path); engine = new ProductEngine(store); return engine; },
   };
 }
