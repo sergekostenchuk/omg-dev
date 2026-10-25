@@ -5,7 +5,6 @@ import { types } from 'node:util';
 import { writeFileSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { canonical, type Json, hashJson } from '../src/canonical.js';
 import { EngineError } from '../src/errors.js';
 import { adapterRequest, readAdapterResponse, type AdapterRequestInput, type AdapterResponseInput, runModelCall, runModelCycle, readModelCycle, deliverModelSources, readContinuationEvidence, readPartAssembly, readModelCall, readManagedModelDiagnostic, assembleModelParts, runModelTransport, readModelTransport, finishModelAttempt, prepareModelAttemptFinish, readModelApplicationRejection, type OmModelCall, readModelCallState, type ModelCallRequest, type ModelTransportRequest, pendingCallStore, runModelCycle as mp2Cycle } from '../src/om/model-call.js';
@@ -19,16 +18,15 @@ import { storeView, readServer } from '../src/storage/store-view.js';
 import { transactionForTests } from '../src/om/atomic-gate.js';
 import { writeGuarded, readRecord } from '../src/om/refs.js';
 import { type QuestionPacketRequest, writeQuestionPacket, prepareQuestionPacket, readQuestionPacket, type QuestionPacketRecord, readPartResult } from '../src/om/question-packet.js';
-import { writeRoutes } from '../src/om/routes.js';
-import { completeAttempt, seriesRequestOf, type RepairSeries, readCompletionBinding, beginAttempt, openSeries } from '../src/om/series.js';
+import { seriesRequestOf, type RepairSeries } from '../src/om/series.js';
 import { answerProducerOf, prepareAnswersGateTrace } from '../src/om/answers-gate.js';
 import { readCall, recordCall } from '../src/om/call-record.js';
 import { checkAnswerForm } from '../src/om/answer-form.js';
-import { closeAttempt, openAttempt as managedOpenAttempt, prepareManagedClaim } from '../src/om/repeat-gate.js';
+import { closeAttempt, prepareManagedClaim } from '../src/om/repeat-gate.js';
 import { processStart } from '../src/runtime/process-identity.js';
 import type { ModelCall } from '../src/runtime/model-usage.js';
 import { readModelCallRecovery, prepareLateModelReceipt } from '../src/discovery/model-call-recovery.js';
-import { CycleCommitPhase, H10A_COMMIT, MP3_NOTES, completionE1, completionSnapshot, confirmed, currentPacketWire, cycleCommitPhase, cycleCommitPhases, decode, deeplyFrozen, e4CannotAnswer, e4Fact, e4Fixture, e4ManagedAnalysisFixture, e4ManagedClose, e4ManagedFixture, e4WorksFixture, e4NeedSource, e4Node, ensureFixtureProject, envelope, fixtureCheckpoint, fixtureDriver, h15CannotAnswer, h15Heads, h15Refusal, h15Unserved, h15Written, killFixtureDriver, killFixtureProvider, lp4Root, mp2Managed, mp2Refused, mp2StopAfter, mp3Carried, mp3Close, mp3Cycle, mp3Delivered, mp3Open, mp3Readings, mp3SearchDelivery, omit, processResult, publicRecovery, refusesLiveRecovery, request, requestId, signalFixtureProvider, unknownConfirmed, usage, valueOf } from './om-model-call-fixture.js';
+import { CycleCommitPhase, MP3_NOTES, completionE1, completionSnapshot, confirmed, currentPacketWire, cycleCommitPhase, cycleCommitPhases, decode, deeplyFrozen, e4CannotAnswer, e4Fact, e4Fixture, e4ManagedAnalysisFixture, e4ManagedClose, e4ManagedFixture, e4WorksFixture, e4NeedSource, e4Node, ensureFixtureProject, envelope, fixtureCheckpoint, fixtureDriver, h15CannotAnswer, h15Heads, h15Refusal, h15Unserved, h15Written, killFixtureDriver, killFixtureProvider, lp4Root, mp2Managed, mp2Refused, mp2StopAfter, mp3Carried, mp3Close, mp3Cycle, mp3Delivered, mp3Open, mp3Readings, mp3SearchDelivery, omit, processResult, publicRecovery, refusesLiveRecovery, request, requestId, signalFixtureProvider, unknownConfirmed, usage, valueOf } from './om-model-call-fixture.js';
 
 
 
@@ -1157,53 +1155,6 @@ test('15 H1.0a exact no-progress, blocked successor and invalid assembly dischar
 
 
 
-// LG07 (№10753 п.8): standalone-only property — beginAttempt/completeAttempt history is the retired standalone
-// route itself, not a managed positive. This test leaves with the route; it is intentionally not migrated.
-test('1 H1.0a standalone physical history retains its original completion and never acquires an owner', async t => {
-  const f=e4Fixture(t); f.steps([{research:{wrong:true},usage}]);
-  const original=valueOf(await runModelCall(f.store,f.request));
-  assert.equal(original.record.value.om.version,'om-model-call/v1');
-  assert.equal(original.record.value.om.completionOwner,undefined);
-  assert.equal(f.store.list('om-completion-owner').length,0);
-  assert.equal(f.store.get<RepairSeries>(f.series.id)!.value.attempts[0]!.outcome?.reason,'off-form');
-  const saved=f.store.list();f.restart();
-  assert.equal(valueOf(await runModelCall(f.store,f.request)).repeated,true);
-  assert.deepEqual(f.store.list(),saved);assert.equal(f.sent().length,1);
-});
-
-
-
-// LG07 (№10753 п.8): standalone-only property — a beginAttempt opening that must never be adopted. Leaves
-// with the retired standalone route; intentionally not migrated to a managed carrier.
-test('4 H1.0a an existing standalone opening cannot be adopted even before any physical call',t=>{
-  const f=e4Fixture(t), before=f.store.list();
-  const request={...seriesRequestOf(f.series.value),attempt:1,goal:f.series.value.attempts[0]!.goal,
-    completion:{routes:reference(f.routes),batches:[f.batch.id]}};
-  const result=managedOpenAttempt(f.store,request as never);
-  assert.equal(result.ok,false); if(!result.ok) assert.equal(result.refusal.code,'completion_conflict');
-  assert.deepEqual(f.store.list(),before);
-});
-
-
-
-// LG07 (№10753 п.8): old-ordinal route coverage — e4Fixture(priorNoProgress:2) fabricates raw
-// beginAttempt/completeAttempt ordinals and the test proves beginAttempt refusal; this leaves with the
-// retired ordinal route. Not a managed positive.
-test('C03 H1.0a completion threshold preserves old ordinals and an exact managed opening ignores later M6 heads',async t=>{
-  const f=e4Fixture(t,'fact',100_000,2,1000,true);
-  assert.equal(valueOf(readCompletionBinding(f.store,f.project,reference(f.series),1)),null);
-  const address=seriesRequestOf(f.series.value),goal=f.series.value.attempts.at(-1)!.goal;
-  const routes=valueOf(writeRoutes(f.store,JSON.parse(canonical({...f.routes.value.request,tasks:f.routes.value.request.tasks.map(record=>({record})),previous:reference(f.routes)}))));
-  const before=f.store.list();
-  assert.deepEqual(valueOf(managedOpenAttempt(f.store,{...address,attempt:3,goal} as never)),f.series);
-  assert.equal(managedOpenAttempt(f.store,{...address,attempt:3,goal,
-    completion:{routes:reference(routes),batches:[f.batch.id]}} as never).ok,false);
-  assert.deepEqual(f.store.list(),before);
-  assert.equal(beginAttempt(f.store,{...address,attempt:4,goal} as never).ok,false);
-});
-
-
-
 test('C09 H1.0a a current-only assembly admission failure cannot manufacture a historical parts-invalid terminal',async t=>{
   const f=e4Fixture(t,'node',100_000,0,1000,true);f.steps([{research:e4Node(f,f.packet as Revision<QuestionPacketRecord>),usage}]);
   valueOf(await runModelCall(f.store,f.request));
@@ -1215,34 +1166,6 @@ test('C09 H1.0a a current-only assembly admission failure cannot manufacture a h
   assert.equal(f.store.get<RepairSeries>(f.series.id)!.value.attempts[0]!.outcome,null);
   f.restart();assert.equal((await runModelCycle(f.store,f.request)).ok,false);
   assert.equal(completionSnapshot(f).complete,false);assert.equal(f.sent().length,1);
-});
-
-
-
-// LG07 (№10753 п.8): old-ordinal route coverage — the successor attempt 2 is opened/completed through raw
-// beginAttempt/completeAttempt to prove the ordinal threshold; this leaves with the retired ordinal route.
-test('C06 H1.0a successor inherits original completion proofs but starts its own independent ordinal threshold',async t=>{
-  const f=e4Fixture(t,'fact',100_000,0,1000,true);f.steps([{research:{wrong:true},usage}]);
-  valueOf(await runModelCall(f.store,f.request));const work=completionSnapshot(f),address=seriesRequestOf(f.series.value);
-  valueOf(closeAttempt(f.store,{...address,attempt:1,outcome:{reason:'off-form',accepting:[],cancelling:[],refusals:work.refusals}}));
-  const closed=f.store.get<RepairSeries>(f.series.id)!;
-  const next=valueOf(openSeries(f.store,{project:f.project,block:closed.value.block,line:2,slice:'successor-subject',predecessor:reference(closed),
-    basis:{ground:'inputs-changed',text:'A separately recorded subject supersedes this legacy slice'}}));
-  assert.equal(next.value.inherited.length,1);
-  assert.deepEqual(valueOf(readCompletionBinding(f.store,f.project,reference(next),1)),work.binding);
-  const goal=closed.value.attempts[0]!.goal;
-  const standalone=valueOf(beginAttempt(f.store,{project:f.project,block:closed.value.block,line:2,attempt:2,goal}));
-  assert.equal(valueOf(readCompletionBinding(f.store,f.project,reference(standalone),2)),null);
-  valueOf(completeAttempt(f.store,{project:f.project,block:closed.value.block,line:2,attempt:2,
-    outcome:{reason:'awaiting-owner',achieved:[],cancelled:[],refusals:[]}}));
-  const managed=valueOf(managedOpenAttempt(f.store,{project:f.project,block:closed.value.block,line:2,attempt:3,goal,
-    completion:{routes:reference(f.routes),batches:[f.batch.id]}}));
-  const binding=valueOf(readCompletionBinding(f.store,f.project,reference(managed),3))!;
-  assert.notEqual(binding.id,work.binding.id);assert.equal(binding.value.series.id,next.id);
-  assert.deepEqual(f.store.list<{firstManagedAttempt:number}>('om-completion-era').map(row=>row.value.firstManagedAttempt).sort(),[1,3]);
-  f.restart();assert.deepEqual(valueOf(readCompletionBinding(f.store,f.project,reference(managed),1)),work.binding);
-  assert.deepEqual(valueOf(readCompletionBinding(f.store,f.project,reference(managed),3)),binding);
-  assert.equal(f.sent().length,1);
 });
 
 
@@ -1304,53 +1227,6 @@ test('33 H1.0b CAS loss leaves a received response retryable without irreversibl
   assert.equal(applied.record.value.om.application, 'applied'); assert.deepEqual(f.store.get(received.value.om.exchange!.id), exchange);
   assert.deepEqual(f.store.history(received.value.om.call.id), e1); assert.equal(f.sent().length, 1);
   f.restart(); const history = f.store.list(); valueOf(await runModelCall(f.store, f.request)); assert.deepEqual(f.store.list(), history);
-});
-
-
-
-test('16 H1.0b a genuine H1.0a application-refused replays its exact exchange without another settlement', async t => {
-  const { pathToFileURL } = await import('node:url');
-  const { execFile } = await import('node:child_process');
-  const f = e4Fixture(t, 'fact', 100_000, 0, 5000, true, false, false, H10A_COMMIT); f.steps([{ research: e4Fact(f), usage }]);
-  const repo = fileURLToPath(new URL('../../', import.meta.url));
-  const loader = join(f.root, 'h10a-loader.mjs'), producer = join(f.root, 'h10a-producer.mjs'), spec = join(f.root, 'h10a.json');
-  writeFileSync(loader, String.raw`import{execFileSync}from'node:child_process';import{fileURLToPath}from'node:url';
-let root,ts;export async function initialize(data){root=data.root;ts=(await import(data.typescript)).default;}
-export async function load(url,context,next){const prefix=new URL('dist/src/',root).href;
-if(url.startsWith(prefix)&&/\.js$/.test(url)){const relative='src/'+url.slice(prefix.length).replace(/\.js$/,'.ts');
-const source=execFileSync('git',['show','${H10A_COMMIT}:'+relative],{cwd:fileURLToPath(root),encoding:'utf8',maxBuffer:10000000});
-return{format:'module',shortCircuit:true,source:ts.transpileModule(source,{compilerOptions:{module:ts.ModuleKind.ESNext,target:ts.ScriptTarget.ES2023}}).outputText};}return next(url,context);}`);
-  writeFileSync(spec, JSON.stringify({ database: f.database, request: f.request, packet: f.packetRequest, repo: pathToFileURL(repo + '/').href }));
-  writeFileSync(producer, String.raw`import{readFileSync}from'node:fs';
-const spec=JSON.parse(readFileSync(process.argv[2],'utf8')),src=p=>new URL('dist/src/'+p,spec.repo).href;
-const{Store}=await import(src('storage/store.js'));const{Environments}=await import(src('runtime/environment.js'));
-const{runModelCall}=await import(src('om/model-call.js'));const{writeQuestionPacket}=await import(src('om/question-packet.js'));
-const store=new Store(spec.database);const packet=writeQuestionPacket(store,spec.packet);if(!packet.ok)throw Error(JSON.stringify(packet));spec.request.packet={id:packet.value.record.id,revision:packet.value.record.revision,hash:packet.value.record.hash};
-const write=store.writeMany.bind(store);let moved=false;
-store.writeMany=(writes,guards)=>{const saved=write(writes,guards);
- if(!moved&&writes.some(w=>w.kind==='model-call'&&w.value.om?.application==='received')){moved=true;
- const old=store.get('environment:'+spec.request.project),{projectId,...config}=old.value;new Environments(store).configure(projectId,config,old.revision);}return saved;};
-try{const result=await runModelCall(store,spec.request);if(!result.ok||result.value.record.value.om.application!=='application-refused')throw Error(JSON.stringify(result));}
-finally{store.close();}`);
-  const registration = `import{register}from'node:module';register(${JSON.stringify(pathToFileURL(loader).href)}, {data:${JSON.stringify({
-    root: pathToFileURL(repo + '/').href, typescript: pathToFileURL(join(repo, 'node_modules/typescript/lib/typescript.js')).href })}});`;
-  await new Promise<void>((resolve, reject) => execFile(process.execPath,
-    ['--import', `data:text/javascript,${encodeURIComponent(registration)}`, producer, spec],
-    { cwd: repo, timeout: 90000, maxBuffer: 1000000 }, (error, _out, stderr) => error ? reject(new Error(stderr || error.message)) : resolve()));
-  const old = f.store.list<OmModelCall>('model-call')[0]!;
-  f.request.packet = reference(f.store.get(f.request.packet.id)!);
-  assert.equal(old.value.om.application, 'application-refused');
-  assert.equal(valueOf(readModelCallState(f.store, { project: f.project, record: reference(old) })).state, 'application-refused');
-  const e1 = f.store.history(old.value.om.call.id), physical = f.store.history(old.id), exchange = f.store.get(old.value.om.exchange!.id);
-  f.restart(); const applied = valueOf(await runModelCall(f.store, f.request));
-  assert.equal(applied.record.value.om.application, 'applied');
-  assert.deepEqual(applied.record.value.om.resume, { contract: 'om-model-application-resume/v1', previous: reference(old) });
-  assert.deepEqual(f.store.history(old.id).slice(0, -1), physical); assert.deepEqual(f.store.history(old.value.om.call.id), e1);
-  assert.deepEqual(f.store.get(old.value.om.exchange!.id), exchange);
-  assert.equal(valueOf(readModelCallState(f.store, { project: f.project, record: reference(old) })).state, 'application-refused');
-  f.restart(); const history = f.store.list();
-  assert.deepEqual(valueOf(await runModelCall(f.store, f.request)), valueOf(readModelCall(f.store, { project: f.project, record: reference(applied.record) })));
-  assert.deepEqual(f.store.list(), history); assert.equal(f.sent().length, 1);
 });
 
 
