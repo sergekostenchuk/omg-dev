@@ -19,7 +19,9 @@ import { writeHorizon } from '../src/om/horizon.js';
 import { writeGaps, type GapRequest } from '../src/om/gaps.js';
 import { writeRoutes, type RoutesRecord } from '../src/om/routes.js';
 import { writeGuarded } from '../src/om/refs.js';
-import { openSeries, beginAttempt } from '../src/om/series.js';
+import { openSeries, readCompletionBinding } from '../src/om/series.js';
+import { openAttempt } from '../src/om/repeat-gate.js';
+import { gapLineKey, gapLineExpectedResult } from '../src/om/gap-lines.js';
 import type { OmResult } from '../src/om/refusal.js';
 import { QUEUE_POLICY_VERSION, computeBlockWeights, prepareBlockQueue, writeBlockQueue, readBlockQueue,
   readQuestionQueue, prepareQuestionQueue, selectMachinePath,
@@ -270,11 +272,28 @@ test('a genuine accepted L1 and horizon produce the first queue before L2 withou
   assert.deepEqual(ok(writeBlockQueue(f.store, f.request)), saved);
 });
 
+/**
+ * The managed attempt the two series-keeping tests stand on: the consumer's own whole node-expansion batch of the second level comes
+ * from the real M5 and M6 producers (routedFixture), and G7 opens attempt 1 of its series on that exact plan — never a standalone begin.
+ */
+function managedConsumerSeries(f: ReturnType<typeof fixture>, slice: string) {
+  const { routes } = routedFixture(f);
+  const batches = routes.value.batches.filter(item => item.task === 'node-expansion' && item.level === 2 && item.node === consumer);
+  assert.equal(batches.length, 1, 'The consumer owns one whole node-expansion batch of the second level');
+  const batch = batches[0]!;
+  assert.ok(batch.items.length > 0 && batch.items.every(item => item.consumers.includes(consumer)));
+  const series = ok(openSeries(f.store, { project, block: consumer, line: 1, slice, predecessor: null, basis: null }));
+  const completion = { routes: reference(routes), batches: [batch.id] };
+  const opened = ok(openAttempt(f.store, { project, block: consumer, line: 1, attempt: 1,
+    goal: { key: 'proposal', questions: batch.items.map(item => gapLineKey(project, item.target, item.field)),
+      result: gapLineExpectedResult(project, batch.items[0]!.target, batch.items[0]!.field) }, completion }));
+  const binding = ok(readCompletionBinding(f.store, project, reference(opened), 1));
+  assert.ok(binding); assert.deepEqual(binding.value.plan, completion);
+  return { series, opened, binding };
+}
+
 test('owner permutation is complete, explicit and reasoned; another horizon and order do not reset a series', t => {
-  const f = fixture(t), series = ok(openSeries(f.store, { project, block: consumer, line: 1,
-    slice: 'legacy-subject', predecessor: null, basis: null }));
-  ok(beginAttempt(f.store, { project, block: consumer, line: 1, attempt: 1,
-    goal: { key: 'proposal', questions: ['Which structure?'], result: 'accepted proposal' } }));
+  const f = fixture(t), { series, opened, binding } = managedConsumerSeries(f, 'legacy-subject');
   const beforeSeries = f.store.history(series.id), initial = ok(writeBlockQueue(f.store, f.request));
   const reversed = { ...f.request, override: { order: [consumer, producer], reason: 'Owner examines the consumer first' } };
   const saved = ok(writeBlockQueue(f.store, reversed));
@@ -288,6 +307,7 @@ test('owner permutation is complete, explicit and reasoned; another horizon and 
   const nextHorizon = f.horizon('new-choice'), next = ok(writeBlockQueue(f.store, { ...f.request, horizon: reference(nextHorizon.gate) }));
   assert.notEqual(next.id, initial.id);
   assert.deepEqual(f.store.history(series.id), beforeSeries);
+  assert.deepEqual(ok(readCompletionBinding(f.store, project, reference(opened), 1)), binding, 'The original completion binding stands at its exact opening');
 });
 
 test('queue history uses original exact sources after heads change and restart while current preparation refuses', t => {
@@ -554,10 +574,7 @@ function acceptQueueL2(f: ReturnType<typeof fixture>) {
 
 test('the owner reorders after genuine L2 acceptance and restart without replacing H, L1, weights or repair series', t => {
   const f = fixture(t), initial = ok(writeBlockQueue(f.store, f.request));
-  const series = ok(openSeries(f.store, { project, block: consumer, line: 1,
-    slice: 'same-repair-subject', predecessor: null, basis: null }));
-  ok(beginAttempt(f.store, { project, block: consumer, line: 1, attempt: 1,
-    goal: { key: 'proposal', questions: ['Which structure?'], result: 'accepted proposal' } }));
+  const { series, opened, binding } = managedConsumerSeries(f, 'same-repair-subject');
   const oldSeries = f.store.history(series.id), oldHorizon = clone(f.first), oldInput = f.input;
   const accepted = acceptQueueL2(f);
   assert.notDeepEqual(reference(accepted.graph), reference(f.graph));
@@ -586,6 +603,7 @@ test('the owner reorders after genuine L2 acceptance and restart without replaci
   assert.deepEqual(f.store.get(oldHorizon.horizon.id), oldHorizon.horizon);
   assert.deepEqual(f.store.get(oldInput.id), oldInput);
   assert.deepEqual(f.store.history(series.id), oldSeries);
+  assert.deepEqual(ok(readCompletionBinding(f.store, project, reference(opened), 1)), binding, 'The original completion binding stands at its exact opening');
   f.restart();
   const exact = new ExactOnlyStore(f.path);
   try {
