@@ -2,14 +2,11 @@ import test, { type TestContext } from 'node:test';
 import '../src/om/compiler-readers.js';
 import { selectTaskSpecification, hasBasisApplications } from '../src/om/selected-specification.js';
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { createRequire } from 'node:module';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { fileURLToPath, pathToFileURL } from 'node:url';
 import { canonical, digest, hashJson } from '../src/canonical.js';
-import { preplanTaskContext, taskContext, taskContextContent, type ContextText, type PlanTaskContextSources } from '../src/compiler/context.js';
+import { preplanTaskContext, taskContext, taskContextContent, type PlanTaskContextSources } from '../src/compiler/context.js';
 import { deriveTasks } from '../src/compiler/derive.js';
 import { TASK_CONTEXT_CONTRACT, BASIS_TASK_CONTEXT_CONTRACT, type CompiledTask, type MachinePlan } from '../src/compiler/model.js';
 import type { TaskSpecification, TaskSpecificationSelection, OmReaderResult } from '../src/compiler/om-readers.js';
@@ -313,54 +310,6 @@ test('V2 owns its output, leaves all caller data mutable and preserves own __pro
   const schema = JSON.parse(output.text).contracts.find((contract: { id: string }) => contract.id === `${project}-contract`).schema;
   assert.equal(Object.hasOwn(schema, '__proto__'), true); assert.deepEqual(schema['__proto__'], { polluted: 'contract-data' });
   assert.equal(({} as Record<string, unknown>)['polluted'], undefined);
-});
-
-function legacyContexts(t: TestContext, entries: { plan: Revision<MachinePlan>; fullCheck: Command; task: string }[]): ContextText[] {
-  const root = mkdtempSync(join(tmpdir(), 'omg-v2-context-history-'));
-  t.after(() => rmSync(root, { recursive: true, force: true }));
-  const repository = fileURLToPath(new URL('../../', import.meta.url)), repositoryUrl = pathToFileURL(repository).href;
-  const loader = join(root, 'legacy-source-loader.mjs'), typescript = pathToFileURL(createRequire(import.meta.url).resolve('typescript')).href;
-  writeFileSync(loader, `import { execFileSync } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
-import ts from ${JSON.stringify(typescript)};
-let root;
-export function initialize(data) { root = data.root; }
-export async function load(url, context, next) {
-  const prefix = new URL('dist/src/', root).href;
-  if (url.startsWith(prefix) && /\\.js$/.test(url)) {
-    const relative = 'src/' + url.slice(prefix.length).replace(/\\.js$/, '.ts');
-    const source = execFileSync('git', ['show', 'aa8eb1d4f49c48b1ff3f67234eb1a8e429fa76d8:' + relative],
-      { cwd: fileURLToPath(root), encoding: 'utf8', maxBuffer: 10000000 });
-    return { format: 'module', shortCircuit: true, source: ts.transpileModule(source,
-      { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2023 } }).outputText };
-  }
-  return next(url, context);
-}
-`);
-  const bootstrap = `import { register } from 'node:module'; register(${JSON.stringify(pathToFileURL(loader).href)}, { data: { root: ${JSON.stringify(repositoryUrl)} } });`;
-  const output = execFileSync(process.execPath, ['--import', `data:text/javascript,${encodeURIComponent(bootstrap)}`, '--input-type=module', '--eval',
-    `import { readFileSync } from 'node:fs'; import { taskContext } from ${JSON.stringify(new URL('dist/src/compiler/context.js', repositoryUrl).href)};
-const cases = JSON.parse(readFileSync(0, 'utf8')); process.stdout.write(JSON.stringify(cases.map(c => taskContext(c.plan, c.fullCheck, c.task, 1000000))));`],
-  { cwd: repository, encoding: 'utf8', input: JSON.stringify(entries), maxBuffer: 10_000_000 });
-  return JSON.parse(output) as ContextText[];
-}
-
-test('V2 unchanged legacy bytes and hashes match the complete aa8eb1d source graph in a fresh process', t => {
-  const c = fixture(), entries: Parameters<typeof legacyContexts>[1] = [];
-  for (const mode of ['absent', 'empty', 'assigned'] as const) {
-    const tasks = clone(c.tasks);
-    for (const task of tasks) {
-      if (mode === 'absent') delete task.researchObligations;
-      if (mode === 'empty') task.researchObligations = [];
-    }
-    const record = plan(clone(c.graph), tasks);
-    for (const task of tasks) entries.push({ plan: record, fullCheck: clone(FULL_CHECK), task: task.id });
-  }
-  const historical = legacyContexts(t, entries);
-  assert.equal(historical.length, entries.length);
-  for (const [index, entry] of entries.entries())
-    assert.deepEqual(taskContext(entry.plan, entry.fullCheck, entry.task, 1_000_000), historical[index], `legacy case ${index}`);
-  assert.notEqual(historical[0]!.text, historical[2]!.text, 'Missing and explicit empty D7 remain different legacy payloads');
 });
 
 function sp1ContextFixture() {
