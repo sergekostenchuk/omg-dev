@@ -1,7 +1,15 @@
-import { hashJson, type Json } from '../canonical.js';
+import { canonical, hashJson, type Json } from '../canonical.js';
 import { EngineError } from '../errors.js';
-import { isRef, type Ref } from '../pipeline/contracts.js';
+import { isRef, reference, type Ref } from '../pipeline/contracts.js';
+import { Store } from '../storage/store.js';
 import { V7_PLAN_SUBJECT_CONTRACT, type V7PlanSubject } from './v7-managed-attempt.js';
+import { proveClaimAddress, type ClaimAddress } from './claim-address.js';
+import { claimContentKey } from './v7-attempt-assessment.js';
+import { readVariantScope } from './variant-scope.js';
+import { proveAttempt, provePlanQuestions, type V7PlanQuestion } from './v7-plan-questions.js';
+import { V7_ATTEMPT_CONTRACT, V7_ATTEMPT_KIND } from './v7-contracts.js';
+import type { V7Attempt } from './v7-plan-questions.js';
+import type { DiscoveryDraft } from './discovery.js';
 
 /** DR5 5.1-F (codex-omg №9189, №9576): the closed form and the pure key of one
  * coverage cell — one plan question (the exact v7-plan-subject/v1 subject) on
@@ -71,4 +79,119 @@ export function decodeCoverageCell(value: unknown): CoverageCell {
 export function coverageCellKey(value: unknown): string {
   const decoded = decodeCoverageCell(value);
   return `${DISCOVERY_COVERAGE_CELL_KIND}:${decoded.projectId}:${hashJson(decoded as unknown as Json)}`;
+}
+
+/* ---------- the main 5.1: the proof-based computation of the missing coverage ---------- */
+
+/** One applied coverage ground: a claim proven accepted by the first application of its paid assessment
+ * (proveClaimAddress — the one door that proves acceptance, the applied progress and the original paid assessment
+ * together), kept with its exact address, its verbatim variant scope and its semantic content key. */
+export interface AppliedCoverageGround {
+  claim: ClaimAddress; kind: string; text: string; contentKey: string;
+  /** The claim's own variants scope, verbatim: common material or exact variant Refs. */
+  variants: 'common' | Ref[];
+}
+/** The addressed reason a cell is not covered. */
+export type CoverageMissing =
+  | { code: 'coverage_no_applied_grounds'; message: string }
+  | { code: 'coverage_no_variant_ground'; message: string };
+// The third addressed shape — applied grounds that serve the question but none scoped to this
+// exact member — shares coverage_no_variant_ground: its message names the member.
+export interface CellCoverage {
+  cell: CoverageCell; key: string; covered: boolean;
+  /** The variant-specific applied grounds of this exact cell. */
+  grounds: AppliedCoverageGround[];
+  /** The applied common material — kept for provenance, never closing a variant cell. */
+  common: AppliedCoverageGround[];
+  missing: CoverageMissing | null;
+}
+export interface CoverageComputation {
+  verification: 'proven'; project: string; scope: Ref; planAnswer: Ref;
+  draft: Ref; set: Ref; member: Ref; cells: CellCoverage[]; missing: CellCoverage[];
+}
+
+/** The closed cell of one proven plan question over the proven variant. */
+function cellOf(project: string, planAnswer: Ref, question: V7PlanQuestion, variant: CoverageVariant): CoverageCell {
+  const value = question.question as Record<string, Json>;
+  return decodeCoverageCell({ contract: DISCOVERY_COVERAGE_CELL_CONTRACT, projectId: project,
+    subject: { contract: V7_PLAN_SUBJECT_CONTRACT, planAnswer, planQuestionId: question.planQuestionId },
+    variant, requiredDepth: value['requiredDepth'], criterion: value['criterion'] });
+}
+
+/** The claim serves exactly this plan edition's question — its own planQuestions link names the exact plan
+ * answer; the same planQuestionId of another edition proves nothing. */
+function servesPlanQuestion(claim: Record<string, unknown>, planAnswer: Ref, planQuestionId: string): boolean {
+  const links = claim['planQuestions'];
+  if (!Array.isArray(links)) return false;
+  return links.some(link => {
+    if (!object(link)) return false;
+    const named = link['planAnswer'];
+    return typeof link['planQuestionId'] === 'string' && link['planQuestionId'] === planQuestionId
+      && isRef(named) && canonical(named) === canonical(planAnswer);
+  });
+}
+
+/** The main 5.1 (codex-omg2 №12393, the №9147 line): the proof-based computation of what is missing — one cell per
+ * plan question of the exact accepted plan (question, requiredDepth and criterion verbatim from it, proven by
+ * provePlanQuestions) over the exact chosen variant (the proven scope of 4P.1: the exact set, member, decision and
+ * its paid generation). A cell is covered only by a ground proven through proveClaimAddress — acceptance by the
+ * first application of a paid assessment; a structural record, a merely paid but unapplied assessment, a rejected
+ * claim or a closed summary without its proven application give no coverage. Common material stays common and never
+ * closes a variant cell; a foreign member, set, plan edition or a matching variant name substitutes nothing — the
+ * member is matched by its exact Ref. No depth ranking or criterion meaning is read from the text. The computation
+ * is a read-only projection over the named proven grounds: it writes nothing, pays nothing, authorizes no dispatch,
+ * and a later head never rewrites an earlier projection. */
+export function computeMissingCoverage(store: Store, project: string, scope: Ref, planAnswer: Ref): CoverageComputation {
+  if (!(store instanceof Store) || typeof project !== 'string' || project.length === 0)
+    invalid('store', 'A coverage computation requires its Store and project');
+  if (!isRef(scope)) invalid('scope', 'The coverage names the exact Ref of its proven variant scope');
+  if (!isRef(planAnswer)) invalid('planAnswer', 'The coverage names the exact Ref of its accepted plan answer');
+  const proven = readVariantScope(store, project, scope);
+  const value = proven.scope.value, variant: CoverageVariant = { set: value.set, member: value.member };
+  const draft = store.get<DiscoveryDraft>(value.draft.id, value.draft.revision);
+  if (draft === null || draft.kind !== 'discovery-draft' || draft.hash !== value.draft.hash)
+    invalid('scope', 'The scope names its exact draft revision');
+  const questions = provePlanQuestions(store, draft, planAnswer);
+  const attempts = store.list<V7Attempt>(V7_ATTEMPT_KIND)
+    .filter(row => row.value?.project === project && row.value?.contract === V7_ATTEMPT_CONTRACT
+      && row.value.planQuestionId !== undefined && isRef(row.value.planAnswer)
+      && canonical(row.value.planAnswer) === canonical(planAnswer));
+  const cells: CellCoverage[] = questions.map(question => {
+    const cell = cellOf(project, planAnswer, question, variant);
+    const grounds: AppliedCoverageGround[] = [], common: AppliedCoverageGround[] = [];
+    let serving = 0;
+    for (const row of attempts.filter(item => item.value.planQuestionId === question.planQuestionId)) {
+      // A structural candidate only: every ground below proves itself through its own door.
+      const proof = proveAttempt(store, reference(row));
+      const claims = proof.claims ?? [];
+      for (const [index, raw] of claims.entries()) {
+        if (!object(raw)) continue;
+        const address: ClaimAddress = { project, container: reference(row), containerKind: V7_ATTEMPT_KIND,
+          pointer: `/claims/${index}`, claimId: String(raw['id']) };
+        let resolved: ReturnType<typeof proveClaimAddress>;
+        try { resolved = proveClaimAddress(store, address); }
+        catch (error) {
+          // Rejected or not-yet-applied acceptance is the lawful negative answer, never coverage.
+          if (error instanceof EngineError && error.code === 'claim_attempt_not_accepted') continue;
+          throw error;
+        }
+        const claim = resolved.claim as Record<string, unknown>;
+        if (!servesPlanQuestion(claim, planAnswer, question.planQuestionId)) continue;
+        serving++;
+        const scopeValue = object(claim['scope']) ? claim['scope']['variants'] : undefined;
+        const ground: AppliedCoverageGround = { claim: address, kind: String(claim['kind']),
+          text: String(claim['text']), contentKey: claimContentKey(store, address),
+          variants: scopeValue === 'common' ? 'common' : Array.isArray(scopeValue) ? scopeValue as Ref[] : [] };
+        if (ground.variants === 'common') { common.push(ground); continue; }
+        if (ground.variants.some(item => canonical(item) === canonical(variant.member))) grounds.push(ground);
+      }
+    }
+    const covered = grounds.length > 0;
+    return { cell, key: coverageCellKey(cell), covered, grounds, common,
+      missing: covered ? null : serving > 0
+        ? { code: 'coverage_no_variant_ground', message: 'The applied grounds serve the question but none is scoped to this exact member; common material and a foreign member never close it' }
+        : { code: 'coverage_no_applied_grounds', message: 'No claim of this question was accepted by the first application of a paid assessment' } };
+  });
+  return { verification: 'proven', project, scope, planAnswer, draft: value.draft,
+    set: value.set, member: value.member, cells, missing: cells.filter(cell => !cell.covered) };
 }
