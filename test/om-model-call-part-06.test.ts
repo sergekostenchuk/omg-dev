@@ -1,4 +1,4 @@
-import test from 'node:test';
+import test, { type TestContext } from 'node:test';
 import { packetPrompt } from '../src/om/packet-brief.js';
 import assert from 'node:assert/strict';
 import { types } from 'node:util';
@@ -18,7 +18,7 @@ import { storeView, readServer } from '../src/storage/store-view.js';
 import { transactionForTests } from '../src/om/atomic-gate.js';
 import { writeGuarded } from '../src/om/refs.js';
 import { type QuestionPacketRequest, writeQuestionPacket, prepareQuestionPacket, readQuestionPacket, type QuestionPacketRecord, readPartResult } from '../src/om/question-packet.js';
-import { seriesRequestOf, type RepairSeries } from '../src/om/series.js';
+import { readCompletionBinding, seriesRequestOf, type RepairSeries } from '../src/om/series.js';
 import { answerProducerOf, prepareAnswersGateTrace } from '../src/om/answers-gate.js';
 import { readCall, recordCall } from '../src/om/call-record.js';
 import { checkAnswerForm } from '../src/om/answer-form.js';
@@ -307,81 +307,94 @@ test('E4 cycle saves delivery overflow without a second dispatch or context trun
 
 
 
+async function e4WorksHandoff(t: TestContext, split: boolean) {
+  const f = e4WorksFixture(t, true), config = split ? f.environment(currentPacketWire(f.packet.value.packet, null) - 1) : f.configured;
+  const packet = split ? valueOf(writeQuestionPacket(f.store, { ...f.packetRequest, environment: reference(config) })).record : f.packet;
+  assert.equal(packet.value.state, 'ready'); assert.equal(packet.value.plan!.mode, split ? 'parts' : 'whole');
+  const count = packet.value.plan!.assignments.length;
+  assert.ok(split ? count > 1 : count === 1);
+  const request = { ...f.request, packet: reference(packet), dispatch: { ...f.request.dispatch, config: reference(config) } };
+  const payload = packet.value.packet as { requestId: string; works: { assigned: string[]; nodeAssignments: string[] } };
+  const beforeForm = f.store.list().map(reference), answer = f.answer(packet as Revision<QuestionPacketRecord>);
+  const raw = (body: object) => JSON.stringify({ ...body, requestId: payload.requestId });
+  const { bindings: _bindings, ...missing } = answer;
+  assert.equal(checkAnswerForm(f.store, { project: f.project, packet: reference(packet), raw: raw(missing) }).ok, false);
+  if (split) {
+    assert.deepEqual(payload.works.assigned, []); assert.ok(payload.works.nodeAssignments.length);
+    assert.equal(checkAnswerForm(f.store, { project: f.project, packet: reference(packet), raw: raw({ ...answer, bindings: f.bindings }) }).ok, false);
+  }
+  assert.deepEqual(f.store.list().map(reference), beforeForm); assert.equal(f.sent().length, 0);
+  f.steps(Array.from({ length: count }, (_, position) => ({ research: f.answer(packet as Revision<QuestionPacketRecord>, position), usage })));
+  const acceptedIds = [`graph:${f.project}`, `graph-layer:${f.project}:2`, `graph-layer:${f.project}:3`, `om-frame:${f.project}:3`];
+  const acceptedBefore = acceptedIds.map(id => f.store.get(id));
+  if (split) {
+    const writeMany = f.store.writeMany.bind(f.store); let stopped = false;
+    f.store.writeMany = ((writes, guards) => {
+      const saved = writeMany(writes, guards);
+      if (!stopped && writes.some(write => write.kind === 'part-result')) {
+        stopped = true; throw new Error('E4 stop after saved work part');
+      }
+      return saved;
+    }) as Store['writeMany'];
+    await assert.rejects(runModelCycle(f.store, request), /E4 stop after saved work part/);
+    f.store.writeMany = writeMany; assert.equal(f.sent().length, 1); f.restart();
+  }
+  const cycle = valueOf(await runModelCycle(f.store, request));
+  assert.equal(cycle.record.value.terminal, 'assembled'); assert.ok(cycle.assembly); assert.equal(f.sent().length, count);
+  const assembly = valueOf(readPartAssembly(f.store, { project: f.project, record: cycle.assembly }));
+  const expected = { contract: 'works-frame/v1', producer: reference(f.ledger.producer), ledger: reference(f.ledger.record), bindings: f.bindings };
+  assert.deepEqual(assembly.record.value.works, expected); assert.equal(assembly.proposal.value.worksContract, 'works-frame/v1');
+  assert.equal(assembly.proposal.value.status, 'proposed'); assert.equal(Object.hasOwn(assembly.proposal.value, 'bindings'), false);
+  const parts = cycle.record.value.results.map(record => valueOf(readPartResult(f.store, { project: f.project, record })));
+  assert.equal(parts.length, count);
+  parts.forEach((part, position) => {
+    const issued = f.store.get<QuestionPacketRecord>(part.record.value.request.packet.id, part.record.value.request.packet.revision)!;
+    const context = issued.value.packet as { works: { obligations: unknown[]; nodeAssignments: string[]; assigned: string[] } };
+    if (position > 0) {
+      const previous = (issued.value.packet as Record<string, any>).expansion.previous;
+      assert.deepEqual(previous.map((item: any) => item.tests), parts.slice(0, position).map(item => item.proposal.value.tests));
+      assert.deepEqual(previous.map((item: any) => item.edges), parts.slice(0, position).map(item => item.proposal.value.edges));
+    }
+    assert.deepEqual(context.works.obligations, f.ledger.handoff.obligations);
+    assert.deepEqual(context.works.nodeAssignments, payload.works.nodeAssignments);
+    assert.deepEqual(context.works.assigned, position === count - 1 ? payload.works.nodeAssignments : []);
+    assert.equal(issued.value.fingerprint!.chars, packetPrompt(issued.value.packet).length);
+    assert.ok(issued.value.fingerprint!.chars <= config.value.requestCapacityChars!);
+    assert.deepEqual(part.record.value.works, { ...expected, bindings: position === count - 1 ? f.bindings : [] });
+    const response = f.store.get<{ raw: string }>(part.record.value.request.response.id, part.record.value.request.response.revision)!;
+    assert.deepEqual(JSON.parse(response.value.raw).bindings, position === count - 1 ? f.bindings : []);
+    const runtime = cycle.record.value.steps[position]!;
+    const call = valueOf(readModelCall(f.store, { project: f.project, record: runtime.record }));
+    assert.equal(call.outcome?.kind, 'node-proposal');
+    if (call.outcome?.kind === 'node-proposal') assert.deepEqual(call.outcome.works, part.record.value.works);
+    assert.deepEqual(valueOf(readCall(f.store, f.project, reference(f.store.get(call.call.id)!))).value.usage, usage);
+  });
+  if (split) {
+    assert.ok(parts[0]!.proposal.value.nodes.some(node => node.id === f.work.id));
+    assert.deepEqual(parts.at(-1)!.proposal.value.nodes, []); assert.deepEqual(parts.at(-1)!.proposal.value.tests, []);
+  }
+  assert.deepEqual(acceptedIds.map(id => f.store.get(id)), acceptedBefore);
+  assert.equal(f.store.get<{attempts: {outcome: unknown}[]}>(f.series.id)!.value.attempts[0]!.outcome, null);
+  assert.equal(f.store.list('accepted-answer').length, 0);
+  const snapshot = f.store.list().map(reference); f.restart();
+  assert.deepEqual(valueOf(readPartAssembly(f.store, { project: f.project, record: cycle.assembly })).record, assembly.record);
+  assert.deepEqual(valueOf(assembleModelParts(f.store, { project: f.project, results: [...cycle.record.value.results] })).record, assembly.record);
+  valueOf(await runModelCycle(f.store, request)); valueOf(await runModelCall(f.store, request));
+  assert.deepEqual(f.store.list().map(reference), snapshot); assert.equal(f.sent().length, count);
+  return { f, packet, assembly, expected, count };
+}
+
+test('E4 works handoffs reach the assembly and the real completion binding of the managed attempt through whole and split dispatch', async t => {
+  for (const split of [false, true]) await t.test(split ? 'split' : 'whole', async t => {
+    const { f } = await e4WorksHandoff(t, split);
+    const binding = valueOf(readCompletionBinding(f.store, f.project, reference(f.series), 1));
+    assert.ok(binding, 'the managed attempt owns a real completion binding');
+  });
+});
+
 test('E4 carries checked works handoffs through local dispatch, split assembly, restart and exact late repeats without accepting L3', { todo: "NR1 №3646: согласованная перезапись цепочки до новейшей записи — om-fsck её не видит; решение позже" }, async t => {
   for (const split of [false, true]) await t.test(split ? 'split with prior work and test' : 'whole node', async t => {
-    const f = e4WorksFixture(t), config = split ? f.environment(currentPacketWire(f.packet.value.packet, null) - 1) : f.configured;
-    const packet = split ? valueOf(writeQuestionPacket(f.store, { ...f.packetRequest, environment: reference(config) })).record : f.packet;
-    assert.equal(packet.value.state, 'ready'); assert.equal(packet.value.plan!.mode, split ? 'parts' : 'whole');
-    const count = packet.value.plan!.assignments.length;
-    assert.ok(split ? count > 1 : count === 1);
-    const request = { ...f.request, packet: reference(packet), dispatch: { ...f.request.dispatch, config: reference(config) } };
-    const payload = packet.value.packet as { requestId: string; works: { assigned: string[]; nodeAssignments: string[] } };
-    const beforeForm = f.store.list().map(reference), answer = f.answer(packet as Revision<QuestionPacketRecord>);
-    const raw = (body: object) => JSON.stringify({ ...body, requestId: payload.requestId });
-    const { bindings: _bindings, ...missing } = answer;
-    assert.equal(checkAnswerForm(f.store, { project: f.project, packet: reference(packet), raw: raw(missing) }).ok, false);
-    if (split) {
-      assert.deepEqual(payload.works.assigned, []); assert.ok(payload.works.nodeAssignments.length);
-      assert.equal(checkAnswerForm(f.store, { project: f.project, packet: reference(packet), raw: raw({ ...answer, bindings: f.bindings }) }).ok, false);
-    }
-    assert.deepEqual(f.store.list().map(reference), beforeForm); assert.equal(f.sent().length, 0);
-    f.steps(Array.from({ length: count }, (_, position) => ({ research: f.answer(packet as Revision<QuestionPacketRecord>, position), usage })));
-    const acceptedIds = [`graph:${f.project}`, `graph-layer:${f.project}:2`, `graph-layer:${f.project}:3`, `om-frame:${f.project}:3`];
-    const acceptedBefore = acceptedIds.map(id => f.store.get(id));
-    if (split) {
-      const writeMany = f.store.writeMany.bind(f.store); let stopped = false;
-      f.store.writeMany = ((writes, guards) => {
-        const saved = writeMany(writes, guards);
-        if (!stopped && writes.some(write => write.kind === 'part-result')) {
-          stopped = true; throw new Error('E4 stop after saved work part');
-        }
-        return saved;
-      }) as Store['writeMany'];
-      await assert.rejects(runModelCycle(f.store, request), /E4 stop after saved work part/);
-      f.store.writeMany = writeMany; assert.equal(f.sent().length, 1); f.restart();
-    }
-    const cycle = valueOf(await runModelCycle(f.store, request));
-    assert.equal(cycle.record.value.terminal, 'assembled'); assert.ok(cycle.assembly); assert.equal(f.sent().length, count);
-    const assembly = valueOf(readPartAssembly(f.store, { project: f.project, record: cycle.assembly }));
-    const expected = { contract: 'works-frame/v1', producer: reference(f.ledger.producer), ledger: reference(f.ledger.record), bindings: f.bindings };
-    assert.deepEqual(assembly.record.value.works, expected); assert.equal(assembly.proposal.value.worksContract, 'works-frame/v1');
-    assert.equal(assembly.proposal.value.status, 'proposed'); assert.equal(Object.hasOwn(assembly.proposal.value, 'bindings'), false);
-    const parts = cycle.record.value.results.map(record => valueOf(readPartResult(f.store, { project: f.project, record })));
-    assert.equal(parts.length, count);
-    parts.forEach((part, position) => {
-      const issued = f.store.get<QuestionPacketRecord>(part.record.value.request.packet.id, part.record.value.request.packet.revision)!;
-      const context = issued.value.packet as { works: { obligations: unknown[]; nodeAssignments: string[]; assigned: string[] } };
-      if (position > 0) {
-        const previous = (issued.value.packet as Record<string, any>).expansion.previous;
-        assert.deepEqual(previous.map((item: any) => item.tests), parts.slice(0, position).map(item => item.proposal.value.tests));
-        assert.deepEqual(previous.map((item: any) => item.edges), parts.slice(0, position).map(item => item.proposal.value.edges));
-      }
-      assert.deepEqual(context.works.obligations, f.ledger.handoff.obligations);
-      assert.deepEqual(context.works.nodeAssignments, payload.works.nodeAssignments);
-      assert.deepEqual(context.works.assigned, position === count - 1 ? payload.works.nodeAssignments : []);
-      assert.equal(issued.value.fingerprint!.chars, packetPrompt(issued.value.packet).length);
-      assert.ok(issued.value.fingerprint!.chars <= config.value.requestCapacityChars!);
-      assert.deepEqual(part.record.value.works, { ...expected, bindings: position === count - 1 ? f.bindings : [] });
-      const response = f.store.get<{ raw: string }>(part.record.value.request.response.id, part.record.value.request.response.revision)!;
-      assert.deepEqual(JSON.parse(response.value.raw).bindings, position === count - 1 ? f.bindings : []);
-      const runtime = cycle.record.value.steps[position]!;
-      const call = valueOf(readModelCall(f.store, { project: f.project, record: runtime.record }));
-      assert.equal(call.outcome?.kind, 'node-proposal');
-      if (call.outcome?.kind === 'node-proposal') assert.deepEqual(call.outcome.works, part.record.value.works);
-      assert.deepEqual(valueOf(readCall(f.store, f.project, reference(f.store.get(call.call.id)!))).value.usage, usage);
-    });
-    if (split) {
-      assert.ok(parts[0]!.proposal.value.nodes.some(node => node.id === f.work.id));
-      assert.deepEqual(parts.at(-1)!.proposal.value.nodes, []); assert.deepEqual(parts.at(-1)!.proposal.value.tests, []);
-    }
-    assert.deepEqual(acceptedIds.map(id => f.store.get(id)), acceptedBefore);
-    assert.equal(f.store.get<{attempts: {outcome: unknown}[]}>(f.series.id)!.value.attempts[0]!.outcome, null);
-    assert.equal(f.store.list('accepted-answer').length, 0);
-    const snapshot = f.store.list().map(reference); f.restart();
-    assert.deepEqual(valueOf(readPartAssembly(f.store, { project: f.project, record: cycle.assembly })).record, assembly.record);
-    assert.deepEqual(valueOf(assembleModelParts(f.store, { project: f.project, results: [...cycle.record.value.results] })).record, assembly.record);
-    valueOf(await runModelCycle(f.store, request)); valueOf(await runModelCall(f.store, request));
-    assert.deepEqual(f.store.list().map(reference), snapshot); assert.equal(f.sent().length, count);
+    const { f, packet, assembly, expected, count } = await e4WorksHandoff(t, split);
     for (const substitute of [null, { ...expected, bindings: [] }]) {
       const value = structuredClone(assembly.record.value) as import('../src/om/model-call.js').PartAssemblyRecord;
       if (substitute) value.works = substitute as NonNullable<typeof value.works>; else delete value.works;

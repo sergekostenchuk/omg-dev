@@ -1,4 +1,4 @@
-import { packetPrompt, packetFingerprint, BRIEF_PACKET_CONTRACT, WORKS_BRIEF_PACKET_CONTRACT, BRIEF_VERSION, WORKS_BRIEF_VERSION } from '../src/om/packet-brief.js';
+import { packetPrompt, packetFingerprint, compactSchema, BRIEF_PACKET_CONTRACT, WORKS_BRIEF_PACKET_CONTRACT, BRIEF_VERSION, WORKS_BRIEF_VERSION } from '../src/om/packet-brief.js';
 import { measureAdapterWire, OM_CAPACITY_DELIVERY_CONTRACT, requireOmCapacityDelivery, type OmCapacityDelivery } from '../src/om/capacity-delivery.js';
 import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
@@ -2948,6 +2948,51 @@ test('G5 a works packet of the wake-test era: several covering tests and an expl
     rejected(check(misplaced), 'part_answer_invalid');
   }
   assert.deepEqual(snapshot(f.store), before, 'E3 writes nothing');
+});
+
+// G5: a stored packet replays the wake-test era its own issued bytes declare — the record mark names a step assigning a
+// producer end, it does not carry the schema form, so an unmarked record resolves its era by its issued bytes; a forged
+// revision dropping the mark of a wake-test packet is still refused.
+test('G5 a saved works packet replays its issued wake-test era exactly; a forged revision dropping the mark is refused without writes', async t => {
+  const f = await worksPacketFixture(t), request = f.request(), packet = ok(writeQuestionPacket(f.store, request)).record;
+  assert.equal(packet.value.wakeTests, true, 'The fixture assigns a producer end');
+  const before = snapshot(f.store);
+  assert.deepEqual(ok(prepareQuestionPacket(f.store, request)).record, packet);
+  assert.deepEqual(snapshot(f.store), before, 'A repeated preparation writes and pays nothing');
+  const { wakeTests: _wake, ...unmarked } = packet.value;
+  f.store.write({ id: packet.id, kind: packet.kind, expected: packet.revision, value: unmarked });
+  const forged = snapshot(f.store);
+  rejected(prepareQuestionPacket(f.store, request), 'packet_record_invalid');
+  assert.deepEqual(snapshot(f.store), forged, 'A substituted saved value writes nothing');
+});
+
+// G5: a pre-wake works packet record replays its own issued form. The ordinary localConnectors[].wakeTest field it
+// still carries is connector schema, not the G5 answer form, so it must not decide the era.
+test('G5 a pre-wake works packet record replays its issued form although its schema still carries ordinary connector wakeTest fields', async t => {
+  const f = await worksPacketFixture(t), request = f.request(), packet = ok(writeQuestionPacket(f.store, request)).record;
+  assert.equal(packet.value.wakeTests, true, 'The fixture assigns a producer end');
+  const legacy = clone(packet.value) as any, form = legacy.packet;
+  delete legacy.wakeTests;
+  const schema = form.responseForm.schema, fillsSchema = (branch: Record<string, any>, key: string) => {
+    const items = branch.properties?.proposal?.properties?.[key]?.items;
+    for (const variant of items?.oneOf ?? (items ? [items] : [])) delete variant?.properties?.wakeTest;
+  };
+  const text = form.brief.text as string, cut = text.indexOf('{"contract":"om-brief-response/v1"');
+  let depth = 0, end = -1;
+  for (let i = cut; i < text.length; i++) { const c = text[i]!; if (c === '{') depth++; else if (c === '}' && --depth === 0) { end = i + 1; break; } }
+  const blob = JSON.parse(text.slice(cut, end)), issued = canonical(form.brief.examples);
+  for (const branch of schema.oneOf ?? []) { fillsSchema(branch, 'fills'); fillsSchema(branch, 'replaces'); }
+  for (const example of form.brief.examples) for (const fill of example.proposal?.fills ?? []) delete fill.wakeTest;
+  blob.responseForm.schema = compactSchema(schema);
+  form.brief.text = `${text.slice(0, cut)}${canonical(blob)}${text.slice(end)}`.replace(issued, canonical(form.brief.examples));
+  assert.ok(JSON.stringify(schema).includes('"wakeTest"'), 'The ordinary connector wakeTest field remains');
+  legacy.fullChars = packetPrompt(legacy.packet).length;
+  legacy.fingerprint = packetFingerprint(legacy.packet);
+  const saved = f.store.write({ id: packet.id, kind: packet.kind, expected: packet.revision, value: legacy });
+  const before = snapshot(f.store), replayed = ok(prepareQuestionPacket(f.store, request));
+  assert.equal(replayed.record.revision, saved.revision);
+  assert.deepEqual(replayed.record.value, saved.value);
+  assert.deepEqual(snapshot(f.store), before, 'A repeated preparation writes and pays nothing');
 });
 
 // G6 (В4, №3869): the G5 invariant «one artifact per real work» is stated in the brief of a works packet of the transition

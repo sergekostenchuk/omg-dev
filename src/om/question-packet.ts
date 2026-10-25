@@ -1311,11 +1311,14 @@ function showsBindings(works: unknown): boolean {
   return object(works) && Array.isArray(works.obligations) && Array.isArray(works.assigned)
     && (works.obligations as Parameters<typeof taskBindingId>[0][]).some(row => (works.assigned as string[]).includes(taskBindingId(row)));
 }
-/** G5: the saved step keeps its own era; a root or part issued now is of the wake-test era (works brief packets only). */
-function wakeTestsEra(contract: QuestionPacketRecord['packetContract'], saved?: QuestionPacketRecord): boolean {
+/** G5: the saved step keeps its own era; a root or part issued now is of the wake-test era (works brief packets only).
+ * An unmarked saved record carries no era evidence of its own: the fields reach only steps assigning a producer end,
+ * which are marked. `null` = undecided here — the issued whole prompt is the witness, resolved at the encode below. */
+function wakeTestsEra(contract: QuestionPacketRecord['packetContract'], saved?: QuestionPacketRecord): boolean | null {
   if (saved && Object.hasOwn(saved, 'wakeTests') && (saved.wakeTests !== true || contract !== WORKS_BRIEF_PACKET_CONTRACT))
     fail('packet_record_invalid', saved.request.routes.id, 'wakeTests', 'Only a works brief packet declares the wake-test era');
-  return contract === WORKS_BRIEF_PACKET_CONTRACT && (saved ? saved.wakeTests === true : true);
+  if (contract !== WORKS_BRIEF_PACKET_CONTRACT) return false;
+  return !saved || saved.wakeTests === true ? true : null;
 }
 /** G6: the saved step keeps its own era; a step issued now is of the transition era (works brief packets only). */
 function transitionEraOf(contract: QuestionPacketRecord['packetContract'], saved?: QuestionPacketRecord): boolean {
@@ -1481,7 +1484,7 @@ function derivePacketOnce(store: Store, request: QuestionPacketRequest, current:
     const input = take(readOmInput(store, request.project, gaps.sources.input));
     const graph = take(readRecord<Graph>(store, gaps.sources.graph,
       { unit: 'E2', target: requestId, id: `graph:${request.project}`, kind: 'graph' }));
-    briefBasis = { ...(briefVersion ? { briefContract: briefVersion } : {}), ...(selection ? { selection } : {}), worksBindings: bindingsEra, wakeTests: wakeEra, project: request.project, node: batch.node ?? null, graph: graph.value as Graph,
+    briefBasis = { ...(briefVersion ? { briefContract: briefVersion } : {}), ...(selection ? { selection } : {}), worksBindings: bindingsEra, wakeTests: wakeEra === true, project: request.project, node: batch.node ?? null, graph: graph.value as Graph,
       gaps: batch.items.map(item => ({ question: item.gap, target: item.target, field: item.field, ref: item.record,
         evidence: json(gaps.records.find(row => same(reference(row), item.record))!.value.gap.evidence) })),
       contexts: unique([gaps.sources.input, gaps.sources.graph, ...input.value.input.sources.map(({ id, revision, hash }) => ({ id, revision, hash }))]),
@@ -1580,6 +1583,16 @@ function derivePacketOnce(store: Store, request: QuestionPacketRequest, current:
     const allIds = open.map(item => item.id).sort(order);
     const whole = { ...context, assigned: allIds, connections: connectionContext(frame.frame.upper, open) };
     packet = encode({ ...common, expansion: whole, ...(works ? { works } : {}) });
+    // An unmarked saved record keeps no era evidence of its own: the wake fields reach only producer ends, and the
+    // steps assigning them are marked. The witness left is the exact whole prompt it was issued with — both forms decide.
+    let era = wakeEra === true;
+    if (wakeEra === null && briefBasis && saved && saved.fullChars !== null && packetPrompt(packet).length !== saved.fullChars) {
+      briefBasis.wakeTests = true;
+      const issued = encode({ ...common, expansion: whole, ...(works ? { works } : {}) });
+      if (packetPrompt(issued).length === saved.fullChars) { era = true; packet = issued; }
+      else briefBasis.wakeTests = false;
+    }
+    if (era && holdsProducerEnd(open)) base.wakeTests = true;
     base.fullChars = packetPrompt(packet).length;
     base.plan = { mode: 'whole', assignments: [{ connector: null, obligations: allIds }], position: 0 };
     if (!bounded(packet, capacity.maxRequestChars) || base.capacityDelivery && !wireFits(packet)) {
@@ -1596,7 +1609,7 @@ function derivePacketOnce(store: Store, request: QuestionPacketRequest, current:
         return { value: base, guards: unique(guards), references: unique(references), writes: routeWrites, ...(briefBasis ? { briefBasis } : {}) };
       const assignment = assignments[request.previous.length]!;
       const assigned = open.filter(item => assignment.obligations.includes(item.id));
-      if (wakeEra && holdsProducerEnd(assigned)) base.wakeTests = true; else delete (base as { wakeTests?: true }).wakeTests;
+      if (era && holdsProducerEnd(assigned)) base.wakeTests = true; else delete (base as { wakeTests?: true }).wakeTests;
       // E2.2 (№1801, row 4): a part carries the causes of the questions it actually sends, never of the whole node.
       const sent = questions.filter(item => assignment.obligations.includes(item.target));
       packet = encode({ ...common, questions: sent,
