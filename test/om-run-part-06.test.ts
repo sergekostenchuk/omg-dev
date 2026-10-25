@@ -3,7 +3,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { mkdirSync, writeFileSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import type { Write } from "../src/storage/store.js";
+import { Store, type Write } from "../src/storage/store.js";
 import { configureDispatch } from "../src/om/dispatch.js";
 import { canonical, type Json } from "../src/canonical.js";
 import { reference, type Ref } from "../src/pipeline/contracts.js";
@@ -486,11 +486,27 @@ test("AT1 door: an unresolved transition refused by G5 is asked in B1 once, rese
   git(f.root, ["-c", "user.name=OMG Test", "-c", "user.email=test@example.invalid", "commit", "-q", "-m", "base"]);
   ok(startRun(f.store, { project }));
   const performed: string[] = [], answered = new Set<string>(), forms: unknown[] = [];
-  let applied = false, restarted = false, last: unknown = null;
+  let applied = false, restarted = false, last: unknown = null, seenPending = false;
   for (let index = 0; index < 500 && !worksAcceptance(f.store).frame; index++) {
     const advanced = ok(await advanceRun(f.store, f.request));
     const action = advanced.performed?.action ?? "";
     if (action) performed.push(action);
+    // LG24 (№12218): the refusal is the real producer's saved G5 — before its question reaches B1 the pending read
+    // answers true, and does so cold, through a second Store on the same database; the read itself writes nothing.
+    if (!seenPending) {
+      const row = f.store.list<{ result: { findings: { code: string }[] } }>("om-atomic-gate")
+        .find(item => item.value.result.findings.some(finding => finding.code === "work_impact_unresolved"));
+      if (row) {
+        seenPending = true;
+        const heads = f.store.list().map(reference);
+        const other = new Store(f.database);
+        try {
+          const cold = readinessPending(other, project, reference(row));
+          assert.ok(cold.ok && cold.value === true, "a saved refused G5 has its transition pending — read cold on a second Store");
+        } finally { other.close(); }
+        assert.deepEqual(f.store.list().map(reference), heads, "the pending check read but never wrote");
+      }
+    }
     // A crash right after the B1 transition: the pass goes on from the store, asking nothing twice.
     if (action === "readiness" && !restarted) { restarted = true; f.restart(); }
     if (action === "apply" && f.store.get<OmInputRecord>(`om-input:${project}`)!.value.input.facts?.some(fact => fact.question.readiness) && !applied) {
@@ -544,8 +560,30 @@ test("AT1 door: an unresolved transition refused by G5 is asked in B1 once, rese
   assert.deepEqual(worksAcceptance(f.store).frame, true, "Layer 3 is written");
   // The repeat: the gate's question is answered — nothing is pending and the same transition writes no new B1.
   assert.equal(ok(readinessPending(f.store, project, reference(refused!))), false);
+  // LG24 (№12218): the same on a second Store — the held question is not pending on a cold read either.
+  const cold = new Store(f.database);
+  try {
+    const held = readinessPending(cold, project, reference(refused!));
+    assert.ok(held.ok && held.value === false, "cold: the held question is not pending on a new Store");
+  } finally { cold.close(); }
   const derivation = f.store.history(input.id).map(row => (row.value as unknown as OmInputRecord).derivation).find(row => row && "kind" in row && row.kind === "readiness")!;
   assert.deepEqual(ok(writeReadinessInput(f.store, { project, input: (derivation as { previous: Ref }).previous, gate: reference(refused!) })).value.derivation, derivation);
   assert.equal(f.store.get(input.id)!.revision, input.revision);
+  // LG24: a copy of this saved gate forged to the earlier or an unknown contract, or losing its contract or its impact,
+  // is refused record_forged at its own address by the common readiness source — never silently false.
+  const copied = () => structuredClone(refused!.value) as Record<string, Json>;
+  const forged: [string, Json][] = [["earlier-v1", { ...copied(), contract: "om-atomic-gate/v1" } as Json],
+    ["unknown-contract", { ...copied(), contract: "om-atomic-gate/v9" } as Json],
+    ["absent-contract", (() => { const value = copied(); delete value.contract; return value; })()],
+    ["absent-impact", (() => { const value = copied(); delete value.impact; return value; })()]];
+  const copies = forged.map(([name, value]) => [name,
+    reference(f.store.write({ id: `om-atomic-gate:${project}:lg24-${name}`, kind: "om-atomic-gate", expected: 0, value }))] as const);
+  const untouched = f.store.list().map(reference);
+  for (const [name, copy] of copies) {
+    const result = readinessPending(f.store, project, copy);
+    assert.ok(!result.ok, `${name}: ${JSON.stringify(result)}`);
+    assert.deepEqual([result.refusal.code, result.refusal.at], ["record_forged", { unit: "G1", target: copy.id, field: "impact", ref: copy }], name);
+  }
+  assert.deepEqual(f.store.list().map(reference), untouched, "the forged checks read but never wrote");
 });
 test("AT1 policy: a durable work's state policy is asked once at its producer and decided by the model in the bypass; the works refer to it and pass G5", async t => policyDoor(t, false));
