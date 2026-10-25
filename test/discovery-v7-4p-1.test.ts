@@ -345,3 +345,64 @@ for (const move of ['selection', 'mode'] as const) test(`4P.1: a second Store mo
     assert.deepEqual(readCurrentVariantScope(f.store, 'p', f.scope!.draft).choice.ref, reference(act.decision));
   }
 });
+
+test('4P.1: a scope over a real but unadmitted model choose (state=null) proves nothing even historically', async t => {
+  const f = await paid(t), mode = modeOf(f.store, 'bypass');
+  f.reply({ action: 'choose', key: 'v1', reason: 'Real paid model choice' });
+  const calibration = reference(f.store.write({ id: 'transport-fixture:scope-unadmitted-calibration', kind: 'transport-fixture', expected: 0, value: { projectId: 'p' } }));
+  for (const role of [f.environment.value.implementer, f.environment.value.reviewer])
+    await researchCall(role, f.environment.value, 'Calibrate decision', { variantSubject: { contract: VARIANT_SUBJECT_CONTRACT,
+      kind: 'decision', set: calibration, mode: reference(mode), expectedSelection: null }, history: [] }, undefined,
+      { store: f.store, draftId: f.calibration.draft.id, questionId: f.calibration.question.id, purpose: 'variant-decision' });
+  const input: VariantSessionInput = { projectId: 'p', environment: f.environment, role: f.environment.value.implementer, prompt: 'Choose from the exact paid set',
+    variantSubject: { contract: VARIANT_SUBJECT_CONTRACT, kind: 'decision', set: reference(f.set!), mode: reference(mode), expectedSelection: reference(f.state1) } };
+  const prepared = prepareVariantSession(f.store, input), v = prepared.intent.value;
+  await researchCall(v.role, v.dispatch, v.cursor.prompt, v.cursor.context, undefined,
+    { store: f.store, draftId: v.draft.id, questionId: v.question.id, purpose: v.kind, consumerIntent: reference(prepared.intent), session: v.owner });
+  modeOf(f.store, 'questions');
+  applyVariantSession(f.store, 'p', reference(f.store.get(prepared.intent.id)!));
+  const model = f.store.list<VariantModelDecision>('discovery-variant-model-decision').find(row => row.value.projectId === 'p')!;
+  assert.equal(readVariantModelDecision(f.store, 'p', reference(model)).state, null, 'the real stale result kept no admitted state');
+  // An explicit negative: a structurally exact scope over the real unadmitted decision, written by hand at its canonical address.
+  const value = { contract: VARIANT_SCOPE_CONTRACT, projectId: 'p', draft: model.value.draft, set: model.value.set,
+    member: (model.value.outcome as { kind: string; member: Ref }).member, decision: reference(model), mode: model.value.mode };
+  const scope = reference(f.store.write({ id: variantRecordId(VARIANT_SCOPE_KIND, value), kind: VARIANT_SCOPE_KIND, expected: 0, value }));
+  const before = history(f.store);
+  refuses(() => readVariantScope(f.store, 'p', scope), 'discovery_variant_scope_invalid');
+  refuses(() => publishVariantScope(f.store, 'p', reference(model)), 'discovery_variant_scope_invalid');
+  assert.deepEqual(history(f.store), before, 'the refusals write nothing');
+});
+
+test('4P.1: a manufactured state returning the rejected old choice is not the current selection', async t => {
+  const f = await paid(t), m = mint(f.store, f.scope!);
+  const first = answerVariantChoice(f.store, f.scope!, m.authority);
+  const scope1 = publishVariantScope(f.store, 'p', reference(first.decision)).scope;
+  const rejected = revised(f.scope!, first, 'reject_all');
+  const last = answerVariantChoice(f.store, rejected, mint(f.store, rejected).authority);
+  const stateId = variantStateId('p', f.scope!.draft.id);
+  // An explicit negative: the next state revision copies the first choice while naming the rejection head as previous.
+  const forged = { ...last.state.value, decision: reference(first.decision), previous: reference(last.state) };
+  f.store.write({ id: stateId, kind: 'discovery-variant-state', expected: last.state.revision, value: forged });
+  const before = history(f.store);
+  refuses(() => readCurrentVariantScope(f.store, 'p', f.scope!.draft), 'discovery_variant_scope_invalid');
+  assert.deepEqual(history(f.store), before, 'the refusal writes nothing');
+  assert.equal(readVariantScope(f.store, 'p', reference(scope1)).verification, 'proven', 'the lawful old scope stays historically proven');
+  refuses(() => readCurrentVariantScope(f.store, 'p', f.scope!.draft), 'discovery_variant_scope_invalid');
+});
+
+test('4P.1: the draft argument is matched as the full exact Ref — a foreign hash, a wrong revision and a second real draft revision all refuse', async t => {
+  const f = await paid(t), m = mint(f.store, f.scope!);
+  const act = answerVariantChoice(f.store, f.scope!, m.authority);
+  publishVariantScope(f.store, 'p', reference(act.decision));
+  const draft = f.scope!.draft, before = history(f.store);
+  refuses(() => readCurrentVariantScope(f.store, 'p', { ...draft, hash: '0'.repeat(64) }), 'discovery_variant_scope_invalid');
+  refuses(() => readCurrentVariantScope(f.store, 'p', { ...draft, revision: draft.revision + 7 }), 'discovery_variant_scope_invalid');
+  assert.deepEqual(history(f.store), before, 'the refusals write nothing');
+  // An explicit negative: a second real revision of the same draft record; the selection still stands on the first.
+  const firstDraft = f.store.get(draft.id, draft.revision)!.value as Record<string, unknown>;
+  const second = reference(f.store.write({ id: draft.id, kind: 'discovery-draft', expected: draft.revision,
+    value: { ...firstDraft, title: 'A second manufactured draft revision' } as never }));
+  assert.notEqual(second.revision, draft.revision);
+  refuses(() => readCurrentVariantScope(f.store, 'p', second), 'discovery_variant_scope_invalid');
+  assert.deepEqual(readCurrentVariantScope(f.store, 'p', draft).choice.ref, reference(act.decision), 'the exact first revision still proves');
+});

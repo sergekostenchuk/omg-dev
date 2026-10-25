@@ -90,11 +90,14 @@ function requireCurrentState(store: Store, project: string, choice: ProvenVarian
 }
 
 /** The evidential reader: the exact scope Ref proven through its decision door and its paid generation, independent of
- * today's mode/state heads — after a later choice the old scope stays provable and is never reactivated. */
+ * today's mode/state heads — after a later choice the old scope stays provable and is never reactivated. A paid choice
+ * whose application admitted no state (a stale model result, state=null) grounds no scope even historically. */
 export function readVariantScope(store: Store, project: string, ref: Ref): ProvenVariantScope {
   requireStore(store, project);
   const record = readVariantScopeStructural(store, project, ref).record;
   const choice = provenChoice(store, project, record.value.decision);
+  if (choice.state === null)
+    scopeInvalid('state', 'A scope grounds a choice whose application proved its admitted state', ref);
   const generation = provenGeneration(store, project, choice, ref);
   return { verification: 'proven', scope: record, generation, choice };
 }
@@ -129,9 +132,13 @@ export function readCurrentVariantScope(store: Store, project: string, draft: Re
   const stateId = variantStateId(project, draft.id), head = store.get<VariantState>(stateId);
   if (!head) scopeRequired('state', 'The draft has no published variant state yet', draft);
   const state = readVariantStateStructural(store, project, draft.id, reference(head)).record;
+  if (!variantSame(state.value.draft, draft))
+    scopeInvalid('draft', 'The current selection stands on another exact draft revision', draft);
   if (state.value.set === null || state.value.decision === null)
     scopeRequired('decision', 'A no_variants result selects no variant', reference(head));
   const choice = provenChoice(store, project, state.value.decision);
+  if (choice.state === null || !variantSame(reference(head), choice.state))
+    scopeInvalid('state', 'The current head is not the state this choice\'s application proved', reference(head));
   const value = scopeValue(project, choice);
   const published = store.get<VariantScope>(variantRecordId(VARIANT_SCOPE_KIND, value));
   if (!published) scopeRequired('scope', 'The scope of the current choice is not published for the requiring path', reference(head));
