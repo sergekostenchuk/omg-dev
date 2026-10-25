@@ -4,6 +4,7 @@ import { variantTransportSubject, requireVariantContext, packetVariantSubject, v
 import { callAddressesSubject, sameSubject, planSubjectOf, type V7PlanSubject } from './v7-managed-attempt.js';
 import { AsyncLocalStorage } from "node:async_hooks";
 import type { Store, ReadGuard, Revision, TransactionGuard } from '../storage/store.js';
+import { provenStore } from '../storage/store-view.js';
 import { canonical, hashJson } from '../canonical.js';
 import { requireCondition } from '../errors.js';
 import type { ModelCall } from '../runtime/model-usage.js';
@@ -178,7 +179,7 @@ function deepIdentityCallsAt(store: Store, preparation: Ref, purpose: string, ac
     return canonical(intent?.value.cursor?.deepPreparation ?? null) === target;
   };
   const candidates = new Map(store.list<ModelCall>('model-call').map(call => [call.id, call]));
-  for (const { id } of store.identities('prefix', 'model-call:consumer:v1:')) {
+  for (const { id } of (provenStore(store) ?? store).identities('prefix', 'model-call:consumer:v1:')) {
     if (candidates.has(id)) continue;
     const first = store.get<ModelCall>(id, 1), head = store.get<ModelCall>(id);
     if (!mentions(first?.value) && !mentions(head?.value)) continue;

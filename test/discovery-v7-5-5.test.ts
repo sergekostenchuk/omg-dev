@@ -5,6 +5,7 @@ import { canonical, hashJson, type Json } from '../src/canonical.js';
 import { reference, type Ref } from '../src/pipeline/contracts.js';
 import { EngineError } from '../src/errors.js';
 import { Store, type Revision } from '../src/storage/store.js';
+import { storeView } from '../src/storage/store-view.js';
 import { uniqueTransactionGuards } from '../src/runtime/environment.js';
 import { processStart } from '../src/runtime/process-identity.js';
 import type { DiscoveryDraft, Question } from '../src/discovery/discovery.js';
@@ -174,18 +175,17 @@ async function ready(t: test.TestContext, model = false) {
   const preparation = produceDeepPreparation(f.store, 'p', inputFor(f, scope)).record;
   f.reply({ action: 'answer', question: 'q-industry', value: end, citations: [] });
   const input = { projectId: 'p', deepPreparation: reference(preparation), environment: f.environment };
-  return { ...f, scopeRecord: scope, preparation, input };
+  return { ...f, get store() { return interceptions.get(f.store) ?? f.store; }, scopeRecord: scope, preparation, input };
 }
 type Ready = Awaited<ReturnType<typeof ready>>;
-function intercept(store: Store, action: (writes: Write[], guards: TransactionGuard[], write: () => Revision<unknown>[]) => Revision<unknown>[]) {
-  const descriptor = Object.getOwnPropertyDescriptor(store, 'writeMany');
-  const saved = store.writeMany.bind(store);
-  store.writeMany = ((writes: Write[], guards: TransactionGuard[] = []) => action(writes, guards, () => saved(writes, guards))) as Store['writeMany'];
-  return () => {
-    if (descriptor) Object.defineProperty(store, 'writeMany', descriptor);
-    else Reflect.deleteProperty(store, 'writeMany');
-  };
+const interceptions = new WeakMap<Store, Store>();
+function intercept(store: Store, action: (writes: Write[], guards: TransactionGuard[], write: () => Revision[]) => Revision[]) {
+  assert.equal(interceptions.has(store), false);
+  const view = storeView(store, { write: (writes, guards) => action(writes, guards, () => store.writeMany(writes, guards)) });
+  interceptions.set(store, view);
+  return () => { interceptions.delete(store); };
 }
+
 function cut(f: Ready, point: 'before'|'after') {
   return intercept(f.store, (writes, _guards, write) => {
     if (writes.some(w => w.kind === 'research-turn' && w.expected === 0)) {
@@ -514,4 +514,21 @@ test('5.5 a refused reservation leaves its exact paused owner unchanged', async 
   assert.ok(expected); assert.equal(activated, true);
   assert.deepEqual(f.store.get(paused.id), paused);
   assert.equal(all(f.store), expected); assert.deepEqual(money(f.store), account); assert.equal(f.wires().length, sent);
+});
+
+
+test('5.5 a prepared head cannot erase its immutable deep identity through the common transport', async t => {
+  const f = await ready(t), intent = prepareDeepResearch(f.store, f.input);
+  const value = structuredClone(intent.value);
+  delete value.cursor.deepPreparation;
+  for (const key of ['deepPreparation', 'deepCell', 'deepScope']) delete value.cursor.context[key];
+  const masked = f.store.write({ id: intent.id, kind: intent.kind, expected: intent.revision, value });
+  const before = all(f.store), account = money(f.store), sent = f.wires().length;
+  const cold = new Store(f.store.path); t.after(() => cold.close());
+  for (const store of [f.store, cold]) {
+    await assert.rejects(researchCall(value.role, value.dispatch, value.cursor.instruction, value.cursor.context, undefined,
+      { store, draftId: value.draft.id, questionId: value.question.id, purpose: 'analyst',
+        consumerIntent: reference(masked), session: value.owner }), EngineError);
+    assert.equal(all(store), before); assert.deepEqual(money(store), account); assert.equal(f.wires().length, sent);
+  }
 });

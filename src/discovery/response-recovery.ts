@@ -1858,6 +1858,7 @@ export function prepareResearchConsumerReservation(store: Store, intentRef: Ref,
       ? 'analyst' : intent.value.kind))
     consumerInvalid(intent.id, 'The pending physical claim is not the exact admitted consumer call');
   const deepRef = deepPreparationRef(intent.value.cursor);
+  requireDeepConsumerBinding(store, intent);
   if (Object.hasOwn(call.value, 'deepPreparation') !== (deepRef !== null)
     || deepRef && canonical((call.value as Record<string, unknown>).deepPreparation ?? null) !== canonical(deepRef))
     consumerInvalid(intent.id, 'The new call and admitted cursor must retain the same explicit deep identity');

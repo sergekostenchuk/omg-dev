@@ -60,7 +60,7 @@ import { decodeVariantGeneration, decodeVariantDecisionAnswer, decodeVariantExec
 import { recoveryDispatchBoundary, operatorReplayedResponse, assessmentSessionEra, isResponseRecovery,
   readResearchConsumerIntent, resumeResearchConsumerExecution,
   refuseResearchConsumerIntent, prepareResearchConsumerReservation, consumerIntentContext, CONSUMER_INTENT_V2,
-  type ResearchConsumerIntent } from './response-recovery.js';
+  requireDeepConsumerBinding, type ResearchConsumerIntent } from './response-recovery.js';
 import { ARCHIVE_PARTS_CONTRACT } from './request-parts.js';
 import type { RecoverableContextSession } from './context-recovery.js';
 import { projectResearchPhysicalReply, SYNTHESIS_SESSION_V3_PREFIX } from './research-consumer-transition.js';
@@ -388,6 +388,9 @@ async function dispatchResearchCall(role: RoleBinding, environment: Environment,
       const head = audit.store.get<ResearchConsumerIntent>(supplied.id);
       requireCondition(head, 'research_consumer_intent_invalid', 'The selected consumer intent disappeared');
       consumerIntent = readResearchConsumerIntent(audit.store, reference(head));
+      // New dispatch/replay classifies deep by immutable admission before any
+      // packing side effect; a masked prepared head cannot enter broad transport.
+      requireDeepConsumerBinding(audit.store, consumerIntent);
     }
     requireCondition(consumerIntent.value.projectId === environment.projectId && consumerIntent.value.draft.id === audit.draftId
       && consumerIntent.value.question.id === audit.questionId && canonical(consumerIntent.value.role) === canonical(role)
