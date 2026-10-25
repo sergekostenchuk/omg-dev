@@ -999,41 +999,55 @@ test("absent arguments, sets and fields fail with typed codes before field acces
   assert.equal(f.store.history(admitted.call.id).length, 1);
 });
 
+/**
+ * LG07 (№13951): the carriers of the masquerade tests on the current route. The own ordinary carrier f and the clean one each hold
+ * a managed attempt with a real completion binding; beside the own attempt stands the managed block of a second project with its
+ * real attempt 1 — the foreign series. A graph holds only its project's blocks, so that block is beta's own consume block.
+ * Completions and series come from their producers.
+ */
+function masqueradeBase(t: test.TestContext) {
+  const f = ordinary(t, "masquerade");
+  const beta = managedBlock(f.store, { root: f.root, path: f.path }, "beta");
+  deliveredOf(openSeries(f.store, { ...beta.address(), slice: "slice:beta-cart@1", predecessor: null, basis: null }));
+  const foreign = beta.open(1);
+  const clean = ordinary(t, "call-masquerade");
+  assert.ok(deliveredOf(readCompletionBinding(f.store, PROJECT, reference(f.series), 1)), "The own attempt is managed: its completion binding is real");
+  assert.ok(deliveredOf(readCompletionBinding(f.store, "beta", reference(foreign), 1)), "The foreign attempt is managed too: its completion binding is real");
+  assert.ok(deliveredOf(readCompletionBinding(clean.store, PROJECT, reference(clean.series), 1)), "The clean carrier is managed: its completion binding is real");
+  assert.deepEqual(deliveredOf(readSeriesAt(f.store, "beta", reference(foreign))), foreign);
+  assert.equal(foreign.value.projectId, "beta"); assert.equal(foreign.value.block, beta.block);
+  return { f, foreign, clean };
+}
+
 test("foreign series, forged hashes and status masquerades cannot stand for exact sources", { todo: "NR1 №3646: согласованная перезапись цепочки до новейшей записи — om-fsck её не видит; решение позже" }, t => {
-  const f = fixture(t, "masquerade");
-  deliveredOf(openSeries(f.store, {
-    project: "beta", block: BLOCK, line: 1, slice: "slice:beta-cart@1", predecessor: null, basis: null,
-  }));
-  const foreign = deliveredOf(beginAttempt(f.store, {
-    project: "beta", block: BLOCK, line: 1, attempt: 1, goal: f.goal,
-  }));
-  addressed(recordCall(f.store, PROJECT, request(f, { series: reference(foreign) })), "call_series_unresolved");
-  addressed(recordCall(f.store, PROJECT, request(f, {
+  const { f, foreign, clean } = masqueradeBase(t);
+  // The request names the foreign block too: only the project makes this series foreign.
+  addressed(recordCall(f.store, PROJECT, lawful(f, { block: foreign.value.block, series: reference(foreign) })), "call_series_unresolved");
+  addressed(recordCall(f.store, PROJECT, lawful(f, {
     dispatch: { adapter: { ...reference(f.adapter), hash: "f".repeat(64) }, config: reference(f.config) },
   })), "dispatch_contract_unresolved");
 
   const disguised = f.store.write({
-    id: seriesId(PROJECT, BLOCK, 2), kind: "repair-series", expected: 0,
-    value: { projectId: PROJECT, block: BLOCK, line: 2, status: "accepted" },
+    id: seriesId(PROJECT, f.block, 2), kind: "repair-series", expected: 0,
+    value: { projectId: PROJECT, block: f.block, line: 2, status: "accepted" },
   });
-  addressed(recordCall(f.store, PROJECT, request(f, { series: reference(disguised) })), "call_series_unresolved");
+  addressed(recordCall(f.store, PROJECT, lawful(f, { series: reference(disguised) })), "call_series_unresolved");
   const emptySeries = f.store.write({
-    id: seriesId(PROJECT, BLOCK, 3), kind: "repair-series", expected: 0, value: null,
+    id: seriesId(PROJECT, f.block, 3), kind: "repair-series", expected: 0, value: null,
   });
-  addressed(recordCall(f.store, PROJECT, request(f, { series: reference(emptySeries) })), "call_series_unresolved");
+  addressed(recordCall(f.store, PROJECT, lawful(f, { series: reference(emptySeries) })), "call_series_unresolved");
   const longBlock = "block:" + "x".repeat(220);
   const longSeries = f.store.write({
     id: "repair-series:forged-long", kind: "repair-series", expected: 0,
     value: { projectId: PROJECT, block: longBlock, line: 1 },
   });
-  addressed(recordCall(f.store, PROJECT, request(f, {
+  addressed(recordCall(f.store, PROJECT, lawful(f, {
     block: longBlock, series: reference(longSeries),
   })), "call_series_unresolved");
 
   // A malformed record occupying the successor address also blocks fresh work on the predecessor.
-  addressed(recordCall(f.store, PROJECT, request(f)), "call_series_unresolved");
-  const clean = fixture(t, "call-masquerade");
-  const admitted = deliveredOf(recordCall(clean.store, PROJECT, request(clean)));
+  addressed(recordCall(f.store, PROJECT, lawful(f)), "call_series_unresolved");
+  const admitted = deliveredOf(recordCall(clean.store, PROJECT, lawful(clean)));
   const forged = clean.store.write({
     id: admitted.call.id, kind: CALL_RECORD_KIND, expected: admitted.call.revision,
     value: {
@@ -1048,6 +1062,20 @@ test("foreign series, forged hashes and status masquerades cannot stand for exac
   });
   addressed(settleCall(clean.store, reference(emptyCall), usage, "succeeded"), "call_record_invalid");
   assert.equal(heldLedger(clean)!.revision, 1);
+});
+
+test("E1 admission beside a real foreign managed series: the own and the clean ordinary carrier each admit their lawful call and read it back exactly", t => {
+  const { f, clean } = masqueradeBase(t);
+  for (const carrier of [f, clean]) { assert.equal(lawfulCall(carrier), null); assert.equal(heldLedger(carrier), null); }
+  // The foreign series stands beside the own attempt, yet the own lawful call is admitted: the masquerade test's refusal of that series is no broken own input.
+  for (const carrier of [f, clean]) {
+    const admitted = deliveredOf(recordCall(carrier.store, PROJECT, lawful(carrier)));
+    assert.equal(admitted.repeated, false);
+    assert.deepEqual(lawfulCall(carrier), admitted.call);
+    assert.deepEqual(deliveredOf(readCall(carrier.store, PROJECT, reference(admitted.call))), admitted.call);
+    assert.equal(admitted.ledger.revision, 1);
+    assert.deepEqual(heldLedger(carrier), admitted.ledger);
+  }
 });
 
 test("every record and settlement path rejects partial or total ledger loss derived from saved calls", async t => {
