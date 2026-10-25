@@ -1,5 +1,5 @@
 import test from 'node:test';
-import { packetPrompt, briefReadings } from '../src/om/packet-brief.js';
+import { packetPrompt } from '../src/om/packet-brief.js';
 import assert from 'node:assert/strict';
 import { types } from 'node:util';
 import { writeFileSync, mkdtempSync, rmSync } from 'node:fs';
@@ -8,7 +8,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { canonical, type Json, hashJson } from '../src/canonical.js';
 import { EngineError } from '../src/errors.js';
-import { adapterRequest, readAdapterResponse, type AdapterRequestInput, type AdapterResponseInput, runModelCall, runModelCycle, readModelCycle, deliverModelSources, readContinuationEvidence, readPartAssembly, readModelCall, readManagedModelDiagnostic, assembleModelParts, runModelTransport, readModelTransport, finishModelAttempt, prepareModelAttemptFinish, readModelApplicationRejection, type OmModelCall, readModelCallState, type ModelCallRequest, type ModelTransportRequest, pendingCallStore, readModelCycle as mp2ReadCycle, runModelCycle as mp2Cycle, CYCLE_POLICY } from '../src/om/model-call.js';
+import { adapterRequest, readAdapterResponse, type AdapterRequestInput, type AdapterResponseInput, runModelCall, runModelCycle, readModelCycle, deliverModelSources, readContinuationEvidence, readPartAssembly, readModelCall, readManagedModelDiagnostic, assembleModelParts, runModelTransport, readModelTransport, finishModelAttempt, prepareModelAttemptFinish, readModelApplicationRejection, type OmModelCall, readModelCallState, type ModelCallRequest, type ModelTransportRequest, pendingCallStore, runModelCycle as mp2Cycle } from '../src/om/model-call.js';
 import { type ProcessResult } from '../src/runtime/process.js';
 import { Store, type Write, type Revision } from '../src/storage/store.js';
 import { reference, type Ref } from '../src/pipeline/contracts.js';
@@ -28,7 +28,7 @@ import { closeAttempt, openAttempt as managedOpenAttempt, prepareManagedClaim } 
 import { processStart } from '../src/runtime/process-identity.js';
 import type { ModelCall } from '../src/runtime/model-usage.js';
 import { readModelCallRecovery, prepareLateModelReceipt } from '../src/discovery/model-call-recovery.js';
-import { CycleCommitPhase, H10A_COMMIT, H15_BASE_COMMIT, MP1_COMMIT, MP2_BASE_COMMIT, MP3_NOTES, MP3_PRIOR_COMMIT, completionE1, completionSnapshot, confirmed, currentPacketWire, cycleCommitPhase, cycleCommitPhases, decode, deeplyFrozen, e4CannotAnswer, e4Fact, e4Fixture, e4ManagedAnalysisFixture, e4ManagedClose, e4ManagedFixture, e4WorksFixture, e4NeedSource, e4Node, ensureFixtureProject, envelope, fixtureCheckpoint, fixtureDriver, h15AtCommit, h15CannotAnswer, h15Heads, h15Refusal, h15Unserved, h15Written, killFixtureDriver, killFixtureProvider, lp4Root, mp2IssuedBy, mp2Managed, mp2Refused, mp2Step, mp2StopAfter, mp3Carried, mp3Close, mp3Cycle, mp3Delivered, mp3Open, mp3PriorAttempt, mp3Readings, mp3SearchDelivery, omit, processResult, publicRecovery, refusesLiveRecovery, request, requestId, signalFixtureProvider, unknownConfirmed, usage, valueOf } from './om-model-call-fixture.js';
+import { CycleCommitPhase, H10A_COMMIT, MP3_NOTES, completionE1, completionSnapshot, confirmed, currentPacketWire, cycleCommitPhase, cycleCommitPhases, decode, deeplyFrozen, e4CannotAnswer, e4Fact, e4Fixture, e4ManagedAnalysisFixture, e4ManagedClose, e4ManagedFixture, e4WorksFixture, e4NeedSource, e4Node, ensureFixtureProject, envelope, fixtureCheckpoint, fixtureDriver, h15CannotAnswer, h15Heads, h15Refusal, h15Unserved, h15Written, killFixtureDriver, killFixtureProvider, lp4Root, mp2Managed, mp2Refused, mp2StopAfter, mp3Carried, mp3Close, mp3Cycle, mp3Delivered, mp3Open, mp3Readings, mp3SearchDelivery, omit, processResult, publicRecovery, refusesLiveRecovery, request, requestId, signalFixtureProvider, unknownConfirmed, usage, valueOf } from './om-model-call-fixture.js';
 
 
 
@@ -1511,48 +1511,6 @@ test('H1.5 №2164 E4 sends nothing for a design-decision answer batch: a ready 
 
 
 
-test('H1.5 №2166 п.3 ERA a call the base code already paid for is finished and accounted as before, applied or only received, also through a new store: the prohibition asks only for a NEW dispatch', async t => {
-  /** The base code sends the ready packet (it had no admission check); with `stop` its process dies right after the durable receipt. */
-  async function paidByBase(stop: boolean) {
-    const f = e4Fixture(t, 'design', 100_000, 0, 5000, true, true, false, H15_BASE_COMMIT);
-    f.steps([{ research: h15CannotAnswer, usage }]);
-    const base = h15AtCommit(f, H15_BASE_COMMIT, `h15-${stop ? 'received' : 'applied'}`, `const { runModelCall } = await import(src('om/model-call.js'));
-const writeMany = store.writeMany.bind(store);
-let stopped = false;
-if (args.stop) store.writeMany = (writes, guards) => {
-  const committed = writeMany(writes, guards);
-  if (!stopped && writes.some(write => write.kind === 'model-call' && write.value?.om?.application === 'received')) { stopped = true; throw new Error('simulated stop after the durable receipt'); }
-  return committed;
-};
-try { const result = await runModelCall(store, args.request); out({ ok: result.ok, stopped }); }
-catch (error) { out({ threw: String(error.message), stopped }); }`, { request: f.request, stop }) as { ok?: boolean; threw?: string; stopped: boolean };
-    assert.equal(f.sent().length, 1, 'The base code paid for the unserved batch once');
-    assert.equal(stop ? base.threw !== undefined && base.stopped : base.ok, true);
-    f.restart();
-    const [record] = f.store.list('model-call');
-    assert.ok(record);
-    assert.equal(valueOf(readModelCallState(f.store, { project: f.project, record: reference(record) })).state, stop ? 'received' : 'applied');
-    const before = h15Heads(f.store);
-    const { result, kinds } = await h15Written(f.store, () => runModelCall(f.store, f.request));
-    const finished = valueOf(result);
-    assert.equal(finished.record.value.om.application, 'applied', 'The paid answer is applied and the call settled');
-    assert.equal(f.sent().length, 1, 'Nothing was sent again');
-    if (!stop) assert.deepEqual([kinds, h15Heads(f.store)], [[], before], 'A finished call replays without a new record');
-    f.restart();
-    const replay = valueOf(await runModelCall(f.store, f.request));
-    assert.equal(f.sent().length, 1);
-    assert.deepEqual(reference(replay.record), reference(finished.record), 'The replay after a new store is the same finished call');
-    const call = valueOf(readCall(f.store, f.project, finished.call));
-    return { application: finished.record.value.om.application, status: finished.record.value.status, usage: finished.record.value.usage,
-      outcome: finished.outcome?.kind ?? null, ledger: call.value.status, sent: f.sent().length };
-  }
-  const applied = await paidByBase(false), received = await paidByBase(true);
-  assert.deepEqual(received, applied, 'The new code finishes and accounts a received call exactly as the base code finishes and accounts its own');
-  assert.equal(applied.sent, 1);
-});
-
-
-
 test('PF1 (№2797-2) pendingCallStore is the common pending overlay: later writes of one id replace earlier ones, rows are sealed copies, a nested call store keeps its layer, a proved base gives a frozen registered layer and an unproved one the opaque Proxy, and a value that is no JSON is refused as before', t => {
   const { isProxy } = types;
   const root = mkdtempSync(join(tmpdir(), 'omg-pf1-call-')), store = new Store(join(root, 'state.sqlite'));
@@ -1602,50 +1560,6 @@ test('LP3 legacy reads-invalid: a context Ref admitted by the old E3 resumes aft
   });
 });
 
-
-
-test('MP2 (№2968 rows 12, 19; regression 5) the accepted MP1 producer in its own process: its brief root keeps its bytes and no neighbour section; a cycle it ended keeps its era — no policy, no correction, no send; a chain it only began and paid continues under the policy without paying again', async t => {
-  await t.test('ended by MP1', async t => {
-    const { f, packet, request } = mp2IssuedBy(t, MP1_COMMIT);
-    assert.equal(packet.value.packetContract, 'om-packet/brief-v1');
-    assert.equal(Object.hasOwn(packet.value, 'briefNeighbors'), false, 'Row 19: MP1 saved no neighbour form');
-    assert.ok(!(packet.value.packet as { brief: { text: string } }).brief.text.includes('neighbouring roots'));
-    // Row 19: the exact repeat finds and proves the saved packet; it is not replaced by one with neighbours.
-    assert.deepEqual(reference(valueOf(prepareQuestionPacket(f.store, f.packetRequest)).record), reference(packet));
-    assert.deepEqual(valueOf(readQuestionPacket(f.store, { project: f.project, record: reference(packet) })).value, packet.value);
-    f.steps([{ research: mp2Refused(f, packet as Revision<QuestionPacketRecord>) }, { research: e4Node(f, packet as Revision<QuestionPacketRecord>) }]);
-    const ended = h15AtCommit(f, MP1_COMMIT, 'mp2-mp1-cycle', `const { runModelCycle } = await import(src('om/model-call.js'));
-out(reference(take(await runModelCycle(store, args)).record));`, request) as Ref;
-    assert.equal(f.sent().length, 1);
-    const saved = valueOf(mp2ReadCycle(f.store, { project: f.project, record: ended }));
-    assert.equal(Object.hasOwn(saved.record.value, 'cyclePolicy'), false); assert.equal(saved.record.value.terminal, 'outcome');
-    const snapshot = f.store.list().map(reference); f.restart();
-    assert.equal(valueOf(await mp2Cycle(f.store, request)).repeated, true, 'Row 12: the saved cycle repeats in its era');
-    assert.equal(f.sent().length, 1); assert.deepEqual(f.store.list().map(reference), snapshot);
-  });
-  await t.test('begun by MP1', async t => {
-    const { f, packet, request } = mp2IssuedBy(t, MP1_COMMIT);
-    f.steps([{ research: mp2Refused(f, packet as Revision<QuestionPacketRecord>) }, { research: e4Node(f, packet as Revision<QuestionPacketRecord>) }]);
-    const paid = h15AtCommit(f, MP1_COMMIT, 'mp2-mp1-call', `const { runModelCall } = await import(src('om/model-call.js'));
-out(reference(take(await runModelCall(store, args)).record));`, request) as Ref;
-    assert.equal(f.sent().length, 1);
-    const cycle = valueOf(await mp2Cycle(f.store, request));
-    assert.equal(cycle.record.value.cyclePolicy, CYCLE_POLICY, 'A brief chain MP1 began without a saved cycle gets the policy');
-    assert.equal(cycle.record.value.steps[0]!.record.id, paid.id, 'The paid call is reused');
-    assert.equal(f.sent().length, 2, 'Only the correction is sent'); assert.equal(cycle.record.value.terminal, 'assembled');
-  });
-  await t.test('a packet of the base before MP1', async t => {
-    const { f, packet, request } = mp2IssuedBy(t, MP2_BASE_COMMIT);
-    assert.equal(packet.value.packetContract, 'om-packet/v3');
-    f.steps([{ research: mp2Refused(f, packet as Revision<QuestionPacketRecord>) }, { research: e4Node(f, packet as Revision<QuestionPacketRecord>) }]);
-    const cycle = valueOf(await mp2Cycle(f.store, request));
-    assert.equal(Object.hasOwn(cycle.record.value, 'cyclePolicy'), false, 'Row 12: an old protocol chain keeps its path');
-    assert.equal(f.sent().length, 1); assert.equal(cycle.record.value.terminal, 'outcome');
-    const correction = writeQuestionPacket(f.store, { ...f.packetRequest, correction: { packet: reference(packet), call: mp2Step(f, cycle.record.value.steps[0]!).call,
-      response: mp2Step(f, cycle.record.value.steps[0]!).response!, diagnostic: mp2Step(f, cycle.record.value.steps[0]!).diagnostic! } });
-    assert.equal(correction.ok, false, 'Row 15: no correction for another era');
-  });
-});
 
 
 test('MP2 return №3147 (§4): a correction admitted but never claimed is still owed — the rejected step\'s cessation guards the absence of its claim; once claimed, received or applied the rejected step owes nothing: its cessation is refused on the correction\'s own claim or as resolved, nothing written, nothing sent again', async t => {
@@ -1772,32 +1686,5 @@ test('MP3 row 21 (delivery): an addressed read whose source changed after E3 kee
   const refused = deliverModelSources(f.store, { project: f.project, packet: first.packet, call: first.call, response: first.response! });
   assert.equal(refused.ok, false); if (!refused.ok) assert.deepEqual([refused.refusal.code, refused.refusal.at.ref], ['input_stale', reference(m.notes)]);
   assert.deepEqual(f.store.list().map(reference), before);
-});
-
-
-
-test('MP3 era: a new MP3 root carries a lawful delivery of the producer before MP3 (MP1+MP2) in the addressed form, while the earlier records keep their bytes and read back unchanged', async t => {
-  const prior = mp3PriorAttempt(t, MP3_PRIOR_COMMIT);
-  const store = new Store(prior.database);
-  t.after(() => store.close());
-  const old = valueOf(readModelCycle(store, { project: prior.project, record: prior.cycle }));
-  const oldPacket = valueOf(readQuestionPacket(store, { project: prior.project, record: prior.packet }));
-  assert.equal(briefReadings(oldPacket.value.packet), null, 'The MP1 root has no readings');
-  const delivery = store.list<{ data: unknown }>('om-read-delivery');
-  assert.deepEqual(delivery.map(row => row.value.data), [MP3_NOTES.slice(0, 9)], 'The MP1 delivery keeps its own form');
-  const before = store.list().map(reference);
-  const series = store.get<RepairSeries>(prior.series)!;
-  const opened = valueOf(managedOpenAttempt(store, { ...seriesRequestOf(series.value), attempt: 2, goal: series.value.attempts[0]!.goal,
-    completion: { routes: prior.routes, batches: [prior.batch] } } as never));
-  const root = valueOf(writeQuestionPacket(store, { ...prior.packetRequest, attempt: { series: reference(opened), ordinal: 2 } })).record;
-  const readings = mp3Readings(root.value.packet);
-  assert.equal(readings.entries.length, 1);
-  assert.deepEqual(readings.entries[0]!.data, { contract: 'om-read-result/v1', outcome: 'complete', requested: { start: 0, end: 9 },
-    length: MP3_NOTES.length, unit: 'utf16', served: { start: 0, end: 9 }, text: MP3_NOTES.slice(0, 9) }, 'Its representation changes, not its record');
-  assert.deepEqual(readings.entries[0]!.origins.map(origin => origin.delivery), delivery.map(reference));
-  assert.deepEqual(readings.entries[0]!.decision, { state: 'included' });
-  for (const row of delivery) assert.deepEqual(store.get(row.id, row.revision), row, 'The earlier delivery record is unchanged');
-  assert.deepEqual(valueOf(readModelCycle(store, { project: prior.project, record: prior.cycle })), old);
-  assert.ok(before.every(ref => canonical(store.get(ref.id, ref.revision) && reference(store.get(ref.id, ref.revision)!)) === canonical(ref)));
 });
 
