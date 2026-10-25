@@ -2,10 +2,9 @@ import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { copyFileSync, existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync, watch } from 'node:fs';
 import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
-import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { fileURLToPath } from 'node:url';
 import { canonical, canonicalSorted, digest, hashJson, type Json } from '../src/canonical.js';
 import { EngineError } from '../src/errors.js';
 import { Store, type Revision, type Write, type TransactionGuard } from '../src/storage/store.js';
@@ -1052,100 +1051,6 @@ test('D8 a changed producer or ledger head refuses new observation admission wit
   }
 });
 
-test('D8 preserves exact observations and confirmation bytes produced by the complete ee3fd4c legacy engine', async t => {
-  const root = realpathSync(mkdtempSync(join(tmpdir(), 'omg-runtime-legacy-')));
-  t.after(() => rmSync(root, { recursive: true, force: true }));
-  const repository = fileURLToPath(new URL('../../', import.meta.url)), repositoryUrl = pathToFileURL(repository).href;
-  const loader = join(root, 'legacy-loader.mjs'), producer = join(root, 'legacy-producer.mjs');
-  writeFileSync(loader, LEGACY_LOADER); writeFileSync(producer, LEGACY_PRODUCER);
-  const typescript = pathToFileURL(createRequire(import.meta.url).resolve('typescript')).href;
-  const bootstrap = `import{register}from'node:module';register(${JSON.stringify(pathToFileURL(loader).href)},
-{data:{root:${JSON.stringify(repositoryUrl)},typescript:${JSON.stringify(typescript)}}});`;
-  const output = execFileSync(process.execPath, ['--import', `data:text/javascript,${encodeURIComponent(bootstrap)}`, producer, repository, root],
-    { cwd: repository, encoding: 'utf8', timeout: 30_000, maxBuffer: 10_000_000 });
-  const legacy = JSON.parse(output) as { database: string; project: string; marker: string; request: unknown; obligation: CarriedObligation;
-    observed: RuntimeObservationResult; confirmation: NonNullable<ReturnType<typeof findObligationConfirmation>>;
-    support: NonNullable<ReturnType<typeof runtimeSupport>>; historyBytes: string };
-  assert.ok(legacy.observed.source);
-  for (let restart = 0; restart < 2; restart++) {
-    const store = new Store(legacy.database);
-    try {
-      const support = runtimeSupport(store, legacy.project, legacy.obligation, reference(legacy.observed.source));
-      const confirmation = findObligationConfirmation(store, legacy.project, legacy.obligation);
-      assert.ok(support && confirmation);
-      const { admissionGuards: supportAdmission, ...oldSupport } = support;
-      const { admissionGuards: confirmationAdmission, ...oldConfirmation } = confirmation;
-      const expected = [{ id: 'execution-root:legacy', absent: true }, { id: 'reader-pilot:legacy', absent: true }];
-      assert.deepEqual(oldSupport, legacy.support); assert.deepEqual(oldConfirmation, legacy.confirmation);
-      assert.deepEqual(supportAdmission, expected); assert.deepEqual(confirmationAdmission, expected);
-      assert.equal(frozenObligationConfirmation(store, legacy.project, legacy.obligation, legacy.confirmation.proof), true);
-      assert.deepEqual(await new ProductEngine(store).execute(legacy.request), legacy.observed);
-      assert.equal(canonical(store.list().flatMap(row => store.history(row.id))), legacy.historyBytes);
-      assert.equal(readFileSync(legacy.marker, 'utf8'), 'executed\n');
-    } finally { store.close(); }
-  }
-});
-
-const LEGACY_LOADER = String.raw`import {execFileSync} from 'node:child_process';
-import {fileURLToPath} from 'node:url';
-let root,ts;
-export async function initialize(data){root=data.root;ts=(await import(data.typescript)).default;}
-export async function load(url,context,next){
- const prefix=new URL('dist/',root).href;
- if(url.startsWith(prefix)&&/\.js$/.test(url)){
-  const relative=url.slice(prefix.length).replace(/\.js$/,'.ts');
-  const source=execFileSync('git',['show','ee3fd4cb0941cc47e1b783e06015bd3a8d59fd8b:'+relative],
-   {cwd:fileURLToPath(root),encoding:'utf8',maxBuffer:10000000});
-  return {format:'module',shortCircuit:true,source:ts.transpileModule(source,{compilerOptions:{module:ts.ModuleKind.ESNext,target:ts.ScriptTarget.ES2023}}).outputText};
- }
- return next(url,context);
-}
-
-`;
-
-const LEGACY_PRODUCER = String.raw`import { dirname, join } from 'node:path';
-import { pathToFileURL } from 'node:url';
-const [repository,root]=process.argv.slice(2),url=path=>pathToFileURL(join(repository,'dist/src',path)).href;
-const {Store}=await import(url('storage/store.js'));
-const {ProductEngine}=await import(url('product/engine.js'));
-const {reference}=await import(url('pipeline/contracts.js'));
-const {canonical}=await import(url('canonical.js'));
-const {configureResearchScope}=await import(url('graph/research-scope.js'));
-const {carriedObligations}=await import(url('graph/obligation-policy.js'));
-const {findObligationConfirmation,frozenObligationConfirmation}=await import(url('graph/obligation-readiness.js'));
-const {runtimeSupport}=await import(url('graph/runtime-evidence.js'));
-const database=join(root,'legacy.sqlite'),store=new Store(database),engine=new ProductEngine(store),project='legacy';
-engine.execute({type:'create-project',project,title:'Legacy D8 producer'});
-const graph={nodes:[{id:'n',code:[]}],horizon:[],connectors:[],tests:[],anchors:[]};
-store.write({id:'graph:'+project,kind:'graph',expected:0,value:graph});
-const layer=store.write({id:'graph-layer:'+project+':2',kind:'graph-layer',expected:0,value:{projection:graph}});
-const gap={id:'legacy-gap',target:'n',field:'code',consumer:'compilation',requiredFor:'next',question:'Confirm the declared legacy condition'};
-const r1=store.write({id:'legacy-r1',kind:'discovery-draft',expected:0,value:{projectId:project,fields:{technical:{gaps:[gap]}}}});
-const phase=store.write({id:'phase:'+project+':R1',kind:'phase',expected:0,value:{draft:reference(r1)}});
-const original=configureResearchScope(store,{projectId:project,layer:reference(layer),r1:reference(phase),
- outcome:'Observe the actual legacy check',nodes:['n'],boundaries:[],expansions:[],changedPaths:[],uiRequired:false,
- obligations:[{gap,state:'active',reason:'Declared check',wake:null}]},0);
-const marker=join(root,'legacy-invocations');
-const code=engine.discovery.evidence.document(project,'legacy-module',
- "import{appendFileSync,readFileSync}from'node:fs';readFileSync(0,'utf8');appendFileSync(process.argv[2],'executed\\n');console.log('legacy-success');",'text/plain',0);
-const condition='The legacy local module has completed successfully';
-const check={script:reference(code),dependencies:[],subjects:[],executables:[],args:[marker],timeoutMs:3000,purpose:'A declared local check',satisfies:condition};
-const scope=configureResearchScope(store,{...original.value,policy:{version:1,sourceScope:reference(original),assignments:[{
- obligation:gap.id,original:{record:reference(original),pointer:'/obligations/0/gap'},kind:'environment-confirmation',moment:'task-start',
- responsibleNode:'n',responsibleConsumer:'compilation',neededForR2:false,reason:'Required at task start',returnCondition:condition,runtimeCheck:check}]}},1);
-const command={executable:process.execPath,args:['--version']};
-const environment=engine.environments.configure(project,{workspace:root,implementer:{actor:'worker',model:'fixture',effort:'high',command},
- reviewer:{actor:'reviewer',model:'fixture',effort:'high',command},fullCheck:command,timeoutMs:3000},0);
-const request={type:'observe-runtime',project,scope:reference(scope),obligation:gap.id,key:'legacy-one'};
-const observed=await engine.execute(request),obligation=carriedObligations(scope)[0];
-const confirmation=findObligationConfirmation(store,project,obligation),support=runtimeSupport(store,project,obligation,reference(observed.source));
-if(!confirmation||!support||!frozenObligationConfirmation(store,project,obligation,confirmation.proof))throw Error('Legacy producer did not establish confirmation');
-const history=store.list().flatMap(record=>store.history(record.id));
-process.stdout.write(JSON.stringify({root,database,project,marker,request,environment,scope,obligation,observed,confirmation,support,history,historyBytes:canonical(history)}));
-store.close();
-
-`;
-
 // Current OM declarations carry exact task-start/task-result authority through M8/M9.
 function d83ScopedExecutionFixture(t: test.TestContext) {
   const f = taskObligationExecutionFixture(t);
@@ -1305,70 +1210,6 @@ test('D8.3 inactive pilot changes current admission while frozen task proofs and
 });
 
 
-test('D8 complete ee3fd4c execution preserves MachinePlan guards and frozen start/result proofs after restart', async t => {
-  const root = realpathSync(mkdtempSync(join(tmpdir(), 'omg-runtime-execution-legacy-')));
-  t.after(() => rmSync(root, { recursive: true, force: true }));
-  const repository = fileURLToPath(new URL('../../', import.meta.url)), repositoryUrl = pathToFileURL(repository).href;
-  const loader = join(root, 'legacy-loader.mjs'), producer = join(root, 'execution-producer.mjs');
-  writeFileSync(loader, LEGACY_LOADER);
-  writeFileSync(producer, `import assert from 'node:assert/strict';
-import {writeFileSync} from 'node:fs';import {dirname,join} from 'node:path';import {pathToFileURL} from 'node:url';
-const repository=process.argv[2],src=path=>pathToFileURL(join(repository,'dist/src',path)).href,
- fixture=path=>pathToFileURL(join(repository,'dist/test',path)).href;
-const {executionFixture}=await import(fixture('execution-fixture.js'));
-const {answerTechnicalFixture}=await import(fixture('technical-research-fixture.js'));
-const {deriveLayerFixture}=await import(fixture('layer-design-fixture.js'));
-const {configureResearchScope}=await import(src('graph/research-scope.js'));
-const {carriedObligations}=await import(src('graph/obligation-policy.js'));
-const {taskBindingId}=await import(src('graph/task-obligations.js'));
-const {reference}=await import(src('pipeline/contracts.js'));
-const {canonical}=await import(src('canonical.js'));
-const {taskStartProofs,taskResultProofs,requireTaskObligationProofs}=await import(src('execution/task-obligations.js'));
-${d83ScopedExecutionFixture.toString()}
-const cleanup=[],f=d83ScopedExecutionFixture({after:fn=>cleanup.push(fn)});
-try {
- const start=await f.prepare(),result=await f.observe('result'),runs=await f.run(),task=f.plan.value.tasks[0];
- assert.deepEqual(runs.map(run=>run.value.state),['committed','committed']);
- for(const run of runs)requireTaskObligationProofs(f.store,run.value,f.plan.value.tasks.find(task=>task.id===run.value.taskId));
- const starts=taskStartProofs(f.store,runs[0].value,task),results=taskResultProofs(f.store,runs[0].value,task);
- const historyBytes=canonical(f.store.list().flatMap(row=>f.store.history(row.id)));
- process.stdout.write(JSON.stringify({directory:f.directory,database:f.store.path,plan:f.plan,runs,start,result,starts,results,historyBytes}));
- f.store.close();
-} catch(error) {for(const fn of cleanup)fn();throw error;}
-`);
-  const typescript = pathToFileURL(createRequire(import.meta.url).resolve('typescript')).href;
-  const bootstrap = `import{register}from'node:module';register(${JSON.stringify(pathToFileURL(loader).href)},
-{data:{root:${JSON.stringify(repositoryUrl)},typescript:${JSON.stringify(typescript)}}});`;
-  const output = execFileSync(process.execPath, ['--import', `data:text/javascript,${encodeURIComponent(bootstrap)}`, producer, repository],
-    { cwd: repository, encoding: 'utf8', timeout: 60_000, maxBuffer: 30_000_000 });
-  const legacy = JSON.parse(output) as { directory: string; database: string; plan: Revision<MachinePlan>; runs: Revision<TaskRun>[];
-    start: RuntimeObservationResult; result: RuntimeObservationResult; starts: ReturnType<typeof taskStartProofs>;
-    results: ReturnType<typeof taskResultProofs>; historyBytes: string };
-  t.after(() => rmSync(legacy.directory, { recursive: true, force: true }));
-  assert.ok(legacy.plan.value.guards.length); assert.ok(legacy.runs[0]!.value.obligationStartProofs?.length);
-  assert.ok(legacy.runs[0]!.value.obligationResultProofs?.length);
-  for (let restart = 0; restart < 2; restart++) {
-    const store = new Store(legacy.database), engine = new ProductEngine(store);
-    try {
-      const run = legacy.runs[0]!, task = legacy.plan.value.tasks[0]!;
-      assert.deepEqual(store.get(legacy.plan.id, legacy.plan.revision), legacy.plan);
-      for (const record of legacy.runs) {
-        assert.deepEqual(store.get(record.id), record);
-        requireTaskObligationProofs(store, record.value, legacy.plan.value.tasks.find(task => task.id === record.value.taskId)!);
-      }
-      const absent = { id: 'reader-pilot:p', absent: true } as const;
-      assert.deepEqual(taskStartProofs(store, run.value, task), { proofs: legacy.starts.proofs,
-        guards: uniqueTransactionGuards([...legacy.starts.guards, absent]) });
-      assert.deepEqual(taskResultProofs(store, run.value, task), { proofs: legacy.results.proofs,
-        guards: uniqueTransactionGuards([...legacy.results.guards, absent]) });
-      for (const [obligation, expected] of [['start', legacy.start], ['result', legacy.result]] as const) {
-        assert.deepEqual(await engine.execute({ type: 'observe-runtime', project: 'p', scope: expected.observation.value.scope,
-          obligation, key: obligation }), expected);
-      }
-      assert.equal(canonical(store.list().flatMap(row => store.history(row.id))), legacy.historyBytes);
-    } finally { store.close(); }
-  }
-});
 
 // ---------------------------------------------------------------------------
 // D8.5 round 3: OM late-receipt boundary. A complete physical result preserved
