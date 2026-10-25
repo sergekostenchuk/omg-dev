@@ -270,6 +270,48 @@ test('5.6: a real new scope with the same cell has its own preparation and paid 
   assert.equal(readVariantScope(f.open(),'p',f.scope).scope.id,old.scope.id);
 });
 
+for(const cold of [false,true])for(const position of [1,2])
+test(`5.6-01: ${cold?'cold':'hot'} prepared cut at deep position ${position} resumes the original owner without revise`,async t=>{
+  const f=await ready(t);let prepared=0, cut=false, savedHistory='', savedMoney=money(f.store), savedWire=f.wires();
+  const restore=interceptWrites(t,f.store,(writes,commit)=>{
+    const preparing=writes.some(row=>row.kind==='research-consumer-intent'&&row.expected===0
+      &&Object.hasOwn((row.value as ResearchConsumerIntent).cursor,'deepPreparation'));
+    const result=commit();
+    if(preparing&&++prepared===position){
+      cut=true;savedHistory=history(f.store);savedMoney=money(f.store);savedWire=f.wires();
+      throw new Error('5.6-01 cut after prepared commit, before reservation');
+    }
+    return result;
+  });
+  try{await f.run(position);}finally{restore();}
+  assert.ok(cut);assert.equal(deepCalls(f).length,position-1);
+  assert.equal(history(f.store),savedHistory);assert.deepEqual(money(f.store),savedMoney);assert.deepEqual(f.wires(),savedWire);
+  const intent=deepIntents(f.store).find(row=>row.value.state==='prepared')!;
+  assert.ok(intent);assert.equal(intent.value.call,null);assert.equal(deepIntents(f.store).length,position);
+  const admitted=f.store.get<ResearchRun>(intent.value.owner.id)!;
+  assert.deepEqual(reference(admitted),intent.value.owner);assert.equal(admitted.value.status,'paused');
+  assert.equal(intent.value.cursor.turn,admitted.value.turns+1);
+  const store=cold?f.open():f.store;
+  await inert(f,store,async()=>assert.deepEqual(await f.run(1,store,true),admitted));
+  const result=await f.run(1,store);
+  assert.equal(result.value.pauseCode,position===1?'research_deep_frontier_pending':'research_deep_frontier_complete',result.value.error!);
+  const applied=store.get<ResearchConsumerIntent>(intent.id)!;
+  assert.equal(applied.value.state,'applied');assert.equal(deepIntents(store).length,position);
+  assert.deepEqual(applied.value.owner,intent.value.owner);assert.equal(applied.value.rootKey,intent.value.rootKey);
+  assert.deepEqual(applied.value.cursor,intent.value.cursor);
+  assert.deepEqual(store.get(intent.id,intent.revision),intent);assert.deepEqual(store.get(admitted.id,admitted.revision),admitted);
+  const proof=readDeepResearchResult(store,'p',reference(applied));
+  assert.deepEqual(reference(proof.preparation.preparation),intent.value.cursor.deepPreparation);
+  assert.equal(deepCalls(f).length,position);assert.equal(f.wires().length,savedWire.length+2,'one deep send and its ordinary MR');
+  assert.deepEqual(f.wires().slice(0,savedWire.length),savedWire);
+  const oldCalls=new Set(savedMoney.filter(row=>row.kind==='model-call').map(row=>row.id));
+  const added=store.list<{requestId:string}>('model-call').filter(row=>!oldCalls.has(row.id));
+  assert.equal(added.length,2);assert.ok(added.some(row=>row.id===proof.call.id));
+  assert.deepEqual(added.map(row=>row.value.requestId).sort(),f.wires().slice(savedWire.length).map(row=>row.requestId).sort());
+  assert.equal(deepPlanSelection(store,'p',f.scope).coverage.cells[position-1]!.covered,true);
+  for(const again of [store,f.open()])await inert(f,again,async()=>assert.deepEqual(await f.run(2,again,true),result));
+});
+
 for(const cold of [false,true])test(`5.6: ${cold?'cold':'hot'} owner revise replaces only the stale unpaid deep admission at the same run position`,async t=>{
   const f=await ready(t);let cut=false;
   const restore=interceptWrites(t,f.store,(writes,commit)=>{

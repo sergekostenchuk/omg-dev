@@ -1806,6 +1806,13 @@ export class Researcher {
       // No local transport or coverage oracle. Preparation and managed admission
       // retain the complete current proof; P guards additionally pin this frontier.
       deepOperation = true;
+      // Each unpaid admission owns a resumable exact pause, including the next
+      // cell after this invocation's earlier paid work. Reservation alone
+      // activates it; a preparation cut must not leave a live busy owner.
+      if (run!.value.status === 'running') run = this.save(run!, { status: 'paused',
+        pauseCode: 'research_deep_frontier_pending',
+        error: canonical({ code: 'research_deep_frontier_pending',
+          message: 'The missing exact cell awaits its managed reservation', ...details }) }, frontier.guards);
       const effective = this.environments.effective(project);
       const intent = withHistoricalReads(() => {
         const prepared = produceDeepPreparation(this.store, project,
@@ -2267,6 +2274,9 @@ export class Researcher {
     } catch (error) {
       if (partialPending) throw error;
       const current = this.store.get<ResearchRun>(id) ?? run;
+      // Before reservation the saved pause is the prepared intent's exact
+      // owner. A diagnostic revision would invalidate that unpaid admission.
+      if (deepOperation && !(error instanceof EngineError) && current?.value.status === 'paused') return current;
       // A CAS/proof refusal must not append a diagnostic over the competitor's
       // state. Once our reservation activated the run, a non-CAS application
       // failure must retain the ordinary paused recovery door, including typed cuts.
