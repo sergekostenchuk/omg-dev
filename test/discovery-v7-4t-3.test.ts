@@ -190,16 +190,19 @@ test('4T.3: the stage budget refuses a new variant send after an overrun, while 
   assert.equal(f.wires().length, sent);
 });
 
-test('4T.3: a decision travels the same way and keeps its own identity apart from a proposal on the same basis', async t => {
+test('4T.3: a new direct v7 decision refuses without inheriting the paid proposal on the same basis', async t => {
   const f = await setup(t), basis = f.transport('basis'), mode = f.transport('mode');
   f.configure(generation('proposal'));
-  const proposal = await f.call(f.subject('proposal', basis, mode), f.v.draft.id, f.v.plan);
+  const subject = f.subject('proposal', basis, mode), proposal = await f.call(subject, f.v.draft.id, f.v.plan);
+  assert.deepEqual(variantCalls(f).map(row => [row.value.purpose, row.value.variantSubject]), [['variant-proposal', subject]]);
+  const snapshot = () => ({ store: f.store.list().flatMap(row => f.store.history(row.id)),
+    calls: f.store.list('model-call'), ledger: f.store.list('research-budget-ledger') });
+  const before = snapshot(), sent = f.wires().length;
   f.configure({ choice: 'decline-all', reason: 'Transport only' });
-  const decision = await f.call(f.subject('decision', basis, mode), f.v.draft.id, f.v.plan);
-  assert.deepEqual(decision, { choice: 'decline-all', reason: 'Transport only' });
-  assert.notDeepEqual(decision, proposal);
-  assert.deepEqual(variantCalls(f).map(row => [row.value.purpose, (row.value.variantSubject as VariantSubject).kind]).sort(),
-    [['variant-decision', 'decision'], ['variant-proposal', 'proposal']]);
+  await assert.rejects(() => f.call(f.subject('decision', basis, mode), f.v.draft.id, f.v.plan), errorCode('discovery_variant_managed'));
+  assert.deepEqual(snapshot(), before); assert.equal(f.wires().length, sent);
+  assert.deepEqual(await f.call(subject, f.v.draft.id, f.v.plan), proposal, 'only the proposal identity returns its own saved answer');
+  assert.deepEqual(snapshot(), before); assert.equal(f.wires().length, sent);
   for (const kind of ['research-attempt', 'v7-progress-state', 'discovery-assessment']) assert.deepEqual(f.store.list(kind), [], kind);
 });
 

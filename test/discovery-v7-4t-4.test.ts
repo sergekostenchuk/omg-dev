@@ -392,7 +392,7 @@ for(const first of ['direct','managed'] as const)test(`4T.4: ${first} execution 
 });
 
 
-test('4T.4: the general managed decision door cannot reserve against a merely structural set',async t=>{
+test('4T.4: the general managed decision door refuses a merely structural set before publishing an intent',async t=>{
   const f=await setup(t),prototype=prepareVariantSession(f.store,f.input);
   const subject:VariantSubject={contract:VARIANT_SUBJECT_CONTRACT,kind:'decision',set:reference(f.saved),mode:reference(f.mode),expectedSelection:null};
   // Negative transport fixtures only: this is deliberately NOT a set producer or a positive paid decision.
@@ -406,13 +406,11 @@ test('4T.4: the general managed decision door cannot reserve against a merely st
   const owner=f.store.write({id:variantExecutionSessionId(initial),kind:'discovery-variant-session',expected:0,value:initial});
   const v=prototype.intent.value;
   const context={...variantTransportFields('p',v.draft,v.question,'variant-decision',v.role.actor,subject),history:[]};
-  const intent=prepareResearchConsumerIntent(f.store,{...v,kind:'variant-decision',key:owner.id,owner:reference(owner),
-    cursor:{sessionId:owner.id,offset:0,variantSubject:subject,prompt:'Decide on this set',context},basis:[subject.set,subject.mode],
-    guards:uniqueTransactionGuards([reference(owner),v.draft,v.question,reference(f.environment),...variantTransportGuards('p',v.draft.id,subject)])});
   assert.deepEqual(readVariantExecutionSession(f.store,'p',reference(owner)),owner);
   const before=snapshot(f.store),calls=f.wires().length;
-  await assert.rejects(researchCall(v.role,v.dispatch,intent.value.cursor.prompt,context,undefined,
-    {store:f.store,draftId:v.draft.id,questionId:v.question.id,purpose:'variant-decision',consumerIntent:reference(intent),session:reference(owner)}),
+  assert.throws(()=>prepareResearchConsumerIntent(f.store,{...v,kind:'variant-decision',key:owner.id,owner:reference(owner),
+    cursor:{sessionId:owner.id,offset:0,variantSubject:subject,prompt:'Decide on this set',context},basis:[subject.set,subject.mode],
+    guards:uniqueTransactionGuards([reference(owner),v.draft,v.question,reference(f.environment),...variantTransportGuards('p',v.draft.id,subject)])}),
     code('discovery_variant_set_not_ready'));
   assert.deepEqual(snapshot(f.store),before);assert.equal(f.wires().length,calls);
 });

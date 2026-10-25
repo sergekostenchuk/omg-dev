@@ -9,7 +9,8 @@ import { uniqueTransactionGuards } from '../src/runtime/environment.js';
 import { processStart } from '../src/runtime/process-identity.js';
 import type { DiscoveryDraft, Question } from '../src/discovery/discovery.js';
 import type { ResearchRun } from '../src/discovery/research-model.js';
-import { prepareResearchConsumerIntent, type ResearchConsumerIntent } from '../src/discovery/response-recovery.js';
+import { prepareResearchConsumerIntent, prepareResearchConsumerApplication, readResearchConsumerExecution,
+  type ResearchConsumerIntent, type ResearchConsumerIntentInput } from '../src/discovery/response-recovery.js';
 import { researchCall } from '../src/discovery/research-protocol.js';
 import { REQUEST_MANIFEST_CONTRACT } from '../src/discovery/request-parts.js';
 import { assessAttempts } from '../src/discovery/research-assessment.js';
@@ -19,7 +20,9 @@ import { produceVariantSnapshot } from '../src/discovery/variant-snapshot.js';
 import { prepareVariantSession, applyVariantSession, runVariantSession, readVariantModelDecision, readVariantExecutionSession,
   type VariantSessionInput } from '../src/discovery/variant-session.js';
 import { VARIANT_SUBJECT_CONTRACT, VARIANT_CRITERIA, variantRecordId, type VariantSubject, type VariantSet, type DiscoveryVariant } from '../src/discovery/discovery-variants.js';
-import { variantStateId, type VariantModelDecision, type VariantState } from '../src/discovery/variant-decision.js';
+import { variantStateId, variantDecisionPublicationWrites, type VariantModelDecision, type VariantState } from '../src/discovery/variant-decision.js';
+import { variantExecutionSessionId, projectPaidVariantSession } from '../src/discovery/research-consumer-transition.js';
+import { variantTransportFields, variantTransportGuards } from '../src/discovery/continuation-packet.js';
 import { ProjectModeSessions, issueProjectModeInvitation } from '../src/product/owner-authority.js';
 import { setProjectMode } from '../src/product/project-mode.js';
 import { researchSetup, produce, rand } from './discovery-v7-fixture.js';
@@ -221,3 +224,164 @@ test('4B.2: no direct transport, unproven set or no_variants buys a model decisi
 function prepareQuestion(f: Awaited<ReturnType<typeof setup>>): string {
   return f.store.get<any>(f.result.intent.id, f.result.intent.revision)!.value.question.id;
 }
+
+const accounting = (store: Store) => history(store).filter(row => ['model-call', 'research-budget-ledger'].includes(row.kind));
+/** Real producer cut after session creation, before the intent transaction. Capture its legal input for common-door
+ * negatives; the readonly callback's throw rolls back the attempted intent. No positive session is hand-written. */
+function sessionOnly(f: Awaited<ReturnType<typeof setup>>, input: VariantSessionInput) {
+  const cut = new Error('session-only cut'), atomic = f.store.atomicWrite.bind(f.store);
+  let pending: ResearchConsumerIntent | null = null;
+  f.store.atomicWrite = ((prepare: Parameters<Store['atomicWrite']>[0]) => atomic(view => {
+    const batch = prepare(view);
+    pending = batch.writes.find(write => write.kind === 'research-consumer-intent')!.value as ResearchConsumerIntent;
+    throw cut;
+  })) as typeof f.store.atomicWrite;
+  try { assert.throws(() => prepareVariantSession(f.store, input), error => error === cut); }
+  finally { f.store.atomicWrite = atomic; }
+  assert.ok(pending);
+  const value = pending as ResearchConsumerIntent;
+  const { contract: _contract, rootKey: _root, generation: _generation, previous: _previous, state: _state,
+    call: _call, request: _request, archive: _archive, outputs: _outputs, refusal: _refusal, ...admission } = value;
+  return { input: admission as ResearchConsumerIntentInput, session: f.store.get(value.owner.id, value.owner.revision)! };
+}
+
+test('4B.2: the common preparer independently rejects questions and missing dispatch dependencies before publishing an intent', async t => {
+  const f = await setup(t), bypass = f.setMode('bypass', reference(f.questions));
+  const saved = sessionOnly(f, f.decisionInput(reference(bypass)));
+  // Explicit negative corruption: a structural session changes the real producer's subject to questions. It must not
+  // become an admission by bypassing prepareVariantSession and entering the common preparer directly.
+  const subject = { ...f.decisionInput(reference(f.questions)).variantSubject }, original = saved.session.value as any;
+  const value = { ...original, variantSubject: subject }, id = variantExecutionSessionId(value);
+  const fake = f.store.write({ id, kind: 'discovery-variant-session', expected: 0, value });
+  const bad: ResearchConsumerIntentInput = { ...saved.input, key: id, owner: reference(fake),
+    cursor: { ...saved.input.cursor, sessionId: id, variantSubject: subject,
+      context: { ...saved.input.cursor.context, ...variantTransportFields(f.project, value.draft, value.question, value.purpose, value.actor, subject) } },
+    guards: uniqueTransactionGuards([reference(fake), value.draft, value.question, reference(f.environment),
+      ...variantTransportGuards(f.project, value.draft.id, subject)]) };
+  const before = history(f.store), sent = f.wires().length;
+  assert.throws(() => prepareResearchConsumerIntent(f.store, bad), code('discovery_variant_owner_door'));
+  for (const key of ['draft', 'question', 'owner', 'projectId', 'key', 'role', 'dispatch', 'cursor', 'guards', 'basis']) {
+    const missing = { ...saved.input } as Record<string, unknown>; delete missing[key];
+    assert.throws(() => prepareResearchConsumerIntent(f.store, missing as ResearchConsumerIntentInput), error => error instanceof EngineError);
+  }
+  for (const guard of variantTransportGuards(f.project, saved.input.draft.id, saved.input.cursor.variantSubject)) {
+    assert.throws(() => prepareResearchConsumerIntent(f.store, { ...saved.input,
+      guards: saved.input.guards.filter(savedGuard => savedGuard.id !== guard.id) }), error => error instanceof EngineError);
+  }
+  assert.deepEqual(history(f.store), before); assert.equal(f.wires().length, sent);
+});
+
+test('4B.2: a structurally valid current state without the paid generation publication never admits a decision', async t => {
+  const f = await setup(t), bypass = f.setMode('bypass', reference(f.questions));
+  // Negative state corruption under the real address; this revision was not an output of the paid set application.
+  const forged = f.store.write({ id: f.state1.id, kind: f.state1.kind, expected: f.state1.revision,
+    value: { ...f.state1.value, mode: reference(bypass), previous: reference(f.state1) } });
+  const before = history(f.store), money = accounting(f.store), sent = f.wires().length;
+  assert.throws(() => prepareVariantSession(f.store, f.decisionInput(reference(bypass), reference(forged))), code('discovery_variant_decision_invalid'));
+  assert.deepEqual(history(f.store), before); assert.deepEqual(accounting(f.store), money); assert.equal(f.wires().length, sent);
+});
+
+test('4B.2: a second Store winning between admission and intent commit admits exactly one identity without a deadlocked loser', async t => {
+  const f = await setup(t), bypass = f.setMode('bypass', reference(f.questions)); f.reply(choose('v1'));
+  const first = f.decisionInput(reference(bypass)), winner = f.decisionInput(reference(bypass), reference(f.state1), f.environment.value.reviewer);
+  sessionOnly(f, first); sessionOnly(f, winner);
+  const other = f.open(), atomic = f.store.atomicWrite.bind(f.store);
+  let raced = false, afterWinner: ReturnType<typeof history> = [];
+  f.store.atomicWrite = ((prepare: Parameters<Store['atomicWrite']>[0]) => {
+    if (!raced) { raced = true; prepareVariantSession(other, winner); afterWinner = history(other); }
+    return atomic(prepare);
+  }) as typeof f.store.atomicWrite;
+  const sent = f.wires().length;
+  try { assert.throws(() => prepareVariantSession(f.store, first), code('discovery_variant_decision_exists')); }
+  finally { f.store.atomicWrite = atomic; }
+  assert.equal(raced, true); assert.deepEqual(history(f.store), afterWinner);
+  assert.equal(f.store.list<ResearchConsumerIntent>('research-consumer-intent').filter(row => row.value.kind === 'variant-decision').length, 1);
+  await runVariantSession(other, winner); assert.equal(f.wires().length, sent + 1);
+  const cold = f.open(), done = history(cold);
+  assert.throws(() => prepareVariantSession(cold, first), code('discovery_variant_decision_exists'));
+  assert.deepEqual(history(cold), done); assert.equal(f.wires().length, sent + 1);
+});
+
+test('4B.2: a mode race at physical reservation sends and pays nothing; a fresh cold admission recovers from the stale prepared intent', async t => {
+  const f = await setup(t), bypass = f.setMode('bypass', reference(f.questions)); f.reply(choose('v1'));
+  const input = f.decisionInput(reference(bypass)); prepareVariantSession(f.store, input);
+  const other = f.open(), write = f.store.writeMany.bind(f.store), sent = f.wires().length, money = accounting(f.store);
+  let changed: Ref | null = null, afterMove: ReturnType<typeof history> = [];
+  f.store.writeMany = ((writes, guards) => {
+    if (!changed && writes.some(row => row.kind === 'model-call' && (row.value as any).purpose === 'variant-decision')) {
+      const sessions = new ProjectModeSessions(other), scope = { project: f.project, mode: 'questions' as const, previous: reference(bypass) };
+      const invite = ok<any>(issueProjectModeInvitation(other, scope)), login = ok<any>(sessions.exchange({ project: f.project, invitation: invite.invitation }));
+      changed = reference(setProjectMode(other, scope, sessions.authority(login.bearer)).record); afterMove = history(other);
+    }
+    return write(writes, guards);
+  }) as typeof f.store.writeMany;
+  try { await assert.rejects(() => runVariantSession(f.store, input), code('input_stale')); }
+  finally { f.store.writeMany = write; }
+  assert.ok(changed); assert.deepEqual(history(f.store), afterMove); assert.deepEqual(accounting(f.store), money); assert.equal(f.wires().length, sent);
+  const latest = f.setMode('bypass', changed!), cold = f.open();
+  const receipt = await runVariantSession(cold, f.decisionInput(reference(latest)));
+  assert.equal(receipt.value.cursor, 1); assert.equal(f.wires().length, sent + 1, 'the unpaid stale preparation does not trap the set');
+  assert.equal(cold.list('discovery-variant-model-decision').length, 1);
+});
+
+test('4B.2: a newer paid generation after decision payment keeps its current state and a cold stale decision reason', async t => {
+  const f = await setup(t), bypass = f.setMode('bypass', reference(f.questions)); f.reply(choose('v1'));
+  const input = f.decisionInput(reference(bypass)), running = await f.pay(input);
+  f.reply(generation);
+  await runVariantSession(f.store, { projectId: f.project, environment: f.environment, role: f.environment.value.reviewer,
+    prompt: 'A new generation from the same real sweep', variantSubject: { contract: VARIANT_SUBJECT_CONTRACT, kind: 'proposal',
+      snapshot: reference(f.saved), mode: reference(bypass), expectedSelection: reference(f.state1) } });
+  const state = f.store.get<VariantState>(f.state1.id)!, money = accounting(f.store), sent = f.wires().length;
+  assert.notDeepEqual(state.value.set, reference(f.set!));
+  const receipt = applyVariantSession(f.store, f.project, reference(running)), cold = f.open();
+  const decision = cold.list('discovery-variant-model-decision')[0]!, proved = readVariantModelDecision(cold, f.project, reference(decision));
+  assert.equal(proved.state, null); assert.deepEqual(proved.stale, { code: 'discovery_variant_stale', reason: 'mode_or_selection_changed' });
+  assert.deepEqual(reference(cold.get(state.id)!), reference(state)); assert.deepEqual(accounting(cold), money);
+  const before = history(cold); assert.deepEqual(await runVariantSession(cold, input), receipt);
+  assert.deepEqual(history(cold), before); assert.equal(f.wires().length, sent);
+});
+
+test('4B.2: the common application rejects every incomplete product and supplies its own mode guard; paid recovery is free after a race', async t => {
+  const f = await setup(t), bypass = f.setMode('bypass', reference(f.questions)); f.reply(choose('v1'));
+  const running = await f.pay(f.decisionInput(reference(bypass))), paid = readResearchConsumerExecution(f.store, f.project, reference(running));
+  assert.equal(paid.kind, 'response'); if (paid.kind !== 'response') throw new Error('Expected real paid decision');
+  const owner = f.store.get<any>(running.value.owner.id, running.value.owner.revision)!;
+  const value = projectPaidVariantSession(owner, running, { call: reference(paid.call), response: paid.response, payload: paid.payload });
+  const product = variantDecisionPublicationWrites(f.store, value, paid.payload);
+  const receipt = { id: owner.id, kind: owner.kind, expected: owner.revision, value };
+  const complete = [receipt, ...product.writes], before = history(f.store), sent = f.wires().length, money = accounting(f.store);
+  for (const writes of [[receipt], [receipt, product.writes[0]!], [receipt, product.writes[1]!],
+    [receipt, { ...product.writes[0]!, value: { ...product.decision.value, outcome: { kind: 'reject_all', reason: 'Substituted result' } } }, product.writes[1]!],
+    [...complete, { id: 'negative-extra-output', kind: 'extra-output', expected: 0, value: {} }]])
+    assert.throws(() => prepareResearchConsumerApplication(f.store, reference(running), reference(paid.call), writes, [reference(owner)]), error => error instanceof EngineError);
+  assert.deepEqual(history(f.store), before);
+  const batch = prepareResearchConsumerApplication(f.store, reference(running), reference(paid.call), complete, [reference(owner)]);
+  assert.ok(batch.guards.some(guard => hashJson(guard) === hashJson(reference(bypass))));
+  assert.ok(batch.guards.some(guard => hashJson(guard) === hashJson(reference(f.set!))));
+  f.setMode('questions', reference(bypass)); const afterMove = history(f.store);
+  assert.throws(() => f.store.writeMany(batch.writes, batch.guards), code('input_stale'));
+  assert.deepEqual(history(f.store), afterMove); assert.deepEqual(accounting(f.store), money); assert.equal(f.wires().length, sent);
+  applyVariantSession(f.open(), f.project, reference(running));
+  assert.equal(readVariantModelDecision(f.open(), f.project, product.decision.ref).state, null);
+  assert.deepEqual(accounting(f.store), money); assert.equal(f.wires().length, sent);
+});
+
+test('4B.2: the historical reader proves every named output in full in warm and cold Stores', async t => {
+  const f = await setup(t), bypass = f.setMode('bypass', reference(f.questions)); f.reply(choose('v1'));
+  const receipt = await runVariantSession(f.store, f.decisionInput(reference(bypass)));
+  const decision = f.store.list('discovery-variant-model-decision')[0]!, state = f.store.get(f.state1.id)!, before = history(f.store);
+  for (const store of [f.store, f.open()]) {
+    const get = store.get.bind(store);
+    for (const target of [reference(receipt), reference(decision), reference(state)]) for (const corruption of ['missing', 'kind', 'value']) {
+      store.get = ((id, revision) => {
+        const row = get(id, revision);
+        if (id !== target.id || revision !== target.revision || !row) return row;
+        return corruption === 'missing' ? null : { ...row, ...(corruption === 'kind' ? { kind: 'negative-lookalike' } : { value: { ...row.value as any, reason: 'Negative substitution' } }) };
+      }) as typeof store.get;
+      try { assert.throws(() => readVariantModelDecision(store, f.project, reference(decision)), error => error instanceof EngineError); }
+      finally { store.get = get; }
+    }
+    assert.equal(readVariantModelDecision(store, f.project, reference(decision)).stale, null);
+  }
+  assert.deepEqual(history(f.store), before);
+});

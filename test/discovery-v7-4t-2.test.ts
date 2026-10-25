@@ -337,7 +337,7 @@ console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research:s
   return {store, engine, discovery, open, configure, transport, subject, project, call, wires, calls, stateOf, progressOf, ownCalls, head};
 }
 
-test('4T.2 on the real researchCall every field of the identity and the actor is its own packet and progress: a new paid initial send, never another history', async t => {
+test('4T.2 on the real researchCall each identity has its own packet and progress: proposals buy an initial send, a direct decision refuses', async t => {
   const r = await realPath(t), p = await r.project('p');
   const base = r.subject('proposal', r.transport('snapshot'), r.transport('mode'));
   r.configure(generation('base'));
@@ -364,6 +364,16 @@ test('4T.2 on the real researchCall every field of the identity and the actor is
     seen.add(before.id); keys.add(progress.key);
     r.configure(reply);
     const sent = r.wires().length;
+    if (other.kind === 'decision') {
+      const history = r.store.list().flatMap(row => r.store.history(row.id));
+      const calls = r.store.list('model-call'), ledger = r.store.list('research-budget-ledger'), wire = r.wires();
+      await assert.rejects(r.call(p, other, actor), errorCode('discovery_variant_managed'));
+      assert.deepEqual(r.store.list().flatMap(row => r.store.history(row.id)), history);
+      assert.deepEqual(r.store.list('model-call'), calls); assert.deepEqual(r.store.list('research-budget-ledger'), ledger);
+      assert.deepEqual(r.wires(), wire); assert.equal(r.wires().length, sent);
+      assert.deepEqual(r.stateOf(p, other, actor), before); assert.deepEqual(r.progressOf(p, other, actor), progress);
+      continue;
+    }
     assert.deepEqual(await r.call(p, other, actor), reply, note);
     assert.equal(r.wires().length, sent + 1, `${note}: a new paid send`);
     const own = r.calls(p).find(row => !before.callGuards.some(guard => guard.id === row.id) && canonical(row.value.variantSubject) === canonical(other)

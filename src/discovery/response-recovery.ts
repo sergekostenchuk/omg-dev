@@ -1624,6 +1624,11 @@ export function prepareResearchConsumerIntent(store: Store, input: ResearchConsu
    * selecting the compact v2 storage for an analyst call. */
   options: { contextContract?: typeof CONTEXT_PREPARATION_CONTRACT } = {}): Revision<ResearchConsumerIntent> {
   if (!object(input)) consumerInvalid('research-consumer-intent', 'A complete consumer admission is required');
+  if (isVariantConsumer(input) && (!isRef(input.draft) || !isRef(input.question) || !isRef(input.owner)
+    || typeof input.projectId !== 'string' || !input.projectId || typeof input.key !== 'string' || !input.key
+    || !object(input.role) || !object(input.dispatch) || !object(input.cursor)
+    || !Array.isArray(input.guards) || !Array.isArray(input.basis)))
+    consumerInvalid('research-consumer-intent', 'The variant admission needs every exact basis, dispatch, role and cursor');
   if (!Array.isArray(permits) || !permits.every(isRef))
     consumerInvalid('research-consumer-intent', 'Retry permits must be exact saved terminal references');
   const scoped = earlyResearchStage(store.get<DiscoveryDraft>(input.draft.id, input.draft.revision)?.value.stage);
@@ -1648,6 +1653,8 @@ export function prepareResearchConsumerIntent(store: Store, input: ResearchConsu
     rootKey: input.key, generation, previous: replacing ? reference(previous!) : previous?.value.previous ?? null,
     state: 'prepared', call: null, request: null, archive: null, outputs: null, refusal: null };
   requireIntentSubject(store, value, input.key);
+  if (value.kind === 'variant-decision' && (!previous || replacing || previous.value.state === 'prepared'))
+    variantDecisionIntentAdmission(store, value);
   // Retain an existing attempt's era; a new external generation declares its
   // own admission. An old paid/unsent operation is never reclassified here.
   value.cursor = { ...input.cursor };
@@ -1729,8 +1736,9 @@ export function prepareResearchConsumerIntent(store: Store, input: ResearchConsu
       consumerInvalid(id, 'The operation key names a different saved admission');
     if (checked.value.state === 'prepared' && canonical(checked.value) !== canonical(value)) {
       if (isResearchPreview()) return { ...checked, revision: checked.revision + 1, hash: hashJson(value), value };
-      return store.writeMany<ResearchConsumerIntent>([...preparationWrites, { id, kind: checked.kind, expected: checked.revision, value }],
-        uniqueTransactionGuards([reference(checked), ...value.guards, ...preparationGuards])).at(-1)!;
+      return writeVariantDecisionIntent(store, value,
+        [...preparationWrites, { id, kind: checked.kind, expected: checked.revision, value }],
+        uniqueTransactionGuards([reference(checked), ...value.guards, ...preparationGuards]));
     }
     return checked;
   }
@@ -1740,9 +1748,21 @@ export function prepareResearchConsumerIntent(store: Store, input: ResearchConsu
   // intent — each new record expected:0 — and positively guards only records
   // that already exist; the intent's saved guards never name a record of
   // this batch.
-  return store.writeMany<ResearchConsumerIntent>([...preparationWrites, { id, kind: 'research-consumer-intent', expected: 0, value }],
+  return writeVariantDecisionIntent(store, value, [...preparationWrites, { id, kind: 'research-consumer-intent', expected: 0, value }],
     uniqueTransactionGuards([...value.guards, ...preparationGuards, ...(replacing ? [reference(previous!), currentRefusedCall!] : []),
-      { id, absent: true }])).at(-1)!;
+      { id, absent: true }]));
+}
+function variantDecisionIntentAdmission(store: Store, value: ResearchConsumerIntent): Ref[] {
+  return requireVariantDecisionAdmission(store, value.projectId, decodeVariantSubject(value.cursor.variantSubject), value.owner.id,
+    decodeVariantExecutionSession(store.get(value.owner.id, value.owner.revision)?.value));
+}
+function writeVariantDecisionIntent(store: Store, value: ResearchConsumerIntent, writes: Write[], guards: TransactionGuard[]): Revision<ResearchConsumerIntent> {
+  if (value.kind !== 'variant-decision') return store.writeMany<ResearchConsumerIntent>(writes, guards).at(-1)!;
+  // Different actors/modes have different intent addresses. Serialize their set-wide admission with publication of
+  // the intent itself: two prepared identities must not both pass the scan and then permanently block each other.
+  const written = store.atomicWrite(view => ({ value: null, writes,
+    guards: uniqueTransactionGuards([...guards, ...variantDecisionIntentAdmission(view, value)]) }));
+  return written.records.at(-1)! as Revision<ResearchConsumerIntent>;
 }
 export function prepareResearchConsumerReservation(store: Store, intentRef: Ref, call: Write,
   request: Ref, archive: Ref): { writes: Write[]; guards: TransactionGuard[] } {
@@ -4176,6 +4196,7 @@ export function readVariantGeneration(store:Store,project:string,ref:Ref):Proven
 }
 export interface ProvenVariantModelDecision {
   verification:'proven'; session:Revision<VariantExecutionSession>; decision:VariantPublicationRecord<VariantModelDecision>; state:Ref|null;
+  stale: { code:'discovery_variant_stale'; reason:'mode_or_selection_changed' } | null;
 }
 /** 4B.2: the proven reader of a paid model decision. The structural record leads to its application and receipt; the
  * decision is recomputed from the paid answer over the exact proven set. A structural decision alone proves nothing. */
@@ -4187,7 +4208,11 @@ export function readVariantModelDecision(store:Store,project:string,ref:Ref):Pro
   if(session.value.variantSubject.kind!=='decision') variantSessionInvalid('A model decision is published by a decision execution');
   const {decision,state}=variantDecisionPublicationWrites(store,session.value,payload,true);
   if(!variantSame(decision.ref,ref)) variantSessionInvalid('The model decision is not the one its paid answer projects');
-  return {verification:'proven',session,decision,state:stateOf(state)};
+  const publishedState=stateOf(state);
+  // The saved output form proves whether publication kept its current-state admission. Do not infer a historical
+  // stale reason from today's heads, which may have moved again since this paid application.
+  return {verification:'proven',session,decision,state:publishedState,
+    stale:publishedState?null:{code:'discovery_variant_stale',reason:'mode_or_selection_changed'}};
 }
 /** 4B.2: the admission of a NEW managed model decision, judged at preparation and again at the common reservation door.
  * Only bypass buys a model choice; questions stops at the owner door. The set is proven, the expected selection is the
@@ -4206,11 +4231,14 @@ export function requireVariantDecisionAdmission(store:Store,project:string,subje
   const decided=store.list<{set?:Ref}>('discovery-variant-model-decision').concat(store.list<{set?:Ref}>('discovery-variant-owner-decision'))
     .some(row=>variantSame(row.value.set,subject.set));
   const bought=store.list<ResearchConsumerIntent>('research-consumer-intent').some(row=>row.value.kind==='variant-decision'
-    && row.value.state!=='refused' && row.value.owner?.id!==sessionId && variantSame(row.value.cursor?.variantSubject?.set,subject.set));
+    && row.value.state!=='refused' && row.value.owner?.id!==sessionId && variantSame(row.value.cursor?.variantSubject?.set,subject.set)
+    && (row.value.state!=='prepared' || !Array.isArray(row.value.guards) || transactionGuardsCurrent(store,row.value.guards)));
   if(!variantSame(state.set,subject.set) || state.decision!==null || decided || bought)
     throw new EngineError('discovery_variant_decision_exists','This set is already decided or being decided; another mode, actor or selection buys no new choice');
   if(variantStateId(project,proven.session.value.draft.id)!==subject.expectedSelection.id)
     throw new EngineError('discovery_variant_decision_invalid','The expected selection is the state of the set\'s own draft');
+  if(!variantSame(proven.state,subject.expectedSelection))
+    throw new EngineError('discovery_variant_decision_invalid','The undecided selection must be the exact state of the paid set publication');
   return [subject.set,subject.mode,subject.expectedSelection];
 }
 

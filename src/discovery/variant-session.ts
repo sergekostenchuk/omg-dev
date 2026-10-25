@@ -106,7 +106,7 @@ export function applyVariantSession(store:Store,project:string,intentRef:Ref):Re
   const owner=readVariantExecutionSession(store,project,paid.intent.value.owner);
   const value=projectPaidVariantSession(owner,paid.intent,{call:reference(paid.call),response:paid.response,payload:paid.payload});
   // 4B.1: the receipt, the members, the set or no_variants and the next current state — one atomic batch of the common
-  // lifecycle. A moved mode or selection refuses the batch; the paid answer stays saved under its original subject.
+  // lifecycle. If mode or selection moved, publish only the paid product under its original subject; keep the newer current state.
   const product=value.variantSubject.kind==='proposal'?variantPublicationWrites(store,value,paid.payload):variantDecisionPublicationWrites(store,value,paid.payload);
   const batch=prepareResearchConsumerApplication(store,reference(paid.intent),reference(paid.call),[
     {id:owner.id,kind:owner.kind,expected:owner.revision,value},...product.writes],[reference(owner),...product.guards]);

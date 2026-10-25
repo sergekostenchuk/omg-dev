@@ -326,7 +326,7 @@ export async function researchCall(role: RoleBinding, environment: Environment, 
   audit?: ResearchCallAudit): Promise<unknown> {
   const answer = await dispatchResearchCall(role, environment, prompt, context, signal, audit);
   if (audit?.purpose === 'variant-proposal' && packetVariantSubject(context)?.kind === 'proposal') decodeVariantGeneration(answer);
-  else if (audit?.purpose === 'variant-decision' && packetVariantSubject(context)?.kind === 'decision') decodeVariantDecisionAnswer(answer);
+  else if (audit?.purpose === 'variant-decision' && audit.consumerIntent && packetVariantSubject(context)?.kind === 'decision') decodeVariantDecisionAnswer(answer);
   return answer;
 }
 
@@ -477,12 +477,12 @@ async function dispatchResearchCall(role: RoleBinding, environment: Environment,
       audit.purpose, role.actor, variantSubject).map(call => variantCallManaged(audit.store, call)).includes(false),
     'discovery_variant_managed', 'This variant identity already has a direct call; a managed send would pay it twice');
     else {
-      // 4B.2: a model decision on a v7 draft is bought only as the managed step of the common door — never directly.
-      requireCondition(variantSubject.kind !== 'decision' || !isDiscoveryV7Draft(draft.value), 'discovery_variant_managed',
-        'A model decision is bought only by its managed execution, which proves its set, mode and selection');
       const paid = replayVariantResponse(audit.store, environment.projectId, audit.draftId, audit.questionId, audit.purpose,
         role.actor, variantSubject);
       if (paid) { audit.onContext?.(paid.subject); return paid.research; }
+      // New v7 decisions use the managed door. An original paid transport return keeps its own historical contract.
+      requireCondition(variantSubject.kind !== 'decision' || !isDiscoveryV7Draft(draft.value), 'discovery_variant_managed',
+        'A model decision is bought only by its managed execution, which proves its set, mode and selection');
     }
   }
   const requestId = randomUUID();
