@@ -13,7 +13,7 @@ import type { MachinePlan } from "../src/compiler/model.js";
 import { deriveTasks } from "../src/compiler/derive.js";
 import { exampleGraph } from "./graph-fixture.js";
 import { enrichedGraph } from "./enriched-graph-fixture.js";
-import { preparedFeatures, refinedLayers } from "./product-fixture.js";
+import { prepareOmFixtureStages, prepareNativeLayers } from "./om-fixture.js";
 
 const FULL_CHECK = { executable: "npm", args: ["run", "check"] };
 
@@ -76,13 +76,18 @@ test("the product API returns compact context and exact detailed evidence, and r
   git(workspace, ["add", "README.md"]); git(workspace, ["-c", "user.name=OMG Test", "-c", "user.email=test@example.invalid", "commit", "-m", "initial"]);
   const store = new Store(join(root, "state.sqlite")), engine = new ProductEngine(store);
   t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
-  preparedFeatures(engine, "p");
+  const desired = enrichedGraph(exampleGraph("p"), "p");
+  prepareOmFixtureStages(engine, "p", desired);
   const command = { executable: process.execPath, args: ["--version"] };
   engine.environments.configure("p", { workspace, implementer: { actor: "worker", model: "fixture", effort: "high", command },
-    reviewer: { actor: "reviewer", model: "fixture", effort: "high", command }, fullCheck: command, timeoutMs: 1000 }, 0);
-  refinedLayers(engine, "p"); const r3 = engine.refinement.assess("p", 0);
-  const stage = engine.refinement.publish("p", reference(r3), 0); engine.pipeline.accept("p", "om-g2", stage.revision);
+    reviewer: { actor: "reviewer", model: "fixture", effort: "high", command }, fullCheck: command, timeoutMs: 1000, requestCapacityChars: 100_000 }, 0);
+  prepareNativeLayers(engine, "p", desired, "executed", { decidePolicies: true });
   const plan = engine.compiler.compile("p"), task = plan.value.tasks[1]!.id;
+  // The plan stands on the current producers: no research phase, no feasibility of the old route, the real OM feasibility and the accepted L3.
+  assert.deepEqual(store.list("phase"), []);
+  assert.equal(store.get("feasibility:p"), null);
+  assert.deepEqual(plan.value.feasibility, reference(store.get("om-feasibility:p")!));
+  assert.equal(store.get<{ acceptance?: { producer?: string } }>("graph-layer:p:3")!.value.acceptance?.producer, "om");
   const request = { type: "task-context", project: "p", plan: reference(plan), task, maxChars: 100_000 };
   const context = engine.execute(request) as ContextText;
   const payload = JSON.parse(context.text);
