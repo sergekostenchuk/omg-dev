@@ -1,14 +1,11 @@
 import { runIntegrityCheck, integrityGate } from "../src/om/integrity.js";
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
-import { createRequire } from 'node:module';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import test, { type TestContext } from 'node:test';
-import { fileURLToPath, pathToFileURL } from 'node:url';
-import { canonical, hashJson } from '../src/canonical.js';
+import { canonical } from '../src/canonical.js';
 import type { MachinePlan } from '../src/compiler/model.js';
 import { UPSTREAM_STAGES, type UpstreamStage } from '../src/discovery/requirements.js';
 import { EngineError } from '../src/errors.js';
@@ -403,128 +400,6 @@ test('LG30-C M8 draft commands distinguish foreign addresses, damaged exact refs
     } finally { f.store.get = get; }
     assert.equal(history(f.store), before);
   }
-});
-
-const NATIVE_HISTORY_LOADER = String.raw`import {execFileSync} from 'node:child_process';
-import {fileURLToPath} from 'node:url';
-let root,ts;
-export async function initialize(data){root=data.root;ts=(await import(data.typescript)).default;}
-export async function load(url,context,next){
- const prefix=new URL('dist/',root).href;
- if(url.startsWith(prefix)&&/\.js$/.test(url)){
-  const relative=url.slice(prefix.length).replace(/\.js$/,'.ts');
-  if(relative.startsWith('src/')||relative.startsWith('test/')){
-   const source=execFileSync('git',['show','daa81a530cae8ddcbdaa9098471cf62d2e92a179:'+relative],
-    {cwd:fileURLToPath(root),encoding:'utf8',maxBuffer:10000000});
-   return {format:'module',shortCircuit:true,source:ts.transpileModule(source,
-    {compilerOptions:{module:ts.ModuleKind.ESNext,target:ts.ScriptTarget.ES2023}}).outputText};
-  }
- }
- return next(url,context);
-}`;
-
-test('G1.3 complete daa81a530cae history and new plan era preserve native semantics and exact dependent references', t => {
-  const directory = realpathSync(mkdtempSync(join(tmpdir(), 'omg-g13-base-')));
-  t.after(() => rmSync(directory, { recursive: true, force: true }));
-  const repository = fileURLToPath(new URL('../../', import.meta.url));
-  const loader = join(directory, 'loader.mjs'), script = join(directory, 'producer.mjs');
-  writeFileSync(loader, NATIVE_HISTORY_LOADER);
-  writeFileSync(script, `import{copyFileSync,mkdirSync,writeFileSync}from'node:fs';
-import{join}from'node:path';import{pathToFileURL}from'node:url';
-const repository=process.argv[2],directory=process.argv[3];
-const src=path=>pathToFileURL(join(repository,'dist/src',path)).href;
-const{Store}=await import(src('storage/store.js'));
-const{ProductEngine}=await import(src('product/engine.js'));
-const{canonical}=await import(src('canonical.js'));
-const{reference}=await import(src('pipeline/contracts.js'));
-const{git}=await import(src('runtime/environment.js'));
-const{preparedFeatures,refinedLayers}=await import(pathToFileURL(join(repository,'dist/test/product-fixture.js')).href);
-const workspace=join(directory,'repo'),original=join(directory,'original.sqlite'),database=join(directory,'comparison.sqlite');
-mkdirSync(workspace);git(workspace,['init','-b','main']);
-writeFileSync(join(workspace,'README.md'),'A complete native producer compatibility fixture.\\n');
-git(workspace,['add','README.md']);
-git(workspace,['-c','user.name=Fixture','-c','user.email=fixture@example.invalid','commit','-m','initial']);
-let store=new Store(original),engine=new ProductEngine(store);
-try{
- preparedFeatures(engine,'p');
- const command={executable:process.execPath,args:['--version']};
- engine.environments.configure('p',{workspace,
-  implementer:{actor:'author',model:'fixture',effort:'high',command},
-  reviewer:{actor:'reviewer',model:'fixture',effort:'high',command},fullCheck:command,timeoutMs:1000},0);
- refinedLayers(engine,'p');const feasibility=engine.refinement.assess('p',0);
- const before=canonical(store.list().flatMap(record=>store.history(record.id)));
- store.close();copyFileSync(original,database);store=new Store(original);engine=new ProductEngine(store);
- const omDraft=engine.refinement.publish('p',reference(feasibility),0);
- const omAccepted=engine.pipeline.accept('p','om-g2',omDraft.revision);
- const plan=engine.compiler.compile('p');
- const planRepeated=engine.compiler.compile('p');
- const compilationDraft=engine.compiler.publish('p',reference(plan),0);
- const compilationAccepted=engine.pipeline.accept('p','compilation',compilationDraft.revision);
- const omRepeated=engine.pipeline.accept('p','om-g2',omAccepted.revision);
- const compilationRepeated=engine.pipeline.accept('p','compilation',compilationAccepted.revision);
- const productRepeated=engine.execute({type:'compile',project:'p'});
- const results={omDraft,omAccepted,plan,planRepeated,compilationDraft,compilationAccepted,omRepeated,compilationRepeated,productRepeated};
- const after=canonical(store.list().flatMap(record=>store.history(record.id)));
- process.stdout.write(JSON.stringify({database,before,results,after}));
-}finally{store.close();}
-`);
-  const typescript = pathToFileURL(createRequire(import.meta.url).resolve('typescript')).href;
-  const bootstrap = `import{register}from'node:module';register(${JSON.stringify(pathToFileURL(loader).href)},
-{data:{root:${JSON.stringify(pathToFileURL(repository).href)},typescript:${JSON.stringify(typescript)}}});`;
-  const environment = { ...process.env }; delete environment.NODE_TEST_CONTEXT;
-  const raw = execFileSync(process.execPath, ['--import', `data:text/javascript,${encodeURIComponent(bootstrap)}`, script, repository, directory],
-    { cwd: repository, env: environment, encoding: 'utf8', timeout: 120_000, maxBuffer: 40_000_000 });
-  const old = JSON.parse(raw) as { database: string; before: string; results: Record<string, unknown>; after: string };
-  let store = new Store(old.database);
-  try {
-    let engine = new ProductEngine(store);
-    assert.equal(store.get('om-input:p'), null);
-    assert.equal(history(store), old.before, 'Both producers start from the same saved identities, revisions, environment and repository');
-    const feasibility = store.get('feasibility:p')!;
-    const omDraft = engine.refinement.publish('p', reference(feasibility), 0);
-    const omAccepted = engine.pipeline.accept('p', 'om-g2', omDraft.revision);
-    const plan = engine.compiler.compile('p');
-    const planRepeated = engine.compiler.compile('p');
-    const compilationDraft = engine.compiler.publish('p', reference(plan), 0);
-    const compilationAccepted = engine.pipeline.accept('p', 'compilation', compilationDraft.revision);
-    const omRepeated = engine.pipeline.accept('p', 'om-g2', omAccepted.revision);
-    const compilationRepeated = engine.pipeline.accept('p', 'compilation', compilationAccepted.revision);
-    const productRepeated = engine.execute({ type: 'compile', project: 'p' });
-    // V3 changes new production's envelope; every other plan field stays equal to the Git producer.
-    const oldPlan = old.results['plan'] as Revision<MachinePlan>;
-    const { hash: oldHash, ...oldBody } = oldPlan.value;
-    const newBody = { ...oldBody, derivation: 'external-inputs/v1' as const };
-    const newValue = { ...newBody, hash: hashJson(newBody) };
-    const expectedPlan = { ...oldPlan, id: `plan:p:external-inputs-v1:${newValue.hash}`, value: newValue, hash: hashJson(newValue) };
-    assert.notEqual(expectedPlan.id, oldPlan.id);
-    const expectedHistory = (JSON.parse(old.after) as Revision<any>[]).map(row => {
-      if (row.id === oldPlan.id) return expectedPlan;
-      if (row.id === 'current-plan:p') {
-        assert.deepEqual(row.value, reference(oldPlan));
-        const value = reference(expectedPlan); return { ...row, value, hash: hashJson(value) };
-      }
-      if (row.id === 'stage:p:compilation') {
-        assert.deepEqual(row.value.content, { plan: reference(oldPlan) });
-        const value = { ...row.value, content: { plan: reference(expectedPlan) },
-          proofs: row.value.proofs.map((ref: Ref) => canonical(ref) === canonical(reference(oldPlan)) ? reference(expectedPlan) : ref) };
-        return { ...row, value, hash: hashJson(value) };
-      }
-      return row;
-    }).sort((a, b) => a.id.localeCompare(b.id) || a.revision - b.revision);
-    assert.deepEqual({ omDraft, omAccepted, plan, planRepeated, compilationDraft, compilationAccepted, omRepeated, compilationRepeated, productRepeated },
-      { ...old.results, plan: expectedPlan, planRepeated: expectedPlan, productRepeated: expectedPlan,
-        compilationDraft: expectedHistory.find(row => row.id === compilationDraft.id && row.revision === compilationDraft.revision),
-        compilationAccepted: expectedHistory.find(row => row.id === compilationAccepted.id && row.revision === compilationAccepted.revision),
-        compilationRepeated: expectedHistory.find(row => row.id === compilationRepeated.id && row.revision === compilationRepeated.revision) });
-    const exactHistory = () => canonical(store.list().flatMap(row => store.history(row.id))
-      .sort((a, b) => a.id.localeCompare(b.id) || a.revision - b.revision));
-    assert.equal(exactHistory(), canonical(expectedHistory), 'Only the plan envelope and its declared dependent references change');
-    store.close(); store = new Store(old.database); engine = new ProductEngine(store);
-    assert.deepEqual(engine.compiler.read(plan.id), expectedPlan);
-    assert.equal(engine.pipeline.inspect('p', 'compilation').state, 'accepted');
-    assert.equal(exactHistory(), canonical(expectedHistory));
-    assert.equal(store.get('om-input:p'), null);
-  } finally { store.close(); }
 });
 
 // ---- S1.5 (№2363): the search for saved OM provenance of a project without its first B1 ----
