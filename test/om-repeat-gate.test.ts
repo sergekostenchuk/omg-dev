@@ -4015,6 +4015,142 @@ test("E5.1 checks the full E1 ledger even when its head is missing, foreign, or 
   });
 });
 
+test("LG07 rg-rest-no-e1: a full managed plan ceases before E1, guards ledger absence and repeats its exact unpaid close", async t => {
+  const { prepareCompletionCause, readCompletionCessationAt } = await import("../src/om/model-call.js");
+  for (const race of [false, true]) await t.test(race ? "a real rival E1 defeats the absent guard" : "unpaid hot and cold close", async child => {
+    const f = lp6Gate(child);
+    const round = await f.joinedRound(1, [{ batch: "fields", unsent: true }, { batch: "expansion", unsent: true }]);
+    const series = f.head(), binding = deliveredOf(readCompletionBinding(f.store, f.project, reference(series), 1))!;
+    assert.deepEqual(binding.value.plan, { routes: reference(round.routes), batches: [round.fields.id, round.expansion.id].sort() });
+    assert.deepEqual(binding.value.goal, round.goal);
+    assert.deepEqual(round.goal.questions, [...round.fields.items, ...round.expansion.items]
+      .map(item => gapLineKey(f.project, item.target, item.field)).sort());
+    const work = () => deliveredOf(readCompletionWorkAt(f.store, f.project,
+      reference(f.store.get(completionWorkId(f.project, binding.id))!)));
+    const packets = f.store.list<QuestionPacketRecord>("question-packet");
+    assert.equal(packets.length, 2);
+    assert.ok(packets.every(packet => packet.value.state === "ready" && packet.value.request.attempt!.ordinal === 1
+      && packet.value.request.attempt!.series.id === series.id));
+    const noE1 = () => {
+      assert.deepEqual(f.store.list("call-record"), []);
+      assert.deepEqual(f.store.list("model-call"), []);
+      assert.equal(deliveredOf(readCallLedger(f.store, f.project)), null);
+      assert.equal(f.store.get(callLedgerId(f.project)), null);
+      assert.deepEqual(f.sent(), []);
+    };
+    noE1();
+    const unpaid = mechanismSnapshot(f.store);
+    assert.equal(refusalOf(f.claim(1)).code, "completion_incomplete");
+    assert.equal(refusalOf(f.close(1, outcome({ reason: "interrupted" }))).code, "completion_incomplete");
+    for (const assignment of work().assignments) {
+      assert.equal(deliveredOf(prepareCompletionCause(f.store, f.project, reference(assignment))).cause, null);
+      assert.equal(refusalOf(writeCompletionCessation(f.store, { project: f.project, binding: reference(binding),
+        assignment: reference(assignment) })).code, "completion_cause_unproved");
+    }
+    assert.deepEqual(mechanismSnapshot(f.store), unpaid);
+    // An actual owner decision replaces the mandatory B1. No physical call has been admitted.
+    const replacement = f.replace("garden-B1", "state", { writer: "garden-produce-block" });
+    let ceased = 0;
+    while (!work().complete) {
+      const current = work(), resolved = new Set(current.resolved.map(row => row.id));
+      const pending = current.assignments.filter(row => !resolved.has(row.id));
+      let moved = false;
+      for (const assignment of pending) {
+        const proof = deliveredOf(prepareCompletionCause(f.store, f.project, reference(assignment)));
+        if (!proof.cause) continue;
+        const cessation = deliveredOf(writeCompletionCessation(f.store, { project: f.project, binding: reference(binding),
+          assignment: reference(assignment) }));
+        assert.deepEqual(deliveredOf(readCompletionCessationAt(f.store, f.project, reference(cessation))), cessation);
+        assert.deepEqual([cessation.value.call, cessation.value.ledger, cessation.value.physical], [null, null, null]);
+        assert.deepEqual(cessation.value.cause, proof.cause);
+        ceased++; moved = true; break;
+      }
+      assert.ok(moved, "Every remaining assignment must have its own producer-proven cessation");
+    }
+    assert.ok(ceased > 0);
+    assert.equal(work().resolved.length, work().assignments.length);
+    noE1();
+    const claim = deliveredOf(f.claim(1)).outcome;
+    assert.deepEqual(claim, outcome({ reason: "interrupted" }));
+    const request = { ...f.address, attempt: 1, outcome: claim };
+
+    // Prepare a separate block's fresh E2 before the close, so only its real E1/ledger arrives in the write window.
+    let rivalCall: import("../src/om/call-record.js").RecordCallRequest | null = null;
+    if (race) {
+      const graph = reference(f.store.get(`graph:${f.project}`)!);
+      const horizon = deliveredOf(writeHorizon(f.store, { project: f.project, input: reference(replacement), graph,
+        refinement: null, available: {}, choice: { choiceVersion: "no-e1-rival", features: [{ outcome: "garden-result" }], excluded: [] } }));
+      const old = round.routes.value.request.gaps.sources;
+      const sources: GapRequest = { ...structuredClone(old), input: reference(replacement), horizon: reference(horizon.gate),
+        operations: { proposals: [], frame: { ...old.operations.frame, horizon: reference(horizon.gate) } } };
+      const gaps = deliveredOf(writeGaps(f.store, sources));
+      const routes = deliveredOf(writeRoutes(f.store, { project: f.project,
+        gaps: { sources: structuredClone(gaps.sources) as GapRequest, records: gaps.records.map(reference) },
+        tasks: [], catalog: { paths: [], records: [] }, previous: null }));
+      const block = "garden-produce-block", batch = routes.value.batches.find(row => row.task === "node-expansion"
+        && row.items.every(item => item.consumers.includes(block)))!;
+      assert.ok(batch);
+      const rivalGoal = { key: "no-e1-rival", questions: batch.items.map(item => gapLineKey(f.project, item.target, item.field)).sort(),
+        result: gapLineExpectedResult(f.project, batch.items[0]!.target, batch.items[0]!.field) };
+      deliveredOf(openSeries(f.store, { project: f.project, block, line: 1, slice: "no-e1-rival", predecessor: null, basis: null }));
+      const rival = deliveredOf(openAttempt(f.store, { project: f.project, block, line: 1, attempt: 1, goal: rivalGoal,
+        completion: { routes: reference(routes), batches: [batch.id] } }));
+      const rivalPacket = deliveredOf(writeQuestionPacket(f.store, { project: f.project, routes: reference(routes), batch: batch.id,
+        environment: packets[0]!.value.request.environment, attempt: { series: reference(rival), ordinal: 1 }, previous: [] })).record;
+      const payload = rivalPacket.value.packet as unknown as { requestId: string; purpose: "model-design"; questions: { id: string }[] };
+      const issued = new Set(payload.questions.map(item => item.id));
+      rivalCall = { call: payload.requestId, purpose: payload.purpose, basis: null, block,
+        gaps: batch.items.filter(item => issued.has(item.gap)).flatMap(item => item.consumers.map(consumer => ({
+          id: item.target, goal: item.target, field: item.field, consumer }))),
+        series: reference(rival), attempt: 1, goal: rivalGoal,
+        dispatch: { adapter: reference(f.adapter), config: rivalPacket.value.request.environment }, packet: structuredClone(rivalPacket.value.packet) as Json };
+    }
+    const prepared = deliveredOf(prepareCloseAttempt(f.store, request));
+    assert.ok(prepared.guards.some(guard => "absent" in guard && guard.id === callLedgerId(f.project)));
+    noE1();
+    if (rivalCall) {
+      const other = new Store(f.store.path); child.after(() => other.close());
+      const admitted = deliveredOf(recordCall(other, f.project, rivalCall));
+      assert.deepEqual(deliveredOf(readCallLedger(f.store, f.project)), admitted.ledger);
+      assert.equal(f.store.list("call-record").length, 1);
+      assert.deepEqual(f.sent(), [], "The competing E1 is recorded but has not dispatched");
+      for (const guard of prepared.guards.filter(row => row.id !== callLedgerId(f.project))) {
+        const current = f.store.get(guard.id);
+        assert.deepEqual(current ? reference(current) : null, "absent" in guard ? null : guard,
+          "Only the ledger guard changes during the E1 race");
+      }
+      const afterRival = mechanismSnapshot(f.store);
+      const rejected = refusalOf(writeGuarded(f.store, { unit: UNIT, target: series.id, writes: prepared.writes, guards: prepared.guards }));
+      assert.deepEqual([rejected.code, rejected.at.target], ["input_stale", callLedgerId(f.project)]);
+      assert.deepEqual(mechanismSnapshot(f.store), afterRival);
+      assert.deepEqual(f.sent(), []);
+      assert.equal(f.store.get(completionCloseId(f.project, binding.id)), null);
+      return;
+    }
+    const closed = deliveredOf(closeAttempt(f.store, request));
+    assert.deepEqual(closed, prepared.value);
+    assert.equal(f.saved(1).ledger, null);
+    assert.equal(f.head().value.attempts[0]!.outcome!.reason, "interrupted");
+    noE1();
+    // Deliberate current-head corruption only AFTER the lawful close. Replay must not use it as historical evidence.
+    f.store.write({ id: callLedgerId(f.project), kind: "foreign-ledger", expected: 0, value: {} });
+    assert.equal(refusalOf(readCallLedger(f.store, f.project)).code, "ledger_invalid");
+    const before = mechanismSnapshot(f.store);
+    for (const cold of [false, true]) {
+      if (cold) f.restart();
+      const get = f.store.get.bind(f.store);
+      f.store.get = ((id: string, revision?: number) => {
+        assert.ok(id !== callLedgerId(f.project) || revision !== undefined, "Exact replay never reads the current E1 ledger");
+        return get(id, revision);
+      }) as Store["get"];
+      try { assert.deepEqual(deliveredOf(closeAttempt(f.store, request)), closed); }
+      finally { f.store.get = get; }
+      assert.deepEqual(mechanismSnapshot(f.store), before);
+      assert.deepEqual(f.sent(), []);
+    }
+  });
+});
+
 test("E5.1 proves an absent E1 ledger for a new G3 closure and does not revisit it on exact repeat", t => {
   const { store, path } = fixture(t);
   opened(store);
