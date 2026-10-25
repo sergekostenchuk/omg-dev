@@ -3,23 +3,12 @@
 # npm test гоняет всё; неизвестный, дублирующийся или вне-прогоновый ключ останавливает check:backend до запуска.
 # Реестр: ~/REPORTS/review/omg-excl1-design_191026.md (описи omg-legacy-inv-{A,B,C,D,D2-cw}_191026.md).
 
-om-question-packet.test.ts :: MP1.1 row 10: two individually proved parts from different brief versions cannot form one producer request or a saved chain # вид 1: эра e88b4ed4
 om-achievements.test.ts :: LP7 rows 23, 24: one answer to the joined input fields proves exactly the LP6 keys the split routing proves by parts, state components included; an answer of some proves only theirs, and their rest is joined again on the next B1 # вид 1, найден GUARD1
 om-spend-report.test.ts :: E6 reads unchanged E1 bytes from the complete 0da9006 producer after restart # вид 1, найден GUARD1
 
 # GS3a: wake-choice supplements exist only for proposals admitted before the wakeTest requirement.
 
 # OLD-DISCOVERY (№7903): собственная логика старого Discovery; общие механизмы и нижние потребители сохранены.
-early-stage-driver.test.ts :: IN1 initializes verbatim Source, brief and fallback objective before the first researchPlan call # вид OLD-DISCOVERY: собственная логика старого Discovery v6, удаляется с включением v7 (слово владельца 20.10)
-early-stage-driver.test.ts :: IN1 explicit objective is selected from the same exact Source; arbitrary model prose is not an input field # вид OLD-DISCOVERY: собственная логика старого Discovery v6, удаляется с включением v7 (слово владельца 20.10)
-early-stage-driver.test.ts :: IN1 derives brief and explicit objective through exact JSON pointers # вид OLD-DISCOVERY: собственная логика старого Discovery v6, удаляется с включением v7 (слово владельца 20.10)
-early-stage-driver.test.ts :: IN1 leaves a previous-era decision and draft without present-day input authorship # вид OLD-DISCOVERY: собственная логика старого Discovery v6, удаляется с включением v7 (слово владельца 20.10)
-early-stage-driver.test.ts :: IN1 changed Source makes the accepted researchPlan addressed stale without another model call # вид OLD-DISCOVERY: собственная логика старого Discovery v6, удаляется с включением v7 (слово владельца 20.10)
-early-stage-driver.test.ts :: DRV1 returns supported no_go as its subject outcome and repeat neither pays nor starts concept # вид OLD-DISCOVERY: собственная логика старого Discovery v6, удаляется с включением v7 (слово владельца 20.10)
-early-stage-driver.test.ts :: DRV1 returns supported conditional as its subject outcome and repeat neither pays nor starts concept # вид OLD-DISCOVERY: собственная логика старого Discovery v6, удаляется с включением v7 (слово владельца 20.10)
-early-stage-driver.test.ts :: DRV1 returns supported insufficient_evidence as its subject outcome and repeat neither pays nor starts concept # вид OLD-DISCOVERY: собственная логика старого Discovery v6, удаляется с включением v7 (слово владельца 20.10)
-early-stage-briefs.test.ts :: DS2 new plan/report/verdict reach A and B; absent analogues alone allow go (go) # вид OLD-DISCOVERY: собственная логика старого Discovery v6, удаляется с включением v7 (слово владельца 20.10)
-early-stage-briefs.test.ts :: DS2 new plan/report/verdict reach A and B; absent analogues alone allow go (insufficient_evidence) # вид OLD-DISCOVERY: собственная логика старого Discovery v6, удаляется с включением v7 (слово владельца 20.10)
 discovery-decision.test.ts :: DS1.1 partial choices survive restart; last choice and normal reopen are atomic and replay exactly once # вид OLD-DISCOVERY: собственная логика старого Discovery v6, удаляется с включением v7 (слово владельца 20.10)
 discovery-decision.test.ts :: OC1 completes a lawful mixed v1/v2 round without upgrading the historical decision # вид OLD-DISCOVERY: собственная логика старого Discovery v6, удаляется с включением v7 (слово владельца 20.10)
 discovery-decision.test.ts :: DS1.1 declined choice remains a meaningful input to a new no_go; evidence has no choice command # вид OLD-DISCOVERY: собственная логика старого Discovery v6, удаляется с включением v7 (слово владельца 20.10)
@@ -34,12 +23,3 @@ discovery-decision.test.ts :: DS1.1 model owner options duplicate-id are refused
 discovery-decision.test.ts :: DS1.1 model owner options no-decline are refused before assessment # вид OLD-DISCOVERY: собственная логика старого Discovery v6, удаляется с включением v7 (слово владельца 20.10)
 discovery-decision.test.ts :: DS1.1 model owner options missing-options are refused before assessment # вид OLD-DISCOVERY: собственная логика старого Discovery v6, удаляется с включением v7 (слово владельца 20.10)
 discovery-decision.test.ts :: DS1.1 concurrent answers to separate conditions cannot lose the final reopen # вид OLD-DISCOVERY: собственная логика старого Discovery v6, удаляется с включением v7 (слово владельца 20.10)
-discovery-v6-era.test.ts :: DS1.2e v6 explicitly retains the Discovery subject gate; field presence never selects the era # вид OLD-DISCOVERY: собственная логика старого Discovery v6, удаляется с включением v7 (слово владельца 20.10)
-discovery-v6-era.test.ts :: DS1.2v current v6 accepted replay keeps the DRV1 public shape and paid bytes after a new Store # вид OLD-DISCOVERY: собственная логика старого Discovery v6, удаляется с включением v7 (слово владельца 20.10)
-discovery-v6-era.test.ts :: DS2 unknown complete contracts from a real producer keep addressed driver and gate refusals # вид OLD-DISCOVERY: собственная логика старого Discovery v6, удаляется с включением v7 (слово владельца 20.10)
-preparation.test.ts :: new initial research requires every scenario category and refuses unresolved essential inputs # вид OLD-DISCOVERY: собственная логика старого Discovery v6, удаляется с включением v7 (слово владельца 20.10)
-preparation.test.ts :: a complete-looking preparation cannot bind a scenario to a foreign beneficiary # вид OLD-DISCOVERY: собственная логика старого Discovery v6, удаляется с включением v7 (слово владельца 20.10)
-preparation.test.ts :: legacy accepted research keeps its era, while a new result cannot use the legacy contract # вид OLD-DISCOVERY: собственная логика старого Discovery v6, удаляется с включением v7 (слово владельца 20.10)
-preparation.test.ts :: B1.1 v4 discovery questions require an explicit legal moment before any answer write # вид OLD-DISCOVERY: собственная логика старого Discovery v6, удаляется с включением v7 (слово владельца 20.10)
-preparation.test.ts :: B1.1 v4 stage research uses the declared question schema and the ordinary consumer gate # вид OLD-DISCOVERY: собственная логика старого Discovery v6, удаляется с включением v7 (слово владельца 20.10)
-preparation.test.ts :: B1.1 current producer does not resume unaccepted version 3 work # вид OLD-DISCOVERY: собственная логика старого Discovery v6, удаляется с включением v7 (слово владельца 20.10)
