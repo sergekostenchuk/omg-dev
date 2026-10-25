@@ -178,9 +178,13 @@ async function ready(t: test.TestContext, model = false) {
 }
 type Ready = Awaited<ReturnType<typeof ready>>;
 function intercept(store: Store, action: (writes: Write[], guards: TransactionGuard[], write: () => Revision<unknown>[]) => Revision<unknown>[]) {
+  const descriptor = Object.getOwnPropertyDescriptor(store, 'writeMany');
   const saved = store.writeMany.bind(store);
   store.writeMany = ((writes: Write[], guards: TransactionGuard[] = []) => action(writes, guards, () => saved(writes, guards))) as Store['writeMany'];
-  return () => { store.writeMany = saved; };
+  return () => {
+    if (descriptor) Object.defineProperty(store, 'writeMany', descriptor);
+    else Reflect.deleteProperty(store, 'writeMany');
+  };
 }
 function cut(f: Ready, point: 'before'|'after') {
   return intercept(f.store, (writes, _guards, write) => {
@@ -416,7 +420,7 @@ test('5.5 deep continues the original broad MR/P run and its next positions, wit
   const prior = f.store.get<any>((baseline.state as { ref: Ref }).ref.id)!;
   const runId = prior.value.summary.cursor.run;
   const oldRun = f.store.get<ResearchRun>(runId)!;
-  f.store.write<ResearchRun>({ id: oldRun.id, kind: oldRun.kind, expected: oldRun.revision, value: { ...oldRun.value, limit: 1 } });
+  f.store.write<ResearchRun>({ id: oldRun.id, kind: oldRun.kind, expected: oldRun.revision, value: { ...oldRun.value, limit: 1, status: 'paused', pauseCode: 'research_variant_handoff_unavailable' } });
   const limit = 1;
   const results: NonNullable<Awaited<ReturnType<typeof runDeepResearch>>>[] = [];
   for (let index = 0; index < 2; index++) {
@@ -481,4 +485,33 @@ test('5.5 explicit linked positions reject absent, foreign and skipped owners be
     assert.equal(all(f.store), before); assert.deepEqual(money(f.store), account); assert.equal(f.wires().length, sent);
   }
 
+});
+
+
+test('5.5 a refused reservation leaves its exact paused owner unchanged', async t => {
+  const f = await ready(t), subject = { project: 'p', planAnswer: f.v.planAnswer, planQuestionId: 'q-industry' };
+  const baseline = v7ProgressBaseline(f.store, subject);
+  assert.equal(baseline.state.kind, 'state');
+  const state = f.store.get<any>((baseline.state as { ref: Ref }).ref.id)!;
+  const before = f.store.get<ResearchRun>(state.value.summary.cursor.run)!;
+  // A runner pause is operational metadata, not a successful paid result or a handoff proof.
+  const paused = f.store.write<ResearchRun>({ id: before.id, kind: before.kind, expected: before.revision,
+    value: { ...before.value, status: 'paused', pauseCode: 'research_variant_handoff_unavailable', limit: 1 } });
+  const intent = prepareDeepResearch(f.store, { ...f.input, owner: reference(paused) });
+  const other = new Store(f.store.path); t.after(() => other.close());
+  const account = money(f.store), sent = f.wires().length;
+  let expected: string | null = null, activated = false;
+  const undo = intercept(f.store, (writes, _guards, write) => {
+    if (writes.some(w => w.kind === 'model-call' && w.expected === 0)) {
+      activated = writes.some(w => w.id === paused.id && w.expected === paused.revision
+        && (w.value as ResearchRun).status === 'running');
+      modeOf(other, 'bypass');
+      expected = all(other);
+    }
+    return write();
+  });
+  await assert.rejects(resumeDeepResearch(f.store, 'p', reference(intent)), EngineError); undo();
+  assert.ok(expected); assert.equal(activated, true);
+  assert.deepEqual(f.store.get(paused.id), paused);
+  assert.equal(all(f.store), expected); assert.deepEqual(money(f.store), account); assert.equal(f.wires().length, sent);
 });
