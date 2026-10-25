@@ -5,7 +5,7 @@ import { VARIANT_SUBJECT_CONTRACT, type VariantExecutionSession } from "./discov
 import { variantStateId, readVariantStateStructural, type VariantHandoff, type VariantState } from "./variant-decision.js";
 import { readVariantOwnerDecision } from "./discovery-decision.js";
 import { publishVariantScope, readCurrentVariantScope } from "./variant-scope.js";
-import { producePartialDossier, readPartialDossier } from "./dossier-manifest.js";
+import { producePartialDossier, produceStoppedPartialDossier, readPartialDossier } from "./dossier-manifest.js";
 import { DISCOVERY_DEEP_PREPARATION_CONTRACT, produceDeepPreparation, readDeepPreparation } from "./deep-research.js";
 import { prepareDeepResearch, resumeDeepResearch } from "./deep-research-execution.js";
 import { withHistoricalReads } from "../history/proofs.js";
@@ -21,7 +21,7 @@ import { stageNeighbors, usesStageNeighbors, STAGE_NEIGHBOR_CONTEXT, STAGE_NEIGH
 import { earlyResearchStage, earlyResearchFailure, earlyResearchCorrection, deliveredConceptSections, RESULT_CAPACITY_REFUSAL,
   requireEscalationReply, EARLY_RESEARCH_OUTCOME } from './early-research-outcome.js';
 import { producerContractEra, type ProducerPolicy, type UpstreamStage } from './requirements.js';
-import { discoveryContext, discoveryInspection, discoveryTraversal, publishVariantHandoff, readVariantHandoff, type DiscoveryOutcome } from './discovery-outcome.js';
+import { discoveryContext, discoveryInspection, discoveryTraversal, publishVariantHandoff, readVariantHandoff, readDeepFrontierStop, produceDeepFrontierStop, type DiscoveryOutcome } from './discovery-outcome.js';
 import { savedSynthesisMaterials, savedV7SynthesisMaterials } from "./saved-synthesis.js";
 import { readResearchContext, researchContextReadEra } from "./research-limits.js";
 import { planningForQuestion, planningForPlanSubject } from "./research-routing.js";
@@ -1724,6 +1724,20 @@ export class Researcher {
     // selection and cannot activate a new paid step after a mode or plan revision.
     let savedPartial: { handoff: Ref; [field: string]: unknown } | null = null;
     let pendingHandoff: VariantHandoff | null = null;
+    let savedStop: Ref | null = null;
+    const mayResumeStopped = async (at: Ref): Promise<boolean> => {
+      const old = await readDeepFrontierStop(this.store, project, at);
+      if (options.restoreOnly || producerContractEra('discovery', options.producerPolicy) !== 7 || old.record.value.reason === 'budget') return false;
+      const current = currentPlan(this.store, project), budget = discoveryTraversal(this.store, current.draft)?.budget;
+      if (!budget || budget.exhausted || budget.reserved) return false;
+      // Owner stage-budget increases have no accepted producer yet. A saved
+      // budget stop above stays terminal even after new P, choice or allowance.
+      if (newPartialRoute(old.handoff.value)) return false;
+      const frontier = deepPlanSelection(this.store, project, old.record.value.scope);
+      const states = frontier.progress.flatMap(row => row.state ? [row.state] : []).sort((a,b) => canonical(a).localeCompare(canonical(b)));
+      return canonical(states) !== canonical(old.record.value.states)
+        && (frontier.next !== null || frontier.coverage.missing.length === 0);
+    };
     const newPartialRoute = (handoff: VariantHandoff): boolean => {
       if (options.restoreOnly || producerContractEra("discovery", options.producerPolicy) !== 7) return false;
       const plan = currentPlan(this.store, project);
@@ -1740,6 +1754,13 @@ export class Researcher {
       const proof = await readVariantHandoff(this.store, project, saved.handoff);
       requireCondition(proof.record.value.draft.id === draftId, "discovery_variant_handoff_invalid", "The partial result names another draft");
       savedPartial = saved;
+      if (proof.record.value.next === 'deep') {
+        requireCondition(isRef(saved.stop), 'discovery_deep_stop_invalid', 'The post-choice partial result lost its exact stop');
+        const stopped = await readDeepFrontierStop(this.store, project, saved.stop);
+        requireCondition(canonical(stopped.record.value.handoff) === canonical(saved.handoff),
+          'discovery_deep_stop_invalid', 'The partial stop belongs to another exact chosen handoff');
+        savedStop = saved.stop;
+      } else requireCondition(!Object.hasOwn(saved, 'stop'), 'discovery_deep_stop_invalid', 'A negative handoff cannot masquerade as a deep stop');
       if (run.value.pauseCode === "research_dossier_assessment_unavailable") {
         requireCondition(isRef(saved.dossier), "discovery_dossier_invalid", "The partial result lost its exact dossier");
         const dossier = await readPartialDossier(this.store, project, saved.dossier);
@@ -1748,8 +1769,12 @@ export class Researcher {
           "discovery_dossier_invalid", "The partial result belongs to another handoff or draft");
         // An explicit new invocation may follow a newer real choice/plan. The old
         // dossier is still proved above; the ordinary loop admits the new route.
-        if (!newPartialRoute(proof.record.value)) return run;
-        savedPartial = null;
+        if (savedStop) {
+          requireCondition(dossier.stop && canonical(reference(dossier.stop)) === canonical(savedStop),
+            'discovery_deep_stop_invalid', 'The snapshot belongs to another stop');
+          if (!await mayResumeStopped(savedStop)) return run;
+        } else if (!newPartialRoute(proof.record.value)) return run;
+        savedPartial = null; savedStop = null;
       } else pendingHandoff = proof.record.value;
     }
     let partialPending = false;
@@ -1776,6 +1801,21 @@ export class Researcher {
       partialPending = false;
       throw new EngineError("research_dossier_assessment_unavailable", message);
     };
+    const receiveStopped = async (stop: Ref, display: object = {}): Promise<never> => {
+      const proof = await readDeepFrontierStop(this.store, project, stop);
+      requireCondition(run && proof.record.value.draft.id === draftId, 'discovery_deep_stop_invalid', 'The stop requires its original run');
+      const details = { ...display, stop, handoff: proof.record.value.handoff, reason: proof.record.value.reason, next: 'dossier' };
+      const pending = canonical({ ...details, code: 'research_partial_dossier_pending', message: 'The saved deep stop awaits its partial dossier' });
+      partialPending = true;
+      if (run.value.pauseCode !== 'research_partial_dossier_pending' || run.value.error !== pending)
+        run = this.save(run, { status: 'paused', owner, pauseCode: 'research_partial_dossier_pending', error: pending });
+      const dossier = await produceStoppedPartialDossier(this.store, project, stop);
+      const message = canonical({ ...details, dossier: reference(dossier.record), completeness: 'partial',
+        code: 'research_dossier_assessment_unavailable', message: 'The partial dossier awaits assessment' });
+      run = this.save(run, { status: 'paused', owner, pauseCode: 'research_dossier_assessment_unavailable', error: message });
+      partialPending = false; deepOperation = false;
+      throw new EngineError('research_dossier_assessment_unavailable', message);
+    };
     const receiveDeep = async (handoff: Ref, display: object): Promise<void> => {
       deepOperation = true;
       const proof = await readVariantHandoff(this.store, project, handoff), value = proof.record.value;
@@ -1797,10 +1837,16 @@ export class Researcher {
       };
       if (!frontier.coverage.missing.length) pause('research_deep_frontier_complete',
         'The selected variant has proven coverage; its next recipient is not connected');
-      if (!frontier.next) pause('research_deep_frontier_stalled',
-        'The remaining cells retain their proven no-progress limit; no new send is admitted');
-      if (traversal.budget?.exhausted) pause('research_deep_budget_exhausted',
-        'The saved stage accounting admits no new deep payment');
+      if (!frontier.next || traversal.budget.exhausted) {
+        // Publication may be interrupted before its durable stop address reaches
+        // the pause. Keep this position resumable even at that first write cut.
+        if (run!.value.status === 'running') run = this.save(run!, { status: 'paused',
+          pauseCode: 'research_deep_frontier_pending', error: canonical(details) }, frontier.guards);
+        // Derive the terminal reason again through the public proof producer;
+        // the local pause/allowance never supplies evidence of exhaustion.
+        const stopped = await produceDeepFrontierStop(this.store, project, handoff);
+        await receiveStopped(reference(stopped.record), details);
+      }
       if (options.restoreOnly || producerContractEra('discovery', options.producerPolicy) !== 7 || used >= limit)
         pause('research_deep_frontier_pending', 'The missing exact cell awaits an explicit new v7 allowance');
       // No local transport or coverage oracle. Preparation and managed admission
@@ -1828,13 +1874,18 @@ export class Researcher {
     };
     try {
       if (savedPartial) {
-        try { await receivePartial(savedPartial.handoff, savedPartial); }
+        try {
+          if (savedStop) await receiveStopped(savedStop, savedPartial);
+          else await receivePartial(savedPartial.handoff, savedPartial);
+        }
         catch (error) {
           // The common producer proves the complete old inventory first and repeats
           // any saved dossier before current admission. Only its typed stale refusal
           // for an unpublished recipient can yield to an explicit new choice/plan.
           // Missing or damaged historical proof must never become this exit.
-          if (!partialPending || !(error instanceof EngineError) || error.code !== "discovery_dossier_stale"
+          if (savedStop && partialPending && error instanceof EngineError && error.code === 'discovery_deep_stop_stale'
+            && await mayResumeStopped(savedStop)) { partialPending = false; savedStop = null; }
+          else if (!partialPending || !(error instanceof EngineError) || error.code !== "discovery_dossier_stale"
             || !pendingHandoff || !newPartialRoute(pendingHandoff)) throw error;
           partialPending = false;
         }

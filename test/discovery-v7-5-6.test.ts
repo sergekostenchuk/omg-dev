@@ -17,7 +17,8 @@ import { answerVariantChoice } from '../src/discovery/discovery-decision.js';
 import { V7_STAGE_TOKEN_CEILING } from '../src/discovery/v7-contracts.js';
 import { discoveryFixture, acceptPlan, planQuestion, validPlan, type PlanQuestion } from './discovery-v7-fixture.js';
 import { answerDiscoveryFixture } from './product-fixture.js';
-import { discoveryInspection, readVariantHandoff } from '../src/discovery/discovery-outcome.js';
+import { discoveryInspection, readVariantHandoff, readDeepFrontierStop } from '../src/discovery/discovery-outcome.js';
+import { readPartialDossier } from '../src/discovery/dossier-manifest.js';
 import { EngineError } from '../src/errors.js';
 import { canonical } from '../src/canonical.js';
 import { deepPlanSelection } from '../src/discovery/v7-plan-questions.js';
@@ -235,8 +236,13 @@ test('5.6: N and exact run cursor survive restart and an environment revision; s
   assert.equal(frontier.next,null);assert.deepEqual(frontier.progress.map(row=>row.summary!.streak),[3,3]);
   assert.deepEqual(deepCalls(f).map(row=>row.subject.deepCell.subject.planQuestionId),['q-one','q-one','q-one','q-two','q-two','q-two']);
   const run=f.store.list<any>('research-run').find(row=>row.value.draftId===f.v.draft.id)!;
-  assert.equal(run.value.pauseCode,'research_deep_frontier_stalled');assert.equal(run.value.turns,8);
-  await inert(f,f.open(),()=>f.run(5,f.open()));
+  assert.equal(run.value.pauseCode,'research_dossier_assessment_unavailable');assert.equal(run.value.turns,8);
+  const details=JSON.parse(run.value.error!), stop=await readDeepFrontierStop(f.store,'p',details.stop);
+  const dossier=await readPartialDossier(f.store,'p',details.dossier);
+  assert.equal(stop.record.value.reason,'stall');assert.deepEqual(stop.coverage.missing,frontier.coverage.missing);
+  assert.deepEqual(reference(dossier.stop!),details.stop);assert.deepEqual(reference(dossier.handoff),details.handoff);
+  assert.equal(dossier.record.value.completeness,'partial');
+  for(const store of [f.store,f.open()])await inert(f,store,async()=>assert.deepEqual(await f.run(5,store),run));
 });
 
 test('5.6: restoreOnly, default policy and zero allowance cannot buy or prepare the missing cell',async t=>{
@@ -250,11 +256,16 @@ test('5.6: restoreOnly, default policy and zero allowance cannot buy or prepare 
 test('5.6: real paid budget stays exhausted across restart and keeps the exact missing cell',async t=>{
   const f=await ready(t);f.configure({assessorTokens:V7_STAGE_TOKEN_CEILING-2_000_000});
   const result=await f.run(2), details=JSON.parse(result.value.error!);
-  assert.equal(result.value.pauseCode,'research_deep_budget_exhausted',result.value.error!);
+  assert.equal(result.value.pauseCode,'research_dossier_assessment_unavailable',result.value.error!);
   assert.equal(deepCalls(f).length,1);assert.equal(details.nextCell.subject.planQuestionId,'q-two');
   assert.equal(details.budget.exhausted,true);assert.ok(details.budget.measured>=V7_STAGE_TOKEN_CEILING-2_000_000);
   assert.ok(details.budget.calls.length);assert.ok(f.store.get(details.budget.ledger.id,details.budget.ledger.revision));
-  await inert(f,f.open(),async()=>assert.deepEqual(await f.run(5,f.open()),result));
+  const stop=await readDeepFrontierStop(f.store,'p',details.stop), dossier=await readPartialDossier(f.store,'p',details.dossier);
+  assert.equal(stop.record.value.reason,'budget');assert.deepEqual(stop.record.value.budget,details.budget);
+  assert.equal(stop.coverage.missing[0]!.cell.subject.planQuestionId,'q-two');
+  assert.deepEqual(reference(dossier.stop!),details.stop);assert.deepEqual(reference(dossier.handoff),details.handoff);
+  assert.equal(dossier.record.value.completeness,'partial');
+  for(const store of [f.store,f.open()])await inert(f,store,async()=>assert.deepEqual(await f.run(5,store),result));
 });
 
 test('5.6: a real new scope with the same cell has its own preparation and paid identity',async t=>{

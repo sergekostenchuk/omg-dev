@@ -1,3 +1,4 @@
+import { withHistoricalReads, pendingSnapshotView } from '../history/proofs.js';
 import { currentPlan, proveAttempt, provePlanQuestions } from "./v7-plan-questions.js";
 import type { ResearchAssessment, ResearchRun, PaidDiscoveryAttemptsAssessment, V7ProgressApplication, V7ProgressState,
   V7ProgressSubject, V7ProgressSummary } from './research-model.js';
@@ -12,7 +13,7 @@ import { readVariantGeneration, readVariantModelDecision } from './variant-sessi
 import { readProjectMode } from '../product/project-mode.js';
 import { VARIANT_HANDOFF_CONTRACT, decodeVariantHandoff, readVariantHandoffStructural, variantStateId, type VariantHandoff } from './variant-decision.js';
 import { variantRecordId, type VariantReason } from './discovery-variants.js';
-import { readResearchConsumerExecution, type ResearchConsumerIntent } from './response-recovery.js';
+import { readResearchConsumerExecution, readResearchConsumerIntent, readResearchConsumerTurn, requireDeepConsumerBinding, type ResearchConsumerIntent } from './response-recovery.js';
 import { readAssessmentSessionOutcomeAt } from './assessment-session.js';
 import type { ModelCall } from '../runtime/model-usage.js';
 import { storeView } from '../storage/store-view.js';
@@ -823,4 +824,171 @@ export async function publishVariantHandoff(store: Store, project: string, reque
   for (const ref of [value.snapshot, value.result, value.decision, value.scope, value.choice]) if (ref) guards.push(ref);
   const record = store.writeMany<VariantHandoff>([{ id, kind: 'discovery-variant-handoff', expected: 0, value }], guards)[0]!;
   return { ...(await readVariantHandoff(store, project, reference(record))), repeated: false };
+}
+
+/** Post-choice stops have their own era. The earlier negative handoff remains v1. */
+export const DEEP_FRONTIER_STOP_KIND = 'discovery-deep-frontier-stop' as const;
+export interface DeepFrontierStop {
+  contract: 'discovery-deep-frontier-stop/v1'; projectId: string;
+  handoff: Ref; draft: Ref; frame: Ref; plan: Ref; scope: Ref; set: Ref; member: Ref; decision: Ref;
+  boundary: { sequence: number; record: Ref }; run: Ref;
+  reason: 'budget' | 'stall'; missing: string[]; states: Ref[];
+  attempts: Ref[]; assessments: Ref[]; budget: V7TraversalBudget;
+}
+function stopRequire(ok: unknown, message: string): asserts ok {
+  requireCondition(ok, 'discovery_deep_stop_invalid', message);
+}
+function stopExact<T>(store: Store, at: Ref, kind?: string): Revision<T> {
+  const row = isRef(at) ? store.get<T>(at.id, at.revision) : null;
+  stopRequire(row && (!kind || row.kind === kind) && same(reference(row), at) && hashJson(row.value) === row.hash,
+    'The stopped frontier lost an exact saved ground');
+  return row;
+}
+/** Opaque, read-only event projection. Every read still reaches the supplied
+ * Store; no source unwrapping, trusted-cache registration or current-head fallback. */
+function stopView(store: Store, sequence: number): Store {
+  const get = <T>(id: string, revision?: number): Revision<T> | null => {
+    const cut = store.getAtEvent<T>(sequence, id, revision);
+    if (!cut) return null;
+    const exact = store.get<T>(cut.id, cut.revision);
+    stopRequire(exact && same(reference(exact), reference(cut)) && hashJson(exact.value) === exact.hash,
+      'The event inventory lost an exact source revision');
+    return exact;
+  };
+  const list = <T>(kind?: string) => store.identitiesAtEvent(sequence, kind).map(row => get<T>(row.id, row.revision)!);
+  const history = <T>(id: string) => store.identitiesAtEvent(sequence, undefined, id, true).map(row => get<T>(row.id, row.revision)!);
+  const reads = { get, list, history,
+    identities: (method: string, id?: string, revision?: number) => method === 'get'
+      ? (() => { const row = get(id!, revision); return row ? [{...reference(row), kind: row.kind}] : []; })()
+      : store.identitiesAtEvent(sequence, method === 'list' ? id : undefined, method === 'history' ? id : undefined, method === 'history')
+        .filter(row => method !== 'prefix' || row.id.startsWith(id!)) };
+  return new Proxy(store, { get(_target, key) {
+    if (Object.hasOwn(reads, key)) return reads[key as keyof typeof reads];
+    if (key === 'path') return store.path;
+    if (key === 'databaseId') return store.databaseId;
+    return () => { throw new EngineError('store_view_method_unsupported', 'Stop proof permits only saved record reads', { method: String(key) }); };
+  } });
+}
+const stopSorted = (refs: Ref[]) => uniqueRefs(refs).sort((a,b) => canonical(a).localeCompare(canonical(b)));
+function deepStopId(value: DeepFrontierStop): string {
+  // A new diagnostic/run revision or an unrelated event cannot duplicate a stop.
+  const { boundary: _boundary, run: _run, ...basis } = value;
+  return `${DEEP_FRONTIER_STOP_KIND}:${value.projectId}:${hashJson(basis as never)}`;
+}
+async function deepStopProjection(store: Store, project: string, handoff: Ref, boundary: DeepFrontierStop['boundary']) {
+  stopRequire(boundary && Number.isSafeInteger(boundary.sequence) && boundary.sequence > 0
+    && isRef(boundary.record) && same(store.eventAt(boundary.sequence), boundary.record), 'The original committed boundary is required');
+  const route = (await readVariantHandoff(store, project, handoff)).record, value = route.value;
+  stopRequire(value.reason === 'choose' && value.next === 'deep' && isRef(value.scope)
+    && isRef(value.set) && isRef(value.choice) && isRef(value.decision), 'Only a proven choose→deep route can stop after choice');
+  const { computeMissingCoverageAt } = await import('./coverage.js');
+  const { foldV7Progress } = await import('./v7-progress.js');
+  const { proveDossierFrame } = await import('./dossier-manifest.js');
+  const { projectDossierMaterials } = await import('./dossier-manifest.js');
+  const scope = value.scope, set = value.set, member = value.choice, decision = value.decision;
+  return withHistoricalReads(() => {
+    const view = stopView(store, boundary.sequence);
+    for (const at of [handoff, value.draft, value.frame, value.plan, scope, set, member, decision]) stopExact(view, at);
+    const draft = stopExact<DiscoveryDraft>(store, value.draft, 'discovery-draft');
+    proveDossierFrame(store, project, draft, value.frame);
+    const coverage = computeMissingCoverageAt(store, project, scope, value.plan, boundary.sequence);
+    stopRequire(coverage.missing.length > 0, 'A fully covered variant is not a partial stop');
+    const run = view.get<ResearchRun>(researchRunId(project, draft.id));
+    stopRequire(run && run.kind === 'research-run' && object(run.value)
+      && run.value.projectId === project && run.value.draftId === draft.id
+      && Number.isSafeInteger(run.value.turns) && run.value.turns >= 0,
+      'A stopped deep frontier requires its original managed run');
+    // At the cut, prove the completed prefix by exact common readers. There is
+    // no replay or current-admission decision here; only absence of unfinished work.
+    const turns = view.list<{run: string; number: number; status: string}>('research-turn')
+      .filter(row => row.value.run === run.id).map(row => readResearchConsumerTurn(store, reference(row)))
+      .sort((a,b) => a.value.number - b.value.number);
+    stopRequire(turns.length === run.value.turns && turns.every((row, i) => row.value.number === i + 1 && row.value.status === 'completed'),
+      'Unfinished managed positions must be restored before stopping');
+    const intents = view.list<ResearchConsumerIntent>('research-consumer-intent')
+      .filter(row => row.value.projectId === project && row.value.draft.id === draft.id && row.value.cursor.run === run.id)
+      .map(row => readResearchConsumerIntent(store, reference(row)));
+    for (const intent of intents) {
+      const deep = withHistoricalReads(() => requireDeepConsumerBinding(store, intent));
+      const successor = intents.find(row => isRef(row.value.previous) && same(row.value.previous, reference(intent)));
+      if (intent.value.state === 'prepared') {
+        stopRequire(deep && successor && withHistoricalReads(() => requireDeepConsumerBinding(store, successor)),
+          'An unpaid prepared admission cannot become a terminal frontier');
+      } else {
+        stopRequire(intent.value.state === 'applied' || intent.value.state === 'refused', 'Begun work must be recovered before stopping');
+        readResearchConsumerExecution(pendingSnapshotView(store, [intent]), project, reference(intent));
+      }
+    }
+    const states: Ref[] = [];
+    const progress = provePlanQuestions(store, draft, value.plan).map(q => {
+      const state = view.get<V7ProgressState>(v7ProgressStateId({ project, planAnswer: value.plan, planQuestionId: q.planQuestionId }));
+      if (!state) return { question: q.planQuestionId, stalled: false };
+      const saved = readV7ProgressStateAt(store, reference(state)); states.push(reference(saved));
+      const s = saved.value.summary;
+      return { question: q.planQuestionId, stalled: s.cursor ? foldV7Progress({ subject: saved.value.subject, run: s.cursor.run,
+        previous: { subject: saved.value.subject, counters: { cursor: s.cursor, count: s.count, streak: s.streak } },
+        attempts: [], accounted: [], knownContentKeys: [] }).stalled : false };
+    });
+    const budget = traversalBudget(view, draft);
+    stopRequire(budget && budget.reserved === 0, 'A stopped frontier requires complete saved stage accounting with no reservation');
+    // The common limit proof additionally proves every physical assignment, not just totals.
+    if (budget.exhausted) handoffLimit(store, draft, [budget.segment, budget.ledger, ...budget.calls]);
+    const stalled = coverage.missing.every(cell => progress.find(row => row.question === cell.cell.subject.planQuestionId)?.stalled);
+    stopRequire(budget.exhausted || stalled, 'Another exact missing cell still admits work');
+    const attempts = view.list<{ project: string; planAnswer: Ref }>(V7_ATTEMPT_KIND)
+      .filter(row => row.value.project === project && same(row.value.planAnswer, value.plan)).map(reference);
+    const assessments = view.list<PaidDiscoveryAttemptsAssessment>(DISCOVERY_ASSESSMENT_KIND)
+      .filter(row => row.value.projectId === project && same(row.value.subject?.packet?.planAnswer, value.plan)).map(reference);
+    // Common material proof also validates rejected/unassessed material and every paid MR.
+    const material = projectDossierMaterials(store, project, draft, proveDossierFrame(store, project, draft, value.frame),
+      value.plan, attempts, assessments, boundary.sequence);
+    const stop: DeepFrontierStop = { contract: 'discovery-deep-frontier-stop/v1', projectId: project, handoff,
+      draft: value.draft, frame: value.frame, plan: value.plan, scope: scope, set: set, member: member,
+      decision: decision, boundary, run: reference(run), reason: budget.exhausted ? 'budget' : 'stall',
+      missing: coverage.missing.map(cell => cell.key).sort(), states: stopSorted(states),
+      attempts: stopSorted(attempts), assessments: stopSorted(assessments), budget };
+    return { value: stop, handoff: route, coverage, material };
+  });
+}
+
+export async function readDeepFrontierStop(store: Store, project: string, at: Ref) {
+  const record = stopExact<DeepFrontierStop>(store, at, DEEP_FRONTIER_STOP_KIND), value = record.value;
+  stopRequire(value && value.contract === 'discovery-deep-frontier-stop/v1' && value.projectId === project
+    && record.revision === 1 && record.id === deepStopId(value), 'The stop has an explicit canonical era and identity');
+  const proof = await deepStopProjection(store, project, value.handoff, value.boundary);
+  stopRequire(same(value, proof.value), 'The saved stop differs from the full proof at its original boundary');
+  return { verification: 'proven' as const, record, handoff: proof.handoff, coverage: proof.coverage, material: proof.material };
+}
+/** Shared new-publication guards for the stop and its partial receiver. */
+export async function deepFrontierStopGuards(store: Store, project: string, value: DeepFrontierStop): Promise<TransactionGuard[]> {
+  const { deepPlanSelection } = await import('./v7-plan-questions.js');
+  const frontier = deepPlanSelection(store, project, value.scope), mode = readProjectMode(store, project);
+  const frame = stopExact<{ projectId: string; question: string }>(store, value.frame, 'research-answer');
+  const question = store.get<Question>(frame.value.question);
+  const stale = (ok: unknown) => requireCondition(ok, 'discovery_deep_stop_stale', 'The stopped frontier no longer owns current admission');
+  stale(same(reference(frontier.draft), value.draft) && same(frontier.planAnswer, value.plan));
+  stale(question && question.kind === 'question' && question.value.projectId === project && question.value.draftId === frontier.draft.id
+    && frontier.draft.value.questions.includes(question.id) && question.value.spec.field === 'frame'
+    && question.value.status === 'answered' && same(question.value.answer, value.frame) && hashJson(question.value) === question.hash);
+  const { readCurrentVariantScope } = await import('./variant-scope.js');
+  const selected = readCurrentVariantScope(store, project, value.draft);
+  stale(same(selected.scope.value.mode, mode.ref) && same(selected.scope.value.decision, value.decision));
+  const currentBudget = traversalBudget(store, frontier.draft);
+  stale(same(currentBudget, value.budget) && same(frontier.coverage.missing.map(cell => cell.key).sort(), value.missing)
+    && same(stopSorted(frontier.progress.flatMap(row => row.state ? [row.state] : [])), value.states));
+  return [...frontier.guards, reference(question!), value.frame, mode.ref, value.budget.segment, value.budget.ledger, ...value.budget.calls];
+}
+export async function produceDeepFrontierStop(store: Store, project: string, handoff: Ref) {
+  const sequence = store.lastEvent(), record = store.eventAt(sequence);
+  stopRequire(record, 'A deep stop needs a committed boundary');
+  const proof = await deepStopProjection(store, project, handoff, { sequence, record }), id = deepStopId(proof.value);
+  const existing = store.get(id, 1);
+  if (existing) return { ...(await readDeepFrontierStop(store, project, reference(existing))), repeated: true };
+  const guards = await deepFrontierStopGuards(store, project, proof.value);
+  const batch = store.atomicWrite(view => {
+    requireCondition(view.lastEvent() === sequence, 'discovery_deep_stop_stale', 'The stop boundary changed before publication');
+    return { value: null, guards, writes: [{ id, kind: DEEP_FRONTIER_STOP_KIND, expected: 0, value: proof.value as unknown as Json }] };
+  });
+  return { verification: 'proven' as const, record: batch.records[0] as Revision<DeepFrontierStop>,
+    handoff: proof.handoff, coverage: proof.coverage, material: proof.material, repeated: false };
 }

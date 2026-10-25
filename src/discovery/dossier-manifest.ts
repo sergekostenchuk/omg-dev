@@ -9,7 +9,7 @@ import type { Store, Revision, TransactionGuard } from '../storage/store.js';
 import { resolveClaimAddress, type ClaimAddress } from './claim-address.js';
 import { decodeDossierContradictions, checkDossierContradictionEvidence, type DossierClassificationGrounds, type ProvenDossierContradiction, type DossierContradiction } from './dossier-contradictions.js';
 import { V7_ATTEMPT_KIND, V7_AXES, V7_DEPTHS, V7_UNKNOWN_MOMENTS, V7_CLAIM_POINTER, discoveryAcceptanceActId, provenAcceptance, type DiscoveryAcceptanceAct, type V7Axis } from './v7-contracts.js';
-import { readVariantHandoff } from './discovery-outcome.js';
+import { readVariantHandoff, readDeepFrontierStop, deepFrontierStopGuards, DEEP_FRONTIER_STOP_KIND, type DeepFrontierStop } from './discovery-outcome.js';
 import { readVariantSnapshot } from './variant-snapshot.js';
 import { readVariantGeneration, readVariantModelDecision } from './variant-session.js';
 import { readVariantOwnerDecision } from './discovery-decision.js';
@@ -23,7 +23,7 @@ import { readAssessmentSessionOutcomeAt } from './assessment-session.js';
 import { discoveryAssessmentId } from './research-consumer-transition.js';
 import type { ModelCall } from '../runtime/model-usage.js';
 import { attemptBindingId, type ResearchAttemptBinding } from './v7-managed-attempt.js';
-import { attemptAccountKey, v7ProgressStateId } from './v7-attempt-assessment.js';
+import { DISCOVERY_ASSESSMENT_KIND, attemptAccountKey, v7ProgressStateId } from './v7-attempt-assessment.js';
 import { proveIssuedAnswer, savedAcceptanceAct } from './projection-reader.js';
 
 /** DR6 6.1 (codex-omg №9189, раздел DR6): the closed structural form of the
@@ -231,6 +231,7 @@ export interface ProvenPartialDossier {
   materials: { claim: ClaimAddress; status: 'accepted' | 'rejected' | 'unassessed'; assessment: Ref | null }[];
   /** Applied classification grounds only; every paid MR also remains in record.reasons[].grounds. */
   assessments: Ref[]; contradictions: ProvenDossierContradiction[];
+  stop?: Revision<DeepFrontierStop>;
 }
 
 const dossierSame = (a: unknown, b: unknown) => canonical(a) === canonical(b);
@@ -486,6 +487,8 @@ export async function readPartialDossier(store: Store, project: string, at: Ref)
   for (const reason of record.value.reasons) for (const ground of reason.grounds) dossierExact(store, ground);
   const link = record.value.reasons[0]?.grounds[0];
   if (!link) invalid('handoff', 'A partial dossier fixes its exact proven handoff');
+  if (store.get(link.id, link.revision)?.kind === DEEP_FRONTIER_STOP_KIND)
+    return readStoppedPartialDossier(store, project, at);
   const proof = await partialProjection(store, project, link);
   if (!dossierSame(record.value, proof.value)) invalid('manifest', 'The saved partial dossier differs from its exact route and complete material inventory');
   return { verification: 'partial', record, handoff: proof.handoff, materials: proof.materials,
@@ -537,4 +540,56 @@ export async function producePartialDossier(store: Store, project: string, hando
   const record = store.writeMany<DossierManifest>([{ id, kind: DOSSIER_MANIFEST_KIND, expected: 0, value: proof.value }], guards)[0]!;
   return { verification: 'partial', record, handoff: proof.handoff, materials: proof.materials,
     assessments: proof.assessments, contradictions: proof.contradictions, repeated: false };
+}
+
+
+/** The post-choice recipient retains the original manifest era, with a distinct
+ * proven stop as its first ground. The negative handoff route is unchanged. */
+async function stoppedPartialProjection(store: Store, project: string, stop: Ref) {
+  const proof = await readDeepFrontierStop(store, project, stop), route = proof.record.value;
+  const material = proof.material;
+  const grounds = [stop, route.handoff, route.draft, route.frame, route.plan, route.scope, route.set,
+    route.member, route.decision, route.run, route.boundary.record, ...route.states, ...route.attempts,
+    ...route.assessments, route.budget.segment, route.budget.ledger, ...route.budget.calls, ...material.grounds];
+  const unique = [...new Map(grounds.map(at => [canonical(at), at])).values()];
+  const value = decodeDossierManifest({ contract: DOSSIER_MANIFEST_CONTRACT, projectId: project,
+    draft: route.draft, frame: route.frame, plan: route.plan, completeness: 'partial',
+    reasons: [{ code: route.reason, message: route.reason === 'budget'
+      ? 'Saved stage accounting exhausted the research budget after choice'
+      : 'Every remaining exact cell reached its applied no-progress limit', grounds: unique }],
+    axes: material.axes, unknowns: material.unknowns, contradictions: material.contradictions });
+  const draft = dossierExact<DiscoveryDraft>(store, route.draft, 'discovery-draft');
+  const contradictions = checkDossierContradictionEvidence(store, value,
+    provePlanQuestions(store, draft, route.plan).map(q => q.planQuestionId), { assessments: material.assessments });
+  return { proof, value, material, contradictions };
+}
+export async function readStoppedPartialDossier(store: Store, project: string, at: Ref): Promise<ProvenPartialDossier> {
+  const record = readDossierManifestStructural(store, project, at).record;
+  const link = record.value.reasons[0]?.grounds[0];
+  if (!isRef(link)) invalid('stop', 'A post-choice partial snapshot requires its exact stop');
+  for (const reason of record.value.reasons) for (const ground of reason.grounds) dossierExact(store, ground);
+  const projected = await stoppedPartialProjection(store, project, link);
+  if (!dossierSame(record.value, projected.value)) invalid('manifest', 'The stopped snapshot lost its full historical material projection');
+  return { verification: 'partial', record, handoff: projected.proof.handoff, stop: projected.proof.record,
+    materials: projected.material.materials, assessments: projected.material.assessments, contradictions: projected.contradictions };
+}
+export async function produceStoppedPartialDossier(store: Store, project: string, stop: Ref): Promise<ProvenPartialDossier & { repeated: boolean }> {
+  const projected = await stoppedPartialProjection(store, project, stop), id = dossierManifestId(projected.value);
+  const existing = store.get(id, 1);
+  if (existing) return { ...(await readStoppedPartialDossier(store, project, reference(existing))), repeated: true };
+  const route = projected.proof.record.value, sequence = store.lastEvent();
+  const guards = await deepFrontierStopGuards(store, project, route);
+  const refs = (kind: string) => store.identitiesAtEvent(sequence, kind).map(at => dossierExact<any>(store, { id: at.id, revision: at.revision, hash: at.hash }))
+    .filter(row => kind === V7_ATTEMPT_KIND ? row.value.project === project && dossierSame(row.value.planAnswer, route.plan)
+      : row.value.projectId === project && dossierSame(row.value.subject?.packet?.planAnswer, route.plan))
+    .map(reference).sort((a,b) => canonical(a).localeCompare(canonical(b)));
+  if (!dossierSame(refs(V7_ATTEMPT_KIND), route.attempts) || !dossierSame(refs(DISCOVERY_ASSESSMENT_KIND), route.assessments))
+    invalid('materials', 'New material changed the stopped frontier before publication', 'discovery_deep_stop_stale');
+  const result = store.atomicWrite(view => {
+    if (view.lastEvent() !== sequence) invalid('boundary', 'The stopped snapshot boundary changed before publication', 'discovery_deep_stop_stale');
+    return { value: null, guards: [...guards, stop], writes: [{ id, kind: DOSSIER_MANIFEST_KIND, expected: 0, value: projected.value as unknown as Json }] };
+  });
+  return { verification: 'partial', record: result.records[0] as Revision<DossierManifest>, stop: projected.proof.record,
+    handoff: projected.proof.handoff, materials: projected.material.materials, assessments: projected.material.assessments,
+    contradictions: projected.contradictions, repeated: false };
 }
