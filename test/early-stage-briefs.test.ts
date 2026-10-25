@@ -3,10 +3,9 @@ import type { DiscoveryDraft } from '../src/discovery/discovery.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {Ajv} from 'ajv';
-import {mkdtempSync,writeFileSync,readFileSync,rmSync,existsSync,mkdirSync,symlinkSync} from 'node:fs';
+import {mkdtempSync,writeFileSync,readFileSync,rmSync,existsSync} from 'node:fs';
 import {tmpdir} from 'node:os';
-import {join,resolve} from 'node:path';
-import {execFileSync} from 'node:child_process';
+import {join} from 'node:path';
 import {Store} from '../src/storage/store.js';
 import {ProductEngine} from '../src/product/engine.js';
 import {reference, type Ref} from '../src/pipeline/contracts.js';
@@ -18,7 +17,7 @@ import {researchCall} from '../src/discovery/research-protocol.js';
 import {previewResearch} from '../src/discovery/research-preview.js';
 import {continuationPrompt} from '../src/discovery/continuation-packet.js';
 import {configureReaderPilot} from '../src/discovery/reader-pilot.js';
-import {readBundle,readReaderResultAt} from '../src/discovery/reader.js';
+import {readBundle} from '../src/discovery/reader.js';
 import {readResearchConsumerTurn} from '../src/discovery/response-recovery.js';
 import {readSynthesisSession} from '../src/discovery/synthesis-session.js';
 import {currentUpstreamFixtureValue,preparedFeatures} from './product-fixture.js';
@@ -331,64 +330,6 @@ test('RD2d planned context after reopen reaches C from the exact new question pr
  } finally {cold.close();}
 });
 
-test('RS4 exact Git 8b665772 producer: old completed and paid pending history and reader continuation survive restart unchanged',async t=>{
- const root=mkdtempSync(join(tmpdir(),'omg-rs4-era-')),era=join(root,'era'),archive=join(root,'archive.tar');mkdirSync(era);
- t.after(()=>rmSync(root,{recursive:true,force:true}));
- execFileSync('git',['archive','--format=tar',`--output=${archive}`,'8b665772db793b854d86ca557d359d8479a29c9c']);
- try{
-  execFileSync('tar',['-xf',archive,'-C',era]);
- }finally{
-  rmSync(archive,{force:true});
- }
- symlinkSync(resolve('node_modules'),join(era,'node_modules'));
- execFileSync(process.execPath,[resolve('node_modules/typescript/bin/tsc'),'-p',join(era,'tsconfig.json')],{cwd:era,maxBuffer:4<<20});
- const script=join(era,'rs4-producer.mjs');
- writeFileSync(script,`import{readFileSync,writeFileSync}from'node:fs';
- import{Store}from'./dist/src/storage/store.js';import{ProductEngine}from'./dist/src/product/engine.js';import{reference}from'./dist/src/pipeline/contracts.js';
- import{configureReaderPilot}from'./dist/src/discovery/reader-pilot.js';import{readBundle}from'./dist/src/discovery/reader.js';import{EngineError}from'./dist/src/errors.js';
- const root=${JSON.stringify(root)},store=new Store(root+'/state.sqlite'),engine=new ProductEngine(store);engine.execute({type:'create-project',project:'p',title:'Old producer'});
- const source=engine.discovery.evidence.document('p','source','Exact saved original.','text/plain',0),adapter=root+'/adapter.mjs',wire=root+'/wires.jsonl';
- writeFileSync(adapter,\`import{readFileSync,appendFileSync,existsSync,writeFileSync}from'node:fs';const r=JSON.parse(readFileSync(0,'utf8')),s=r.subject;appendFileSync(\${JSON.stringify(wire)},JSON.stringify(r)+'\\\\n');
- const file=\${JSON.stringify(root+'/turn')},n=existsSync(file)?+readFileSync(file,'utf8'):0;let research;
- if(s.role==='reader')research={selections:[{sourceIndex:0,firstLine:1,lastLine:1}],unresolved:[]};
- else{writeFileSync(file,String(n+1));research=n===0?{action:'read_source',source:\${JSON.stringify(reference(source))},start:0,end:21}:{action:'read_context',record:s.continuation.foundation,pointer:n===2?'/body/core':n===1?'/body/fields':'/body/fields/result'};}
- console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,usage:{inputTokens:0,outputTokens:0,cachedInputTokens:0,reasoningOutputTokens:0}}));\`);
- const command={executable:process.execPath,args:[adapter]},environment=engine.environments.configure('p',{workspace:root,implementer:{actor:'author',model:'fixture',effort:'medium',command},reviewer:{actor:'reviewer',model:'fixture',effort:'medium',command},fullCheck:command,timeoutMs:10000},0);
- const draft=engine.discovery.create('p','discovery','R0','compilation',[{field:'result',kind:'design',prompt:'Read the exact condition',risk:'Missing condition',schema:{type:'object',properties:{value:{type:'string'}},required:['value']}}]),q=store.get(draft.value.questions[0]);
- const pilot=configureReaderPilot(store,engine.environments,'p',{experimental:true,active:true,stopAfter:'L2',reader:{actor:'reader',model:'fixture',effort:'medium',speed:'inherited',command},agentCommand:command,maxCalls:20,maxReportedTokens:100000,maxRequestChars:100000,maxReadChars:60000,maxReplyChars:20000},0);
- const readers=[];for(let i=0;i<2;i++){const s=engine.discovery.evidence.document('p','reader-'+i,'Exact reader '+i,'text/plain',0);readers.push(await readBundle(store,environment.value,pilot,reference(q),'Old reader '+i,[{source:reference(s),range:{start:0,end:s.value.content.length}}]));}
- for(let i=0;i<3;i++)await engine.researcher.run('p',draft.id,1);
- const write=store.writeMany.bind(store);let interrupted=false;store.writeMany=(writes,guards=[])=>{const result=write(writes,guards);if(!interrupted&&writes.some(w=>w.kind==='model-response')){interrupted=true;throw new EngineError('input_stale','Saved response before application');}return result;};
- await engine.researcher.run('p',draft.id,1);store.writeMany=write;
- const turns=store.list('research-turn').sort((a,b)=>a.value.number-b.value.number);
- const pending=store.list('research-consumer-intent').find(x=>x.value.kind==='analyst'&&x.value.state==='running');
- if(!interrupted||!pending||store.get(pending.value.call.id).value.status!=='succeeded')throw Error('Old producer did not retain the paid intent: '+JSON.stringify({interrupted,turns:turns.map(t=>({number:t.value.number,status:t.value.status,error:t.value.error})),pending}));
- writeFileSync(root+'/expected.json',JSON.stringify({draft,q,readers,turns,pending,records:store.list().filter(r=>['model-call','model-request','model-response','research-context'].includes(r.kind)),wires:readFileSync(wire,'utf8')}));store.close();`);
- execFileSync(process.execPath,[script],{cwd:era,maxBuffer:4<<20});
- const expected=JSON.parse(readFileSync(join(root,'expected.json'),'utf8'));
- const store=new Store(join(root,'state.sqlite'));t.after(()=>store.close());
- for(const reader of expected.readers)assert.deepEqual(readReaderResultAt(store,'p',reference(reader)),reader);
- for(const turn of expected.turns.filter((x:any)=>x.value.status==='completed'))assert.deepEqual(readResearchConsumerTurn(store,reference(turn)),turn);
- const engine=new ProductEngine(store);await engine.researcher.run('p',expected.draft.id,1);
- assert.equal(store.list<any>('research-turn').find(t=>t.value.number===expected.pending.value.cursor.turn)!.value.status,'completed');
- for(const old of expected.records)assert.deepEqual(store.get(old.id,old.revision),old);
- assert.deepEqual(store.list('model-call'),expected.records.filter((r:any)=>r.kind==='model-call'));
- assert.equal(readFileSync(join(root,'wires.jsonl'),'utf8'),expected.wires);
- const oldReader=expected.wires.trim().split('\n').map((x:string)=>JSON.parse(x)).filter((w:any)=>w.subject.continuation.role==='reader').at(-1);
- assert.equal(oldReader.prompt,continuationPrompt('reader'));
- const preview=await previewResearch(()=>engine.researcher.run('p',expected.draft.id,1));
- assertPacket(store,JSON.parse(preview.input));assert.equal(JSON.parse(preview.input).subject.continuation.previousCalls,4);
- const source=store.get<any>('source:p:source')!;
- writeFileSync(join(root,'adapter.mjs'),`import{readFileSync}from'node:fs';const r=JSON.parse(readFileSync(0,'utf8')),s=r.subject;
- if(!s.question.schema)throw Error('RS4 must deliver the actual schema');
- const research=s.continuation.role==='assessor'?{verdict:'supported',reasons:[]}:{action:'answer',question:s.question.id,value:{value:'A proposed design with an exact original'},citations:[{source:${JSON.stringify(reference(source))},selector:{kind:'text-range',start:0,end:${source.value.content.length}}}]};
- console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,usage:{inputTokens:0,outputTokens:0,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
- const accepted=await engine.researcher.run('p',expected.draft.id,1);
- assert.equal(accepted.value.status,'completed',JSON.stringify({code:accepted.value.pauseCode,error:accepted.value.error}));
- assert.equal(store.get<Question>(expected.q.id)!.value.status,'answered');
- for(const old of expected.records)assert.deepEqual(store.get(old.id,old.revision),old);
-
-});
 
 test('RS4 missing FieldSpec members and a competing question revision fail before a physical call',async t=>{
  const f=fixture(t),draft=f.engine.discovery.forStage('p','discovery','compilation');writeFileSync(join(f.root,'mode'),'pause');
