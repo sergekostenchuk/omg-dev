@@ -564,13 +564,19 @@ test('MP3 row 18 (MP2 correction of a later part): the correction keeps the carr
 
 
 
-test('PF3.1 rows 4, 25, 27, 31, 32: the historical E4 continuation keeps its refusal of exact saved inputs — the same code and address at every repeat, in this and the next operation; a different request is another key; current applicability is never taken from it', { todo: "NR1 №3591: записанное не перепроверяется при чтении — проверка была у производителя при записи" }, async t => {
-  const m = mp3Cycle(t), { f } = m;
+/** The PF3.1 base on the current route: a managed fact attempt (a real completion binding) whose paid cycle reads twice and answers; its second step carries the continuation with the real deliveries. */
+async function continuationBase(t: test.TestContext) {
+  const m = mp3Cycle(t, 'fact', 100_000, true), { f } = m;
   f.steps([{ research: m.need([m.range(0, 9), { action: 'read', path: 'mp3-notes.txt', media: 'text/plain' }]), usage }, { research: e4Fact(f), usage }]);
   const cycle = valueOf(await runModelCycle(f.store, f.request));
   const link = valueOf(readQuestionPacket(f.store, { project: f.project, record: cycle.record.value.steps[1]!.packet })).value.request.continuation!;
   const evidence = { project: f.project, ...link, deliveries: [...link.deliveries] };
   assert.ok(evidence.deliveries.length > 1);
+  return { f, cycle, evidence };
+}
+
+test('PF3.1 rows 4, 25, 27, 31, 32: the historical E4 continuation keeps its refusal of exact saved inputs — the same code and address at every repeat, in this and the next operation; a different request is another key; current applicability is never taken from it', { todo: "NR1 №3591: записанное не перепроверяется при чтении — проверка была у производителя при записи" }, async t => {
+  const { f, evidence } = await continuationBase(t);
   const short = { ...evidence, deliveries: evidence.deliveries.slice(1) };
   const refusal = () => { const read = readContinuationEvidence(f.store, short); assert.equal(read.ok, false); return read.ok ? null : read.refusal; };
   let first: unknown, repeat = 0;
@@ -588,5 +594,14 @@ test('PF3.1 rows 4, 25, 27, 31, 32: the historical E4 continuation keeps its ref
   assert.equal(current.ok, false); if (!current.ok) assert.equal(current.refusal.code, 'input_stale');
   assert.ok(readsOf(() => readContinuationEvidence(f.store, evidence, true)) > 0, 'The current branch derives at every call');
   assert.deepEqual(refusal(), first);
+});
+
+test('PF3.1 the current managed route pays two calls and its continuation carries the real deliveries — the full evidence reads back with data', async t => {
+  const { f, cycle, evidence } = await continuationBase(t);
+  assert.ok(valueOf(readCompletionBinding(f.store, f.project, reference(f.series), 1)), 'The attempt is managed: its completion binding is real');
+  assert.equal(f.sent().length, 2, 'Two paid calls');
+  assert.equal(cycle.record.value.steps.length, 2);
+  assert.ok(evidence.deliveries.length > 1, 'The continuation carries several deliveries');
+  assert.ok(valueOf(readContinuationEvidence(f.store, evidence)).data.length > 0, 'The full evidence reads back with data');
 });
 
