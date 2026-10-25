@@ -8,7 +8,7 @@ import type { Command, Graph } from "../graph/model.js";
 import { graphSchema, graphV2Schema } from "../graph/schema.js";
 import { controlPredecessors } from "../graph/dependencies.js";
 import { sealed, type Sealed } from "../om/refusal.js";
-import { neighborsOf, readAcceptedFrame, readAtomicGate, readDeliveries, readFeasibility, readFrame, readNeighbors, readWorksFrame,
+import { neighborsOf, readDeliveries, readFeasibility, readFrame, readWorksFrame,
   type DeliveryOwnershipBasis, type FrameRequest, type NeighborCollection, type NeighborPacket, type NeighborSources,
   readTaskContextBasis, readTaskSpecification, type TaskSpecification, type TaskContextBasis, type OmReaderResult } from "./om-readers.js";
 import { historicalTrace, withHistoricalReads } from "../history/proofs.js";
@@ -118,6 +118,7 @@ export function loadTaskContextSources(store: Store, plan: Revision<MachinePlan>
   if (!(store instanceof Store)) invalid("store");
   plan = copy(plan); requirePlan(plan);
   if (!needsOmSources(plan.value)) return null;
+  if (!plan.value.feasibility.id.startsWith("om-feasibility:")) invalid("plan.feasibility", plan.id);
   return withHistoricalReads(() => {
     const project = plan.value.projectId, references: Ref[] = [];
     const source = historicalTrace(store, ref => { references.push(ref); }, "distinct");
@@ -127,35 +128,12 @@ export function loadTaskContextSources(store: Store, plan: Revision<MachinePlan>
     const graph = take(readRecord<Graph>(source, plan.value.graph,
       { unit: "G3", target: plan.id, id: `graph:${project}`, kind: "graph" }));
     if (!same(graph.value, plan.value.graphSnapshot)) invalid("plan.graphSnapshot", plan.id);
-    let candidateRef: Ref, layer: Ref, frame: Ref, ownership: DeliveryOwnershipBasis;
-    if (plan.value.feasibility.id.startsWith("om-feasibility:")) {
-      const checked = take(readFeasibility(source, { project, record: plan.value.feasibility })), value = checked.value;
-      if (!value.ready || !same(value.graph, plan.value.graph) || !same(value.environment, plan.value.environment)
-        || !value.producer.deliveries.ownership) invalid("feasibility", checked.id);
-      references.push(...value.inputs);
-      candidateRef = value.producer.candidate; layer = value.producer.layer; frame = value.producer.frame;
-      ownership = { contract: "delivery-ownership/v1", ...value.producer.deliveries.ownership };
-    } else {
-      // In the earlier plan era these records were direct guards. Never select a head or the first of several revisions.
-      const exact = (id: string): Ref => {
-        const matches = uniqueRefs(plan.value.guards.filter(ref => ref.id === id));
-        if (matches.length !== 1) invalid("plan.guards", id);
-        return matches[0]!;
-      };
-      layer = exact(`graph-layer:${project}:3`); frame = exact(`om-frame:${project}:3`);
-      const accepted = take(readAcceptedFrame(source, { project, level: 3, graph: plan.value.graph, layer, frame }));
-      if (!accepted.frame) invalid("frame", frame.id);
-      candidateRef = accepted.frame.value.acceptance.candidate;
-      const gate = accepted.frame.value.acceptance.gate;
-      if (gate.name !== "G5" || !("basis" in gate) || !isRef(gate.basis)) invalid("frame.acceptance.gate", frame.id);
-      const atomic = take(readAtomicGate(source, { project, record: gate.basis }));
-      if (!same(atomic.value.request.candidate, candidateRef)) invalid("frame.acceptance.candidate", frame.id);
-      const neighbors = take(readNeighbors(source, { project, neighbors: atomic.value.request.neighbors }));
-      if (!same(neighbors.value.source.candidate, candidateRef)) invalid("neighbors.candidate", neighbors.id);
-      ownership = neighbors.value.source.ownership;
-      const roots = uniqueRefs(plan.value.guards.filter(ref => ref.id === `execution-root:${project}`));
-      if (roots.length > 1 || !same(ownership.root, roots[0] ?? null)) invalid("plan.guards.execution-root", plan.id);
-    }
+    const checked = take(readFeasibility(source, { project, record: plan.value.feasibility })), value = checked.value;
+    if (!value.ready || !same(value.graph, plan.value.graph) || !same(value.environment, plan.value.environment)
+      || !value.producer.deliveries.ownership) invalid("feasibility", checked.id);
+    references.push(...value.inputs);
+    const candidateRef = value.producer.candidate, layer = value.producer.layer, frame = value.producer.frame;
+    const ownership: DeliveryOwnershipBasis = { contract: "delivery-ownership/v1", ...value.producer.deliveries.ownership };
     const candidate = take(readWorksFrame(source, { project, candidate: candidateRef }));
     if (!same(candidate.value.graph, plan.value.graphSnapshot)) invalid("candidate.graph", candidate.id);
     const request: FrameRequest = { ...candidate.value.request.frame, graph: plan.value.graph, layer, frame };

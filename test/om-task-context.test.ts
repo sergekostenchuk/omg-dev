@@ -579,8 +579,31 @@ async function sp1CurrentWorks(t: TestContext) {
   return fixture.acceptedWorksFixture(t);
 }
 
+/** Count actual fixture agent sends while preserving the current producer chain. */
+async function sp1TrackedWorks(t: TestContext) {
+  const { Environments } = await import('../src/runtime/environment.js');
+  const configure = Environments.prototype.configure;
+  let journal = '';
+  Environments.prototype.configure = function(project, value, expected) {
+    journal = `${value.workspace}/../context-agent-sends.jsonl`;
+    const command = { executable: process.execPath, args: ['--input-type=module', '-e',
+      "import{appendFileSync}from'node:fs';appendFileSync(process.argv[1],'sent\\n');", journal] };
+    return configure.call(this, project, { ...value, implementer: { ...value.implementer, command },
+      reviewer: { ...value.reviewer, command } }, expected);
+  };
+  let f: Awaited<ReturnType<typeof sp1CurrentWorks>>;
+  try { f = await sp1CurrentWorks(t); } finally { Environments.prototype.configure = configure; }
+  const sends = () => {
+    try { return readFileSync(journal, 'utf8').split('\n').filter(Boolean).length; }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return 0; throw error; }
+  };
+  assert.notEqual(journal, ''); assert.equal(sends(), 0);
+  return { f, sends };
+}
+const m8ContextSnapshot = (store: Store) => canonical(store.list().map(head => ({ head, history: store.history(head.id) })));
+
 test('SP1b current G5 and compiled v3 plan deliver the same full material and later stages cannot replace its exact sources', async t => {
-  const f = await sp1CurrentWorks(t);
+  const { f, sends } = await sp1TrackedWorks(t);
   const { ProductEngine } = await import('../src/product/engine.js');
   const { writeFeasibility } = await import('../src/om/feasibility.js');
   const { writeHandoff } = await import('../src/om/handoff.js');
@@ -593,7 +616,16 @@ test('SP1b current G5 and compiled v3 plan deliver the same full material and la
   assert.equal(plan.value.derivation, 'external-inputs/v1');
   assert.equal(f.gate.value.request.taskContextContract, BASIS_TASK_CONTEXT_CONTRACT);
   assert.deepEqual(engine.compiler.compile(f.project), plan);
+  const beforeSources = m8ContextSnapshot(f.store), sent = sends();
   const sources = loadTaskContextSources(f.store, plan)!;
+  assert.equal(m8ContextSnapshot(f.store), beforeSources); assert.equal(sends(), sent);
+  assert.deepEqual(sources.plan, reference(plan)); assert.deepEqual(sources.graph, m8.value.graph);
+  assert.deepEqual(sources.candidate, m8.value.producer.candidate);
+  const ownership = m8.value.producer.deliveries.ownership!;
+  assert.deepEqual(sources.deliveryOwnership, { contract: 'delivery-ownership/v1', ...ownership });
+  for (const exact of [reference(m8), m8.value.graph, m8.value.environment, m8.value.producer.candidate,
+    m8.value.producer.layer, m8.value.producer.frame, ...Object.values(ownership.indexes), ...(ownership.root ? [ownership.root] : [])])
+    assert.ok(sources.references.some(item => canonical(item) === canonical(exact)), `Missing exact M8 source ${exact.id}`);
   const task = plan.value.tasks[0]!, neighbors = ok(readNeighbors(f.store, { project: f.project, neighbors: f.gate.value.request.neighbors }));
   const actual = engine.compiler.context(f.project, reference(plan), task.id, 1_000_000);
   const selected = JSON.parse(actual.text).selectedSpecification;
@@ -606,21 +638,79 @@ test('SP1b current G5 and compiled v3 plan deliver the same full material and la
   assert.equal(JSON.parse(preplan.text).version, 'omg-task-context/preplan-v3');
   assert.deepEqual(JSON.parse(preplan.text).selectedSpecification, selected);
   assert.deepEqual(sources.specification!.tasks[task.id], selected);
-  const raw = f.store.get(selected.contracts[0].source.id, selected.contracts[0].source.revision)!;
-  assert.deepEqual(selected.contracts[0].value, raw.value.content.fields.behaviorContracts[selected.contracts[0].index]);
+  for (const [rows, field] of [[selected.contracts, 'behaviorContracts'], [selected.preparations, 'featurePreparation']] as const)
+    for (const item of rows) {
+      const raw = f.store.get(item.source.id, item.source.revision)!;
+      assert.deepEqual(reference(raw), item.source);
+      assert.deepEqual(item.value, raw.value.content.fields[field][item.index]);
+      assert.ok(sources.references.some(source => canonical(source) === canonical(item.source)));
+    }
+  const originalSpecification = f.store.get(selected.constraints.source.id, selected.constraints.source.revision)!;
+  assert.deepEqual(selected.constraints.value, originalSpecification.value.content.fields.constraints);
   assert.ok(sources.references.some(item => canonical(item) === canonical(selected.contracts[0].source)));
   assert.ok(sources.references.some(item => canonical(item) === canonical(selected.contracts[0].effective.source)));
   assert.equal(selected.contracts[0].effective.source.id, `om-input:${f.project}`);
   const beforeTask = canonical(task), oldStage = f.store.get(selected.constraints.source.id)!;
   const changed = clone(oldStage.value.content); changed.fields.constraints = ['A later stage is not this plan material'];
   engine.pipeline.draft(f.project, 'specification', changed, oldStage.revision);
-  f.restart(); const restarted = new ProductEngine(f.store);
-  assert.deepEqual(taskContext(plan, f.environment.value.fullCheck, task.id, 1_000_000,
-    loadTaskContextSources(f.store, plan)), actual);
+  const afterChange = m8ContextSnapshot(f.store);
+  for (const cold of [false, true]) {
+    if (cold) f.restart();
+    const repeated = loadTaskContextSources(f.store, plan)!;
+    assert.deepEqual(repeated, sources);
+    assert.equal(m8ContextSnapshot(f.store), afterChange); assert.equal(sends(), sent);
+    assert.deepEqual(taskContext(plan, f.environment.value.fullCheck, task.id, 1_000_000, repeated), actual);
+    assert.equal(m8ContextSnapshot(f.store), afterChange); assert.equal(sends(), sent);
+  }
+  const restarted = new ProductEngine(f.store);
   assert.throws(() => restarted.compiler.context(f.project, reference(plan), task.id, 1_000_000), { code: 'plan_stale' });
   assert.deepEqual(restarted.compiler.read(plan.id), plan);
   assert.equal(canonical(restarted.compiler.read(plan.id).value.tasks[0]), beforeTask);
   assert.throws(() => restarted.compiler.compile(f.project), EngineError);
+});
+
+
+for (const prefix of ['om-frame:', 'om-neighbors:', 'om-candidate:'] as const)
+test(`LG42 explicit unmarked non-M8 plan imitation with ${prefix} guard refuses its missing M8 basis hot/cold without writes or sends`, async t => {
+  const { f, sends } = await sp1TrackedWorks(t);
+  const { ProductEngine } = await import('../src/product/engine.js');
+  const { writeFeasibility } = await import('../src/om/feasibility.js');
+  const { writeHandoff } = await import('../src/om/handoff.js');
+  const { loadTaskContextSources } = await import('../src/compiler/context.js');
+  const m8 = ok(writeFeasibility(f.store, f.feasibility));
+  ok(writeHandoff(f.store, { project: f.project, feasibility: reference(m8), expected: 0 }));
+  const plan = new ProductEngine(f.store).compiler.compile(f.project);
+  const sources = loadTaskContextSources(f.store, plan)!;
+  assert.deepEqual(sources.candidate, m8.value.producer.candidate);
+  assert.equal(JSON.parse(taskContext(plan, f.environment.value.fullCheck, plan.value.tasks[0]!.id,
+    1_000_000, sources).text).version, BASIS_TASK_CONTEXT_CONTRACT);
+
+  // Explicit negative imitation, not a historical producer: it removes the marker and M8
+  // and keeps exactly one direct OM signal, so requirePlan's marked-plan check cannot mask it.
+  const { taskContextContract: _contract, hash: _hash, ...body } = clone(plan.value);
+  const guard: Ref = prefix === 'om-frame:' ? m8.value.producer.frame
+    : prefix === 'om-neighbors:' ? f.gate.value.request.neighbors : m8.value.producer.candidate;
+  assert.ok(guard.id.startsWith(prefix));
+  const imitationBody = { ...body, feasibility: ref(`feasibility:${f.project}:explicit-non-m8-imitation`),
+    guards: [m8.value.producer.layer, guard] };
+  const value = { ...imitationBody, hash: hashJson(imitationBody) };
+  const imitation = (f.store as Store).write<MachinePlan>({ id: `plan:${f.project}:external-inputs-v1:${value.hash}`,
+    kind: 'plan', expected: 0, value });
+  assert.equal(Object.hasOwn(imitation.value, 'taskContextContract'), false);
+  assert.equal(imitation.value.feasibility.id.startsWith('om-feasibility:'), false);
+  assert.deepEqual(imitation.value.guards.filter(item => ['om-frame:', 'om-neighbors:', 'om-candidate:']
+    .some(signal => item.id.startsWith(signal))), [guard]);
+  const afterImitation = m8ContextSnapshot(f.store), sent = sends();
+  for (const cold of [false, true]) {
+    if (cold) f.restart();
+    assert.deepEqual(f.store.get(imitation.id), imitation);
+    assert.throws(() => loadTaskContextSources(f.store, imitation), (error: unknown) => {
+      assert.ok(error instanceof EngineError); assert.equal(error.code, 'context_source_invalid');
+      assert.deepEqual(error.details, { unit: 'V2', target: imitation.id, field: 'plan.feasibility' });
+      return true;
+    });
+    assert.equal(m8ContextSnapshot(f.store), afterImitation); assert.equal(sends(), sent);
+  }
 });
 
 
