@@ -333,7 +333,7 @@ test("LG01a executed uses accepted L3 and M8 M9 with real committed runs and rec
 });
 
 test("LG01a missing and masquerading modes fail before creating a fixture", async t => {
-  for (const options of [null, {}, { mode: null }, { mode: "unknown" }, 1, []]) {
+  for (const options of [null, {}, { mode: null }, { mode: "unknown" }, 1, [], "", "must-never-load-this-era", "stages", "n2", "executed"]) {
     const invalid = (error: unknown) => error instanceof EngineError && error.code === OM_FIXTURE_ERROR
       && canonical(error.details) === canonical({ target: "/mode" });
     await assert.rejects(createOmFixture(t, "standard", "garden", options as never), invalid);

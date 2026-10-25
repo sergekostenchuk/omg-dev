@@ -518,14 +518,14 @@ export function acceptNativeWorks(engine: ProductEngine, project: string, operat
 
 export function createOmFixture(t: TestContext, variant: GardenVariant, project: string, options: { mode: "executed" }): Promise<OmFixture>;
 export function createOmFixture(t: TestContext, variant: GardenVariant, project: string, options: OmFixtureOptions): Promise<OmPreparedFixture>;
-export function createOmFixture(t: TestContext, variant?: GardenVariant, project?: string, historicalCommit?: string): Promise<OmFixture>;
-export async function createOmFixture(t: TestContext, variant: GardenVariant = "standard", project = "garden", route?: string | OmFixtureOptions): Promise<OmPreparedFixture | OmFixture> {
+export function createOmFixture(t: TestContext, variant?: GardenVariant, project?: string): Promise<OmFixture>;
+export async function createOmFixture(t: TestContext, variant: GardenVariant = "standard", project = "garden", options?: OmFixtureOptions): Promise<OmPreparedFixture | OmFixture> {
   validateTestContext(t);
   validateGardenArguments(variant, project);
-  if (route !== undefined && typeof route !== "string" && (route === null || typeof route !== "object"
-    || !["stages", "n2", "executed"].includes(route.mode)))
+  if (options !== undefined && (options === null || typeof options !== "object"
+    || !["stages", "n2", "executed"].includes(options.mode)))
     throw new EngineError(OM_FIXTURE_ERROR, "Fixture mode must be stages, n2 or executed", { target: "/mode" });
-  const mode = typeof route === "object" ? route.mode : undefined;
+  const mode = options?.mode;
   const maxContextChars = mode ? 200_000 : 100_000;
   const root = mkdtempSync(join(tmpdir(), "omg-om-fixture-"));
   const workspace = join(root, "workspace");
@@ -543,7 +543,7 @@ export async function createOmFixture(t: TestContext, variant: GardenVariant = "
 
   const graph = gardenGraph(variant, project);
   if (mode) prepareOmFixtureStages(engine, project, graph);
-  else preparedFeatures(engine, project, graph, undefined, route as string | undefined);
+  else preparedFeatures(engine, project, graph);
   const command = { executable: process.execPath, args: [agent] };
   engine.environments.configure(project, {
     workspace,
