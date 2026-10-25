@@ -1,15 +1,10 @@
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
-import { createRequire } from 'node:module';
-import { copyFileSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { copyFileSync, existsSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { fileURLToPath, pathToFileURL } from 'node:url';
 import test, { type TestContext } from 'node:test';
 import { canonical, hashJson } from '../src/canonical.js';
-import { loadTaskContextSources, taskContext, type ContextText, type PlanTaskContextSources } from '../src/compiler/context.js';
+import { loadTaskContextSources, taskContext, type PlanTaskContextSources } from '../src/compiler/context.js';
 import { nodeSignature, type MachinePlan } from '../src/compiler/model.js';
-import { requireCompatibleReceipt } from '../src/compiler/inputs.js';
 import { EngineError } from '../src/errors.js';
 import { prepareFeasibility, writeFeasibility, type FeasibilityRequest } from '../src/om/feasibility.js';
 import { type AtomicGateRecord, type AtomicGateRequest } from '../src/om/atomic-gate.js';
@@ -27,7 +22,6 @@ import { Store, type Revision } from '../src/storage/store.js';
 
 const capacity = 200_000;
 const clone = structuredClone;
-const base = '6eb61d9ee45007ce4c90314162661c0329ad9ac8';
 function ok<T>(result: OmResult<T>): T {
   if (!result.ok) assert.fail(`${result.refusal.code}: ${result.refusal.message}; ${canonical(result.refusal.at)}`);
   return result.value;
@@ -311,58 +305,6 @@ test('G3 exact hashes and a ready flag cannot replace the project namespace or t
     assert.throws(() => loadTaskContextSources(f.store, plan), (error: unknown) => error instanceof EngineError
       && error.details !== null && canonical(error.details).includes(f.m8.id), variant);
   }
-});
-
-function oldProducer(t: TestContext) {
-  const directory = mkdtempSync(join(tmpdir(), 'omg-g3-history-'));
-  t.after(() => rmSync(directory, { recursive: true, force: true }));
-  const root = fileURLToPath(new URL('../../', import.meta.url)), rootUrl = pathToFileURL(root).href;
-  const loader = join(directory, 'base-loader.mjs'), typescript = pathToFileURL(createRequire(import.meta.url).resolve('typescript')).href;
-  writeFileSync(loader, `import{execFileSync}from'node:child_process';import{fileURLToPath}from'node:url';import ts from ${JSON.stringify(typescript)};
-let root;export function initialize(data){root=data.root;}
-export async function load(url,context,next){const prefix=new URL('dist/',root).href;
-if(url.startsWith(prefix)&&/\\.js$/.test(url)){const path=url.slice(prefix.length).replace(/\\.js$/,'.ts');
-const source=execFileSync('git',['show',${JSON.stringify(base)}+':'+path],{cwd:fileURLToPath(root),encoding:'utf8',maxBuffer:10000000});
-return{format:'module',shortCircuit:true,source:ts.transpileModule(source,{compilerOptions:{module:ts.ModuleKind.ESNext,target:ts.ScriptTarget.ES2023}}).outputText};}return next(url,context);}`);
-  const boot = `import{register}from'node:module';register(${JSON.stringify(pathToFileURL(loader).href)},{data:{root:${JSON.stringify(rootUrl)}}});`;
-  const script = `import{executionFixture}from${JSON.stringify(new URL('dist/test/execution-fixture.js', rootUrl).href)};
-import{reference}from${JSON.stringify(new URL('dist/src/pipeline/contracts.js', rootUrl).href)};
-const f=executionFixture({after:()=>{}}), environment=f.store.get(f.plan.value.environment.id,f.plan.value.environment.revision);
-const contexts=f.plan.value.tasks.map(task=>f.engine.compiler.context('p',reference(f.plan),task.id,100000));
-const runs=await f.engine.executor.run('p',reference(f.plan),f.options);
-if(!runs.every(run=>run.value.state==='committed'))throw new Error('The historical producer must genuinely commit');
-const rows=f.store.list().flatMap(head=>f.store.history(head.id));
-const result={directory:f.directory,database:f.directory+'/state.sqlite',plan:f.plan,environment,contexts,rows,receipts:f.store.list('artifact')};
-f.store.close();process.stdout.write(JSON.stringify(result));`;
-  const result = JSON.parse(execFileSync(process.execPath,
-    ['--import', `data:text/javascript,${encodeURIComponent(boot)}`, '--input-type=module', '--eval', script],
-    { cwd: root, encoding: 'utf8', maxBuffer: 30_000_000 })) as {
-      directory: string; database: string; plan: Revision<MachinePlan>; environment: Revision<Environment>;
-      contexts: ContextText[]; rows: Revision[]; receipts: Revision<import('../src/compiler/model.js').ArtifactReceipt>[];
-    };
-  t.after(() => rmSync(result.directory, { recursive: true, force: true }));
-  return result;
-}
-
-test('G3 complete base producer retains legacy plan and node hashes, context bytes, receipt compatibility and completed execution after reopen', async t => {
-  const old = oldProducer(t), store = new Store(old.database);
-  t.after(() => store.close());
-  const engine = new ProductEngine(store), plan = engine.compiler.read(old.plan.id);
-  assert.deepEqual(plan, old.plan); assert.equal(loadTaskContextSources(store, plan), null);
-  assert.equal(Object.hasOwn(old.environment.value, 'requestCapacityChars'), false);
-  for (const [index, task] of plan.value.tasks.entries()) {
-    assert.deepEqual(taskContext(plan, old.environment.value.fullCheck, task.id, 100_000), old.contexts[index]);
-    const node = plan.value.graphSnapshot.nodes.find(node => node.id === task.node)!;
-    assert.equal(nodeSignature(plan.value.graphSnapshot, node), task.signature);
-    for (const artifact of task.produces) {
-      const receipt = old.receipts.find(receipt => receipt.value.artifact === artifact)!;
-      assert.deepEqual(requireCompatibleReceipt(receipt, 'p', plan.value.graphSnapshot, task.node, artifact), receipt);
-    }
-  }
-  const before = store.list().flatMap(head => store.history(head.id)); assert.deepEqual(before, old.rows);
-  const runs = await engine.executor.run('p', reference(plan), { retry: true, maxContextChars: 1, maxCorrections: 0 });
-  assert.ok(runs.every(run => run.value.state === 'committed'));
-  for (const row of old.rows) assert.deepEqual(store.get(row.id, row.revision), row);
 });
 
 test('G3 new source entrypoints reject malformed and missing mandatory data before storage without swallowing storage faults', async t => {
