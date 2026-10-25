@@ -466,7 +466,7 @@ test("MP2 (№2968 row 6) a packet issued before its neighbour finished keeps it
 
 
 test("LP7 rows 14, 24 (run): an answer of some joined fields — part of state included — applies only them; on the new B1 today's routing joins the rest, and its answer completes the subject keys of one full answer", async t => {
-  const f = lp6Line(t, ""), scenario = join(f.root, "scenario.json"), steps: unknown[] = [], keys: string[] = [];
+  const f = lp6Line(t), scenario = join(f.root, "scenario.json"), steps: unknown[] = [], keys: string[] = [];
   const round = async (ordinal: number, values: Record<string, Json>) => {
     const routes = lp7Routes(f), joined = routes.value.batches.find(batch => batch.task === "input-field" && batch.items.every(item => item.consumers.includes(f.block))
       && new Set(batch.items.map(item => item.field)).size > 1)!;

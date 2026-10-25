@@ -1493,97 +1493,17 @@ function g51AmbiguousAnswer(f: WorksRun, saved: Ref) {
   proposal.tests.push(...twins); proposal.nodes[0]!.tests.push(...twins.map(test => test.id));
   return answer;
 }
-const LP6_BASE = "e7db0ba81cf6f049420b5ea3c054108bf99c2cdb";
 
 type Lp6Op = { op: "round"; ordinal: number; answers: { field: "nodes" | "state" | "checkKind" | "expansion"; value?: Json; cannot?: string; owner?: string; exit?: number; unsent?: true }[] }
   | { op: "replace"; target: string; field: string; value: Json } | { op: "cease"; ordinal: number } | { op: "close"; ordinal: number }
   | { op: "analyze"; decided: boolean } | { op: "resume"; stop: number };
-/** The operations of a line, performed by the WHOLE code of e7db0ba8 in its own process — every record as that code writes it. */
-const LP6_OLD_BODY = `
-await import(src('om/run.js'));
-const { writeFileSync } = await import('node:fs');
-const { writeHorizon } = await import(src('om/horizon.js'));
-const { writeGaps } = await import(src('om/gaps.js'));
-const { writeRoutes } = await import(src('om/routes.js'));
-const { writeQuestionPacket } = await import(src('om/question-packet.js'));
-const { runModelCall, writeCompletionCessation, readCompletionWorkAt } = await import(src('om/model-call.js'));
-const { openAttempt, prepareManagedClaim, closeAttempt } = await import(src('om/repeat-gate.js'));
-const { readCompletionBinding, completionWorkId, resumeSeries } = await import(src('om/series.js'));
-const { inputDecisionWrite, writeAddressing } = await import(src('om/addressing.js'));
-const { gapLineKey, gapLineExpectedResult } = await import(src('om/gap-lines.js'));
-const { runStopAnalysis } = await import(src('om/stop-analysis.js'));
-const { project, block, scenario, dispatch } = args, steps = args.steps, address = { project, block, line: 1 }, done = [];
-const head = () => store.get('repair-series:' + project + ':1:' + block);
-const say = step => { steps.push(step); writeFileSync(scenario, JSON.stringify({ database, steps })); };
-const routesNow = () => {
-  const input = store.get('om-input:' + project), graph = store.get('graph:' + project);
-  const horizon = take(writeHorizon(store, { project, input: reference(input), graph: reference(graph), refinement: null, available: {},
-    choice: { choiceVersion: 'lp6-' + input.revision, features: [{ outcome: 'garden-result' }], excluded: [] } }));
-  const sources = { project, input: reference(input), graph: reference(graph), horizon: reference(horizon.gate),
-    operations: { proposals: [], frame: { project, level: 2, graph: reference(graph), horizon: reference(horizon.gate), layer: null, frame: null, upper: null } },
-    works: { state: 'upper-not-accepted', layer: reference(store.get('graph-layer:' + project + ':2')) } };
-  const gaps = take(writeGaps(store, sources));
-  return take(writeRoutes(store, { project, gaps: { sources: structuredClone(gaps.sources), records: gaps.records.map(reference) },
-    tasks: [], catalog: { paths: [], records: [] }, previous: null }));
-};
-let analysis = null;
-for (const item of args.ops) {
-  if (item.op === 'round') {
-    const routes = routesNow();
-    const batches = item.answers.map(answer => routes.value.batches.find(batch => answer.field === 'expansion'
-      ? batch.task === 'node-expansion' && batch.items.every(row => row.consumers.includes(block))
-      : batch.task === 'input-field' && batch.items.some(row => row.field === answer.field && row.consumers.includes(block))));
-    const items = batches.flatMap(batch => batch.items);
-    const goal = { key: 'lp6:' + item.ordinal + ':' + item.answers.map(answer => answer.field).join('+'),
-      questions: items.map(row => gapLineKey(project, row.target, row.field)).sort(), result: gapLineExpectedResult(project, items[0].target, items[0].field) };
-    const series = take(openAttempt(store, { ...address, attempt: item.ordinal, goal, completion: { routes: reference(routes), batches: batches.map(batch => batch.id).sort() } }));
-    const packets = batches.map(batch => take(writeQuestionPacket(store, { project, routes: reference(routes), batch: batch.id, environment: dispatch.config,
-      attempt: { series: reference(series), ordinal: item.ordinal }, previous: [] })).record);
-    for (const [index, batch] of batches.entries()) {
-      const answer = item.answers[index];
-      if (answer.unsent) continue;
-      say(answer.exit !== undefined ? { exitCode: answer.exit } : { research: answer.cannot !== undefined ? { protocol: '$answerProtocol', requestId: '$requestId', questionIds: batch.items.map(row => row.gap), action: 'cannot_answer', reason: answer.cannot }
-        : answer.owner !== undefined ? { protocol: '$answerProtocol', requestId: '$requestId', questionIds: batch.items.map(row => row.gap), action: 'need_owner', reason: answer.owner, decision: 'Decide it' }
-        : { protocol: '$answerProtocol', requestId: '$requestId', action: 'answer', results: batch.items.map(row => ({ target: row.target, field: row.field, basis: row.record, value: answer.value })) },
-        usage: { inputTokens: 120, outputTokens: 30, cachedInputTokens: 20, reasoningOutputTokens: 10 } });
-      take(await runModelCall(store, { project, packet: reference(packets[index]), dispatch, role: 'implementer' }));
-    }
-  } else if (item.op === 'replace') {
-    const input = store.get('om-input:' + project), graph = store.get('graph:' + project);
-    take(writeAddressing(store, { project, input: reference(input), graph: reference(graph), decisions: [{ pending: structuredClone(inputDecisionWrite({
-      project, input: reference(input), graph: reference(graph), layers: [], decision: { target: item.target, field: item.field, value: item.value } })) }] }));
-  } else if (item.op === 'cease') {
-    // Roots first: a part under a ceased root owes nothing more; whatever still stands open is ended after them.
-    const binding = take(readCompletionBinding(store, project, reference(head()), item.ordinal));
-    for (let open = true; open;) {
-      const snapshot = take(readCompletionWorkAt(store, project, reference(store.get(completionWorkId(project, binding.id)))));
-      const resolved = new Set(snapshot.resolved.map(ref => ref.id));
-      const row = snapshot.assignments.filter(row => !resolved.has(row.id)).sort((a, b) => Number(a.value.kind !== 'root') - Number(b.value.kind !== 'root'))[0];
-      open = row !== undefined;
-      if (open) take(writeCompletionCessation(store, { project, binding: reference(binding), assignment: reference(row) }));
-    }
-  } else if (item.op === 'close') {
-    const claim = take(prepareManagedClaim(store, { ...address, attempt: item.ordinal, outcome: { reason: 'result', accepting: [], cancelling: [], refusals: [] } }));
-    done.push(take(closeAttempt(store, { ...address, attempt: item.ordinal, outcome: claim.outcome })).verdict);
-  } else if (item.op === 'analyze') {
-    const series = reference(head());
-    say({ research: { protocol: 'omg-stop-analysis/v1', cause: { kind: 'hypothesis', text: 'The work of this window stopped on its own input', sources: [] },
-      change: { text: 'Continue on the decided input', addresses: [{ ref: item.decided ? series : series.id, field: 'review-record' }] }, origin: null },
-      usage: { inputTokens: 90, outputTokens: 20, cachedInputTokens: 0, reasoningOutputTokens: 5 } });
-    analysis = take(await runStopAnalysis(store, { project, series, hold: null, dispatch }));
-  } else if (item.op === 'resume') {
-    take(resumeSeries(store, { ...address, stop: item.stop, ground: 'review-record', text: 'The independent review of this stop decided', review: { ref: reference(analysis) } }));
-  }
-}
-out({ verdicts: done, analysis: analysis && reference(analysis), steps });
-`;
 /** The garden block garden-consume-block on a B1 that leaves its contract's nodes and state and its criterion's checkKind open. */
-function lp6Line(t: test.TestContext, historicalCommit = LP6_BASE) {
+function lp6Line(t: test.TestContext) {
   const root = mkdtempSync(join(tmpdir(), "omg-lp6-era-")), database = join(root, "state.sqlite");
   let store = new Store(database);
   t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
   const engine = new ProductEngine(store), { level: _level, ...l1 } = projectGraph(gardenGraph("cross"), 1);
-  preparedFeatures(engine, project, l1 as Graph, field => preparedField(project, field), historicalCommit);
+  preparedFeatures(engine, project, l1 as Graph, field => preparedField(project, field), "");
   const stages = Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(store.get(`stage:${project}:${stage}`)!)])) as Record<UpstreamStage, Ref>;
   ok(writeOmInput(store, { project, expected: 0, stages }));
   const scenario = join(root, "scenario.json"), trace = join(root, "trace.jsonl"), block = "garden-consume-block";
@@ -1595,21 +1515,12 @@ function lp6Line(t: test.TestContext, historicalCommit = LP6_BASE) {
   const adapter = store.write({ id: `adapter:${project}:lp6`, kind: "dispatch-adapter", expected: 0, value: { projectId: project, protocol: "codex-stdio" } });
   ok(openSeries(store, { project, block, line: 1, slice: "lp6", predecessor: null, basis: null } as never));
   const address = { project, block, line: 1 }, dispatch = { adapter: reference(adapter), config: reference(configured) };
-  let steps: unknown[] = [];
   return {
     root, database, address, dispatch, block,
     get store() { return store; },
     restart() { store.close(); store = new Store(database); },
     head: () => store.get<RepairSeries>(`repair-series:${project}:1:${block}`)!,
     sent(): unknown[] { return existsSync(trace) ? readFileSync(trace, "utf8").trim().split("\n").filter(Boolean) : []; },
-    old(name: string, ops: Lp6Op[], commit = LP6_BASE) {
-      store.close();
-      const output = atCommit({ root, database }, commit, name, LP6_OLD_BODY, { project, block, scenario, dispatch, steps, ops }) as
-        { verdicts: string[]; analysis: Ref | null; steps: unknown[] };
-      steps = output.steps;
-      store = new Store(database);
-      return output;
-    },
   };
 }
 const lp6Close = (f: ReturnType<typeof lp6Line>, ordinal: number) => {

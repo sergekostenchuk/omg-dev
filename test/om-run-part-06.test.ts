@@ -340,7 +340,7 @@ test("MP2 return №3147: through the pass after a restart, a changed environmen
 
 test("LP6 current mixed attempts keep their applied field beside refusal, owner wait or interruption: progress closes preserve failure evidence after restart", async t => {
   for (const kind of ["refusal", "owner", "interrupted"] as const) await t.test(kind, async t => {
-    const f = lp6Line(t, "");
+    const f = lp6Line(t);
     const failed: Lp6Op & { op: "round" } = { op: "round", ordinal: 1, answers: [
       { field: "expansion", ...(kind === "refusal" ? { cannot: "The expansion is unresolved" } : kind === "owner" ? { owner: "The owner decides the expansion" } : { exit: 1 }) },
       { field: "nodes", value: ["garden-produce-block", "garden-consume-block"] },
