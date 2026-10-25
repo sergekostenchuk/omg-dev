@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { writeFileSync } from 'node:fs';
+import { DatabaseSync } from 'node:sqlite';
 import { canonical, hashJson, type Json } from '../src/canonical.js';
 import { reference, type Ref } from '../src/pipeline/contracts.js';
 import { EngineError } from '../src/errors.js';
@@ -10,7 +11,7 @@ import { uniqueTransactionGuards } from '../src/runtime/environment.js';
 import { processStart } from '../src/runtime/process-identity.js';
 import type { DiscoveryDraft, Question } from '../src/discovery/discovery.js';
 import type { ResearchRun } from '../src/discovery/research-model.js';
-import { prepareResearchConsumerIntent } from '../src/discovery/response-recovery.js';
+import { prepareResearchConsumerIntent, staleUnpaidDeepAdmission } from '../src/discovery/response-recovery.js';
 import { replayDeepResponse } from '../src/discovery/response-replay.js';
 import { researchCall } from '../src/discovery/research-protocol.js';
 import { REQUEST_MANIFEST_CONTRACT, CONTEXT_PREPARATION_CONTRACT } from '../src/discovery/request-parts.js';
@@ -25,7 +26,7 @@ import { VARIANT_SUBJECT_CONTRACT, VARIANT_CRITERIA,
   type VariantSubject, type VariantSet } from '../src/discovery/discovery-variants.js';
 import { variantStateId, VARIANT_OWNER_ACTION,
   type VariantChoiceScope, type VariantModelDecision, type VariantState } from '../src/discovery/variant-decision.js';
-import { publishVariantScope } from '../src/discovery/variant-scope.js';
+import { publishVariantScope, readCurrentVariantChoice, readCurrentVariantScope } from '../src/discovery/variant-scope.js';
 import { ProjectModeSessions, VariantChoiceSessions, issueProjectModeInvitation, issueVariantChoiceInvitation } from '../src/product/owner-authority.js';
 import { setProjectMode } from '../src/product/project-mode.js';
 import { researchSetup, produce, rand, validPlan, type PlanQuestion } from './discovery-v7-fixture.js';
@@ -539,12 +540,15 @@ function linkedInput(f: Ready): DeepResearchInput {
   const state = f.store.get<any>((baseline.state as { ref: Ref }).ref.id)!;
   return { ...f.input, owner: reference(f.store.get<ResearchRun>(state.value.summary.cursor.run)!) };
 }
-function revisedPreparation(f: Ready) {
+function revisedChoice(f: Ready) {
   const previous = f.store.get(f.scopeRecord.value.decision.id, f.scopeRecord.value.decision.revision)!;
   const state = f.store.get(variantStateId('p', f.draft.id))!;
   const scope: VariantChoiceScope = { ...f.scope!, operation: 'revise', previous: reference(previous), expectedSelection: reference(state),
     outcome: { ...f.scope!.outcome, reason: 'A lawful owner revision before the next deep position' } };
-  const act = answerVariantChoice(f.store, scope, mint(f.store, scope).authority);
+  return answerVariantChoice(f.store, scope, mint(f.store, scope).authority);
+}
+function revisedPreparation(f: Ready) {
+  const act = revisedChoice(f);
   const published = publishVariantScope(f.store, 'p', reference(act.decision)).scope;
   return produceDeepPreparation(f.store, 'p', inputFor(f, published)).record;
 }
@@ -637,5 +641,88 @@ test('5.345-01 a current unpaid admission cannot be replaced by another valid ce
     await assert.rejects(runDeepResearch(store, { ...first, deepPreparation: reference(preparation) }), { code: 'discovery_deep_execution_invalid' });
     assert.equal(all(store), before); assert.deepEqual(money(store), account); assert.equal(f.wires().length, sent);
     assert.deepEqual(store.get(old.id), old);
+  }
+});
+
+for (const cold of [false, true]) test(`5.345-01 a proven replacement choice releases unpaid admission before its scope exists ${cold ? 'cold' : 'hot'}`, async t => {
+  const f = await ready(t), first = linkedInput(f), old = prepareDeepResearch(f.store, first);
+  const history = f.store.history(old.id), act = revisedChoice(f);
+  const store = cold ? new Store(f.store.path) : f.store; if (cold) t.after(() => store.close());
+  const before = all(store), account = money(store), sent = f.wires().length;
+  const choice = readCurrentVariantChoice(store, 'p', reference(f.v.draft));
+  assert.deepEqual(choice.choice.ref, reference(act.decision));
+  assert.deepEqual(reference(choice.state), reference(act.state));
+  assert.throws(() => readCurrentVariantScope(store, 'p', reference(f.v.draft)), { code: 'discovery_variant_scope_required' });
+  assert.equal(staleUnpaidDeepAdmission(store, old), true);
+  assert.equal(await runDeepResearch(store, first, { restoreOnly: true, allowance: 0 }), null);
+  assert.equal(all(store), before); assert.deepEqual(money(store), account); assert.equal(f.wires().length, sent);
+  const scope = publishVariantScope(store, 'p', reference(act.decision)).scope;
+  const preparation = produceDeepPreparation(store, 'p', inputFor(f, scope)).record;
+  const input = { ...first, deepPreparation: reference(preparation) };
+  const result = (await runDeepResearch(store, input, { allowance: 1 }))!;
+  assert.deepEqual(result.intent.value.previous, reference(old));
+  assert.equal(result.intent.value.cursor.turn, old.value.cursor.turn);
+  assert.deepEqual(store.history(old.id), history); assert.equal(f.wires().length, sent + 1);
+  const saved = all(store), paid = money(store), wires = f.wires().length, fresh = new Store(store.path); t.after(() => fresh.close());
+  assert.deepEqual(await runDeepResearch(fresh, input, { restoreOnly: true, allowance: 0 }), result);
+  assert.equal(all(fresh), saved); assert.deepEqual(money(fresh), paid); assert.equal(f.wires().length, wires);
+});
+
+for (const defect of ['lost-original-scope', 'lost-mode', 'structural-choice'] as const)
+test(`5.345-01 ${defect} cannot manufacture a replacement before scope publication`, async t => {
+  const f = await ready(t), old = prepareDeepResearch(f.store, linkedInput(f));
+  if (defect !== 'lost-original-scope') revisedChoice(f);
+  if (defect === 'structural-choice') {
+    const state = f.store.get<VariantState>(variantStateId('p', f.draft.id))!;
+    const decision = f.store.get(state.value.decision!.id, state.value.decision!.revision)!;
+    const fake = f.store.write({ id: 'structural-replacement-choice', kind: decision.kind, expected: 0, value: decision.value });
+    f.store.write({ id: state.id, kind: state.kind, expected: state.revision, value: { ...state.value, decision: reference(fake) } });
+  } else {
+    const sql = new DatabaseSync(f.store.path);
+    try { sql.prepare('DELETE FROM heads WHERE entity_id=?').run(defect === 'lost-mode' ? 'project-mode:p' : f.scopeRecord.id); }
+    finally { sql.close(); }
+  }
+  const before = all(f.store), account = money(f.store), sent = f.wires().length;
+  const orphaned = { scope: f.store.history(f.scopeRecord.id), mode: f.store.history('project-mode:p') };
+  const cold = new Store(f.store.path); t.after(() => cold.close());
+  for (const store of [f.store, cold]) {
+    assert.throws(() => staleUnpaidDeepAdmission(store, old), EngineError);
+    assert.equal(all(store), before); assert.deepEqual(money(store), account); assert.equal(f.wires().length, sent);
+    assert.deepEqual({ scope: store.history(f.scopeRecord.id), mode: store.history('project-mode:p') }, orphaned);
+  }
+});
+
+test('5.345-01 a proven reject_all supersedes unpaid deep without inventing a scope', async t => {
+  const f = await ready(t), old = prepareDeepResearch(f.store, linkedInput(f));
+  const request: VariantChoiceScope = { ...f.scope!, operation: 'revise', previous: f.scopeRecord.value.decision,
+    expectedSelection: reference(f.store.get(variantStateId('p', f.draft.id))!),
+    outcome: { kind: 'reject_all', reason: 'The owner rejects every variant before the unpaid deep operation' } };
+  const act = answerVariantChoice(f.store, request, mint(f.store, request).authority);
+  const before = all(f.store), account = money(f.store), sent = f.wires().length;
+  const cold = new Store(f.store.path); t.after(() => cold.close());
+  for (const store of [f.store, cold]) {
+    const current = readCurrentVariantChoice(store, 'p', reference(f.v.draft));
+    assert.deepEqual(current.choice.ref, reference(act.decision)); assert.equal(current.choice.value.outcome.kind, 'reject_all');
+    assert.equal(staleUnpaidDeepAdmission(store, old), true);
+    assert.throws(() => readCurrentVariantScope(store, 'p', reference(f.v.draft)), { code: 'discovery_variant_scope_required' });
+    assert.equal(all(store), before); assert.deepEqual(money(store), account); assert.equal(f.wires().length, sent);
+  }
+});
+
+test('5.345-01 current-choice proof refuses missing state, decision, grant, session, set and member', async t => {
+  const f = await ready(t), old = prepareDeepResearch(f.store, linkedInput(f)), act = revisedChoice(f);
+  const before = all(f.store), account = money(f.store), sent = f.wires().length;
+  const cold = new Store(f.store.path); t.after(() => cold.close());
+  const missing = [
+    { id: variantStateId('p', f.draft.id), headOnly: true },
+    { id: act.decision.id }, { id: act.decision.value.authority.grant.id },
+    { id: act.decision.value.authority.session.id }, { id: f.scopeRecord.value.set.id }, { id: f.scopeRecord.value.member.id },
+  ];
+  for (const store of [f.store, cold]) for (const absent of missing) {
+    const view = storeView(store, { get: (id, revision) => id === absent.id && (!absent.headOnly || revision === undefined) ? null : undefined,
+      write: () => { throw new Error('A read-only proof attempted a write'); } });
+    assert.throws(() => staleUnpaidDeepAdmission(view, old), EngineError, absent.id);
+    assert.throws(() => readCurrentVariantChoice(view, 'p', reference(f.v.draft)), EngineError, absent.id);
+    assert.equal(all(store), before); assert.deepEqual(money(store), account); assert.equal(f.wires().length, sent);
   }
 });

@@ -34,6 +34,9 @@ export interface ProvenVariantScope {
 }
 export interface PublishedVariantScope { scope: Revision<VariantScope>; repeated: boolean }
 export interface CurrentVariantScope extends ProvenVariantScope { state: Revision<VariantState> }
+export interface CurrentVariantChoice {
+  verification: 'proven'; choice: ProvenVariantChoice; state: Revision<VariantState>;
+}
 
 function scopeInvalid(field: string, message: string, ref?: Ref): never {
   return variantInvalid(field, message, 'discovery_variant_scope_invalid', ref);
@@ -125,10 +128,10 @@ export function publishVariantScope(store: Store, project: string, decision: Ref
   return { scope, repeated: false };
 }
 
-/** The current exact scope a requiring path (a deep preparation) must stand on, resolved from today's state head: the
- * current decision proven by its door, its scope published and itself fully proven. A draft without a state, a negative
- * or rejected selection, or an unpublished scope is the typed discovery_variant_scope_required refusal. */
-export function readCurrentVariantScope(store: Store, project: string, draft: Ref): CurrentVariantScope {
+/** The current choice and its exact applied state, proven without requiring a
+ * scope publication. Choose also proves its paid set/member; reject_all stays
+ * a proven negative choice. No state or no_variants selects no decision. */
+export function readCurrentVariantChoice(store: Store, project: string, draft: Ref): CurrentVariantChoice {
   requireStore(store, project);
   if (!isRef(draft)) scopeInvalid('draft', 'The current-scope reader needs the exact draft of the selection');
   const stateId = variantStateId(project, draft.id), head = store.get<VariantState>(stateId);
@@ -141,9 +144,17 @@ export function readCurrentVariantScope(store: Store, project: string, draft: Re
   const choice = provenChoice(store, project, state.value.decision);
   if (choice.state === null || !variantSame(reference(head), choice.state))
     scopeInvalid('state', 'The current head is not the state this choice\'s application proved', reference(head));
+  if (choice.value.outcome.kind === 'choose') provenGeneration(store, project, choice, choice.ref);
+  return { verification: 'proven', choice, state };
+}
+
+/** A current choice remains proven before its scope is published. A path that
+ * requires the scope still needs its immutable publication and full proof. */
+export function readCurrentVariantScope(store: Store, project: string, draft: Ref): CurrentVariantScope {
+  const { choice, state } = readCurrentVariantChoice(store, project, draft);
   const value = scopeValue(project, choice);
   const published = store.get<VariantScope>(variantRecordId(VARIANT_SCOPE_KIND, value));
-  if (!published) scopeRequired('scope', 'The scope of the current choice is not published for the requiring path', reference(head));
+  if (!published) scopeRequired('scope', 'The scope of the current choice is not published for the requiring path', reference(state));
   return { ...readVariantScope(store, project, reference(published)), state };
 }
 

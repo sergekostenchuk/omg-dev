@@ -5,6 +5,7 @@ import { decodeVariantExecutionSession, decodeVariantSubject, readVariantNoneStr
   type VariantExecutionSession, type VariantPublication, type VariantPublicationRecord, type VariantSubject } from './discovery-variants.js';
 import { variantPublicationWrites, variantDecisionPublicationWrites, readVariantDecisionStructural, readVariantStateStructural,
   variantStateId, type VariantModelDecision } from './variant-decision.js';
+import { readCurrentVariantChoice } from './variant-scope.js';
 import { readProjectMode } from '../product/project-mode.js';
 import { readVariantSnapshot } from './variant-snapshot.js';
 import { variantExecutionSessionId, projectPaidVariantSession } from './research-consumer-transition.js';
@@ -4387,6 +4388,15 @@ export function staleUnpaidDeepAdmission(store: Store, intent: Revision<Research
   try { requireCurrentDeepPreparation(store, intent.value.projectId, reference(proof.preparation)); }
   catch (error) {
     if (error instanceof EngineError && error.code === 'discovery_deep_preparation_stale') return true;
+    if (error instanceof EngineError && error.code === 'discovery_variant_scope_required') {
+      // A lawful replacement choice precedes publication of its scope. Prove
+      // that act and its applied state; missing scope alone proves no change.
+      const project = intent.value.projectId;
+      const current = readCurrentVariantChoice(store, project, reference(proof.draft));
+      if (variantSame(current.choice.ref, proof.scope.choice.ref)) throw error;
+      readProjectMode(store, project);
+      return true;
+    }
     throw error;
   }
   return false;
