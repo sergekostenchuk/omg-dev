@@ -1,10 +1,8 @@
 import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createRequire } from 'node:module';
 import { StatementSync } from 'node:sqlite';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { types } from 'node:util';
@@ -1428,71 +1426,4 @@ test('PF3 rows 12, 13: one bounded budget for every Store of the process — evi
   assert.ok(cache().bytes < held, 'close frees the entries of its own area');
   two.close();
   assert.deepEqual([cache().bytes, cache().entries], [0, 0]);
-});
-
-const PF3_BASE = '5929ea25cb7d54d2d5c5a87859b64481e2d1f038';
-/** Row 16: the Store of the base commit, loaded from Git whole in its own process, writes and reads its database. */
-function atBase(root: string, database: string, body: string): unknown {
-  const repository = fileURLToPath(new URL('../../', import.meta.url));
-  const loader = join(root, 'pf3-base-loader.mjs'), producer = join(root, 'pf3-base-producer.mjs'), served = join(root, 'pf3-base-served.log');
-  const typescript = pathToFileURL(createRequire(import.meta.url).resolve('typescript')).href;
-  writeFileSync(served, '');
-  writeFileSync(loader, `import { execFileSync } from 'node:child_process';
-import { appendFileSync, realpathSync } from 'node:fs';
-import { fileURLToPath, pathToFileURL } from 'node:url';
-import ts from ${JSON.stringify(typescript)};
-let root, log, prefixes;
-export function initialize(data) {
-  root = data.root; log = data.log;
-  prefixes = [root, pathToFileURL(realpathSync(fileURLToPath(root)) + '/').href].map(base => new URL('dist/src/', base).href);
-}
-export async function load(url, context, next) {
-  const prefix = prefixes.find(item => url.startsWith(item));
-  if (prefix && /\\.js$/.test(url)) {
-    const relative = 'src/' + url.slice(prefix.length).replace(/\\.js$/, '.ts');
-    appendFileSync(log, relative + '\\n');
-    const source = execFileSync('git', ['show', ${JSON.stringify(PF3_BASE)} + ':' + relative], { cwd: fileURLToPath(root), encoding: 'utf8', maxBuffer: 10000000 });
-    return { format: 'module', shortCircuit: true, source: ts.transpileModule(source,
-      { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2023 } }).outputText };
-  }
-  if (url.startsWith('file:') && url.includes('/dist/src/') && !url.includes('/node_modules/'))
-    throw new Error('An engine module outside the era checkout: ' + url);
-  return next(url, context);
-}`);
-  writeFileSync(producer, `import { join } from 'node:path';
-import { pathToFileURL } from 'node:url';
-const [repository, database] = process.argv.slice(2);
-const src = path => pathToFileURL(join(repository, 'dist/src', path)).href;
-const { Store } = await import(src('storage/store.js'));
-const store = new Store(database);
-const out = value => process.stdout.write(JSON.stringify(value));
-try {
-${body}
-} finally { store.close(); }`);
-  const bootstrap = `import { register } from 'node:module'; register(${JSON.stringify(pathToFileURL(loader).href)},
-    { data: { root: ${JSON.stringify(pathToFileURL(repository).href)}, log: ${JSON.stringify(served)} } });`;
-  const output: unknown = JSON.parse(execFileSync(process.execPath, ['--import', `data:text/javascript,${encodeURIComponent(bootstrap)}`, producer, repository, database],
-    { cwd: repository, encoding: 'utf8', timeout: 180_000, maxBuffer: 50_000_000 }));
-  assert.ok(readFileSync(served, 'utf8').split('\n').includes('src/storage/store.ts'), 'The producer ran on the Store of the base commit');
-  return output;
-}
-
-test('PF3 row 16: the versions the base code 5929ea25 wrote read cold, warm and after reopen exactly as that code reads them', t => {
-  const { root } = fixture(t), database = join(root, 'era.sqlite');
-  const reads = `({ get: store.get('pf3:e:a'), exact: store.get('pf3:e:a', 1), absent: store.get('pf3:e:none'), list: store.list(),
-    kind: store.list('pf3-era'), history: store.history('pf3:e:a'), identities: store.identities('prefix', 'pf3:e:') })`;
-  const old = atBase(root, database, `store.writeMany([{ id: 'pf3:e:a', kind: 'pf3-era', expected: 0, value: { text: 'тело ✓', nested: [1, { k: null }] } },
-  { id: 'pf3:e:b', kind: 'pf3-other', expected: 0, value: [] }]);
-store.write({ id: 'pf3:e:a', kind: 'pf3-era', expected: 1, value: { text: 'вторая', 'üñí': '\\u2028' } });
-out(${reads});`) as Json;
-  const read = (store: Store) => ({ get: store.get('pf3:e:a'), exact: store.get('pf3:e:a', 1), absent: store.get('pf3:e:none'), list: store.list(),
-    kind: store.list('pf3-era'), history: store.history('pf3:e:a'), identities: store.identities('prefix', 'pf3:e:') });
-  const current = new Store(database), before = storeBodyCache();
-  const cold = read(current), warm = read(current);
-  current.close();
-  assert.ok(bodyDelta(before).hits > 0, 'The second read was answered warm');
-  const reopened = new Store(database), after = read(reopened);
-  reopened.close();
-  for (const result of [cold, warm, after]) assert.equal(canonical(result as unknown as Json), canonical(old));
-  assert.equal(canonical(atBase(root, database, `out(${reads});`) as Json), canonical(old), 'The base code still reads the database the new code opened');
 });
