@@ -2,15 +2,12 @@ import test, { type TestContext } from 'node:test';
 import '../src/om/compiler-readers.js';
 import { selectTaskSpecification, hasBasisApplications } from '../src/om/selected-specification.js';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { readFileSync } from 'node:fs';
 import { canonical, digest, hashJson } from '../src/canonical.js';
 import { preplanTaskContext, taskContext, taskContextContent, type PlanTaskContextSources } from '../src/compiler/context.js';
 import { deriveTasks } from '../src/compiler/derive.js';
 import { TASK_CONTEXT_CONTRACT, BASIS_TASK_CONTEXT_CONTRACT, type CompiledTask, type MachinePlan } from '../src/compiler/model.js';
 import type { TaskSpecification, TaskSpecificationSelection, OmReaderResult } from '../src/compiler/om-readers.js';
-import type { AtomicGateRequest } from '../src/om/atomic-gate.js';
 import { EngineError } from '../src/errors.js';
 import { LEVEL, type Command, type Graph, type Node } from '../src/graph/model.js';
 import { RefinementRelations } from '../src/graph/relations.js';
@@ -20,7 +17,7 @@ import { buildPackets, NEIGHBOR_CONTRACT, type NeighborCollection, type Neighbor
 import type { OmResult } from '../src/om/refusal.js';
 import { writerIndexId } from '../src/ownership/writer-index.js';
 import { reference, type Ref, type StageArtifact } from '../src/pipeline/contracts.js';
-import type { Revision } from '../src/storage/store.js';
+import type { Revision, Store } from '../src/storage/store.js';
 import { enrichedGraph } from './enriched-graph-fixture.js';
 import { exampleGraph } from './graph-fixture.js';
 
@@ -385,76 +382,118 @@ test('SP1b declared context with missing material refuses at the pure boundary w
   sourceError(() => preplanTaskContext(unmarked, 1_000_000));
 });
 
-// A real live snapshot is supplied by the operator; the test never manufactures an old-era database.
-test('SP1b actual saved v1 plan and G5 keep their exact era after a native stage change and restart; the lower selector reads original stage refs',
-  { skip: !process.env['OMG_SP1_HISTORY_SNAPSHOT'], timeout: 300_000 }, async t => {
-  const { DatabaseSync, backup } = await import('node:sqlite');
-  const { Store } = await import('../src/storage/store.js');
-  const { loadTaskContextSources } = await import('../src/compiler/context.js');
-  const { readAtomicGate, writeAtomicGate } = await import('../src/om/atomic-gate.js');
-  const { readTaskContextBasis } = await import('../src/compiler/om-readers.js');
+const contextHistory = (store: Store) => store.list().map(head => ({ head, history: store.history(head.id) }));
+
+async function currentContextPlan(t: TestContext) {
+  const f = await sp1CurrentWorks(t);
   const { ProductEngine } = await import('../src/product/engine.js');
+  const { writeFeasibility } = await import('../src/om/feasibility.js');
+  const { writeHandoff } = await import('../src/om/handoff.js');
+  const m8 = ok(writeFeasibility(f.store, f.feasibility));
+  ok(writeHandoff(f.store, { project: f.project, feasibility: reference(m8), expected: 0 }));
+  const saved = new ProductEngine(f.store).compiler.compile(f.project);
+  assert.equal(saved.value.taskContextContract, BASIS_TASK_CONTEXT_CONTRACT);
+  assert.deepEqual(saved.value.feasibility, reference(m8));
+  return { f, m8, saved };
+}
+
+test('SP1b current G5/M8 lower selector preserves the full original stages, requirements and nodes after a newer stage head and restart', async t => {
+  const { f, m8, saved } = await currentContextPlan(t);
+  const { ProductEngine } = await import('../src/product/engine.js');
+  const { loadTaskContextSources } = await import('../src/compiler/context.js');
+  const { readTaskContextBasis } = await import('../src/compiler/om-readers.js');
   const { taskSpecificationReader } = await import('../src/om/compiler-readers.js');
-  const root = mkdtempSync(join(tmpdir(), 'omg-sp1-history-')), path = join(root, 'history.sqlite');
-  t.after(() => rmSync(root, { recursive: true, force: true }));
-  const original = new DatabaseSync(process.env['OMG_SP1_HISTORY_SNAPSHOT']!, { readOnly: true });
-  try { await backup(original, path); } finally { original.close(); }
-  let store = new Store(path);
-  t.after(() => store.close());
-  const saved = store.list<MachinePlan>('plan').find(row => row.value.feasibility.id.startsWith('om-feasibility:')
-    && !Object.hasOwn(row.value, 'taskContextContract'))!;
-  assert.ok(saved, 'The supplied live snapshot contains an authentic old plan');
-  const engine = new ProductEngine(store);
-  assert.deepEqual(engine.compiler.read(saved.id), saved);
-  const basis = readTaskContextBasis(store, { project: saved.value.projectId, record: saved.value.feasibility });
-  assert.equal(basis.ok, true); if (!basis.ok) return;
-  assert.equal(basis.value.contract, 'omg-task-context/v1');
-  const gate = ok(readAtomicGate(store, { project: saved.value.projectId, record: basis.value.gate }));
-  assert.equal(Object.hasOwn(gate.value.request, 'taskContextContract'), false);
-  assert.deepEqual(ok(writeAtomicGate(store, clone(gate.value.request) as AtomicGateRequest)), gate, 'A late exact repeat never upgrades the saved gate');
-  const environment = store.get<{ fullCheck: Command }>(saved.value.environment.id, saved.value.environment.revision)!;
-  const contexts = () => {
-    const sources = loadTaskContextSources(store, saved);
-    assert.equal(sources?.specification, undefined);
-    return saved.value.tasks.map(task => taskContext(saved, environment.value.fullCheck, task.id, 1_000_000, sources));
-  };
-  const before = contexts();
-  assert.ok(before.length > 0);
-  const inputRef = gate.value.request.gaps.sources.input;
-  let selected: TaskSpecificationSelection | undefined;
-  const reader = taskSpecificationReader(selection => {
-    selected = selection;
-    const specification = selection.accepted.find(stage => stage.stage === 'specification')!;
-    assert.ok(specification); assert.ok(Array.isArray(specification.fields['constraints']));
-    return { contract: 'selected-specification/v1', contracts: [], preparations: [], constraints: {
-      source: specification.ref, pointer: '/content/fields/constraints', value: specification.fields['constraints']! } };
+  const input = f.gate.value.request.gaps.sources.input as Ref;
+  assert.deepEqual(ok(readTaskContextBasis(f.store, { project: f.project, record: reference(m8) })), {
+    contract: BASIS_TASK_CONTEXT_CONTRACT, gate: reference(f.gate), horizon: m8.value.producer.horizon, input,
   });
-  const request = { project: saved.value.projectId, input: inputRef, requirements: ['fixture-requirement'], nodes: ['fixture-work', 'fixture-operation'] };
-  const originalSelection = ok(reader(store, request));
-  assert.ok(selected); assert.deepEqual(selected.inputRef, inputRef);
+  const task = saved.value.tasks[0]!;
+  const request = { project: f.project, input, contract: 'selected-specification/v2' as const,
+    requirements: (task.requirements ?? []).map(row => row.id),
+    nodes: new RefinementRelations(saved.value.graphSnapshot).ancestry(task.node).map(row => row.id) };
+  assert.ok(request.requirements.length > 0); assert.ok(request.nodes.length > 0);
+  let selected: TaskSpecificationSelection | undefined;
+  const reader = taskSpecificationReader(selection => { selected = selection; return selectTaskSpecification(selection); });
+  const originalSelection = ok(reader(f.store, request));
+  assert.equal(originalSelection.contract, 'selected-specification/v2');
+  assert.ok(selected); assert.deepEqual(selected.inputRef, input);
   assert.deepEqual(selected.requirements, request.requirements); assert.deepEqual(selected.nodes, request.nodes);
+  assert.ok(selected.input.sources.length > 0);
+  assert.equal(selected.accepted.length, selected.input.sources.length);
   for (const source of selected.input.sources) {
-    const delivered: TaskSpecificationSelection['accepted'][number] = selected.accepted.find(stage => stage.stage === source.stage)!;
-    const exact = store.get<StageArtifact>(source.id, source.revision)!;
+    const exact = (f.store as Store).get<StageArtifact>(source.id, source.revision)!;
+    const delivered: TaskSpecificationSelection['accepted'][number] = selected.accepted.find(stage => canonical(stage.ref) === canonical(reference(exact)))!;
+    assert.ok(delivered); assert.equal(delivered.stage, source.stage);
     assert.deepEqual(delivered.ref, reference(exact));
     assert.deepEqual(delivered.fields, (exact.value.content as { fields: unknown }).fields, 'Full original fields reach the shared selector');
   }
-  const oldSpecification = store.get<StageArtifact>(originalSelection.constraints.source.id)!;
+  const originalInput = clone(selected), sources = loadTaskContextSources(f.store, saved)!;
+  assert.deepEqual(sources.specification!.tasks[task.id], originalSelection);
+  const before = taskContext(saved, f.environment.value.fullCheck, task.id, 1_000_000, sources);
+  const oldSpecification = (f.store as Store).get<StageArtifact>(originalSelection.constraints.source.id)!;
   const content = clone(oldSpecification.value.content) as { fields: Record<string, import('../src/canonical.js').Json> };
-  content.fields['constraints'] = ['A later draft must not replace material bound by the old plan'];
-  const changed = engine.pipeline.draft(saved.value.projectId, 'specification', content, oldSpecification.revision);
+  content.fields['constraints'] = ['A later draft must not replace material bound by the exact G5/M8 input'];
+  const changed = new ProductEngine(f.store).pipeline.draft(f.project, 'specification', content, oldSpecification.revision);
   assert.ok(changed.revision > oldSpecification.revision);
-  assert.deepEqual(ok(reader(store, request)), originalSelection);
-  assert.deepEqual(contexts(), before);
-
-  for (const result of before) {
-    const body = JSON.parse(result.text);
-    assert.equal(body.version, 'omg-task-context/v1'); assert.equal(Object.hasOwn(body, 'selectedSpecification'), false);
+  const afterChange = contextHistory(f.store);
+  for (const cold of [false, true]) {
+    if (cold) f.restart();
+    assert.deepEqual(ok(reader(f.store, request)), originalSelection);
+    assert.deepEqual(selected, originalInput);
+    assert.deepEqual(taskContext(saved, f.environment.value.fullCheck, task.id, 1_000_000,
+      loadTaskContextSources(f.store, saved)), before);
+    assert.deepEqual(new ProductEngine(f.store).compiler.read(saved.id), saved);
+    assert.deepEqual(contextHistory(f.store), afterChange);
   }
-  store.close(); store = new Store(path);
-  assert.deepEqual(contexts(), before);
-  assert.deepEqual(ok(reader(store, request)), originalSelection);
-  assert.deepEqual(new ProductEngine(store).compiler.read(saved.id), saved);
+});
+
+for (const contract of ['absent', null, 'omg-task-context/v1', 'omg-task-context/unknown'] as const)
+test(`LG43 explicit G5 contract substitution ${contract} refuses at basis, marked plan and context sources, hot and cold without writes`, async t => {
+  const { f, m8, saved } = await currentContextPlan(t);
+  const { ProductEngine } = await import('../src/product/engine.js');
+  const { readAtomicGate } = await import('../src/om/atomic-gate.js');
+  const { readTaskContextBasis } = await import('../src/compiler/om-readers.js');
+  const { loadTaskContextSources } = await import('../src/compiler/context.js');
+  const request = { project: f.project, record: reference(m8) };
+  const basis = ok(readTaskContextBasis(f.store, request));
+  assert.deepEqual(basis, { contract: BASIS_TASK_CONTEXT_CONTRACT, gate: reference(f.gate),
+    horizon: m8.value.producer.horizon, input: f.gate.value.request.gaps.sources.input });
+  assert.deepEqual(new ProductEngine(f.store).compiler.read(saved.id), saved);
+  const sources = loadTaskContextSources(f.store, saved)!;
+  assert.deepEqual(sources.specification!.basis, basis);
+  for (const ref of [basis.gate, basis.horizon, basis.input])
+    assert.ok(sources.references.some(source => canonical(source) === canonical(ref)));
+
+  // Explicit negative substitution of the body read for this genuine, exact G5. All other
+  // reads still use the real Store; its original records and producer chain stay intact.
+  const corrupted = clone(f.gate.value);
+  if (contract === 'absent') delete corrupted.request.taskContextContract;
+  else corrupted.request.taskContextContract = contract;
+  const substituteGate = () => {
+    const store: Store = f.store, get = store.get.bind(store);
+    store.get = ((id: string, revision?: number) => {
+      const row = get(id, revision);
+      return row?.id === basis.gate.id && row.revision === basis.gate.revision
+        ? { ...row, value: clone(corrupted) } : row;
+    }) as Store['get'];
+  };
+  substituteGate();
+  const afterSubstitution = contextHistory(f.store);
+  for (const cold of [false, true]) {
+    if (cold) { f.restart(); substituteGate(); }
+    const damaged: Revision<unknown> = ok(readAtomicGate(f.store, { project: f.project, record: basis.gate }));
+    assert.deepEqual(reference(damaged), basis.gate); assert.deepEqual(damaged.value, corrupted);
+    assert.deepEqual(contextHistory(f.store), afterSubstitution);
+    for (const read of [() => readTaskContextBasis(f.store, request),
+      () => new ProductEngine(f.store).compiler.read(saved.id), () => loadTaskContextSources(f.store, saved)]) {
+      assert.throws(read, (error: unknown) => {
+        assert.ok(error instanceof EngineError); assert.equal(error.code, 'context_source_invalid');
+        assert.deepEqual(error.details, { unit: 'V2', target: basis.gate.id, field: 'taskContextContract' });
+        return true;
+      });
+      assert.deepEqual(contextHistory(f.store), afterSubstitution);
+    }
+  }
 });
 
 

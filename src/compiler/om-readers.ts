@@ -90,8 +90,7 @@ export interface AcceptedFrameView {
 }
 export interface AtomicGateView { readonly request: { readonly candidate: Ref; readonly neighbors: Ref;
   readonly taskContextContract?: "omg-task-context/v2" | "omg-task-context/v3" } }
-export type TaskContextBasis = { contract: "omg-task-context/v1"; gate: Ref }
-  | { contract: "omg-task-context/v2" | "omg-task-context/v3"; gate: Ref; horizon: Ref; input: Ref };
+export type TaskContextBasis = { contract: "omg-task-context/v2" | "omg-task-context/v3"; gate: Ref; horizon: Ref; input: Ref };
 export interface SpecificationBases {
   catalogue: { contract: 'discovery-basis-catalogue/v1'; source: Ref;
     constraints: { address: { record: Ref; pointer: string }; value: Json }[];

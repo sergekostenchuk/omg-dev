@@ -34,7 +34,6 @@ export const readTaskContextBasis: CompilerOmReaders['readTaskContextBasis'] = (
   const value = gate.value.value, contract = value.request.taskContextContract;
   requireContext(value.result.passed && canonical(value.request.candidate) === canonical(producer.candidate),
     'The exact G5 admitted the M8 candidate', { unit: 'V2', target: gateRef.basis.id, field: 'candidate' });
-  if (!Object.hasOwn(value.request, 'taskContextContract')) return delivered({ contract: 'omg-task-context/v1', gate: gateRef.basis });
   requireContext(contract === 'omg-task-context/v2' || contract === 'omg-task-context/v3', 'The saved G5 names a known context contract',
     { unit: 'V2', target: gateRef.basis.id, field: 'taskContextContract' });
   const horizon = readHorizon(store, request.project, producer.horizon); if (!horizon.ok) return horizon;
