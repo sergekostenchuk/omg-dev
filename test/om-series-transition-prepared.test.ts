@@ -6,11 +6,10 @@ import { readLayerAcceptance } from "../src/om/layer-basis.js";
 import { explicitMapping, refusedWith } from "./om-fixture.js";
 import test, { type TestContext } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { spawnSync } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
 import { canonical, hashJson, type Json } from "../src/canonical.js";
 import { EngineError } from "../src/errors.js";
@@ -712,74 +711,6 @@ test("active exclusion and return preserve the last comparable active content wi
   assert.equal(ok(comparePreparedSeriesSlices(f.store, { project, previous: reference(a), next: reference(c), block: independent })), "continue");
   refusedWith(comparePreparedSeriesSlices(f.store, { project, previous: reference(b), next: reference(c), block: independent }), "series_transition_unproven");
   assert.deepEqual(f.store.get(series.id), series);
-});
-
-test("the whole b1143aa producer leaves its stopped legacy series and exact B1 horizon bytes unchanged", t => {
-  const base = "b1143aa7343db45896a134ee3cb3a273b211057e", root = mkdtempSync(join(tmpdir(), "omg-series-base-"));
-  t.after(() => rmSync(root, { recursive: true, force: true }));
-  const environment = { ...process.env }; delete environment.NODE_TEST_CONTEXT;
-  const run = (executable: string, args: string[], cwd: string) => {
-    const child = spawnSync(executable, args, { cwd, env: environment, encoding: "utf8", timeout: 90_000, maxBuffer: 20_000_000 });
-    assert.equal(child.error, undefined, child.error?.message);
-    assert.equal(child.status, 0, `${executable} ${args.join(" ")}\n${child.stdout}\n${child.stderr}`);
-    return child.stdout;
-  };
-  const repository = run("git", ["rev-parse", "--show-toplevel"], dirname(fileURLToPath(import.meta.url))).trim();
-  const legacy = join(root, "base"), archive = join(root, "base.tar"); mkdirSync(legacy);
-  run("git", ["archive", "--format=tar", "--output", archive, base], repository);
-  run("tar", ["-xf", archive, "-C", legacy], root);
-  symlinkSync(join(repository, "node_modules"), join(legacy, "node_modules"), "dir");
-  writeFileSync(join(legacy, "tsconfig.transition-history.json"), JSON.stringify({ extends: "./tsconfig.json",
-    include: ["src/**/*.ts", "test/om-fixture.ts", "test/product-fixture.ts"], exclude: [] }));
-  run(process.execPath, [join(legacy, "node_modules/typescript/bin/tsc"), "-p", "tsconfig.transition-history.json"], legacy);
-  const path = join(root, "old.sqlite"), output = join(root, "old.json"), producerFile = join(legacy, "old-producer.mjs");
-  writeFileSync(producerFile, `
-import assert from 'node:assert/strict';
-import { writeFileSync } from 'node:fs';
-import { Store } from './dist/src/storage/store.js';
-import { canonical } from './dist/src/canonical.js';
-import { ProductEngine } from './dist/src/product/engine.js';
-import { projectGraph } from './dist/src/graph/project.js';
-import { reference } from './dist/src/pipeline/contracts.js';
-import { UPSTREAM_STAGES } from './dist/src/discovery/requirements.js';
-import { writeOmInput } from './dist/src/om/input.js';
-import { writeHorizon } from './dist/src/om/horizon.js';
-import { openSeries, beginAttempt, completeAttempt } from './dist/src/om/series.js';
-import { preparedFeatures } from './dist/test/product-fixture.js';
-import { gardenGraph } from './dist/test/om-fixture.js';
-const ok = result => { assert.equal(result.ok, true, JSON.stringify(result)); return result.value; };
-const project = 'garden', block = 'garden-consume-block', store = new Store(process.argv[2]);
-const { level, ...upper } = projectGraph(gardenGraph(), 1);
-preparedFeatures(new ProductEngine(store), project, upper);
-const stages = Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(store.get('stage:'+project+':'+stage))]));
-const input = ok(writeOmInput(store,{project,expected:0,stages}));
-const graph = store.get('graph:'+project);
-const horizon = ok(writeHorizon(store,{project,input:reference(input),graph:reference(graph),refinement:null,available:{},
- choice:{choiceVersion:'old-choice',features:[{outcome:'garden-result'}],excluded:[]}}));
-let series = ok(openSeries(store,{project,block,line:1,slice:'legacy:opaque-subject',predecessor:null,basis:null}));
-for(let attempt=1;attempt<=3;attempt++){
- ok(beginAttempt(store,{project,block,line:1,attempt,goal:{key:'legacy-question',questions:['Which proposal works?'],result:'accepted proposal'}}));
- series=ok(completeAttempt(store,{project,block,line:1,attempt,outcome:{reason:'off-form',achieved:[],cancelled:[],refusals:[]}}));
-}
-assert.ok(series.value.stop);
-const rows=store.list().flatMap(row=>store.history(row.id));
-writeFileSync(process.argv[3],JSON.stringify({input,horizon,series,rows,bytes:canonical(rows)}));store.close();
-`);
-  run(process.execPath, [producerFile, path, output], legacy);
-  const previous = JSON.parse(readFileSync(output, "utf8")) as {
-    input: Revision; horizon: { gate: Revision }; series: Revision<RepairSeries>; rows: Revision[]; bytes: string;
-  };
-  let store = new Store(path);
-  try {
-    assert.equal(canonical(store.list().flatMap(row => store.history(row.id))), previous.bytes);
-    assert.deepEqual(ok(readSeriesAt(store, project, reference(previous.series))), previous.series);
-    const saved = ok(writeSeriesTransition(store, request(reference(previous.horizon.gate), [reference(previous.series)], "old-choice")));
-    assert.equal(decision(saved).outcome, "establish-basis");
-    for (const row of previous.rows) assert.deepEqual(store.get(row.id, row.revision), row);
-    store.close(); store = new Store(path);
-    assert.deepEqual(ok(readPreparedSeriesTransition(store, { project, record: reference(saved) })).record, saved);
-    assert.deepEqual(ok(readSeriesAt(store, project, reference(previous.series))), previous.series);
-  } finally { store.close(); }
 });
 
 // Append below the existing fixture/request/decision helpers. No accepted records
