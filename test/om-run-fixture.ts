@@ -12,6 +12,7 @@ import { reference, type Ref } from "../src/pipeline/contracts.js";
 import { type Sealed, type OmResult, type Refusal } from "../src/om/refusal.js";
 import type { Graph } from "../src/graph/model.js";
 import { ProductEngine } from "../src/product/engine.js";
+import { EngineError } from "../src/errors.js";
 import { git } from "../src/runtime/environment.js";
 import { Evidence } from "../src/evidence/evidence.js";
 import type { FrameRead, FrameRequest } from "../src/om/frame-obligations.js";
@@ -20,8 +21,8 @@ import type { OmInputRecord } from "../src/om/input.js";
 import { writeQuestionPacket, type QuestionPacketRecord } from "../src/om/question-packet.js";
 import { WORKS_BRIEF_PACKET_CONTRACT } from "../src/om/packet-brief.js";
 import { prepareFrameProposals, type ProposalRequest } from "../src/om/frame-proposals.js";
-import { explicitMapping, gardenGraph, prepareNativeLayers } from "./om-fixture.js";
-import { preparedFeatures, refinedLayers } from "./product-fixture.js";
+import { explicitMapping, gardenGraph, OM_FIXTURE_ERROR, prepareNativeLayers } from "./om-fixture.js";
+import { preparedFeatures } from "./product-fixture.js";
 import { projectGraph } from "../src/graph/project.js";
 import { prepareFrame, type FrameScope } from "../src/om/frame-obligations.js";
 import { writeCandidate } from "../src/om/frame-candidate.js";
@@ -77,13 +78,19 @@ function ok<T>(result: OmResult<T>): T {
 function refusal<T>(result: OmResult<T>): Refusal { if (result.ok) assert.fail("Expected a refusal"); return result.refusal; }
 
 /**
- * A run with its own graph, questions and adapter. Explicit modes use current upstream producers and native
- * N2/L3 acceptance; boolean refinement remains for consumers not yet moved off the research route.
+ * A run with its own graph, questions and adapter. The mode is one of the three current ones: stages (the current upstream
+ * producers), n2 and executed (those and the native N2/L3 acceptance); anything else is refused before any state is made.
  * A cold run never prebuilds B1 or an OM frame, even if an accepted-layer mode was requested.
  */
 type RunFixtureMode = "stages" | "n2" | "executed";
-function runFixture(t: test.TestContext, questions = ["encoding", "spare"], refine: boolean | RunFixtureMode = true, addressed: boolean | string[] = false, later = false, cold = false,
+/** The one door of the mode: a boolean of the retired research route, a typo or a missing value is refused before the first effect. */
+function requireRunFixtureMode(mode: unknown): void {
+  if (mode !== "stages" && mode !== "n2" && mode !== "executed")
+    throw new EngineError(OM_FIXTURE_ERROR, "A run fixture needs a current mode: stages, n2 or executed", { target: "/mode" });
+}
+function runFixture(t: test.TestContext, questions = ["encoding", "spare"], mode: RunFixtureMode, addressed: boolean | string[] = false, later = false, cold = false,
   unknowns: Readonly<Record<string, { consumer?: string; moment?: string }>> = {}) {
+  requireRunFixtureMode(mode);
   const root = mkdtempSync(join(tmpdir(), "omg-h1-run-")), database = join(root, "state.sqlite"), workspace = join(root, "repo");
   mkdirSync(workspace); git(workspace, ["init", "-b", "main"]); writeFileSync(join(workspace, "README.md"), "H1 pass repository\n");
   writeFileSync(join(workspace, "h1-source.txt"), "UTF-8 is the supported encoding.\n");
@@ -97,9 +104,8 @@ function runFixture(t: test.TestContext, questions = ["encoding", "spare"], refi
     graphData.requirements!.push({ ...structuredClone(graphData.requirements![0]!), id: "garden-R2", outcome: "garden-later", statement: "Deliver the later result" });
     graphData.nodes.find(node => node.id === "garden-later-block")!.implements!.push("garden-R2");
   }
-  const mode = typeof refine === "string" ? refine : undefined;
   const { level: _currentLevel, ...currentUpper } = projectGraph(graphData, 1);
-  preparedFeatures(engine, project, mode ? currentUpper as Graph : graphData, field => {
+  preparedFeatures(engine, project, currentUpper as Graph, field => {
     const value = preparedField(project, field);
     if (field === "preparation" && questions.length) (value as Record<string, Json>).unknowns = questions.map(id => ({ id,
       question: `Which ${id} is supported?`, consumer: unknowns[id]?.consumer ?? "garden-consume-block", moment: unknowns[id]?.moment ?? "om-pass", blocksCurrentStage: false,
@@ -128,7 +134,7 @@ function runFixture(t: test.TestContext, questions = ["encoding", "spare"], refi
         ...(field === "featurePreparation" ? { requirements: ["garden-R2"], behaviorContracts: ["garden-B2"] } : {}) });
     }
     return value;
-  }, mode ? "" : undefined);
+  }, "");
   const scenario = join(root, "scenario.json"), trace = join(root, "trace.jsonl");
   const command = { executable: process.execPath, args: [adapterFixture, "--scenario", scenario, "--trace", trace] };
   const environment = (amount = 100_000) => engine.environments.configure(project, { workspace,
@@ -137,14 +143,13 @@ function runFixture(t: test.TestContext, questions = ["encoding", "spare"], refi
     fullCheck: { executable: process.execPath, args: ["--version"] }, timeoutMs: 10_000, requestCapacityChars: amount },
   store.get(`environment:${project}`)?.revision ?? 0);
   const configured = environment();
-  if (mode && mode !== "stages" && !cold) prepareNativeLayers(engine, project, graphData, mode);
-  else if (refine === true) refinedLayers(engine, project);
+  if (mode !== "stages" && !cold) prepareNativeLayers(engine, project, graphData, mode);
   const stages = Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(store.get(`stage:${project}:${stage}`)!)])) as Record<UpstreamStage, Ref>;
   const graph = reference(store.get(`graph:${project}`)!);
   // A cold project has no OM record at all: its first B1 is written by the machine bases (H1.1).
   const input = cold ? null : fixtureInput();
   function fixtureInput() {
-  const base = (mode ? store.get<OmInputRecord>(`om-input:${project}`) : null)
+  const base = store.get<OmInputRecord>(`om-input:${project}`)
     ?? ok(writeOmInput(store, { project, expected: 0, stages }));
   const decisions = base.value.gaps.filter(gap => gap.code !== "inventory_missing" && gap.code !== "question_unaddressed").map(gap => {
     const field = gap.code === "contract_node_unbound" ? "nodes" : gap.code === "acceptance_kind_missing" ? "checkKind" : "state";
@@ -169,7 +174,7 @@ function runFixture(t: test.TestContext, questions = ["encoding", "spare"], refi
   /** The owner's B3 transition over the current roots: P and G2 on a horizon of this choice, then its application. */
   function activate(choiceVersion: string, choice: { features: { outcome: string }[]; excluded: { block: string; reason: string; returnCondition: string }[] }) {
     const horizon = ok(writeHorizon(store, { project, input: reference(store.get(`om-input:${project}`)!), graph,
-      refinement: mode && store.get(`om-frame:${project}:2`) ? reference(store.get(`graph-layer:${project}:2`)!) : null,
+      refinement: store.get(`om-frame:${project}:2`) ? reference(store.get(`graph-layer:${project}:2`)!) : null,
       available: {}, choice: { choiceVersion, ...choice } }));
     assert.equal(horizon.gate.value.state, "accepted", JSON.stringify(horizon.gate.value));
     const roots = store.list<RepairSeries>("repair-series").filter(row => "block" in row.value)
@@ -312,7 +317,7 @@ function stoppedBlockLine(f: Fixture, block = "garden-consume-block") {
 }
 
 /** Reaches the second rung of the M5 line: three refused attempts, the one undecided review, nothing ended yet. */
-async function secondRung(t: test.TestContext, mode: boolean | RunFixtureMode = true) {
+async function secondRung(t: test.TestContext, mode: RunFixtureMode) {
   const f = runFixture(t, ["encoding"], mode);
   const b = f.bases("h12-window"), request = f.request(b), none = cannotAnswer(f, b.routes);
   f.steps([none, none, none, stopAnswer(f, false), addressAll(f, b.routes)]);
@@ -1087,7 +1092,7 @@ async function ownerAnswers(f: Fixture, ids: readonly string[]) {
       value: `Explicit owner choice for ${id}`, basis: "Explicit choice for this question" }, { routes: readRoutes, input: readOmInput }));
   });
 }
-async function twoOwnerAnswers(t: test.TestContext, moved: boolean, mode: boolean | RunFixtureMode = true) {
+async function twoOwnerAnswers(t: test.TestContext, moved: boolean, mode: RunFixtureMode) {
   const f = runFixture(t, ["encoding", "spare"], mode);
   addressQuestions(f, [["encoding", "owner-decision"], ["spare", "owner-decision"]]);
   const request = f.request(), [encoding, spare] = await ownerAnswers(f, ["encoding", "spare"]);

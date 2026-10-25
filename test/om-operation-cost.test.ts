@@ -1115,7 +1115,7 @@ const h1 = await import(config.dist + 'test/om-run-fixture.js');
 const outcomes = {};
 try {
   // ---- R4: one N2 frame of two blocks — A positive, B1 negative, B2 positive. ----
-  const f = h1.runFixture(t, [], false);
+  const f = h1.runFixture(t, [], "stages");
   const bases = f.bases('s11-n2'), p = pass(f, f.request(bases), 'n2');
   ok(startRun(f.store, { project }));
   const answers = [];
@@ -1154,7 +1154,7 @@ try {
   // ---- R4, the branch "B stopped": three refusals of B stop it (A3), A6 reviews and decides; the pass continues B itself, A stays
   // open unpaid; B's fourth attempt succeeds and the common C5, D2 and separate G7 follow. (H1.2: an undecided review ends the pass on
   // the second rung, and a decision of the owner is no way to continue an autonomous pass — №1908.) ----
-  const g = h1.runFixture(t, [], false);
+  const g = h1.runFixture(t, [], "stages");
   const stopBases = g.bases('s11-n2-stop'), q = pass(g, g.request(stopBases), 'n2s');
   ok(startRun(g.store, { project }));
   const replies = [];
