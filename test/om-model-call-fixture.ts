@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import { rmSync, writeFileSync, existsSync, readFileSync, mkdtempSync, watch, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { fileURLToPath } from 'node:url';
 import { type Json, hashJson } from '../src/canonical.js';
 import { EngineError } from '../src/errors.js';
 import { type AdapterRequestInput, readAdapterResponse, finishModelAttempt, type ModelCallRequest, type ModelTransportRequest, type OmModelCall, readCompletionWorkAt, runModelCall, readModelCallState, runModelCycle as mp2Cycle, runModelCycle } from '../src/om/model-call.js';
@@ -41,11 +41,10 @@ import { openAttempt as managedOpenAttempt, closeAttempt, prepareManagedClaim, t
 import { Environments } from '../src/runtime/environment.js';
 import { unitRefusalNamespace, UNIT_REFUSAL_KIND, recordRefusal } from '../src/om/refusal-journal.js';
 import { Evidence, Source } from '../src/evidence/evidence.js';
-import { spawn, type ChildProcess, execFileSync } from 'node:child_process';
+import { spawn, type ChildProcess } from 'node:child_process';
 import { setTimeout as fixtureDelay } from 'node:timers/promises';
 import { processStart } from '../src/runtime/process-identity.js';
 import type { ModelCall } from '../src/runtime/model-usage.js';
-import { createRequire } from 'node:module';
 import { runFixture, regatedHold, defectedWork } from './om-run-fixture.js';
 import { startRun } from '../src/om/run.js';
 
@@ -702,67 +701,6 @@ export async function h15Written<T>(store: Store, action: () => Promise<T>): Pro
 
 
 export const h15Unserved = { code: 'route_result_unsupported', unit: 'E4', target: 'discovery:spare', field: 'answer', route: 'producer' };
-
-
-
-/**
- * Runs a producer script with every engine module loaded from one exact commit, in its own process (the era check of
- * test/om-answers-gate.test.ts): the loader serves each module from Git and refuses an engine module outside the commit,
- * so a missed prefix cannot fall back to the current build and let the test pass vacuously.
- */
-export function h15AtCommit(f: { root: string; database: string }, commit: string, name: string, body: string, input: unknown): unknown {
-  const repository = fileURLToPath(new URL('../../', import.meta.url));
-  const loader = join(f.root, `${name}-loader.mjs`), producer = join(f.root, `${name}-producer.mjs`);
-  const argsFile = join(f.root, `${name}-input.json`), served = join(f.root, `${name}-served.log`);
-  const typescript = pathToFileURL(createRequire(import.meta.url).resolve('typescript')).href;
-  writeFileSync(served, '');
-  writeFileSync(loader, `import { execFileSync } from 'node:child_process';
-import { appendFileSync, realpathSync } from 'node:fs';
-import { fileURLToPath, pathToFileURL } from 'node:url';
-import ts from ${JSON.stringify(typescript)};
-let root, log, prefixes;
-export function initialize(data) {
-  root = data.root; log = data.log;
-  prefixes = [root, pathToFileURL(realpathSync(fileURLToPath(root)) + '/').href].map(base => new URL('dist/src/', base).href);
-}
-export async function load(url, context, next) {
-  const prefix = prefixes.find(item => url.startsWith(item));
-  if (prefix && /\\.js$/.test(url)) {
-    const relative = 'src/' + url.slice(prefix.length).replace(/\\.js$/, '.ts');
-    appendFileSync(log, relative + '\\n');
-    const source = execFileSync('git', ['show', ${JSON.stringify(commit)} + ':' + relative],
-      { cwd: fileURLToPath(root), encoding: 'utf8', maxBuffer: 10000000 });
-    return { format: 'module', shortCircuit: true, source: ts.transpileModule(source,
-      { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2023 } }).outputText };
-  }
-  if (url.startsWith('file:') && url.includes('/dist/src/') && !url.includes('/node_modules/'))
-    throw new Error('An engine module outside the era checkout: ' + url);
-  return next(url, context);
-}`);
-  writeFileSync(producer, `import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
-import { pathToFileURL } from 'node:url';
-const [repository, database, input] = process.argv.slice(2);
-const src = path => pathToFileURL(join(repository, 'dist/src', path)).href;
-const { Store } = await import(src('storage/store.js'));
-const { reference } = await import(src('pipeline/contracts.js'));
-const args = JSON.parse(readFileSync(input, 'utf8')), store = new Store(database);
-const take = result => { if (!result.ok) throw Error(JSON.stringify(result.refusal)); return result.value; };
-const out = value => process.stdout.write(JSON.stringify(value));
-try {
-${body}
-} finally { store.close(); }`);
-  writeFileSync(argsFile, JSON.stringify(input));
-  const bootstrap = `import { register } from 'node:module'; register(${JSON.stringify(pathToFileURL(loader).href)},
-    { data: { root: ${JSON.stringify(pathToFileURL(repository).href)}, log: ${JSON.stringify(served)} } });`;
-  const output: unknown = JSON.parse(execFileSync(process.execPath,
-    ['--import', `data:text/javascript,${encodeURIComponent(bootstrap)}`, producer, repository, f.database, argsFile],
-    { cwd: repository, encoding: 'utf8', timeout: 180_000, maxBuffer: 10_000_000 }));
-  const loaded = readFileSync(served, 'utf8').split('\n').filter(Boolean);
-  assert.ok(loaded.includes('src/storage/store.ts') && loaded.includes('src/om/model-call.ts'),
-    `The producer ran on the modules of ${commit}: ${loaded.join(', ')}`);
-  return output;
-}
 
 
 
