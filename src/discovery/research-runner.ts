@@ -6,9 +6,12 @@ import { variantStateId, readVariantStateStructural, type VariantHandoff, type V
 import { readVariantOwnerDecision } from "./discovery-decision.js";
 import { publishVariantScope, readCurrentVariantScope } from "./variant-scope.js";
 import { producePartialDossier, readPartialDossier } from "./dossier-manifest.js";
+import { DISCOVERY_DEEP_PREPARATION_CONTRACT, produceDeepPreparation, readDeepPreparation } from "./deep-research.js";
+import { prepareDeepResearch, resumeDeepResearch } from "./deep-research-execution.js";
+import { withHistoricalReads } from "../history/proofs.js";
 import { readProjectMode } from "../product/project-mode.js";
 import { REQUEST_MANIFEST_CONTRACT, CONTEXT_PREPARATION_CONTRACT } from "./request-parts.js";
-import { currentPlan, v7CheckpointPrefixes, planAttemptSelection, planOwnerSubject, rejectedPlanOwnerRequest, provePlanQuestions, selectV7AnalystRecovery } from "./v7-plan-questions.js";
+import { currentPlan, deepPlanSelection, v7CheckpointPrefixes, planAttemptSelection, planOwnerSubject, rejectedPlanOwnerRequest, provePlanQuestions, selectV7AnalystRecovery } from "./v7-plan-questions.js";
 import { applyDiscoveryAssessment, v7ProgressBaseline } from "./v7-progress.js";
 import { projectAttemptPacket, proveAttemptPacket, attemptAccountKey } from "./v7-attempt-assessment.js";
 import { recordV7Attempt } from "./v7-attempts.js";
@@ -18,7 +21,7 @@ import { stageNeighbors, usesStageNeighbors, STAGE_NEIGHBOR_CONTEXT, STAGE_NEIGH
 import { earlyResearchStage, earlyResearchFailure, earlyResearchCorrection, deliveredConceptSections, RESULT_CAPACITY_REFUSAL,
   requireEscalationReply, EARLY_RESEARCH_OUTCOME } from './early-research-outcome.js';
 import { producerContractEra, type ProducerPolicy, type UpstreamStage } from './requirements.js';
-import { discoveryContext, discoveryInspection, publishVariantHandoff, readVariantHandoff, type DiscoveryOutcome } from './discovery-outcome.js';
+import { discoveryContext, discoveryInspection, discoveryTraversal, publishVariantHandoff, readVariantHandoff, type DiscoveryOutcome } from './discovery-outcome.js';
 import { savedSynthesisMaterials, savedV7SynthesisMaterials } from "./saved-synthesis.js";
 import { readResearchContext, researchContextReadEra } from "./research-limits.js";
 import { planningForQuestion, planningForPlanSubject } from "./research-routing.js";
@@ -1609,7 +1612,8 @@ export class Researcher {
    * a new decision goes through the same managed admission/reservation as a direct B.2 client. */
   private async advanceV7VariantChoice(project: string, generation: ProvenVariantGeneration,
     variants: ReturnType<Researcher["restoreV7Variants"]>, allowNew: boolean, allowance: boolean,
-    signal: AbortSignal | undefined, beforeSend: () => void, receivePartial: (handoff: Ref, details?: object) => Promise<never>): Promise<void> {
+    signal: AbortSignal | undefined, beforeSend: () => void, receivePartial: (handoff: Ref, details?: object) => Promise<never>,
+    receiveDeep: (handoff: Ref, display: object) => Promise<void>): Promise<void> {
     const result = generation.publication.result, session = generation.session;
     const mode = readProjectMode(this.store, project);
     requireCondition(generation.state, "research_variant_context_stale",
@@ -1654,6 +1658,11 @@ export class Researcher {
       if (handoff.record.value.next === "dossier") await receivePartial(reference(handoff.record),
         { result: result.ref, draft: session.value.draft, set: result.ref, mode: choice.decision.value.mode,
           decision: ref, selection: applied, scope });
+      if (handoff.record.value.next === "deep") {
+        await receiveDeep(reference(handoff.record), { result: result.ref, set: result.ref,
+          mode: choice.decision.value.mode, decision: ref, selection: applied, reason: outcome.kind, next: 'deep' });
+        return;
+      }
       pause("research_variant_handoff_unavailable", "The saved handoff awaits its addressed consumer",
         { draft: session.value.draft, set: result.ref, mode: choice.decision.value.mode,
           decision: ref, selection: applied, scope, handoff: reference(handoff.record), reason: outcome.kind, next: outcome.kind === "choose" ? "deep" : "dossier" });
@@ -1744,6 +1753,7 @@ export class Researcher {
       } else pendingHandoff = proof.record.value;
     }
     let partialPending = false;
+    let deepOperation = false;
     const receivePartial = async (handoff: Ref, display: object = {}): Promise<never> => {
       const proof = await readVariantHandoff(this.store, project, handoff);
       requireCondition(proof.record.value.draft.id === draftId && proof.record.value.next === "dossier"
@@ -1766,6 +1776,49 @@ export class Researcher {
       partialPending = false;
       throw new EngineError("research_dossier_assessment_unavailable", message);
     };
+    const receiveDeep = async (handoff: Ref, display: object): Promise<void> => {
+      deepOperation = true;
+      const proof = await readVariantHandoff(this.store, project, handoff), value = proof.record.value;
+      requireCondition(value.next === 'deep' && value.reason === 'choose' && isRef(value.scope)
+        && value.draft.id === draftId && run, 'discovery_deep_frontier_invalid',
+        'The deep recipient requires this run and its proven exact chosen handoff');
+      const frontier = deepPlanSelection(this.store, project, value.scope);
+      requireCondition(canonical(frontier.planAnswer) === canonical(value.plan), 'discovery_deep_preparation_stale',
+        'The deep handoff belongs to the current accepted plan');
+      const traversal = discoveryTraversal(this.store, frontier.draft);
+      requireCondition(traversal && traversal.budget && canonical(traversal.plan) === canonical(frontier.planAnswer),
+        'discovery_deep_frontier_invalid', 'The frontier needs the common proven accounting');
+      const details = { ...display, handoff, scope: value.scope, draft: reference(frontier.draft), plan: frontier.planAnswer,
+        coverage: frontier.coverage, progress: frontier.progress, budget: traversal.budget,
+        nextCell: frontier.next?.cell ?? null, grounds: traversal.guards };
+      const pause = (code: string, message: string): never => {
+        deepOperation = false;
+        throw new EngineError(code, canonical({ code, message, ...details }));
+      };
+      if (!frontier.coverage.missing.length) pause('research_deep_frontier_complete',
+        'The selected variant has proven coverage; its next recipient is not connected');
+      if (!frontier.next) pause('research_deep_frontier_stalled',
+        'The remaining cells retain their proven no-progress limit; no new send is admitted');
+      if (traversal.budget?.exhausted) pause('research_deep_budget_exhausted',
+        'The saved stage accounting admits no new deep payment');
+      if (options.restoreOnly || producerContractEra('discovery', options.producerPolicy) !== 7 || used >= limit)
+        pause('research_deep_frontier_pending', 'The missing exact cell awaits an explicit new v7 allowance');
+      // No local transport or coverage oracle. Preparation and managed admission
+      // retain the complete current proof; P guards additionally pin this frontier.
+      deepOperation = true;
+      const effective = this.environments.effective(project);
+      const intent = withHistoricalReads(() => {
+        const prepared = produceDeepPreparation(this.store, project,
+          { contract: DISCOVERY_DEEP_PREPARATION_CONTRACT, cell: frontier.next!.cell, scope: value.scope });
+        return prepareDeepResearch(this.store, { projectId: project, deepPreparation: reference(prepared.record),
+          environment: effective.environment, owner: reference(run!), turn: run!.value.turns + 1, guards: frontier.guards });
+      });
+      used++;
+      const result = await resumeDeepResearch(this.store, project, reference(intent), { allowance: 1, ...(signal ? { signal } : {}) });
+      requireCondition(result, 'discovery_deep_frontier_invalid', 'An admitted deep step must retain its managed result');
+      run = this.store.get<ResearchRun>(id)!;
+      deepOperation = false;
+    };
     try {
       if (savedPartial) {
         try { await receivePartial(savedPartial.handoff, savedPartial); }
@@ -1786,8 +1839,28 @@ export class Researcher {
         if (reserved) requireCondition(run && synthesis!.session.value.delivery?.run === id
           && synthesis!.deliveryTurn === run.value.turns, "research_synthesis_ambiguous",
           "The unfinished synthesis does not own this run position");
-        const recovery = selectV7AnalystRecovery(this.store, project, draftId, run, reserved);
+        const recovery = selectV7AnalystRecovery(this.store, project, draftId, run, reserved,
+          !options.restoreOnly && producerContractEra('discovery', options.producerPolicy) === 7 && used < limit);
         const { turns, intents, outstanding } = recovery;
+        // Recover the original paid deep identity before current selection, actor,
+        // allowance or coverage can select another cell. Its ordinary K then goes
+        // through the existing shared MR/P checkpoint below.
+        const turnIntent = recovery.turn?.value.consumerIntent;
+        const deepIntent = outstanding ?? (isRef(turnIntent) ? intents.find(intent => intent.id === turnIntent.id) : null);
+        if (deepIntent && Object.hasOwn(deepIntent.value.cursor, 'deepPreparation')) {
+          deepOperation = true;
+          const ref = deepIntent.value.cursor.deepPreparation;
+          readDeepPreparation(this.store, project, ref);
+          const unpaid = deepIntent.value.state === 'prepared';
+          const restoreOnly = options.restoreOnly || producerContractEra('discovery', options.producerPolicy) !== 7 || used >= limit;
+          if (unpaid && restoreOnly) return run!;
+          if (unpaid) used++;
+          await resumeDeepResearch(this.store, project, reference(deepIntent),
+            { restoreOnly, allowance: restoreOnly ? 0 : 1, ...(signal ? { signal } : {}) });
+          run = this.store.get<ResearchRun>(id)!;
+          deepOperation = false;
+          continue;
+        }
         if (synthesis) {
           requireCondition(!recovery.turn && !outstanding, "research_synthesis_ambiguous",
             "Saved synthesis conflicts with another unfinished run operation");
@@ -2063,7 +2136,7 @@ export class Researcher {
         const advanceChoice = async () => this.advanceV7VariantChoice(project, generations[0]!, variants, allowNew, used < limit, signal, () => {
           if (run!.value.status !== "running") run = this.save(run!, { status: "running", owner, ownerQuestion: null, error: null, pauseCode: null });
           used++;
-        }, receivePartial);
+        }, receivePartial, receiveDeep);
         if (generations.length && run) { await advanceChoice(); continue; }
         const readiness = variantSnapshotReadiness(this.store, project);
         if (readiness.budget?.exhausted) {
@@ -2194,6 +2267,13 @@ export class Researcher {
     } catch (error) {
       if (partialPending) throw error;
       const current = this.store.get<ResearchRun>(id) ?? run;
+      // A CAS/proof refusal must not append a diagnostic over the competitor's
+      // state. Once our reservation activated the run, a non-CAS application
+      // failure must retain the ordinary paused recovery door, including typed cuts.
+      if (deepOperation && error instanceof EngineError
+        && !['discovery_budget_reserve', 'budget_estimate_missing', 'discovery_budget_overrun'].includes(error.code)
+        && (['input_stale', 'revision_conflict'].includes(error.code) || current?.value.status !== 'running'
+          || canonical(current.value.owner) !== canonical(owner))) throw error;
       if (!current) throw error;
       if (error instanceof EngineError && ["revision_conflict", "input_stale"].includes(error.code)
         && run && canonical(reference(current)) !== canonical(reference(run))) return current;

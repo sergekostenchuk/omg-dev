@@ -206,7 +206,7 @@ for (const shift of ['mode', 'owner', 'edition'] as const) test(`4R.2: second St
     return write(ws, guards);
   }) as typeof f.store.writeMany;
   const refused = await f.run(3); f.store.writeMany = write;
-  assert.ok(hit); assert.equal(f.store.list('discovery-variant-handoff').length, 0); assert.notEqual(refused.value.pauseCode, 'research_variant_handoff_unavailable');
+  assert.ok(hit); assert.equal(f.store.list('discovery-variant-handoff').length, 0); assert.notEqual(refused.value.pauseCode, 'research_deep_frontier_pending');
   assert.equal(subjectCalls(f, 'proposal').length, 1); assert.equal(subjectCalls(f, 'decision').length, 1);
   const paid = money(f.store), wire = f.wires(); await f.run(1, f.open(), true); assert.deepEqual(money(f.store), paid); assert.deepEqual(f.wires(), wire);
 });

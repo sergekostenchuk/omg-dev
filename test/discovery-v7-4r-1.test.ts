@@ -1,5 +1,6 @@
 import { readVariantHandoff, discoveryInspection } from '../src/discovery/discovery-outcome.js';
 import { readPartialDossier } from '../src/discovery/dossier-manifest.js';
+import { readVariantScope } from '../src/discovery/variant-scope.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync, writeFileSync } from 'node:fs';
@@ -117,15 +118,23 @@ test('4R.1: ordinary runner restores MR/P, covers the whole sweep including appl
 
 test('4R.1: bypass buys a separate model choice after generation and pauses at the exact saved handoff', async t => {
   const f = await setup(t, undefined, 'bypass'); const result = await f.run(3);
-  assert.equal(result.value.pauseCode, 'research_variant_handoff_unavailable', JSON.stringify(result.value));
+  assert.equal(result.value.pauseCode, 'research_deep_frontier_pending', JSON.stringify(result.value));
   assert.equal(f.generationCalls().filter(row => row.subject.variantSubject.kind === 'proposal').length, 1);
   assert.equal(f.generationCalls().filter(row => row.subject.variantSubject.kind === 'decision').length, 1);
   const state = f.store.list<any>('discovery-variant-state')[0]!; assert.ok(state.value.decision);
   assert.deepEqual(JSON.parse(result.value.error!).decision, state.value.decision);
   assert.ok(JSON.parse(result.value.error!).scope);
-  const before = history(f.store), sent = f.wires().length;
+  const details = JSON.parse(result.value.error!), handoff = await readVariantHandoff(f.store, 'p', details.handoff);
+  const scope = readVariantScope(f.store, 'p', details.scope);
+  assert.equal(handoff.record.value.next, 'deep'); assert.equal(handoff.record.value.reason, 'choose');
+  assert.equal(handoff.record.value.projectId, 'p'); assert.equal(handoff.record.value.draft.id, f.v.draft.id);
+  assert.deepEqual(handoff.record.value.scope, reference(scope.scope));
+  assert.deepEqual(handoff.record.value.decision, state.value.decision);
+  assert.deepEqual(scope.scope.value.decision, state.value.decision);
+  assert.equal(f.store.list('discovery-deep-preparation').length, 0);
+  const before = history(f.store), sent = f.wires();
   assert.deepEqual(await f.run(2, f.open(), true), result);
-  assert.deepEqual(history(f.store), before); assert.equal(f.wires().length, sent);
+  assert.deepEqual(history(f.store), before); assert.deepEqual(f.wires(), sent);
 });
 
 test('4R.1: no_variants is its own paid result and cold fixed point, never completed Discovery', async t => {

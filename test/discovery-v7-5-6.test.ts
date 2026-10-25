@@ -1,0 +1,422 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { readFileSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
+import { reference } from '../src/pipeline/contracts.js';
+import { Store, type Revision, type TransactionGuard, type Write } from '../src/storage/store.js';
+import { Discovery, type DiscoveryDraft, type Question } from '../src/discovery/discovery.js';
+import { ProductEngine } from '../src/product/engine.js';
+import { Researcher } from '../src/discovery/research-runner.js';
+import { researchCall } from '../src/discovery/research-protocol.js';
+import { VARIANT_OWNER_ACTION, variantStateId, type VariantChoiceScope, type VariantState } from '../src/discovery/variant-decision.js';
+import { VARIANT_SUBJECT_CONTRACT, type VariantSet } from '../src/discovery/discovery-variants.js';
+import { ProjectModeSessions, issueProjectModeInvitation, VariantChoiceSessions, issueVariantChoiceInvitation } from '../src/product/owner-authority.js';
+import { setProjectMode } from '../src/product/project-mode.js';
+import { answerVariantChoice } from '../src/discovery/discovery-decision.js';
+import { V7_STAGE_TOKEN_CEILING } from '../src/discovery/v7-contracts.js';
+import { discoveryFixture, acceptPlan, planQuestion, validPlan, type PlanQuestion } from './discovery-v7-fixture.js';
+import { answerDiscoveryFixture } from './product-fixture.js';
+import { discoveryInspection, readVariantHandoff } from '../src/discovery/discovery-outcome.js';
+import { EngineError } from '../src/errors.js';
+import { canonical } from '../src/canonical.js';
+import { deepPlanSelection } from '../src/discovery/v7-plan-questions.js';
+import { readDeepResearchResult, runDeepResearch } from '../src/discovery/deep-research-execution.js';
+import { readDeepPreparation } from '../src/discovery/deep-research.js';
+import { projectAttemptPacket } from '../src/discovery/v7-attempt-assessment.js';
+import { applyDiscoveryAssessment, v7ProgressBaseline } from '../src/discovery/v7-progress.js';
+import { assessAttemptsWithRequirements } from '../src/discovery/research-assessment.js';
+import { readVariantScope } from '../src/discovery/variant-scope.js';
+import type { ResearchConsumerIntent } from '../src/discovery/response-recovery.js';
+import type { ResearchRun, V7ProgressState } from '../src/discovery/research-model.js';
+
+// Include orphaned history as well as current heads after the explicit missing-head corruptions.
+function history(store: Store): string {
+  const db = new DatabaseSync(store.path, { readOnly: true });
+  try {
+    return canonical({ heads: db.prepare('SELECT * FROM heads ORDER BY entity_id').all(),
+      revisions: db.prepare('SELECT * FROM revisions ORDER BY entity_id, revision').all() });
+  } finally { db.close(); }
+}
+// The public runner uses Store indices outside the deliberately narrow storeView
+// surface. Intercept only writes to this connection; all reads stay real and the
+// second Store still commits independently inside the tested reservation window.
+function interceptWrites(t:test.TestContext, target:Store,
+  action:(writes:Write[],commit:()=>Revision<unknown>[])=>Revision<unknown>[]) {
+  const original=Store.prototype.writeMany;
+  const method=t.mock.method(Store.prototype,'writeMany',function<T>(this:Store,writes:Write[],guards:TransactionGuard[]=[]):Revision<T>[] {
+    const commit=()=>original.call(this,writes,guards);
+    return (this===target?action(writes,commit):commit()) as Revision<T>[];
+  });
+  return ()=>method.mock.restore();
+}
+async function setup(t: test.TestContext, questions: PlanQuestion[] = [planQuestion('q-one', 'industry', 'blocking'), planQuestion('q-two', 'market')], initialMode: 'questions'|'bypass'|null = 'questions') {
+  const f = discoveryFixture(t, 'omg-56-');
+  f.engine.execute({ type: 'create-project', project: 'p', title: 'Runner generation' });
+  const settings = join(f.root, 'settings.json'), wire = join(f.root, 'wire.ndjson'), adapter = join(f.root, 'adapter.mjs');
+  const configure = (patch: Record<string, unknown> = {}) => {
+    let prior = {}; try { prior = JSON.parse(readFileSync(settings, 'utf8')); } catch {}
+    writeFileSync(settings, JSON.stringify({ ...prior, ...patch }));
+  };
+  configure();
+  writeFileSync(adapter, `import {readFileSync,appendFileSync} from 'node:fs';
+const r=JSON.parse(readFileSync(0,'utf8')), s=JSON.parse(readFileSync(${JSON.stringify(settings)},'utf8')), q=r.subject.question?.id??'probe';
+let prior=[];try{prior=readFileSync(${JSON.stringify(wire)},'utf8').trim().split('\\n').filter(Boolean).map(line=>JSON.parse(line))}catch{}
+appendFileSync(${JSON.stringify(wire)},JSON.stringify(r)+'\\n');
+let research=s.actions?.[prior.filter(row=>!row.subject.assessmentSubject&&!row.subject.variantSubject).length]??{action:'answer',question:q,value:{type:'impossible',code:'source_unavailable',evidence:[],text:'No accessible source'},citations:[]};
+if(research.question==='$selected')research.question=q;
+if(r.subject.subject?.contract==='v7-plan-subject/v1'&&!r.subject.deepPreparation){
+ const at=r.subject.subject,id=at.planQuestionId;
+ research={action:'answer',question:id,value:{type:'submitted',contract:'discovery-claims/v7',value:{claims:[{id:'broad-'+prior.length,kind:'hypothesis',text:'Common sweep material '+prior.length,axis:id==='q-one'?'industry':'market',planQuestions:[{planAnswer:at.planAnswer,planQuestionId:id}],scope:{variants:'common'},basis:{howToVerify:'Measure the common domain'}}]}},citations:[]};
+}
+if(r.subject.deepPreparation){
+ const cell=r.subject.deepCell, id=cell.subject.planQuestionId;
+ const claim={id:'deep-'+prior.length,kind:'hypothesis',text:'Exact variant material '+prior.length,axis:id==='q-one'?'industry':'market',planQuestions:[{planAnswer:cell.subject.planAnswer,planQuestionId:id}],scope:{variants:s.deepMode==='common'?'common':[cell.variant.member]},basis:{howToVerify:'Measure the exact chosen variant'}};
+ research={action:'answer',question:id,value:s.deepMode==='impossible'?{type:'impossible',code:'source_unavailable',evidence:[],text:'No accessible source'}:{type:'submitted',contract:'discovery-claims/v7',value:{claims:[claim]}},citations:[]};
+}
+if(r.subject.variantSubject?.kind==='decision')research=s.reject?{action:'reject_all',reason:'Model rejects this exact set'}:{action:'choose',key:'v1',reason:'Model chooses the bounded member'};
+else if(r.subject.variantSubject){
+ const grounds=[r.subject.variantSubject.snapshot],keys=['value','user','payer','costAndTime','risk','mandateFit'];
+ research=s.none?{action:'no_variants',reasons:[{code:'bounded_search',message:'No bounded variant',grounds}],searchLimits:['Saved sweep only'],unknowns:['Demand unknown']}
+ :{action:'variants',variants:[{key:'v1',title:'Bounded variant',proposal:{bounded:true},criteria:Object.fromEntries(keys.map(key=>[key,{conclusion:'Bounded model proposal',grounds,assumptions:[],unknowns:['Demand unknown'],quantity:null}]))}],scale:Object.fromEntries(keys.map(key=>[key,'Same bounded scale'])),comparison:'One bounded option',recommendation:{key:'v1',reason:'Only bounded candidate'},searchLimits:['Saved sweep only'],unknowns:['Demand unknown']};
+}
+if(r.subject.role==='reader'){if(s.readerFail)process.exit(42);research={selections:r.subject.sources.map((source,sourceIndex)=>({sourceIndex,firstLine:source.lines[0][0],lastLine:source.lines.at(-1)[0]})),unresolved:[]}};
+if(r.subject.assessmentSubject){
+ const entries=r.subject.assessmentSubject.packet.entries;
+ const all=r.subject.value.attempts.flatMap(row=>row.end.type==='submitted'?row.end.value.claims.map((claim,index)=>({accepted:true,claim:{project:r.subject.assessmentSubject.packet.project,container:row.attempt,containerKind:'research-attempt',pointer:'/claims/'+index,claimId:claim.id}})):[]);
+ const accepted=all.filter(c=>c.accepted).map(c=>({claim:c.claim,reason:'Supported exact hypothesis or addressed unknown'}));
+ research={verdict:'supported',reasons:['Exact material classification'],return:null,novelty:{attempts:entries.map(e=>({attempt:e.attempt,reason:'Exact attempt'})),accepted,rejected:all.filter(c=>!c.accepted).map(c=>({claim:c.claim,reason:'Counterargument not supported'})),newContent:accepted,duplicates:[],noProgress:entries.filter(e=>!accepted.some(c=>c.claim.container.id===e.attempt.id)).map(e=>({attempt:e.attempt,reason:'No accepted addition'})),transition:accepted.length&&s.close!==false?{outcome:'closed',bases:accepted.map(c=>({claim:c.claim})),reason:'The exact criterion has enough supported material',sufficiency:{criterion:'Named basis answering '+r.subject.assessmentSubject.packet.planQuestionId,requiredDepth:'deep',reason:'Required depth is met',methodologyRequirements:[]}}:accepted.length&&s.outcome?{outcome:s.outcome,bases:accepted.map(c=>({claim:c.claim})),reason:'Reopened by the applied assessment',...(s.outcome==='unknown'?{consequence:'The deep cell stays missing',nextAction:'Find the named evidence'}:{})}:null},methodology:{contract:'assessment-methodology/v1',policy:'assessment-methodology-policy/v2',facts:[]}};
+}
+console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,usage:{inputTokens:r.subject.assessmentSubject?(s.assessorTokens??10):r.subject.variantSubject?.kind==='proposal'?(s.proposalTokens??10):r.subject.deepPreparation?(s.deepTokens??10):10,outputTokens:1,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
+  const command = { executable: process.execPath, args: [adapter] };
+  const environment = f.engine.environments.configure('p', { workspace: f.root,
+    implementer: { actor: 'model-author', model: 'fixture', effort: 'high', command },
+    reviewer: { actor: 'model-reviewer', model: 'fixture', effort: 'high', command }, fullCheck: command, timeoutMs: 10000 }, 0);
+  const calibration = f.discovery.create('p', 'discovery', 'R0', 'concept', [{ field: 'probe', kind: 'fact', prompt: 'Calibrate', risk: 'unknown', schema: { type: 'object' } }], [], 6);
+  for (const purpose of ['analyst', 'assessor', 'escalation-assessor', 'reading-planner', 'reader']) await researchCall(purpose === 'reader'
+    ? { actor: 'reader', model: 'fixture', effort: 'high', speed: 'inherited', command } : ['assessor', 'escalation-assessor'].includes(purpose) ? environment.value.reviewer : environment.value.implementer,
+    environment.value, 'Calibrate', {}, undefined, { store: f.store, draftId: calibration.id, questionId: calibration.value.questions[0]!, purpose });
+  const v = acceptPlan(f, 'p', questions);
+  function mode(value: 'questions'|'bypass', store = f.store) {
+    const request = { project: 'p', mode: value, previous: store.get('project-mode:p') ? reference(store.get('project-mode:p')!) : null };
+    const sessions = new ProjectModeSessions(store), invitation = issueProjectModeInvitation(store, request);
+    assert.ok(invitation.ok); if (!invitation.ok) assert.fail();
+    const login = sessions.exchange({ project: 'p', invitation: invitation.value.invitation }); assert.ok(login.ok); if (!login.ok) assert.fail();
+    const record = setProjectMode(store, request, sessions.authority(login.value.bearer)).record;
+    assert.ok(sessions.revoke(login.value.bearer).ok); return record;
+  }
+  const initial = initialMode === null ? null : mode(initialMode);
+  if (initial) {
+    const cal = f.store.write({ id: 'variant-calibration', kind: 'transport-fixture', expected: 0, value: { projectId: 'p' } });
+    for (const kind of ['proposal', 'decision'] as const) await researchCall(environment.value.implementer, environment.value, 'Calibrate variant step',
+      { variantSubject: { contract: VARIANT_SUBJECT_CONTRACT, kind, ...(kind === 'proposal' ? {snapshot: reference(cal)} : {set: reference(cal)}), mode: reference(initial), expectedSelection: null }, history: [] }, undefined,
+      { store: f.store, draftId: calibration.id, questionId: calibration.value.questions[0]!, purpose: `variant-${kind}` });
+  }
+  writeFileSync(wire, '');
+  const run = (limit = 8, store = f.store, restoreOnly = false) => new Researcher(store, new Discovery(store), new ProductEngine(store).environments)
+    .run('p', v.draft.id, limit, undefined, { producerPolicy: { discovery: 7 }, restoreOnly });
+  const wires = () => readFileSync(wire, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line));
+  const generationCalls = () => wires().filter(row => row.subject.variantSubject);
+  const nextEdition = (store = f.store) => {
+    const discovery = new Discovery(store), engine = new ProductEngine(store);
+    const plan = store.get<Question>(v.plan.id)!; discovery.reopen(plan.id, plan.revision);
+    const question = store.get<Question>(plan.id)!, draft = store.get<DiscoveryDraft>(v.draft.id)!;
+    const source = discovery.evidence.document('p', 'edition-two', 'New accepted edition', 'text/plain', 0);
+    answerDiscoveryFixture(engine, 'p', draft, question, validPlan(v.frameRef, questions, 2, v.planAnswer), source);
+    return store.get<Question>(plan.id)!.value.answer!;
+  };
+  return { ...f, v, environment, command, run, wires, generationCalls, configure, mode, initial, nextEdition };
+}
+const money = (store: Store) => store.list().filter(row => ['model-call', 'research-budget-ledger'].includes(row.kind)).flatMap(row => store.history(row.id));
+function choiceScope(f: Awaited<ReturnType<typeof setup>>, kind: 'choose' | 'reject_all' = 'choose'): VariantChoiceScope {
+  const state = f.store.get<VariantState>(variantStateId('p', f.v.draft.id))!;
+  const set = f.store.get<VariantSet>(state.value.set!.id, state.value.set!.revision)!;
+  return { action: VARIANT_OWNER_ACTION, projectId: 'p', draft: set.value.draft, set: reference(set),
+    mode: reference(f.store.get('project-mode:p')!), operation: 'initial', previous: null, expectedSelection: reference(state),
+    outcome: kind === 'choose' ? { kind, member: set.value.members[0]!, reason: 'Authorized owner chooses the member' }
+      : { kind, reason: 'Authorized owner rejects the exact set' } };
+}
+function owner(store: Store, scope: VariantChoiceScope) {
+  const sessions = new VariantChoiceSessions(store), issued = issueVariantChoiceInvitation(store, scope);
+  assert.ok(issued.ok); if (!issued.ok) assert.fail('Expected successful owner exchange');
+  const login = sessions.exchange({ projectId: 'p', invitation: issued.value.invitation });
+  assert.ok(login.ok); if (!login.ok) assert.fail('Expected successful owner exchange');
+  const act = answerVariantChoice(store, scope, sessions.authority(login.value.bearer));
+  assert.ok(sessions.revoke(login.value.bearer).ok); return act;
+}
+
+const deepCalls = (f: Awaited<ReturnType<typeof setup>>) => f.wires().filter(row => row.subject.deepPreparation);
+const deepIntents = (store: Store) => store.list<ResearchConsumerIntent>('research-consumer-intent')
+  .filter(row => Object.hasOwn(row.value.cursor, 'deepPreparation'));
+async function inert(f: Awaited<ReturnType<typeof setup>>, store: Store, action: () => Promise<unknown>) {
+  const before=history(store), paid=money(store), wire=f.wires();
+  const result=await action();
+  assert.equal(history(store),before);assert.deepEqual(money(store),paid);assert.deepEqual(f.wires(),wire);return result;
+}
+async function ready(t:test.TestContext,model=false,config:Record<string,unknown>={}) {
+  const f=await setup(t,undefined,model?'bypass':'questions');
+  const generated=await f.run(3);
+  assert.equal(generated.value.pauseCode,model?'research_turns_exhausted':'research_variant_owner_required',generated.value.error!);
+  f.configure(config);
+  if(model)await f.run(1);else owner(f.store,choiceScope(f));
+  const pending=await f.run(1,f.store,true), details=JSON.parse(pending.value.error!);
+  assert.equal(pending.value.pauseCode,'research_deep_frontier_pending',pending.value.error!);
+  const handoff=(await readVariantHandoff(f.store,'p',details.handoff)).record;
+  assert.equal(handoff.value.next,'deep');assert.deepEqual(handoff.value.scope,details.scope);
+  assert.deepEqual(reference(readVariantScope(f.store,'p',details.scope).scope),details.scope);
+  return {...f,scope:details.scope,pending};
+}
+for(const model of [false,true])test(`5.6: real ${model?'model':'owner'} choose buys only the other cell after applied coverage, then cold fixed point`,async t=>{
+  const f=await ready(t,model), first=await f.run(1), details=JSON.parse(first.value.error!);
+  assert.equal(first.value.pauseCode,'research_deep_frontier_pending',first.value.error!);
+  const coverage=deepPlanSelection(f.store,'p',f.scope);
+  assert.deepEqual(coverage.coverage.cells.map(row=>row.covered),[true,false]);
+  assert.equal(coverage.next!.cell.subject.planQuestionId,'q-two');
+  assert.deepEqual(details.progress.map((row:any)=>row.summary.count),[2,1]);
+  assert.deepEqual(deepCalls(f).map(row=>row.subject.deepCell.subject.planQuestionId),['q-one']);
+  const final=await f.run(1,f.open());
+  assert.equal(final.value.pauseCode,'research_deep_frontier_complete',final.value.error!);
+  assert.deepEqual(deepCalls(f).map(row=>row.subject.deepCell.subject.planQuestionId),['q-one','q-two']);
+  assert.deepEqual(deepPlanSelection(f.store,'p',f.scope).coverage.cells.map(row=>row.covered),[true,true]);
+  for(const row of deepIntents(f.store))assert.equal(readDeepResearchResult(f.store,'p',reference(row)).verification,'proven');
+  assert.equal(f.store.list('discovery-dossier-manifest').length,0);
+  assert.equal(discoveryInspection(f.store,f.store.get<DiscoveryDraft>(f.v.draft.id)!).outcome.state,'researching');
+  for(const store of [f.store,f.open()])await inert(f,store,async()=>assert.deepEqual(await f.run(3,store,true),final));
+});
+
+for(const mode of ['common','insufficient'] as const)test(`5.6: applied ${mode} material stays in the exact missing frontier`,async t=>{
+  const f=await ready(t,false,mode==='common'?{deepMode:'common'}:{close:false,outcome:'open'});
+  const result=await f.run(1), selection=deepPlanSelection(f.store,'p',f.scope);
+  assert.equal(result.value.pauseCode,'research_deep_frontier_pending',result.value.error!);
+  assert.equal(selection.coverage.cells[0]!.covered,false);
+  assert.equal(selection.coverage.cells[0]!.missing!.code,mode==='common'?'coverage_no_variant_ground':'coverage_no_sufficiency');
+  assert.equal(selection.next!.cell.subject.planQuestionId,'q-one');
+  assert.equal(selection.next!.cell.requiredDepth,'deep');
+  assert.equal(selection.next!.cell.criterion,'Named basis answering q-one');
+  await inert(f,f.open(),()=>f.run(1,f.open(),true));
+});
+
+for(const outcome of ['open','unknown'] as const)test(`5.6: a later real applied ${outcome} supersedes coverage and restores the exact frontier hot and cold`,async t=>{
+  const f=await ready(t);await f.run(1);
+  const first=deepIntents(f.store)[0]!, subject=first.value.cursor.subject!;
+  assert.equal(deepPlanSelection(f.store,'p',f.scope).coverage.cells[0]!.covered,true);
+  // A separate lawful managed attempt supplies new evidence; no saved P or paid record is manufactured.
+  f.configure({close:false,outcome});
+  const run=f.store.get<ResearchRun>(first.value.owner.id)!;
+  const result=(await runDeepResearch(f.store,{projectId:'p',deepPreparation:first.value.cursor.deepPreparation!,
+    environment:f.environment,owner:reference(run)}))!;
+  const packet=projectAttemptPacket(f.store,{project:'p',...subject,
+    entries:[{attempt:reference(result.attempt),binding:reference(result.binding)}]});
+  const assessment=await assessAttemptsWithRequirements(f.store,packet,v7ProgressBaseline(f.store,packet),f.environment,f.root);
+  applyDiscoveryAssessment(f.store,'p',reference(assessment));
+  const before=history(f.store), paid=money(f.store), wire=f.wires();
+  for(const store of [f.store,f.open()]){
+    const frontier=deepPlanSelection(store,'p',f.scope);
+    assert.equal(frontier.coverage.cells[0]!.covered,false);
+    assert.equal(frontier.next!.cell.subject.planQuestionId,'q-one');
+    assert.equal(frontier.progress[0]!.summary!.outcome,outcome);
+    assert.deepEqual(frontier.next!.cell.subject,subject);
+    assert.equal(history(store),before);assert.deepEqual(money(store),paid);assert.deepEqual(f.wires(),wire);
+  }
+});
+
+test('5.6: N and exact run cursor survive restart and an environment revision; stalled cells are not bought again',async t=>{
+  const f=await ready(t,false,{deepMode:'impossible'});
+  await f.run(1);
+  assert.equal(deepPlanSelection(f.store,'p',f.scope).progress[0]!.summary!.streak,1);
+  const environment=f.store.get<typeof f.environment.value>(f.environment.id)!;
+  f.engine.environments.configure('p',{...environment.value,timeoutMs:environment.value.timeoutMs+1},environment.revision);
+  await f.run(2,f.open());
+  let frontier=deepPlanSelection(f.store,'p',f.scope);
+  assert.equal(frontier.progress[0]!.summary!.streak,3);
+  assert.equal(frontier.progress[0]!.stalled,true);
+  assert.equal(frontier.next!.cell.subject.planQuestionId,'q-two');
+  await f.run(3,f.open());frontier=deepPlanSelection(f.store,'p',f.scope);
+  assert.equal(frontier.next,null);assert.deepEqual(frontier.progress.map(row=>row.summary!.streak),[3,3]);
+  assert.deepEqual(deepCalls(f).map(row=>row.subject.deepCell.subject.planQuestionId),['q-one','q-one','q-one','q-two','q-two','q-two']);
+  const run=f.store.list<any>('research-run').find(row=>row.value.draftId===f.v.draft.id)!;
+  assert.equal(run.value.pauseCode,'research_deep_frontier_stalled');assert.equal(run.value.turns,8);
+  await inert(f,f.open(),()=>f.run(5,f.open()));
+});
+
+test('5.6: restoreOnly, default policy and zero allowance cannot buy or prepare the missing cell',async t=>{
+  const f=await ready(t), store=f.open();
+  await inert(f,store,()=>f.run(1,store,true));
+  await inert(f,store,()=>new Researcher(store,new Discovery(store),new ProductEngine(store).environments).run('p',f.v.draft.id,1));
+  await inert(f,store,()=>assert.rejects(()=>f.run(0,store),{code:'research_budget_invalid'}));
+  assert.equal(deepCalls(f).length,0);assert.equal(f.store.list('discovery-deep-preparation').length,0);
+});
+
+test('5.6: real paid budget stays exhausted across restart and keeps the exact missing cell',async t=>{
+  const f=await ready(t);f.configure({assessorTokens:V7_STAGE_TOKEN_CEILING-2_000_000});
+  const result=await f.run(2), details=JSON.parse(result.value.error!);
+  assert.equal(result.value.pauseCode,'research_deep_budget_exhausted',result.value.error!);
+  assert.equal(deepCalls(f).length,1);assert.equal(details.nextCell.subject.planQuestionId,'q-two');
+  assert.equal(details.budget.exhausted,true);assert.ok(details.budget.measured>=V7_STAGE_TOKEN_CEILING-2_000_000);
+  assert.ok(details.budget.calls.length);assert.ok(f.store.get(details.budget.ledger.id,details.budget.ledger.revision));
+  await inert(f,f.open(),async()=>assert.deepEqual(await f.run(5,f.open()),result));
+});
+
+test('5.6: a real new scope with the same cell has its own preparation and paid identity',async t=>{
+  const f=await ready(t,false,{close:false,outcome:'open'});await f.run(1);
+  const old=readVariantScope(f.store,'p',f.scope), state=f.store.get<VariantState>(variantStateId('p',f.v.draft.id))!;
+  owner(f.store,{...choiceScope(f),operation:'revise',previous:old.scope.value.decision,expectedSelection:reference(state)});
+  await f.run(1,f.open());
+  const sent=deepCalls(f);assert.equal(sent.length,2);
+  assert.deepEqual(sent[0].subject.deepCell,sent[1].subject.deepCell);
+  assert.notDeepEqual(sent[0].subject.deepPreparation,sent[1].subject.deepPreparation);
+  assert.notDeepEqual(sent[0].subject.deepScope.decision,sent[1].subject.deepScope.decision);
+  assert.equal(deepIntents(f.store).length,2);
+  assert.equal(readVariantScope(f.open(),'p',f.scope).scope.id,old.scope.id);
+});
+
+for(const cold of [false,true])test(`5.6: ${cold?'cold':'hot'} owner revise replaces only the stale unpaid deep admission at the same run position`,async t=>{
+  const f=await ready(t);let cut=false;
+  const restore=interceptWrites(t,f.store,(writes,commit)=>{
+    const preparing=writes.some(row=>row.kind==='research-consumer-intent'&&row.expected===0
+      &&Object.hasOwn((row.value as ResearchConsumerIntent).cursor,'deepPreparation'));
+    const result=commit();
+    if(preparing&&!cut){cut=true;throw new Error('5.6 cut after prepared intent, before reservation');}
+    return result;
+  });
+  try{await f.run(1);}finally{restore();}
+  assert.ok(cut);assert.equal(deepCalls(f).length,0);
+  const oldIntent=deepIntents(f.store)[0]!, oldHistory=f.store.history(oldIntent.id);
+  assert.equal(oldIntent.value.state,'prepared');assert.equal(oldIntent.value.call,null);
+  const oldPreparation=readDeepPreparation(f.store,'p',oldIntent.value.cursor.deepPreparation!).preparation;
+  const oldOwner=f.store.get<ResearchRun>(oldIntent.value.owner.id)!;
+  const scope=readVariantScope(f.store,'p',f.scope), state=f.store.get<VariantState>(variantStateId('p',f.v.draft.id))!;
+  owner(f.store,{...choiceScope(f),operation:'revise',previous:scope.scope.value.decision,expectedSelection:reference(state)});
+  const store=cold?f.open():f.store;
+  await inert(f,store,async()=>assert.deepEqual(await f.run(1,store,true),oldOwner));
+  const result=await f.run(1,store);
+  assert.equal(result.value.pauseCode,'research_deep_frontier_pending',result.value.error!);
+  assert.equal(deepCalls(f).length,1);
+  assert.deepEqual(store.history(oldIntent.id),oldHistory,'the old immutable admission is preserved');
+  const active=deepIntents(store).find(row=>row.id!==oldIntent.id)!;
+  assert.ok(active);assert.equal(active.value.state,'applied');
+  assert.equal(active.value.owner.id,oldOwner.id);assert.equal(active.value.cursor.turn,oldIntent.value.cursor.turn);
+  assert.equal(store.get<ResearchRun>(oldOwner.id)!.value.turns,oldOwner.value.turns+1);
+  assert.notDeepEqual(active.value.cursor.deepPreparation,oldIntent.value.cursor.deepPreparation);
+  const proven=readDeepResearchResult(store,'p',reference(active));
+  assert.notDeepEqual(proven.preparation.preparation.value.scope,f.scope);
+  assert.deepEqual(proven.preparation.preparation.value.cell,oldPreparation.value.cell);
+  assert.equal(f.generationCalls().filter(row=>row.subject.variantSubject.kind==='proposal').length,1);
+  assert.equal(f.generationCalls().filter(row=>row.subject.variantSubject.kind==='decision').length,0);
+  for(const again of [store,f.open()])await inert(f,again,async()=>assert.deepEqual(await f.run(2,again,true),result));
+});
+
+test('5.6: paid replacement recovers before a reopened plan and never rechecks the retired admission against current heads',async t=>{
+  const f=await ready(t);let preparedCut=false,paidCut=false;
+  const restore=interceptWrites(t,f.store,(writes,commit)=>{
+    if(preparedCut&&writes.some(row=>row.kind==='research-turn'&&row.expected===0)&&!paidCut){
+      paidCut=true;throw new Error('5.6 replacement paid before application');
+    }
+    const preparing=writes.some(row=>row.kind==='research-consumer-intent'&&row.expected===0
+      &&Object.hasOwn((row.value as ResearchConsumerIntent).cursor,'deepPreparation'));
+    const result=commit();
+    if(preparing&&!preparedCut){preparedCut=true;throw new Error('5.6 original prepared before revise');}
+    return result;
+  });
+  try{
+    await f.run(1);assert.ok(preparedCut);
+    const scope=readVariantScope(f.store,'p',f.scope), state=f.store.get<VariantState>(variantStateId('p',f.v.draft.id))!;
+    owner(f.store,{...choiceScope(f),operation:'revise',previous:scope.scope.value.decision,expectedSelection:reference(state)});
+    await f.run(1);assert.ok(paidCut);
+  }finally{restore();}
+  const old=deepIntents(f.store).find(row=>row.value.state==='prepared')!;
+  const paid=deepIntents(f.store).find(row=>row.value.state==='running')!;
+  assert.ok(old);assert.ok(paid);assert.equal(deepCalls(f).length,1);
+  const oldHistory=f.store.history(old.id), calls=money(f.store), wire=f.wires();
+  const plan=f.store.get<Question>(f.v.plan.id)!;f.discovery.reopen(plan.id,plan.revision);
+  const restored=await f.run(1,f.open(),true);
+  const applied=f.store.get<ResearchConsumerIntent>(paid.id)!;
+  assert.equal(applied.value.state,'applied');assert.equal(readDeepResearchResult(f.open(),'p',reference(applied)).verification,'proven');
+  // Paid K is restored first. The existing checkpoint then refuses the reopened
+  // current plan before admitting an unpaid assessment; no new MR is purchased.
+  assert.equal(restored.value.pauseCode,'plan_questions_invalid',restored.value.error!);
+  assert.deepEqual(f.store.history(old.id),oldHistory);assert.deepEqual(money(f.store),calls);assert.deepEqual(f.wires(),wire);
+  await inert(f,f.open(),()=>f.run(1,f.open(),true));
+});
+
+test('5.6: a new accepted plan with the same question ids buys no replay of the former edition',async t=>{
+  const f=await ready(t);await f.run(2);const before=deepCalls(f);
+  assert.equal(before.length,2);const next=f.nextEdition();
+  await f.run(3);owner(f.store,choiceScope(f));await f.run(1);
+  const sent=deepCalls(f);assert.equal(sent.length,3);
+  assert.equal(sent[2].subject.deepCell.subject.planQuestionId,before[0].subject.deepCell.subject.planQuestionId);
+  assert.deepEqual(sent[2].subject.deepCell.subject.planAnswer,next);
+  assert.notDeepEqual(sent[2].subject.deepPreparation,before[0].subject.deepPreparation);
+});
+
+for(const shift of ['frame','plan','mode','selection'] as const)
+test(`5.6: second Store ${shift} at deep reservation refuses without payment or a diagnostic write`,async t=>{
+  const f=await ready(t), other=f.open(), sent=f.wires();
+  let after:string|null=null, paid:ReturnType<typeof money>|null=null;
+  const restore=interceptWrites(t,f.store,(writes,commit)=>{
+    if(after===null&&writes.some(row=>row.kind==='model-call'&&row.expected===0)){
+      if(shift==='frame'){
+        const draft=other.get<DiscoveryDraft>(f.v.draft.id)!;
+        const q=draft.value.questions.map(id=>other.get<Question>(id)!).find(row=>row.value.spec.field==='frame')!;
+        new Discovery(other).reopen(q.id,q.revision);
+      }
+      if(shift==='plan')f.nextEdition(other);
+      if(shift==='mode')f.mode('bypass',other);
+      if(shift==='selection'){
+        const state=other.get<VariantState>(variantStateId('p',f.v.draft.id))!, previous=readVariantScope(other,'p',f.scope).scope.value.decision;
+        owner(other,{...choiceScope(f,'reject_all'),operation:'revise',previous,expectedSelection:reference(state)});
+      }
+      after=history(other);paid=money(other);
+    }
+    return commit();
+  });
+  try{await assert.rejects(()=>f.run(1),{code:'input_stale'});}finally{restore();}
+  assert.ok(after,'The real reservation window was reached');assert.equal(history(f.store),after);
+  assert.deepEqual(money(f.store),paid);assert.deepEqual(f.wires(),sent);
+});
+
+test('5.6: a missing applied progress head is a proof refusal, never an empty coverage frontier',async t=>{
+  const f=await ready(t);await f.run(1);
+  const head=f.store.list<V7ProgressState>('v7-progress-state').find(row=>row.value.subject.planQuestionId==='q-one')!;
+  assert.ok(head);
+  for(const store of [f.store,f.open()]){
+    const before=history(store), sent=f.wires(), get=store.get.bind(store);
+    const method=t.mock.method(store,'get',((id:string,revision?:number)=>
+      id===head.id&&revision===undefined?null:get(id,revision)) as typeof store.get);
+    try{assert.throws(()=>deepPlanSelection(store,'p',f.scope),{code:'discovery_progress_conflict'});}finally{method.mock.restore();}
+    assert.equal(history(store),before);assert.deepEqual(f.wires(),sent);
+  }
+});
+
+for(const point of ['paid','typed-paid','applied','assessed'] as const)test(`5.6: cold recovery at ${point} uses the original deep identity before a new actor or allowance`,async t=>{
+  const f=await ready(t);let cut=false;
+  const restore=interceptWrites(t,f.store,(writes,commit)=>{
+    const trigger=point==='paid'||point==='typed-paid'?writes.some(row=>row.kind==='research-turn'&&row.expected===0)
+      :point==='applied'?writes.some(row=>row.kind==='research-attempt-binding')
+      :writes.some(row=>row.kind==='v7-progress-application');
+    if(trigger&&!cut){cut=true;throw point==='typed-paid'
+      ?new EngineError('discovery_deep_execution_invalid','5.6 typed paid-application cut')
+      :new Error(`5.6 ${point} cut`);}return commit();
+  });
+  try{await f.run(1);}finally{restore();}
+  assert.ok(cut);assert.equal(deepCalls(f).length,1);
+  const intent=deepIntents(f.store)[0]!, call=intent.value.call;
+  const current=f.store.get<typeof f.environment.value>(f.environment.id)!;
+  f.engine.environments.configure('p',{...current.value,implementer:{...current.value.implementer,actor:'new-actor'}},current.revision);
+  if(point==='paid'){
+    const old=readVariantScope(f.store,'p',f.scope), state=f.store.get<VariantState>(variantStateId('p',f.v.draft.id))!;
+    owner(f.store,{...choiceScope(f),operation:'revise',previous:old.scope.value.decision,expectedSelection:reference(state)});
+  }
+  const sent=f.wires().length;
+  const restored=await f.run(1,f.open(),true);
+  assert.equal(deepCalls(f).length,1);assert.equal(f.wires().length,sent,'paid recovery never buys for today actor');
+  assert.deepEqual(f.store.get<ResearchConsumerIntent>(intent.id)!.value.call,call);
+  assert.equal(deepIntents(f.store).length,1);
+  const applied=f.store.get<ResearchConsumerIntent>(intent.id)!;assert.equal(applied.value.state,'applied');
+  const original=readDeepResearchResult(f.open(),'p',reference(applied));
+  assert.deepEqual(original.preparation.preparation.value.scope,f.scope);
+  assert.equal(original.intent.value.role.actor,'model-author');
+  if(point==='assessed')assert.equal(deepPlanSelection(f.store,'p',f.scope).coverage.cells[0]!.covered,true);
+  else assert.equal(restored.value.pauseCode,'research_assessment_pending');
+  await inert(f,f.open(),()=>f.run(1,f.open(),true));
+});

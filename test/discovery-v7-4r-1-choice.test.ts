@@ -107,7 +107,7 @@ async function fixed(f: Awaited<ReturnType<typeof setup>>, result: Revision<impo
 }
 for (const kind of ['choose', 'reject_all'] as const) test(`4R.1 choice: public bypass generation -> separate paid ${kind} -> addressed handoff pause and cold fixed point`, async t => {
   const f = await setup(t, undefined, 'bypass'); f.configure({ reject: kind === 'reject_all' });
-  const result = await f.run(3); assert.equal(result.value.pauseCode, kind === 'choose' ? 'research_variant_handoff_unavailable' : 'research_dossier_assessment_unavailable', JSON.stringify(result.value));
+  const result = await f.run(3); assert.equal(result.value.pauseCode, kind === 'choose' ? 'research_deep_frontier_pending' : 'research_dossier_assessment_unavailable', JSON.stringify(result.value));
   assert.equal(result.value.status, 'paused'); assert.equal(subjectCalls(f, 'proposal').length, 1); assert.equal(subjectCalls(f, 'decision').length, 1);
   const decision = f.store.list<VariantModelDecision>('discovery-variant-model-decision')[0]!, proof = readVariantModelDecision(f.store, 'p', reference(decision));
   assert.ok(proof.state); assert.equal(decision.value.outcome.kind, kind);
@@ -123,7 +123,7 @@ for (const kind of ['choose', 'reject_all'] as const) test(`4R.1 choice: questio
   const f = await setup(t), door = await f.run(3);
   assert.equal(door.value.pauseCode, 'research_variant_owner_required'); assert.equal(subjectCalls(f, 'decision').length, 0);
   const scope = choiceScope(f, kind), act = owner(f.store, scope), paid = money(f.store), sent = f.wires(), mode = reference(f.store.get('project-mode:p')!);
-  const result = await f.run(1, f.open(), true); assert.equal(result.value.pauseCode, kind === 'choose' ? 'research_variant_handoff_unavailable' : 'research_dossier_assessment_unavailable', JSON.stringify(result.value));
+  const result = await f.run(1, f.open(), true); assert.equal(result.value.pauseCode, kind === 'choose' ? 'research_deep_frontier_pending' : 'research_dossier_assessment_unavailable', JSON.stringify(result.value));
   assert.deepEqual(JSON.parse(result.value.error!).decision, reference(act.decision)); assert.deepEqual(readVariantOwnerDecision(f.store, 'p', reference(act.decision)).state, act.state);
   assert.deepEqual(money(f.store), paid); assert.deepEqual(f.wires(), sent); assert.deepEqual(reference(f.store.get('project-mode:p')!), mode);
   assert.equal(f.store.list('discovery-variant-scope').length, kind === 'choose' ? 1 : 0); await fixed(f, result);
@@ -133,7 +133,7 @@ test('4R.1 choice: a mode switch after paid generation buys only its separate ch
   const f = await setup(t); assert.equal((await f.run(2)).value.pauseCode, 'research_variant_owner_required');
   const set = f.store.list<VariantSet>('discovery-variant-set')[0]!, original = readVariantGeneration(f.store, 'p', reference(set));
   const bypass = f.mode('bypass'), result = await f.run(1, f.open());
-  assert.equal(result.value.pauseCode, 'research_variant_handoff_unavailable', JSON.stringify(result.value));
+  assert.equal(result.value.pauseCode, 'research_deep_frontier_pending', JSON.stringify(result.value));
   assert.equal(subjectCalls(f, 'proposal').length, 1); assert.equal(subjectCalls(f, 'decision').length, 1);
   assert.deepEqual(readVariantGeneration(f.store, 'p', reference(set)), original);
   const decision = f.store.list<VariantModelDecision>('discovery-variant-model-decision')[0]!;
@@ -145,7 +145,7 @@ test('4R.1 choice: generation and decision each consume an allowance; restoreOnl
   assert.equal(limited.value.pauseCode, 'research_turns_exhausted', JSON.stringify(limited.value)); assert.equal(subjectCalls(f, 'proposal').length, 1);
   assert.equal(subjectCalls(f, 'decision').length, 0); assert.equal(f.store.list('discovery-variant-session').length, 1);
   const sent = f.wires(), restored = await f.run(1, f.open(), true); assert.equal(restored.value.pauseCode, 'research_restore_complete'); assert.deepEqual(f.wires(), sent);
-  const ready = await f.run(1, f.open()); assert.equal(ready.value.pauseCode, 'research_variant_handoff_unavailable'); assert.equal(subjectCalls(f, 'decision').length, 1); await fixed(f, ready);
+  const ready = await f.run(1, f.open()); assert.equal(ready.value.pauseCode, 'research_deep_frontier_pending'); assert.equal(subjectCalls(f, 'decision').length, 1); await fixed(f, ready);
 });
 
 function cutDecision(store: Store, phase: 'session-only' | 'prepared' | 'reservation' | 'paid' | 'application') {
@@ -177,9 +177,9 @@ for (const phase of ['session-only', 'prepared', 'reservation', 'paid', 'applica
     const sent = f.wires(), restored = await f.run(1, f.open(), true); assert.deepEqual(f.wires(), sent);
     if (phase === 'session-only' || phase === 'prepared') {
       assert.equal(restored.value.pauseCode, 'research_restore_complete'); assert.equal(subjectCalls(f, 'decision').length, 0);
-      assert.equal((await f.run(1, f.open())).value.pauseCode, 'research_variant_handoff_unavailable');
-    } else if (phase === 'reservation') assert.notEqual(restored.value.pauseCode, 'research_variant_handoff_unavailable');
-    else assert.equal(restored.value.pauseCode, 'research_variant_handoff_unavailable', JSON.stringify(restored.value));
+      assert.equal((await f.run(1, f.open())).value.pauseCode, 'research_deep_frontier_pending');
+    } else if (phase === 'reservation') assert.notEqual(restored.value.pauseCode, 'research_deep_frontier_pending');
+    else assert.equal(restored.value.pauseCode, 'research_deep_frontier_pending', JSON.stringify(restored.value));
     assert.equal(f.store.list<VariantExecutionSession>('discovery-variant-session').filter(row => row.value.variantSubject.kind === 'decision').length, 1);
     assert.equal(f.store.list<VariantExecutionSession>('discovery-variant-session').find(row => row.value.variantSubject.kind === 'decision')!.id, session.id);
     assert.equal(subjectCalls(f, 'decision').length, phase === 'reservation' ? 0 : 1);
@@ -189,7 +189,7 @@ for (const phase of ['session-only', 'prepared', 'reservation', 'paid', 'applica
 test('4R.1 choice: concurrent authorized owner after a paid decision keeps the owner state and restores the stale model free', async t => {
   const f = await setup(t); await f.run(2); f.mode('bypass'); const undo = cutDecision(f.store, 'paid'); await f.run(1); undo();
   f.mode('questions'); const act = owner(f.store, choiceScope(f)), paid = money(f.store), sent = f.wires();
-  const result = await f.run(1, f.open(), true); assert.equal(result.value.pauseCode, 'research_variant_handoff_unavailable', JSON.stringify(result.value));
+  const result = await f.run(1, f.open(), true); assert.equal(result.value.pauseCode, 'research_deep_frontier_pending', JSON.stringify(result.value));
   const model = f.store.list<VariantModelDecision>('discovery-variant-model-decision')[0]!;
   assert.equal(readVariantModelDecision(f.store, 'p', reference(model)).state, null);
   assert.deepEqual(JSON.parse(result.value.error!).decision, reference(act.decision)); assert.deepEqual(f.store.get(act.state.id), act.state);
@@ -202,7 +202,7 @@ test('4R.1 choice: paid decision restores before a new accepted edition or a for
   const result = await new Researcher(f.store, f.discovery, f.engine.environments).run('p', f.v.draft.id, 1, undefined,
     { restoreOnly: true, producerPolicy: { discovery: 6 } });
   const decision = f.store.list<VariantModelDecision>('discovery-variant-model-decision')[0]!;
-  assert.ok(readVariantModelDecision(f.store, 'p', reference(decision))); assert.notEqual(result.value.pauseCode, 'research_variant_handoff_unavailable');
+  assert.ok(readVariantModelDecision(f.store, 'p', reference(decision))); assert.notEqual(result.value.pauseCode, 'research_deep_frontier_pending');
   assert.equal(f.store.list('discovery-variant-scope').length, 0); assert.deepEqual(money(f.store), paid); assert.deepEqual(f.wires(), sent); await fixed(f, result);
 });
 
@@ -236,9 +236,9 @@ for (const shift of ['mode', 'owner-state'] as const) test(`4R.1 choice: a secon
     return result;
   }) as typeof f.store.atomicWrite;
   const refused = await f.run(1); f.store.atomicWrite = atomic; assert.ok(moved);
-  assert.notEqual(refused.value.pauseCode, 'research_variant_handoff_unavailable'); assert.deepEqual(f.wires(), sent); assert.deepEqual(money(f.store), paid);
+  assert.notEqual(refused.value.pauseCode, 'research_deep_frontier_pending'); assert.deepEqual(f.wires(), sent); assert.deepEqual(money(f.store), paid);
   const resumed = await f.run(1, f.open(), true);
-  assert.equal(resumed.value.pauseCode, shift === 'mode' ? 'research_variant_owner_required' : 'research_variant_handoff_unavailable', JSON.stringify(resumed.value));
+  assert.equal(resumed.value.pauseCode, shift === 'mode' ? 'research_variant_owner_required' : 'research_deep_frontier_pending', JSON.stringify(resumed.value));
   assert.deepEqual(f.wires(), sent); assert.deepEqual(money(f.store), paid); await fixed(f, resumed);
   if (shift === 'mode') {
     const old = [...f.store.list<VariantExecutionSession>('discovery-variant-session').filter(row => row.value.variantSubject.kind === 'decision'),
@@ -246,7 +246,7 @@ for (const shift of ['mode', 'owner-state'] as const) test(`4R.1 choice: a secon
     const saved = old.map(row => f.store.history(row.id)); f.mode('bypass');
     const restored = await f.run(1, f.open(), true); assert.equal(restored.value.pauseCode, 'research_restore_complete');
     assert.deepEqual(f.wires(), sent); assert.deepEqual(money(f.store), paid);
-    const ready = await f.run(1, f.open()); assert.equal(ready.value.pauseCode, 'research_variant_handoff_unavailable', JSON.stringify(ready.value));
+    const ready = await f.run(1, f.open()); assert.equal(ready.value.pauseCode, 'research_deep_frontier_pending', JSON.stringify(ready.value));
     assert.equal(subjectCalls(f, 'proposal').length, 1); assert.equal(subjectCalls(f, 'decision').length, 1);
     assert.equal(f.store.list('discovery-variant-model-decision').length, 1);
     assert.deepEqual(old.map(row => f.store.history(row.id)), saved); await fixed(f, ready);
@@ -260,7 +260,7 @@ test('4R.1 choice: a structural owner lookalike and its fabricated current state
   const state = f.store.get<VariantState>(variantStateId('p', f.v.draft.id))!;
   const corrupted = f.store.write({ id: state.id, kind: state.kind, expected: state.revision, value: { ...state.value, previous: reference(state), decision: reference(fake) } });
   const sent = f.wires(), paid = money(f.store), result = await f.run(2, f.open());
-  assert.notEqual(result.value.pauseCode, 'research_variant_handoff_unavailable'); assert.equal(f.store.list('discovery-variant-scope').length, 0);
+  assert.notEqual(result.value.pauseCode, 'research_deep_frontier_pending'); assert.equal(f.store.list('discovery-variant-scope').length, 0);
   assert.deepEqual(f.store.get(state.id), corrupted); assert.deepEqual(f.wires(), sent); assert.deepEqual(money(f.store), paid);
 });
 
@@ -271,13 +271,13 @@ test('4R.1 choice: a changed model head/current selection cannot masquerade as t
     value: { ...saved.value, outcome: { kind: 'reject_all' as const, reason: 'Explicitly forged changed head' } } });
   f.store.write({ id: state.id, kind: state.kind, expected: state.revision, value: { ...state.value, previous: reference(state), decision: reference(bad) } });
   const sent = f.wires(), paid = money(f.store), scopes = f.store.list('discovery-variant-scope'), result = await f.run(3, f.open());
-  assert.notEqual(result.value.pauseCode, 'research_variant_handoff_unavailable'); assert.deepEqual(f.store.list('discovery-variant-scope'), scopes);
+  assert.notEqual(result.value.pauseCode, 'research_deep_frontier_pending'); assert.deepEqual(f.store.list('discovery-variant-scope'), scopes);
   assert.deepEqual(f.wires(), sent); assert.deepEqual(money(f.store), paid); assert.ok(readVariantModelDecision(f.store, 'p', reference(saved)));
 });
 
 test('4R.1 choice: a real model -> owner override -> owner revise stays current across restart, mode and actor changes without another purchase', async t => {
   const f = await setup(t, undefined, 'bypass'); const first = await f.run(3);
-  assert.equal(first.value.pauseCode, 'research_variant_handoff_unavailable');
+  assert.equal(first.value.pauseCode, 'research_deep_frontier_pending');
   const model = f.store.list<VariantModelDecision>('discovery-variant-model-decision')[0]!, proof = readVariantModelDecision(f.store, 'p', reference(model));
   const override: VariantChoiceScope = { ...choiceScope(f, 'reject_all'), operation: 'override', previous: reference(model), expectedSelection: proof.state! };
   const act = owner(f.store, override), sent = f.wires(), paid = money(f.store);
@@ -286,10 +286,18 @@ test('4R.1 choice: a real model -> owner override -> owner revise stays current 
   const revise: VariantChoiceScope = { ...choiceScope(f), operation: 'revise', previous: reference(act.decision), expectedSelection: reference(act.state) };
   const last = owner(f.store, revise); f.mode('questions');
   f.engine.environments.configure('p', { ...f.environment.value, implementer: { ...f.environment.value.implementer, actor: 'new-author-after-owner-act' } }, f.environment.revision);
-  const chosen = await f.run(3, f.open()); assert.equal(chosen.value.pauseCode, 'research_variant_handoff_unavailable');
-  assert.deepEqual(JSON.parse(chosen.value.error!).decision, reference(last.decision));
+  // The owner choice survives, but its saved mode precedes the new mode head.
+  // The connected deep recipient must refuse new payment through the common 5.2 admission.
+  await assert.rejects(()=>f.run(3,f.open()),{code:'discovery_deep_preparation_stale',details:{field:'mode'}});
   assert.deepEqual(readCurrentVariantScope(f.store, 'p', last.decision.value.draft).choice.ref, reference(last.decision));
-  assert.deepEqual(f.wires(), sent); assert.deepEqual(money(f.store), paid); await fixed(f, chosen);
+  assert.equal(f.store.list('discovery-deep-preparation').length,0);
+  assert.deepEqual(f.wires(),sent);assert.deepEqual(money(f.store),paid);
+  const before=history(f.store);
+  for(const store of [f.store,f.open()]){
+    await assert.rejects(()=>f.run(3,store),{code:'discovery_deep_preparation_stale',details:{field:'mode'}});
+    assert.deepEqual(history(store),before);assert.deepEqual(f.wires(),sent);assert.deepEqual(money(store),paid);
+  }
+  await fixed(f,rejected);
 });
 
 test('4R.1 choice: actual paid generation exhausts the research reserve and saves early_limit without buying the next choice', async t => {
@@ -318,7 +326,7 @@ for (const phase of ['session-only', 'prepared'] as const)
     const saved = old.map(id => f.store.history(id)), bypass = f.mode('bypass'), sent = f.wires(), paid = money(f.store);
     const restored = await f.run(1, f.open(), true); assert.equal(restored.value.pauseCode, 'research_restore_complete');
     assert.deepEqual(f.wires(), sent); assert.deepEqual(money(f.store), paid); await fixed(f, restored);
-    const ready = await f.run(1, f.open()); assert.equal(ready.value.pauseCode, 'research_variant_handoff_unavailable', JSON.stringify(ready.value));
+    const ready = await f.run(1, f.open()); assert.equal(ready.value.pauseCode, 'research_deep_frontier_pending', JSON.stringify(ready.value));
     assert.equal(subjectCalls(f, 'proposal').length, 1); assert.equal(subjectCalls(f, 'decision').length, 1);
     assert.equal(f.store.list('discovery-variant-model-decision').length, 1);
     const decision = f.store.list<VariantModelDecision>('discovery-variant-model-decision')[0]!, proof = readVariantModelDecision(f.store, 'p', reference(decision));

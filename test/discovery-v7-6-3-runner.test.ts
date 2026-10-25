@@ -22,6 +22,12 @@ import { EngineError } from '../src/errors.js';
 import { canonical } from '../src/canonical.js';
 import { producePartialDossier, readPartialDossier, DOSSIER_MANIFEST_KIND } from '../src/discovery/dossier-manifest.js';
 import type { ClaimAddress } from '../src/discovery/claim-address.js';
+import { readDeepPreparation } from '../src/discovery/deep-research.js';
+import { readDeepResearchResult } from '../src/discovery/deep-research-execution.js';
+import { readDiscoveryAssessment } from '../src/discovery/research-assessment.js';
+import type { ResearchConsumerIntent } from '../src/discovery/response-recovery.js';
+import type { PaidDiscoveryAttemptsAssessment } from '../src/discovery/research-model.js';
+import type { ModelCall } from '../src/runtime/model-usage.js';
 
 // Include orphaned history as well as current heads after the explicit missing-head corruptions.
 function history(store: Store): string {
@@ -349,8 +355,11 @@ test(`6.3-RUNNER-01: ${cold?'cold':'hot'} owner revise exits an unpublished reci
       .run('p',f.v.draft.id,1),{code:'discovery_dossier_stale'})); // default policy is not a new v7 admission
     assert.deepEqual(currentRun(f,store),f.pending);
   }
+  // The cut helper restored a bound own writeMany; remove that interceptor's
+  // shell before the new paid step, preserving this same hot Store and its data.
+  Reflect.deleteProperty(f.store,'writeMany');
   const next=await f.run(1,store), pause=JSON.parse(next.value.error!);
-  assert.equal(next.value.pauseCode,'research_variant_handoff_unavailable',JSON.stringify(next.value));
+  assert.equal(next.value.pauseCode,'research_deep_frontier_pending',JSON.stringify(next.value));
   const deep=(await readVariantHandoff(store,'p',pause.handoff)).record;
   assert.equal(deep.value.next,'deep');assert.equal(deep.value.reason,'choose');
   assert.deepEqual(deep.value.decision,reference(f.chosen.decision));assert.deepEqual(pause.decision,reference(f.chosen.decision));
@@ -359,7 +368,34 @@ test(`6.3-RUNNER-01: ${cold?'cold':'hot'} owner revise exits an unpublished reci
   assert.deepEqual((await readVariantHandoff(store,'p',reference(f.oldHandoff))).record,f.oldHandoff);
   assert.equal(store.list(DOSSIER_MANIFEST_KIND).length,published?1:0);
   if(existing)assert.deepEqual((await readPartialDossier(store,'p',reference(existing))).record,existing);
-  assert.deepEqual(money(store),paid);assert.deepEqual(f.wires(),wire);
+  // 5.6 connects the recipient: the unchanged explicit allowance now buys one
+  // managed deep attempt plus its MR/P, without another generation or choice.
+  const intents=store.list<ResearchConsumerIntent>('research-consumer-intent')
+    .filter(row=>Object.hasOwn(row.value.cursor,'deepPreparation'));
+  assert.equal(intents.length,1);
+  const result=readDeepResearchResult(store,'p',reference(intents[0]!));
+  const preparation=readDeepPreparation(store,'p',reference(result.preparation.preparation));
+  assert.deepEqual(preparation.preparation.value.scope,deep.value.scope);
+  assert.deepEqual(preparation.scope.scope.value.decision,reference(f.chosen.decision));
+  assert.deepEqual(preparation.preparation.value.cell.subject.planAnswer,deep.value.plan);
+  assert.equal(preparation.preparation.value.cell.subject.planQuestionId,'q-one');
+  const assessed=store.list<PaidDiscoveryAttemptsAssessment>('discovery-assessment')
+    .find(row=>row.value.subject.packet.entries.some(entry=>entry.attempt.id===result.attempt.id))!;
+  assert.ok(assessed);readDiscoveryAssessment(store,'p',reference(assessed));
+  const application=store.get<{call:import('../src/pipeline/contracts.js').Ref}>(assessed.value.application.id,assessed.value.application.revision)!;
+  const priorIds=new Set(paid.map(row=>row.id)), added=store.list<ModelCall>('model-call').filter(row=>!priorIds.has(row.id));
+  assert.deepEqual(added.map(row=>row.id).sort(),[result.call.id,application.value.call.id].sort());
+  const extra=f.wires().slice(wire.length);assert.equal(extra.length,2);
+  assert.deepEqual(f.wires().slice(0,wire.length),wire);
+  assert.deepEqual(extra.map(row=>row.requestId).sort(),added.map(row=>row.value.requestId).sort());
+  const deepWire=extra.find(row=>row.subject.deepPreparation);assert.ok(deepWire);
+  assert.deepEqual(deepWire.subject.deepPreparation,reference(result.preparation.preparation));
+  for(const id of new Set(paid.filter(row=>row.kind==='model-call').map(row=>row.id)))
+    assert.deepEqual(store.history(id),paid.filter(row=>row.id===id));
+  for(const row of paid.filter(row=>row.kind==='research-budget-ledger'))
+    assert.deepEqual(store.get(row.id,row.revision),row);
+  const ledger=store.list<{assignments:{call:string}[]}>('research-budget-ledger');
+  assert.deepEqual(ledger.flatMap(row=>row.value.assignments.map(a=>a.call)).filter(id=>!priorIds.has(id)).sort(),added.map(row=>row.id).sort());
   assert.equal(f.generationCalls().filter(c=>c.subject.variantSubject.kind==='proposal').length,1);
   assert.equal(f.generationCalls().filter(c=>c.subject.variantSubject.kind==='decision').length,0);
   for(const repeat of [store,f.open()])await inert(f,repeat,async()=>assert.deepEqual(await f.run(1,repeat,true),next));

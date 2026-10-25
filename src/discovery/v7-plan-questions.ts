@@ -3,11 +3,14 @@ import { canonical, hashJson, type Json } from "../canonical.js";
 import { isRef, reference, type Ref } from "../pipeline/contracts.js";
 import { EngineError } from "../errors.js";
 import type { Store, Revision, TransactionGuard } from "../storage/store.js";
+import { withHistoricalReads } from "../history/proofs.js";
 import type { DiscoveryDraft, Question } from "./discovery.js";
 import type { ResearchAnswer, ResearchRun, V7AttemptPacketEntry, V7ProgressState, V7ProgressApplication } from "./research-model.js";
-import { readV7ProgressStateAt } from "./v7-progress.js";
+import { foldV7Progress, readV7ProgressStateAt } from "./v7-progress.js";
 import { v7ProgressStateId } from "./v7-attempt-assessment.js";
-import { consumerIntentContext, listResearchConsumerIntents, readResearchConsumerExecution, readResearchConsumerTurn, readResearchAttemptBinding,
+import { computeMissingCoverage, type CellCoverage, type CoverageComputation } from "./coverage.js";
+import { readCurrentVariantScope } from "./variant-scope.js";
+import { consumerIntentContext, findResearchConsumerIntent, listResearchConsumerIntents, readResearchConsumerExecution, readResearchConsumerTurn, readResearchAttemptBinding, requireDeepConsumerBinding, staleUnpaidDeepAdmission,
   type ResearchConsumerIntent } from "./response-recovery.js";
 import { planSubjectOf, sameSubject, type V7PlanSubject } from "./v7-managed-attempt.js";
 import { synthesisReservationConsumed, turnAction, type ManagedResearchTurn } from "./research-consumer-transition.js";
@@ -203,6 +206,49 @@ export function planAttemptSelection(store: Store, projectId: string): CurrentPl
     next: open.find(question => (question.question as Record<string, Json>)["class"] === "blocking") ?? open[0] ?? null };
 }
 
+/** Deep retains the ordinary applied P counters, but coverage is the common
+ * question × exact member × depth × criterion proof. A closed broad summary
+ * alone never removes a missing cell. Neither selection nor a saved pause
+ * grants dispatch: the managed deep door also supplies its mandatory guards. */
+export function deepPlanSelection(store: Store, project: string, scope: Ref): CurrentPlan & {
+  coverage: CoverageComputation; next: CellCoverage | null;
+  progress: { question: string; state: Ref | null; summary: V7ProgressState['summary'] | null; stalled: boolean }[];
+  guards: TransactionGuard[];
+} {
+  return withHistoricalReads(() => deepPlanSelectionAt(store, project, scope));
+}
+function deepPlanSelectionAt(store: Store, project: string, scope: Ref): ReturnType<typeof deepPlanSelection> {
+  if (!isRef(scope)) refuse('discovery_deep_frontier_invalid', 'scope', 'The deep frontier requires its exact scope');
+  const plan = currentPlan(store, project), selected = readCurrentVariantScope(store, project, reference(plan.draft));
+  if (canonical(reference(selected.scope)) !== canonical(scope))
+    refuse('discovery_deep_preparation_stale', 'scope', 'The deep frontier belongs to the current proven choice');
+  const coverage = computeMissingCoverage(store, project, scope, plan.planAnswer);
+  const guards: TransactionGuard[] = [reference(plan.draft), reference(plan.question), plan.planAnswer,
+    scope, reference(selected.state)];
+  const progress = plan.questions.map(question => {
+    const id = v7ProgressStateId({ project, planAnswer: plan.planAnswer, planQuestionId: question.planQuestionId });
+    const head = store.get<V7ProgressState>(id);
+    if (!head && store.history(id).length)
+      refuse('discovery_progress_conflict', id, 'The deep frontier lost an existing progress head');
+    const state = head ? readV7ProgressStateAt(store, reference(head)) : null;
+    guards.push(state ? reference(state) : { id, absent: true });
+    // Ask the shared fold whether the proven prefix exhausted N. A broad closed
+    // outcome may still have no variant coverage; it does not reset that prefix.
+    const summary = state?.value.summary;
+    const stalled = state && summary?.cursor ? foldV7Progress({ subject: state.value.subject, run: summary.cursor.run,
+      previous: { subject: state.value.subject, counters: { cursor: summary.cursor, count: summary.count, streak: summary.streak } },
+      attempts: [], accounted: [], knownContentKeys: [] }).stalled : false;
+    return { question: question.planQuestionId, state: state ? reference(state) : null,
+      summary: summary ?? null, stalled };
+  });
+  const eligible = coverage.missing.filter(cell => progress.find(row => row.question === cell.cell.subject.planQuestionId)
+    ?.stalled === false);
+  const blocking = new Set(plan.questions.filter(question => (question.question as Record<string, Json>)['class'] === 'blocking')
+    .map(question => question.planQuestionId));
+  return { ...plan, coverage, progress, guards,
+    next: eligible.find(cell => blocking.has(cell.cell.subject.planQuestionId)) ?? eligible[0] ?? null };
+}
+
 /** R.1: the finished run prefix, grouped by its original exact subject.
  * A pending position stops the prefix, including queued/split reading children.
  * Only a completed attempt through the common K reader enters assessment. */
@@ -238,7 +284,7 @@ export function v7CheckpointPrefixes(store: Store, project: string, draftId: str
  * An exact unfilled v3 reservation may account for the last run position;
  * synthesis selection and execution remain with the runner. */
 export function selectV7AnalystRecovery(store: Store, projectId: string, draftId: string,
-  run: Revision<ResearchRun> | null, reservedSynthesis?: Ref): {
+  run: Revision<ResearchRun> | null, reservedSynthesis?: Ref, allowNewDeep = false): {
     turns: Revision<ManagedResearchTurn>[]; intents: Revision<ResearchConsumerIntent>[];
     turn: Revision<ManagedResearchTurn> | undefined;
     outstanding: Revision<ResearchConsumerIntent> | undefined;
@@ -257,8 +303,23 @@ export function selectV7AnalystRecovery(store: Store, projectId: string, draftId
   const intents = listResearchConsumerIntents(store, projectId, draftId)
     .filter(row => row.value.cursor.run === runId);
   const pending = turns.filter(row => row.value.status === "pending");
-  const unfinished = intents.filter(row => row.value.state === "prepared" || row.value.state === "running");
-  if ((turns.length || unfinished.length) && !run) invalid("The unfinished analyst work lost its run");
+  // The common generation reader selects an already replaced admission without
+  // today's heads. Only a genuinely new replacement needs the current stale
+  // proof; neither restoreOnly nor older paid work depends on that admission.
+  const superseded = withHistoricalReads(() => intents.filter(row => {
+    if (row.value.state !== "prepared" || !requireDeepConsumerBinding(store, row)) return false;
+    const latest = findResearchConsumerIntent(store, projectId, row.value.kind, row.value.rootKey, draftId);
+    if (!latest || !requireDeepConsumerBinding(store, latest)) return invalid("The deep generation lost its proven admission");
+    return latest.id !== row.id;
+  }));
+  const released = new Set(superseded.map(row => row.id));
+  const staleDeep = allowNewDeep && !pending.length && !intents.some(row => row.value.state === "running")
+    ? withHistoricalReads(() => intents.filter(row => row.value.state === "prepared" && !released.has(row.id)
+      && staleUnpaidDeepAdmission(store, row))) : [];
+  for (const row of staleDeep) released.add(row.id);
+  const unfinished = intents.filter(row => !released.has(row.id)
+    && (row.value.state === "prepared" || row.value.state === "running"));
+  if ((turns.length || unfinished.length || released.size) && !run) invalid("The unfinished analyst work lost its run");
   const session = reservedSynthesis ? readSynthesisSessionV3(store, reservedSynthesis) : null;
   if (session && (!run || session.value.projectId !== projectId || session.value.binding.draft.id !== draftId
     || session.value.delivery?.run !== runId || session.value.delivery.turn !== run.value.turns
