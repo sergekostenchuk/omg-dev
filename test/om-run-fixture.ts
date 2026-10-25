@@ -1250,7 +1250,6 @@ const asRunResult = <T>(result: RunResult<T>): RunResult<T> => result;
 
 
 // ---- LP4 (№2887): a step of a node's cycle ceased on a changed environment no longer stops the pass ----
-const LP4_COMMITS = { "3cba953": "3cba9536e2d8fd8ad4fdb0b04b7a84014c9b7da0", "202c470": "202c4709a02316338275e66c7acb173498b30a39" } as const;
 type WorksRun = ReturnType<typeof worksFixture>;
 /** The roles moved onto another copy of the adapter: a lawful configure that ends their old steps (№2872). */
 function lp4Configure(f: WorksRun, request: RunRequest): RunRequest {
@@ -1378,7 +1377,6 @@ function threeArtifacts(graph: Graph) {
 
 // G6.2: current E3 accepts the work's shape; G5 refuses its missing write scope. Only that proposal is
 // rejected; G7 closes it on its own rows, preserves the sound member and never reuses the rejected assembly.
-const G62_BASE = "a62940ecc6ee43d2b44ef315abf1067b060d4db0";
 async function g62Rejection(t: test.TestContext, chain: boolean, prior = false) {
   const f = worksFixture(t, false, false, undefined, ""), scenario = join(f.root, "scenario.json"), steps: unknown[] = [], trail: string[] = [];
   const push = (research: unknown) => { steps.push({ research, usage }); writeFileSync(scenario, JSON.stringify({ database: f.database, steps })); };
@@ -1804,9 +1802,5 @@ async function policyDoor(t: test.TestContext, owner: boolean) {
   assert.ok(works.length > 0, "The works brief after the decision carries it");
 }
 
-// AT1 return №4124 P2-6: a group the code before AT1 refused by its own G5 (the era before the impact) ends the way it
-// always did under the new code — its rejection asks no readiness question and never stands on a refusal of the era.
-const AT1_BASE = "e475bd594fc2f4cde4fb58b6f26f2083f7c00954";
-
-export { project, adapterFixture, ok, refusal, runFixture, addressAll, usage, factsAll, assessor, refOf, mechanismSeries, blockSeries, actions, actionsSteps, ends, driveTo, drive, reasonsOf, blockBases, stopAnswer, cannotAnswer, untouched, stoppedBlockLine, secondRung, frameAnswer, OWN1_DECISION, decisionCalls, restWithDecisions, until, RacingStore, loadOperations, gardenPass, regatePolicy, nodeAnswer, worksFixture, worksAcceptance, factWorksPass, LostApplication, lostAfterClaim, heldAfterClaim, a6Survives, nodeRefusal, driveUntil, gapHeads, addressQuestions, answerBatch, atCommit, openPlanned, managedPlan, managedAwaitOwner, ownerAnswers, sameEnd, twoOwnerAnswers, advanceRun, regatedHold, defectedWork, lp3Need, lp3Order, lp3Blocked, lp3Pointers, LP3_UNPROVED, lp3Hiding, lp3Context, isRefOf, asCycleStart, asRunResult, LP4_COMMITS, lp4Configure, lp4Questions, lp4Sent, lp4Close, mp2Upper, mp2Rank, mp2Works, mp2WorkAnswer, twoArtifacts, threeArtifacts, G62_BASE, g62Rejection, lp5ReplaceB1, lp5Kind, g51AmbiguousAnswer, lp6Line, lp6CurrentRounds, lp6Close, LP7_VALUES, lp7Routes, passRows, unavailableReview, policyDoor, AT1_BASE };
+export { project, adapterFixture, ok, refusal, runFixture, addressAll, usage, factsAll, assessor, refOf, mechanismSeries, blockSeries, actions, actionsSteps, ends, driveTo, drive, reasonsOf, blockBases, stopAnswer, cannotAnswer, untouched, stoppedBlockLine, secondRung, frameAnswer, OWN1_DECISION, decisionCalls, restWithDecisions, until, RacingStore, loadOperations, gardenPass, regatePolicy, nodeAnswer, worksFixture, worksAcceptance, factWorksPass, LostApplication, lostAfterClaim, heldAfterClaim, a6Survives, nodeRefusal, driveUntil, gapHeads, addressQuestions, answerBatch, atCommit, openPlanned, managedPlan, managedAwaitOwner, ownerAnswers, sameEnd, twoOwnerAnswers, advanceRun, regatedHold, defectedWork, lp3Need, lp3Order, lp3Blocked, lp3Pointers, LP3_UNPROVED, lp3Hiding, lp3Context, isRefOf, asCycleStart, asRunResult, lp4Configure, lp4Questions, lp4Sent, lp4Close, mp2Upper, mp2Rank, mp2Works, mp2WorkAnswer, twoArtifacts, threeArtifacts, g62Rejection, lp5ReplaceB1, lp5Kind, g51AmbiguousAnswer, lp6Line, lp6CurrentRounds, lp6Close, LP7_VALUES, lp7Routes, passRows, unavailableReview, policyDoor };
 export type { Fixture, Verdict, Lp5State, Lp6Op, Reopened };
