@@ -1541,7 +1541,7 @@ test('NR1 (№3591) a journal is read as written: the sources its rows name are 
   });
 });
 
-function emptyPacketFixture(t: TestContext, _historicalCommit?: string) {
+function emptyPacketFixture(t: TestContext) {
   const root = mkdtempSync(join(tmpdir(), 'omg-packet-accepted-')), database = join(root, 'state.sqlite');
   const workspace = join(root, 'workspace');
   mkdirSync(workspace);
@@ -1782,7 +1782,7 @@ test('E2 admits an MC2 missing input field with a proven block consumer under th
 });
 
 // Prepare current N2 while keeping L3 genuinely open for the packet's producer.
-async function workExpansionFixture(database: string, root: string, late?: 'multiple' | 'overlap' | 'initial-realizes', initialWorks = false, _historicalCommit?: string) {
+async function workExpansionFixture(database: string, root: string, late?: 'multiple' | 'overlap' | 'initial-realizes', initialWorks = false) {
   const assert: typeof import('node:assert/strict') = (await import('node:assert/strict')).default;
   const { writeFileSync } = await import('node:fs'), { join } = await import('node:path');
   const { canonical } = await import('../src/canonical.js');
@@ -1905,9 +1905,9 @@ test('E2 work expansion belongs to its proven consumer block rather than the upp
   assert.equal(ok(readQuestionPacket(store, { project, record: acceptedPacket })).value.state, 'ready');
 });
 
-async function worksPacketFixture(t: TestContext, late?: 'multiple' | 'overlap' | 'initial-realizes', initialWorks = false, historicalCommit?: string) {
+async function worksPacketFixture(t: TestContext, late?: 'multiple' | 'overlap' | 'initial-realizes', initialWorks = false) {
   const root = mkdtempSync(join(tmpdir(), 'omg-e21-works-')), database = join(root, 'state.sqlite');
-  const base = await workExpansionFixture(database, root, late, initialWorks, historicalCommit);
+  const base = await workExpansionFixture(database, root, late, initialWorks);
   let store = base.store;
   t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
   const gaps = { sources: clone(base.gaps.sources) as GapRequest, records: base.gaps.records.map(reference) };
