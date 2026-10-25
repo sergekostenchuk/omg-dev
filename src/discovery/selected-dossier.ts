@@ -169,9 +169,18 @@ export function readSelectedDossier(store: Store, project: string, at: Ref): Pro
 function currentGuards(store: Store, project: string, value: SelectedDossier): TransactionGuard[] {
   const plan = currentPlan(store, project), scope = readCurrentVariantScope(store, project, value.draft);
   const mode = readProjectMode(store, project);
-  const frame = plan.draft.value.questions.map(id => store.get<Question>(id)).find(q => q?.value.spec.field === 'frame');
+  const answer = exact<ResearchAnswer>(store, value.frame, 'research-answer');
+  if (answer.value.projectId !== project || typeof answer.value.question !== 'string'
+    || !plan.draft.value.questions.includes(answer.value.question)) stale('frame');
+  const frame = store.get<Question>(answer.value.question);
+  if (!frame || frame.id !== answer.value.question || frame.kind !== 'question'
+    || !frame.value || typeof frame.value !== 'object' || Array.isArray(frame.value)
+    || frame.value.projectId !== project || frame.value.draftId !== plan.draft.id
+    || frame.value.spec?.field !== 'frame' || frame.value.status !== 'answered'
+    || !same(frame.value.answer, value.frame) || hashJson(frame.value as never) !== frame.hash) stale('frame');
+  // Pin the current head only after its saved Ref/body and exact frame ownership hold.
+  exactRef(reference(frame), 'frameQuestion');
   if (!same(reference(plan.draft), value.draft) || !same(plan.planAnswer, value.plan)
-    || !frame || frame.value.status !== 'answered' || !same(frame.value.answer, value.frame)
     || !same(reference(scope.scope), value.scope) || !same(mode.ref, scope.scope.value.mode)) stale('admission');
   const guards: TransactionGuard[] = [reference(plan.draft), reference(plan.question), reference(frame), value.frame, value.plan,
     value.scope, value.decision, value.set, value.member, reference(scope.state), mode.ref, ...value.inventory.states];

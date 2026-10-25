@@ -12,7 +12,7 @@ import { processStart } from '../src/runtime/process-identity.js';
 import type { DiscoveryDraft, Question } from '../src/discovery/discovery.js';
 import { Discovery } from '../src/discovery/discovery.js';
 import { ProductEngine } from '../src/product/engine.js';
-import type { ResearchRun } from '../src/discovery/research-model.js';
+import type { ResearchAnswer, ResearchRun } from '../src/discovery/research-model.js';
 import { prepareResearchConsumerIntent } from '../src/discovery/response-recovery.js';
 import { researchCall } from '../src/discovery/research-protocol.js';
 import { REQUEST_MANIFEST_CONTRACT } from '../src/discovery/request-parts.js';
@@ -254,11 +254,39 @@ for (const model of [false, true]) test(`6.3 selected: real ${model ? 'model' : 
   revise(f);
   modeOf(f.store, model ? 'questions' : 'bypass');
   nextPlan(f, f.store);
+  const frameAnswer = f.store.get<ResearchAnswer>(first.record.value.frame.id, first.record.value.frame.revision)!;
+  const frameQuestion = f.store.get<Question>(frameAnswer.value.question)!;
+  f.store.write({ id: frameQuestion.id, kind: frameQuestion.kind, expected: frameQuestion.revision,
+    value: { ...frameQuestion.value, projectId: 'foreign-project', draftId: 'foreign-draft' } });
   for (const store of [f.store, cold]) unchanged(f, store, () => {
     const historical = readSelectedDossier(store, 'p', reference(first.record));
     assert.deepEqual(historical.record, first.record); assert.deepEqual(historical.manifest, first.manifest);
     assert.deepEqual(produceSelectedDossier(store, 'p', reference(first.record)), { ...first, repeated: true });
   });
+});
+
+for (const cold of [false, true])
+test(`6.3 selected: ${cold ? 'cold' : 'hot'} foreign frame Question head cannot publish either half of a new snapshot`, async t => {
+  const f = await setup(t); await complete(f);
+  const frameAnswer = f.store.get<ResearchAnswer>(f.v.frameRef.id, f.v.frameRef.revision)!;
+  const original = f.store.get<Question>(frameAnswer.value.question)!;
+  assert.ok(f.store.get<DiscoveryDraft>(f.draft.id)!.value.questions.includes(original.id));
+  const acceptedHistory = f.store.history(original.id);
+  for (const field of ['projectId', 'draftId'] as const) {
+    const previous = f.store.get<Question>(original.id)!;
+    const foreign = f.store.write({ id: original.id, kind: original.kind, expected: previous.revision,
+      value: { ...original.value, [field]: `foreign-${field}` } });
+    assert.equal(foreign.hash, hashJson(foreign.value));
+    assert.deepEqual(f.store.history(original.id).slice(0, acceptedHistory.length), acceptedHistory);
+    const store = cold ? new Store(f.store.path) : f.store;
+    try {
+      unchanged(f, store, () => assert.throws(() => produceSelectedDossier(store, 'p', f.input),
+        error => error instanceof EngineError && error.code === 'discovery_selected_dossier_stale'
+          && (error.details as { field?: string } | null)?.field === 'frame'));
+      assert.equal(store.list(SELECTED_DOSSIER_KIND).length, 0);
+      assert.equal(store.list(DOSSIER_MANIFEST_KIND).length, 0);
+    } finally { if (cold) store.close(); }
+  }
 });
 
 test('6.3 selected: missing cell, merely paid MR, common/foreign grounds, material-only and reopened sufficiency never imply completeness', async t => {
