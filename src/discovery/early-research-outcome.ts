@@ -447,8 +447,8 @@ export function withoutResultCapacity(context: Record<string, any>): Record<stri
 export async function checkDossierResearchReply(store: Store, project: string, subject: unknown,
   saved: ResearchResultCapacity, response: unknown) {
   const packet = await requireDossierAssessmentSubject(store, project, subject);
-  const declaration = dossierReplyContract(packet), mandatory = researchCapacityProjection(saved,store);
-  requireDossierReplyCapacity(packet,saved,mandatory,(record,pointer)=>readCapacityProjection(store,record,pointer));
+  const declaration = dossierReplyContract(packet);
+  requireDossierReplyCapacity(packet,saved,(record,pointer)=>readCapacityProjection(store,record,pointer));
   requireDossierResultRoom(saved);
   const validate = new Ajv({strict:true}).compile(declaration.schema);
   requireCondition(validate(response),'discovery_dossier_result_invalid','Reply does not match the declared dossier terminal or continuation shape');

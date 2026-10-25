@@ -413,6 +413,7 @@ test('6.4 result transport: full rejected/unassessed/unknown and blocking sides;
     for(const change of [(b:any)=>{b.dossierReplyContract.schema.oneOf=[]},(b:any)=>{b.dossierResultTransport=null},
       (b:any)=>{delete b.dossierReplyContract},(b:any)=>{b.resultCapacity.forms.pop()},(b:any)=>{b.resultCapacity.mandatory={}},
       (b:any)=>{b.resultCapacity.mandatory=null},
+      ...[null,[],0,'projection'].map(value=>(b:any)=>{b.resultCapacity.mandatory={projection:value};}),
       (b:any)=>{delete b.dossierReplyContract;delete b.dossierResultTransport},(b:any)=>{b.dossierPacket.contradictions[0].sides.pop()}]) {
       const value=structuredClone(original.value);change(value.body);const id=`research-context:${hashJson(value)}`;
       const fake=store.get(id)??store.write({id,kind:'research-context',expected:0,value});
@@ -441,6 +442,22 @@ test('6.4 result transport: real nonempty partial preserves reasons and quality 
   for(const store of [f.store,new Store(f.store.path)]) {
     if(store!==f.store)t.after(()=>store.close());
     await unchanged(f,store,async()=>assert.deepEqual(await checkDossierResearchReply(store,'p',packet.subject,capacity,result),checked));
+    for(const absent of [undefined,null,[],0,'capacity'])
+      await unchanged(f,store,()=>checkDossierResearchReply(store,'p',packet.subject,absent as any,result),true);
+    for(const damage of [
+      (c:any)=>{delete c.mandatory;},
+      ...[null,[],0,'minimum',{}].map(value=>(c:any)=>{c.mandatory=value;}),
+      (c:any)=>{delete c.mandatory.projection;},
+      ...[null,[],0,'projection',{}].map(value=>(c:any)=>{c.mandatory={projection:value};}),
+      ...[null,[],0,'subject'].map(value=>(c:any)=>{c.mandatory={projection:{subject:value}};}),
+      (c:any)=>{c.mandatory={archive:null};},
+      (c:any)=>{c.mandatory={projection:{subject:{}},archive:{}};},
+      (c:any)=>{c.bindings=null;},
+      (c:any)=>{c.forms=null;}
+    ]) {
+      const corrupt=structuredClone(capacity);damage(corrupt);
+      await unchanged(f,store,()=>checkDossierResearchReply(store,'p',packet.subject,corrupt,result),true);
+    }
     await unchanged(f,store,async()=>assert.deepEqual(await requireDossierTransportArchive(store,'p',built.subject.working.archive,packet.subject),packet));
   }
 });

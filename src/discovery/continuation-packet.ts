@@ -160,7 +160,26 @@ export function dossierResultCapacityForms(packet: DossierAssessmentPacket, phys
 }
 /** One transport check for live preflight replies and exact archived declarations. */
 export function requireDossierReplyCapacity(packet: DossierAssessmentPacket, saved: ResearchResultCapacity,
-  mandatory: Record<string,any>, resolve?: (record:Ref,pointer:string)=>unknown) {
+  resolve?: (record:Ref,pointer:string)=>unknown) {
+  const object = (value: unknown): value is Record<string,any> =>
+    value !== null && typeof value === 'object' && !Array.isArray(value);
+  requireCondition(object(saved) && object(saved.bindings) && Array.isArray(saved.forms)
+    && saved.forms.length > 0 && saved.forms.every(object) && object(saved.mandatory),
+    'research_capacity_invalid','The dossier result capacity lost its required shape');
+  const minimum=saved.mandatory;
+  requireCondition(Object.hasOwn(minimum,'projection') !== Object.hasOwn(minimum,'archive'),
+    'research_capacity_invalid','The dossier needs one exact result minimum');
+  let mandatory: unknown;
+  if ('projection' in minimum) mandatory=minimum.projection;
+  else {
+    requireCondition(object(minimum.archive) && isRef(minimum.archive.record)
+      && typeof minimum.archive.pointer==='string' && typeof minimum.archive.hash==='string'
+      && resolve !== undefined,
+      'research_capacity_invalid','The dossier result minimum needs its exact archive');
+    mandatory=resolve(minimum.archive.record,minimum.archive.pointer);
+  }
+  requireCondition(object(mandatory) && object(mandatory.subject),
+    'research_capacity_invalid','The dossier result minimum lost its subject projection');
   const declaration=dossierReplyContract(packet);
   requireDossierSubjectBinding(saved.bindings,packet.subject);
   requireCondition(saved.bindings.projectId===packet.subject.projectId
@@ -182,6 +201,7 @@ export function requireDossierReplyCapacity(packet: DossierAssessmentPacket, sav
     role:saved.role,purpose:saved.purpose,actionMode:saved.actionMode,envelopeLimitChars:saved.envelopeLimitChars,
     mandatoryEnvelope:mandatory,forms:dossierResultCapacityForms(packet,physical),
     ...('archive' in saved.mandatory?{mandatoryArchive:saved.mandatory.archive}:{})},resolve);
+  return mandatory;
 }
 export function packetDossierSubject(container: unknown): DossierAssessmentSubject | null {
   if (!container || typeof container !== 'object') return null;
@@ -269,14 +289,7 @@ export async function requireDossierTransportArchive(store: Store, project: stri
         'research_capacity_invalid','The exact capacity projection is missing');
       return saved.value.body;
     };
-    requireCondition(capacity.mandatory && typeof capacity.mandatory==='object' && !Array.isArray(capacity.mandatory)
-      && ('projection' in capacity.mandatory ? capacity.mandatory.projection && typeof capacity.mandatory.projection==='object'
-        && !Array.isArray(capacity.mandatory.projection) : capacity.mandatory.archive
-        && isRef(capacity.mandatory.archive.record) && typeof capacity.mandatory.archive.pointer==='string'),
-      'research_capacity_invalid','The archived dossier lost its result minimum');
-    const mandatory='projection' in capacity.mandatory?capacity.mandatory.projection
-      :resolve(capacity.mandatory.archive.record,capacity.mandatory.archive.pointer);
-    requireDossierReplyCapacity(packet,capacity,mandatory,resolve);
+    const mandatory=requireDossierReplyCapacity(packet,capacity,resolve);
     requireCondition(canonical((body as any).responseOutputLimit)===canonical((mandatory as any).subject.responseOutputLimit),
       'discovery_dossier_transport_invalid','The exact archive lost its declared physical output bound');
   } else requireCondition((body.resultCapacity as any)?.actionMode==='dossier-preflight'
