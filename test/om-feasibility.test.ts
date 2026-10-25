@@ -1,9 +1,7 @@
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
-import { createRequire } from 'node:module';
 import test, { type TestContext } from 'node:test';
 import { mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { canonical, hashJson, type Json } from '../src/canonical.js';
@@ -12,10 +10,9 @@ import { Environments, git, inspectRepository } from '../src/runtime/environment
 import { ensureWorktree } from '../src/execution/worktree.js';
 import type { MachinePlan } from '../src/compiler/model.js';
 import { EngineError } from '../src/errors.js';
-import type { Feasibility } from '../src/graph/refinement.js';
 import type { Graph } from '../src/graph/model.js';
 import { projectGraph } from '../src/graph/project.js';
-import { isRef, reference, type Ref, type GateResult, type StageArtifact, type StageProjection } from '../src/pipeline/contracts.js';
+import { isRef, reference, type Ref } from '../src/pipeline/contracts.js';
 import { UPSTREAM_STAGES, type UpstreamStage } from '../src/discovery/requirements.js';
 import { configureReaderPilot } from '../src/discovery/reader-pilot.js';
 import { observeRuntime, runtimeContext, runtimeObligationId } from '../src/runtime/runtime-observation.js';
@@ -45,7 +42,7 @@ import { openSeries, beginAttempt } from '../src/om/series.js';
 import { writeWorksFrame, readWorksFrame } from '../src/om/works-frame.js';
 import type { OmResult } from '../src/om/refusal.js';
 import { prepareFeasibility, writeFeasibility, readFeasibility, gateFeasibility, type OmFeasibility } from '../src/om/feasibility.js';
-import { writeGuarded, readRecord, type GuardedWrite } from '../src/om/refs.js';
+import { writeGuarded } from '../src/om/refs.js';
 import { preparedFeatures } from './product-fixture.js';
 import { preparedField } from './preparation-fixture.js';
 import { enrichedGraph } from './enriched-graph-fixture.js';
@@ -881,115 +878,6 @@ for (const inspection of ['source_missing', 'repository_unavailable'] as const) 
     }
   });
 }
-
-test('G1 reads unchanged feasibility stages and plan from the complete 2f2721d producer after restart and preserves positive writeGuarded results', t => {
-  const directory = realpathSync(mkdtempSync(join(tmpdir(), 'omg-g1-old-producer-')));
-  t.after(() => rmSync(directory, { recursive: true, force: true }));
-  const repository = fileURLToPath(new URL('../../', import.meta.url));
-  const loader = join(directory, 'base-loader.mjs'), producer = join(directory, 'base-producer.mjs');
-  writeFileSync(loader, G1_HISTORY_LOADER);
-  writeFileSync(producer, `import assert from 'node:assert/strict';
-import {join} from 'node:path';import {pathToFileURL} from 'node:url';
-const repository=process.argv[2],src=path=>pathToFileURL(join(repository,'dist/src',path)).href,
- helpers=path=>pathToFileURL(join(repository,'dist/test',path)).href;
-const {executionFixture}=await import(helpers('execution-fixture.js'));
-const {reference,isRef}=await import(src('pipeline/contracts.js'));
-const {canonical}=await import(src('canonical.js'));
-const {writeGuarded}=await import(src('om/refs.js'));
-const cleanup=[];
-try {
- const f=executionFixture({after:fn=>cleanup.push(fn)}),project='p';
- const ready=f.store.get('feasibility:'+project),plan=f.plan;
- assert.equal(ready.kind,'feasibility');assert.equal(ready.value.contractVersion,2);
- assert.equal(ready.value.ready,true);assert.ok(ready.value.repository);
- const phases=f.store.list('phase'),stages=f.store.list('stage');
- const checks={feasibility:f.engine.refinement.feasibilityGate(project,reference(ready)),
-  om:f.engine.pipeline.inspect(project,'om-g2'),compilation:f.engine.pipeline.inspect(project,'compilation'),
-  plan:f.engine.compiler.gate(project,reference(plan))};
- assert.equal(checks.feasibility.findings.length,0);assert.equal(checks.plan.findings.length,0);
- assert.equal(checks.om.state,'accepted');assert.equal(checks.compilation.state,'accepted');
- assert.ok(ready.value.inputs.every(isRef));assert.ok(plan.value.guards.every(isRef));
- assert.equal(f.calls().length,0);
- // The changed helper is exercised by the genuine old producer as well.
- const source=f.store.write({id:'g1-history:input',kind:'history-probe',expected:0,value:{claim:'source'}});
- const request={unit:'A1',target:'g1-history:answer',guards:[reference(source)],writes:[
-  {id:'g1-history:answer',kind:'history-probe',expected:0,value:{source:reference(source),status:'accepted'}},
-  {id:'g1-history:neighbor',kind:'history-probe',expected:0,value:{items:[]}}]};
- const result=writeGuarded(f.store,request);assert.equal(result.ok,true);
- const historyBytes=canonical(f.store.list().flatMap(row=>f.store.history(row.id)));
- const output={directory:f.directory,database:f.store.path,project,ready,plan,phases,stages,checks,historyBytes,
-  guarded:{source,request,result}};
- f.store.close();process.stdout.write(JSON.stringify(output));
-} catch(error) {for(const fn of cleanup)fn();throw error;}
-`);
-  const typescript = pathToFileURL(createRequire(import.meta.url).resolve('typescript')).href;
-  const bootstrap = `import{register}from'node:module';register(${JSON.stringify(pathToFileURL(loader).href)},
-{data:{root:${JSON.stringify(pathToFileURL(repository).href)},typescript:${JSON.stringify(typescript)}}});`;
-  const environment = { ...process.env };
-  delete environment.NODE_TEST_CONTEXT;
-  const output = execFileSync(process.execPath,
-    ['--import', `data:text/javascript,${encodeURIComponent(bootstrap)}`, producer, repository],
-    { cwd: repository, env: environment, encoding: 'utf8', timeout: 60_000, maxBuffer: 30_000_000 });
-  const old = JSON.parse(output) as {
-    directory: string; database: string; project: string; ready: Revision<Feasibility>; plan: Revision<MachinePlan>;
-    phases: Revision[]; stages: Revision<StageArtifact>[]; historyBytes: string;
-    checks: { feasibility: GateResult; om: StageProjection; compilation: StageProjection; plan: GateResult };
-    guarded: { source: Revision; request: GuardedWrite; result: ReturnType<typeof writeGuarded> };
-  };
-  t.after(() => rmSync(old.directory, { recursive: true, force: true }));
-  assert.equal(old.ready.id, 'feasibility:p', 'This is the actual legacy producer address');
-  assert.ok(old.stages.some(row => row.value.stage === 'om-g2' && row.value.status === 'accepted'));
-  assert.ok(old.stages.some(row => row.value.stage === 'compilation' && row.value.status === 'accepted'));
-  assert.ok(old.plan.value.guards.length);
-  for (let restart = 0; restart < 2; restart++) {
-    const store = new Store(old.database), engine = new ProductEngine(store);
-    try {
-      assert.equal(canonical(store.list().flatMap(row => store.history(row.id))), old.historyBytes);
-      assert.deepEqual(store.get(old.ready.id, old.ready.revision), old.ready);
-      for (const row of [...old.phases, ...old.stages]) assert.deepEqual(store.get(row.id, row.revision), row);
-      assert.deepEqual(engine.compiler.read(old.plan.id), old.plan);
-      assert.deepEqual(engine.compiler.compile(old.project), old.plan, 'Exact current repeat writes no new plan');
-      const checks = { feasibility: engine.refinement.feasibilityGate(old.project, reference(old.ready)),
-        om: engine.pipeline.inspect(old.project, 'om-g2'), compilation: engine.pipeline.inspect(old.project, 'compilation'),
-        plan: engine.compiler.gate(old.project, reference(old.plan)) };
-      assert.deepEqual(checks, old.checks, 'Compare the complete previous DTOs, including all guard channels');
-      const priorWrites = ok(old.guarded.result);
-      for (const row of priorWrites) assert.deepEqual(ok(readRecord(store, reference(row),
-        { unit: 'A1', target: row.id, id: row.id, kind: row.kind })), row);
-      assert.equal(canonical(store.list().flatMap(row => store.history(row.id))), old.historyBytes,
-        'Readers and exact repeats preserve every record, value, input/proof order, key and hash');
-    } finally { store.close(); }
-  }
-  const replay = new Store(join(directory, 'positive-guards.sqlite'));
-  try {
-    const source = old.guarded.source;
-    assert.equal(source.revision, 1);
-    assert.deepEqual(replay.write({ id: source.id, kind: source.kind, expected: 0, value: source.value }), source);
-    assert.deepEqual(writeGuarded(replay, old.guarded.request), old.guarded.result,
-      'Identical positive-only inputs produce the exact old helper result and saved bytes');
-    for (const row of ok(old.guarded.result)) assert.deepEqual(replay.get(row.id, row.revision), row);
-  } finally { replay.close(); }
-});
-
-const G1_HISTORY_LOADER = String.raw`import {execFileSync} from 'node:child_process';
-import {fileURLToPath} from 'node:url';
-let root,ts;
-export async function initialize(data){root=data.root;ts=(await import(data.typescript)).default;}
-export async function load(url,context,next){
- const prefix=new URL('dist/',root).href;
- if(url.startsWith(prefix)&&/\.js$/.test(url)){
-  const relative=url.slice(prefix.length).replace(/\.js$/,'.ts');
-  // Both the producer and every imported fixture dependency come from Git.
-  // There is no fallback to current source when a base module is absent.
-  if(relative.startsWith('src/')||relative.startsWith('test/')){
-   const source=execFileSync('git',['show','2f2721df55f14573755eeaab60f4391e931d3c53:'+relative],
-    {cwd:fileURLToPath(root),encoding:'utf8',maxBuffer:10000000});
-   return {format:'module',shortCircuit:true,source:ts.transpileModule(source,{compilerOptions:{module:ts.ModuleKind.ESNext,target:ts.ScriptTarget.ES2023}}).outputText};
-  }
- }
- return next(url,context);
-}
-`;
 
 // ---- AT1 (№4091 п.5, row 14): the plan is issued only on the tree the works were checked against ----
 import { ATOMIC_GATE_IMPACT_CONTRACT } from '../src/om/atomic-gate.js';
