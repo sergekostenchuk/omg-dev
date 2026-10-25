@@ -14,7 +14,8 @@ import { Refinement } from "../src/graph/refinement.js";
 import { ProductEngine } from "../src/product/engine.js";
 import { Store, type Revision, type Write } from "../src/storage/store.js";
 import { inputDecisionWrite, writeAddressing } from "../src/om/addressing.js";
-import { applySeriesActivation, beginAttempt, openSeries } from "../src/om/series.js";
+import { applySeriesActivation, beginAttempt, openSeries, readCompletionBinding } from "../src/om/series.js";
+import { openAttempt } from "../src/om/repeat-gate.js";
 import { writeSeriesTransition } from "../src/om/series-transition.js";
 import { readHorizon, writeHorizon, writeHorizonIssuance, type HorizonRecord } from "../src/om/horizon.js";
 import type { OmInputRecord } from "../src/om/input.js";
@@ -32,7 +33,7 @@ import { writeCandidate } from "../src/om/frame-candidate.js";
 import { prepareFrame, type FrameRead, type FrameRequest } from "../src/om/frame-obligations.js";
 import type { LayerProposal, ProposalRequest } from "../src/om/frame-proposals.js";
 import { writeGaps, type GapRequest } from "../src/om/gaps.js";
-import { writeGapLines } from "../src/om/gap-lines.js";
+import { gapLineExpectedResult, gapLineKey, writeGapLines } from "../src/om/gap-lines.js";
 import { writeOmInput } from "../src/om/input.js";
 import { writeNeighbors } from "../src/om/neighbors.js";
 import { writeOmObligations } from "../src/om/obligations.js";
@@ -528,7 +529,18 @@ test("C19 №1860-5 H1.1 new heads wait for open work: a build refuses while an 
   // A block attempt is open on the current bases (its check and close still need them) when M5 changes B1.
   const address = { project, block: "garden-consume-block", line: 1 };
   ok(openSeries(f.store, { ...address, slice: "h11-open", predecessor: null, basis: null }));
-  const series = ok(beginAttempt(f.store, { ...address, attempt: 1, goal: { key: "h11-open-goal", questions: ["Hold the scope"], result: "A held scope" } }));
+  // The attempt is the current managed opening on the exact plan of the first bases' own routes, while that M6 is still current.
+  const routes = routesOf(f.store, first), batches = routes.value.batches.filter(item => item.task === "node-expansion" && item.level === 2 && item.node === address.block);
+  assert.equal(batches.length, 1, "The block owns one whole node-expansion batch of the second level");
+  const batch = batches[0]!;
+  assert.ok(batch.items.length > 0 && batch.items.every(item => item.consumers.includes(address.block)));
+  const completion = { routes: reference(routes), batches: [batch.id] };
+  const series = ok(openAttempt(f.store, { ...address, attempt: 1, goal: { key: "h11-open-goal",
+    questions: batch.items.map(item => gapLineKey(project, item.target, item.field)),
+    result: gapLineExpectedResult(project, batch.items[0]!.target, batch.items[0]!.field) }, completion }));
+  const binding = ok(readCompletionBinding(f.store, project, reference(series), 1));
+  assert.ok(binding); assert.deepEqual(binding.value.plan, completion);
+  const history = f.store.history(series.id);
   decide(f, [{ target: "discovery:encoding", field: "address", value: { consumer: "garden-consume-block", kind: "repository-fact" } }]);
   assert.deepEqual(ok(prepareRunBases(f.store, { project })), { state: "missing", stage: "horizon" });
   const gaps = heads(f.store).filter(ref => ref.id.startsWith("om-gap:"));
@@ -536,9 +548,12 @@ test("C19 №1860-5 H1.1 new heads wait for open work: a build refuses while an 
   assert.deepEqual([refused.code, refused.at.target, refused.at.field], ["run_bases_work_open", series.id, "attempts"]);
   assert.deepEqual(heads(f.store).filter(ref => ref.id.startsWith("om-gap:")), gaps, "No D1 head moves under the open attempt");
   assert.equal(f.store.list("om-horizon").length, 1);
+  assert.deepEqual(f.store.history(series.id), history, "The refusal leaves the open attempt as it was");
   // The caller that owns that attempt's completion (the D2 of an accepted frame) names it; then the build goes on.
   const built = ok(writeRunBases(f.store, { project }, { open: [series.id] }));
   assert.notDeepEqual(built.bases.horizon, first.bases.horizon);
+  assert.deepEqual(f.store.history(series.id), history, "Both paths of the builder leave the open attempt as it was");
+  assert.deepEqual(ok(readCompletionBinding(f.store, project, reference(series), 1)), binding, "The original completion binding is the same after both paths");
 });
 
 test("R16 №1937 M5 STALE-8 H1.1 the L1 external inputs are not the list: a self connector is named by L1 while the candidate's tasks need no Source", t => {
