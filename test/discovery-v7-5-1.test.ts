@@ -126,8 +126,10 @@ const addressOf = (f: Paid, a: Claimed, index: number): ClaimAddress => ({ proje
   containerKind: 'research-attempt', pointer: `/claims/${index}`,
   claimId: (a.claims[index] as Record<string, Json>)['id'] as string });
 /** A paid assessment over the claim attempts. `close` adds the applied closed sufficiency of the plan question's own
- * criterion and depth standing on the accepted claims; without it the acceptance is material only. */
-async function assess(f: Paid, planQuestionId: string, claimed: Claimed[], accept: boolean, close = false) {
+ * criterion and depth standing on the accepted claims; an `outcome` of open/unknown adds that decision instead;
+ * without either the acceptance is material only. */
+async function assess(f: Paid, planQuestionId: string, claimed: Claimed[], accept: boolean,
+  close: boolean | 'open' | 'unknown' = false) {
   const packet = projectAttemptPacket(f.store, { project: f.project, planAnswer: f.v.planAnswer, planQuestionId,
     entries: claimed.map(item => ({ attempt: item.attempt, binding: item.binding })) });
   const rows = claimed.flatMap(item => item.claims.map((_, index) => addressOf(f, item, index)));
@@ -139,16 +141,20 @@ async function assess(f: Paid, planQuestionId: string, claimed: Claimed[], accep
       newContent: accept ? rows.map(claim => ({ claim, reason: 'New variant ground' })) : [],
       duplicates: [],
       noProgress: accept ? [] : claimed.map(item => ({ attempt: item.attempt, reason: 'No acknowledged basis' })),
-      transition: close && accept ? { outcome: 'closed', bases: rows.map(claim => ({ claim })),
+      transition: close === true && accept ? { outcome: 'closed', bases: rows.map(claim => ({ claim })),
         reason: 'The plan question is answered for the chosen variant',
         sufficiency: { criterion: `Named basis answering ${planQuestionId}`, requiredDepth: 'deep', reason: 'Enough for the required depth',
-          methodologyRequirements: [] } } : null },
-    methodology: close && accept
+          methodologyRequirements: [] } }
+        : close === 'open' && accept ? { outcome: 'open', bases: rows.map(claim => ({ claim })), reason: 'The material stays insufficient' }
+        : close === 'unknown' && accept ? { outcome: 'unknown', bases: rows.map(claim => ({ claim })), reason: 'The answer is unknown yet',
+          consequence: 'The stage stays blocked on this question', nextAction: 'Gather the named quote' }
+        : null },
+    methodology: close === true && accept
       ? { contract: 'assessment-methodology/v1', policy: 'assessment-methodology-policy/v2', facts: [] }
       : { contract: 'assessment-methodology/v1', policy: 'assessment-methodology-policy/v1', facts: [] } };
   writeFileSync(f.settings, JSON.stringify({ tokens: 10, reply }));
   // A closed sufficiency runs through the v3 requirements producer; an open verdict keeps the v1 policy producer.
-  return close && accept
+  return close === true && accept
     ? await assessAttemptsWithRequirements(f.store, packet, v7ProgressBaseline(f.store, packet), f.environment, f.root)
     : await assessAttempts(f.store, packet, v7ProgressBaseline(f.store, packet), f.environment, f.root);
 }
@@ -313,3 +319,53 @@ const mintOf = (store: Store, scope: VariantChoiceScope) => {
   const exchanged = ok(sessions.exchange({ projectId: scope.projectId, invitation: issued.invitation }));
   return { sessions, issued, ...exchanged, authority: sessions.authority(exchanged.bearer)! };
 };
+
+test('5.1: a later applied open or unknown decision supersedes an earlier own closed sufficiency — the cell is uncovered hot and cold', async t => {
+  const f = await paid(t), [member] = f.set.value.members;
+  const closed = await claimAttempt(f, 'q-industry', [hypothesisClaim(f, 'q-industry', 'The chosen variant bounds the industry risk', [member!])]);
+  applyDiscoveryAssessment(f.store, f.project, reference(await assess(f, 'q-industry', [closed], true, true)));
+  const first = computeMissingCoverage(f.store, f.project, reference(f.published.scope), f.v.planAnswer);
+  assert.equal(first.cells.find(cell => cell.cell.subject.planQuestionId === 'q-industry')!.covered, true);
+  // Own member ground again, but the operative applied decision reopens: open, then unknown.
+  for (const decision of ['open', 'unknown'] as const) {
+    const reopened = await claimAttempt(f, 'q-industry', [hypothesisClaim(f, 'q-industry', `The ground needs more: ${decision}`, [member!])]);
+    applyDiscoveryAssessment(f.store, f.project, reference(await assess(f, 'q-industry', [reopened], true, decision)));
+    const report = computeMissingCoverage(f.store, f.project, reference(f.published.scope), f.v.planAnswer);
+    const industry = report.cells.find(cell => cell.cell.subject.planQuestionId === 'q-industry')!;
+    assert.equal(industry.covered, false, `the operative ${decision} decision supersedes the earlier closed sufficiency`);
+    assert.equal(industry.missing!.code, 'coverage_no_sufficiency');
+    assert.ok(industry.grounds.length >= 2, 'the own member grounds stay listed as material');
+    const cold = new Store(f.store.path); t.after(() => cold.close());
+    assert.deepEqual(computeMissingCoverage(cold, f.project, reference(f.published.scope), f.v.planAnswer), report,
+      'the superseded answer is the same cold');
+  }
+  // Re-closing on the member's own ground makes the cell covered again.
+  const again = await claimAttempt(f, 'q-industry', [hypothesisClaim(f, 'q-industry', 'Enough for the required depth now', [member!])]);
+  applyDiscoveryAssessment(f.store, f.project, reference(await assess(f, 'q-industry', [again], true, true)));
+  const last = computeMissingCoverage(f.store, f.project, reference(f.published.scope), f.v.planAnswer);
+  assert.equal(last.cells.find(cell => cell.cell.subject.planQuestionId === 'q-industry')!.covered, true);
+});
+
+test('5.1: a hidden or damaged application of the applied chain is a typed refusal, never a negative answer', async t => {
+  const f = await paid(t), [member] = f.set.value.members;
+  const claimed = await claimAttempt(f, 'q-industry', [hypothesisClaim(f, 'q-industry', 'The chosen variant bounds the industry risk', [member!])]);
+  applyDiscoveryAssessment(f.store, f.project, reference(await assess(f, 'q-industry', [claimed], true, true)));
+  const report = computeMissingCoverage(f.store, f.project, reference(f.published.scope), f.v.planAnswer);
+  assert.equal(report.cells.find(cell => cell.cell.subject.planQuestionId === 'q-industry')!.covered, true);
+  // An explicit negative: hide the exact application of the applied chain in a new Store; proveClaimAddress refuses
+  // discovery_progress_conflict and the computation must keep that refusal, never swallow it into an empty negative.
+  const application = report.cells.find(cell => cell.cell.subject.planQuestionId === 'q-industry')!.sufficiency!.assessment;
+  const paidRecord = f.store.get(application.id, application.revision)!;
+  const appRef = (paidRecord.value as unknown as { application: Ref }).application;
+  const cold = new Store(f.store.path); t.after(() => cold.close());
+  const get = cold.get.bind(cold);
+  cold.get = ((id: string, revision?: number) => id === appRef.id && revision === appRef.revision ? null : get(id, revision)) as typeof cold.get;
+  const before = history(cold);
+  let caught: unknown;
+  try { computeMissingCoverage(cold, f.project, reference(f.published.scope), f.v.planAnswer); }
+  catch (error) { caught = error; }
+  assert.ok(caught instanceof EngineError, 'the computation refuses');
+  assert.ok(['discovery_progress_conflict', 'assessment_invalid', 'research_context_application_invalid'].includes((caught as EngineError).code),
+    `the typed refusal, got ${(caught as EngineError).code}`);
+  assert.deepEqual(history(cold), before, 'the refusal writes nothing');
+});

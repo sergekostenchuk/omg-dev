@@ -177,10 +177,9 @@ export function computeMissingCoverage(store: Store, project: string, scope: Ref
         let resolved: ReturnType<typeof proveClaimAddress>;
         try { resolved = proveClaimAddress(store, address); }
         catch (error) {
-          // Rejected or not-yet-applied acceptance is the lawful negative answer, never coverage: the applied
-          // classification is absent (discovery_progress_conflict) or the exact pointer was not accepted.
-          if (error instanceof EngineError
-            && (error.code === 'claim_attempt_not_accepted' || error.code === 'discovery_progress_conflict')) continue;
+          // Rejected or not-yet-applied acceptance is the lawful negative answer, never coverage. A broken applied
+          // chain (a hidden or damaged application) is a proof failure, not a negative: it keeps its own refusal.
+          if (error instanceof EngineError && error.code === 'claim_attempt_not_accepted') continue;
           throw error;
         }
         const claim = resolved.claim as Record<string, unknown>;
@@ -210,16 +209,12 @@ export function computeMissingCoverage(store: Store, project: string, scope: Ref
     set: value.set, member: value.member, cells, missing: cells.filter(cell => !cell.covered) };
 }
 
-/** Walks the proven applied progress chain of the subject and returns the proven closed sufficiency that stands on
- * one of the member's own grounds. The head state is proven by readV7ProgressStateAt — which re-derives the whole
- * application, its prior chain and every account and event from the paid assessment — and each applied assessment is
- * proven paid by its own reader. An open, unknown or absent transition, a sufficiency of another criterion or depth,
- * and a closing without this member's own ground all leave the cell uncovered. */
-function provenSufficiency(store: Store, project: string, planAnswer: Ref, question: V7PlanQuestion,
-  grounds: AppliedCoverageGround[]): AppliedSufficiency | null {
-  if (grounds.length === 0) return null;
-  const groundAddresses = new Set(grounds.map(ground => canonical(ground.claim)));
-  const stateId = v7ProgressStateId({ project, planAnswer, planQuestionId: question.planQuestionId });
+/** The operative applied decision of the subject: the FIRST transition-bearing application on the proven chain from
+ * the head — a later open/unknown decision supersedes an earlier closed one, and plain acceptances are walked through.
+ * The head state is proven by readV7ProgressStateAt — which re-derives the whole application, its prior chain and
+ * every account and event from the paid assessment — and each applied assessment is proven paid by its own reader. */
+function operativeDecision(store: Store, project: string, stateId: string):
+  { transition: V7QuestionTransition | null; assessment: Ref } | null {
   const head = store.get(stateId);
   if (head === null) return null;
   let state: Ref = reference(readV7ProgressStateAt(store, reference(head)));
@@ -233,13 +228,31 @@ function provenSufficiency(store: Store, project: string, planAnswer: Ref, quest
       invalid('state', 'The proven application names its exact paid assessment');
     const paid = readDiscoveryAssessment(store, project, application.value.assessment);
     const transition: V7QuestionTransition | null = paid.value.novelty?.transition ?? null;
-    const own = question.question as Record<string, Json>;
-    if (transition !== null && transition.outcome === 'closed' && transition.sufficiency !== undefined
-      && typeof own['criterion'] === 'string' && typeof own['requiredDepth'] === 'string'
-      && transition.bases.some(basis => 'claim' in basis && groundAddresses.has(canonical(basis.claim))))
-      return { assessment: application.value.assessment, transition };
+    if (transition !== null) return { transition, assessment: application.value.assessment };
     const previous = application.value.previous;
     if (previous === null || !isRef(previous)) return null;
     state = reference(readV7ProgressStateAt(store, previous));
   }
+}
+
+/** The cell's sufficiency: the operative applied decision must close against the plan question's own criterion and
+ * depth and stand on one of the member's own grounds. An open or unknown decision — however many closed ones preceded
+ * it — leaves the cell uncovered with its material grounds; a closing on common or a foreign member substitutes
+ * nothing. */
+function provenSufficiency(store: Store, project: string, planAnswer: Ref, question: V7PlanQuestion,
+  grounds: AppliedCoverageGround[]): AppliedSufficiency | null {
+  if (grounds.length === 0) return null;
+  const groundAddresses = new Set(grounds.map(ground => canonical(ground.claim)));
+  const decision = operativeDecision(store, project,
+    v7ProgressStateId({ project, planAnswer, planQuestionId: question.planQuestionId }));
+  if (decision === null || decision.transition === null) return null;
+  const transition = decision.transition, assessment = decision.assessment;
+  const own = question.question as Record<string, Json>;
+  if (transition.outcome === 'closed' && transition.sufficiency !== undefined
+    && typeof own['criterion'] === 'string' && typeof own['requiredDepth'] === 'string'
+    && transition.sufficiency.criterion === own['criterion']
+    && transition.sufficiency.requiredDepth === own['requiredDepth']
+    && transition.bases.some(basis => 'claim' in basis && groundAddresses.has(canonical(basis.claim))))
+    return { assessment, transition };
+  return null;
 }
