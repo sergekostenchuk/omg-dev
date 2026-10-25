@@ -26,9 +26,9 @@ import { prepareQuestionTasks, writeQuestionPacket } from "../src/om/question-pa
 import type { OmResult, Refusal } from "../src/om/refusal.js";
 import { recordRefusal, unitRefusalNamespace, UNIT_REFUSAL_KIND } from "../src/om/refusal-journal.js";
 import { writeGuarded } from "../src/om/refs.js";
-import { closeAttempt } from "../src/om/repeat-gate.js";
+import { closeAttempt, openAttempt } from "../src/om/repeat-gate.js";
 import { writeRoutes } from "../src/om/routes.js";
-import { beginAttempt, openSeries, seriesAddress, type AnyRepairSeries, type AttemptGoal } from "../src/om/series.js";
+import { beginAttempt, openSeries, readCompletionBinding, seriesAddress, type AnyRepairSeries, type AttemptGoal } from "../src/om/series.js";
 import { runStopAnalysis } from "../src/om/stop-analysis.js";
 import { acquireRunExecution, admitRunControl, readRunControl, releaseRunExecution, resumeStoppedRun, runControlId, RunControlGate,
   RunControlLost, RUN_CONTROL_CODES, stopRun, type RunControlRecord, type RunExecution, RUN_CONTROL_MOVED, liftedStop } from "../src/om/run-control.js";
@@ -90,7 +90,7 @@ async function killed(child: ChildProcess): Promise<void> {
   child.kill("SIGKILL"); await exited;
 }
 
-/** A real standalone MC1 fact attempt with its packet, its E4 dispatch and, after the original call, its E5 request. */
+/** A real managed MC1 fact attempt, opened on the exact plan of its own routes and batch, with its packet, its E4 dispatch and, after the original call, its E5 request. */
 function factFixture(t: TestContext) {
   const root = mkdtempSync(join(tmpdir(), "omg-h13-fact-")), database = join(root, "state.sqlite"), project = "garden";
   let store = new Store(database);
@@ -126,7 +126,10 @@ function factFixture(t: TestContext) {
   const goal: AttemptGoal = { key: "h13:fact", questions: batch.items.map(item => gapLineKey(project, item.target, item.field)),
     result: gapLineExpectedResult(project, batch.items[0]!.target, batch.items[0]!.field) };
   ok(openSeries(store, { project, block, line: 1, slice: "h13-fact", predecessor: null, basis: null }));
-  const series = ok(beginAttempt(store, { project, block, line: 1, attempt: 1, goal }));
+  const completion = { routes: reference(routes), batches: [batch.id] };
+  const series = ok(openAttempt(store, { project, block, line: 1, attempt: 1, goal, completion }));
+  const binding = ok(readCompletionBinding(store, project, reference(series), 1));
+  assert.ok(binding); assert.deepEqual(binding.value.plan, completion);
   const scenario = join(root, "scenario.json"), trace = join(root, "trace.jsonl");
   const command = { executable: process.execPath, args: [adapterFixture, "--scenario", scenario, "--trace", trace] };
   const config = engine.environments.configure(project, { workspace: root,
@@ -136,6 +139,8 @@ function factFixture(t: TestContext) {
   const adapter = store.write({ id: `adapter:${project}:h13`, kind: "dispatch-adapter", expected: 0, value: { projectId: project, protocol: "codex-stdio" } });
   const packet = ok(writeQuestionPacket(store, { project, routes: reference(routes), batch: batch.id, environment: reference(config),
     attempt: { series: reference(series), ordinal: 1 }, previous: [] })).record;
+  assert.equal(packet.value.state, "ready");
+  assert.deepEqual(packet.value.request.attempt, { series: reference(series), ordinal: 1 });
   const dispatch = { adapter: reference(adapter), config: reference(config) };
   const original = { research: { protocol: "$answerProtocol", requestId: "$requestId", action: "answer",
     results: batch.items.map(item => ({ questionId: item.gap, value: "UTF-8", citations: [{ source: reference(source),
