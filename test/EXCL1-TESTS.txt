@@ -9,17 +9,3 @@ om-spend-report.test.ts :: E6 reads unchanged E1 bytes from the complete 0da9006
 # GS3a: wake-choice supplements exist only for proposals admitted before the wakeTest requirement.
 
 # OLD-DISCOVERY (№7903): собственная логика старого Discovery; общие механизмы и нижние потребители сохранены.
-discovery-decision.test.ts :: DS1.1 partial choices survive restart; last choice and normal reopen are atomic and replay exactly once # вид OLD-DISCOVERY: собственная логика старого Discovery v6, удаляется с включением v7 (слово владельца 20.10)
-discovery-decision.test.ts :: OC1 completes a lawful mixed v1/v2 round without upgrading the historical decision # вид OLD-DISCOVERY: собственная логика старого Discovery v6, удаляется с включением v7 (слово владельца 20.10)
-discovery-decision.test.ts :: DS1.1 declined choice remains a meaningful input to a new no_go; evidence has no choice command # вид OLD-DISCOVERY: собственная логика старого Discovery v6, удаляется с включением v7 (слово владельца 20.10)
-discovery-decision.test.ts :: DS1.1 invalid option, foreign project, changed report and changed verdict fail at the addressed door without writes # вид OLD-DISCOVERY: собственная логика старого Discovery v6, удаляется с включением v7 (слово владельца 20.10)
-discovery-decision.test.ts :: DS1.1 concurrent legitimate researchPlan reopen aborts decision and round together # вид OLD-DISCOVERY: собственная логика старого Discovery v6, удаляется с включением v7 (слово владельца 20.10)
-discovery-decision.test.ts :: DS1.1 concurrent legitimate researchReport reopen aborts decision and round together # вид OLD-DISCOVERY: собственная логика старого Discovery v6, удаляется с включением v7 (слово владельца 20.10)
-discovery-decision.test.ts :: DS1.1 concurrent legitimate verdict reopen aborts decision and round together # вид OLD-DISCOVERY: собственная логика старого Discovery v6, удаляется с включением v7 (слово владельца 20.10)
-discovery-decision.test.ts :: DS1.2 stage acceptance checks report constraint coverage: missing # вид OLD-DISCOVERY: собственная логика старого Discovery v6, удаляется с включением v7 (слово владельца 20.10)
-discovery-decision.test.ts :: DS1.2 stage acceptance checks report constraint coverage: foreign # вид OLD-DISCOVERY: собственная логика старого Discovery v6, удаляется с включением v7 (слово владельца 20.10)
-discovery-decision.test.ts :: DS1.2 stage acceptance checks report constraint coverage: correct # вид OLD-DISCOVERY: собственная логика старого Discovery v6, удаляется с включением v7 (слово владельца 20.10)
-discovery-decision.test.ts :: DS1.1 model owner options duplicate-id are refused before assessment # вид OLD-DISCOVERY: собственная логика старого Discovery v6, удаляется с включением v7 (слово владельца 20.10)
-discovery-decision.test.ts :: DS1.1 model owner options no-decline are refused before assessment # вид OLD-DISCOVERY: собственная логика старого Discovery v6, удаляется с включением v7 (слово владельца 20.10)
-discovery-decision.test.ts :: DS1.1 model owner options missing-options are refused before assessment # вид OLD-DISCOVERY: собственная логика старого Discovery v6, удаляется с включением v7 (слово владельца 20.10)
-discovery-decision.test.ts :: DS1.1 concurrent answers to separate conditions cannot lose the final reopen # вид OLD-DISCOVERY: собственная логика старого Discovery v6, удаляется с включением v7 (слово владельца 20.10)
