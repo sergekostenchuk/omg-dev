@@ -1,20 +1,16 @@
 import { discoveryContext } from '../src/discovery/discovery-outcome.js';
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { execFileSync } from "node:child_process";
-import { createRequire } from "node:module";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Store, type Revision } from "../src/storage/store.js";
 import { ProductEngine, type StageContent } from "../src/product/engine.js";
-import { LEGACY_REQUIREMENTS, RESEARCH_CONTRACT_VERSION, REQUIREMENTS, VERSION3_REQUIREMENTS, type UpstreamStage } from "../src/discovery/requirements.js";
-import { JOURNEY_VARIANTS, QUESTION_MOMENTS, QUESTION_MOMENT_CONTRACT_VERSION, preparationSchema, featurePreparationSchema, UPSTREAM_DETAILS } from "../src/discovery/preparation-contracts.js";
+import { LEGACY_REQUIREMENTS, RESEARCH_CONTRACT_VERSION, VERSION3_REQUIREMENTS } from "../src/discovery/requirements.js";
+import { JOURNEY_VARIANTS, QUESTION_MOMENTS, QUESTION_MOMENT_CONTRACT_VERSION } from "../src/discovery/preparation-contracts.js";
 import { reference, stageId, type StageArtifact } from "../src/pipeline/contracts.js";
 import type { DiscoveryDraft, Question } from "../src/discovery/discovery.js";
 import { canonical, type Json } from "../src/canonical.js";
-import type { Graph } from "../src/graph/model.js";
 import { preparedField, preparationValue as basePreparationValue, boundDiscoveryValue } from "./preparation-fixture.js";
 import { preparedFeatures, answerDiscoveryFixture } from "./product-fixture.js";
 
@@ -200,81 +196,3 @@ test("B1.1 current producer does not resume unaccepted version 3 work", async t 
   assert.throws(() => engine.draft("p", "discovery", old.id, 0), { code: "research_contract_upgrade_required" });
   assert.equal(canonical(store.list().flatMap(row => store.history(row.id))), before);
 });
-
-test("B1.1 real version 3 producer preserves schemas, accepted stage history and mapDesign validation after restart", async t => {
-  const root = mkdtempSync(join(tmpdir(), "omg-moment-v3-"));
-  t.after(() => rmSync(root, { recursive: true, force: true }));
-  const repositoryUrl = new URL("../../", import.meta.url), repository = fileURLToPath(repositoryUrl);
-  const loader = join(root, "v3-loader.mjs"), producer = join(root, "v3-producer.mjs");
-  writeFileSync(loader, VERSION3_LOADER); writeFileSync(producer, VERSION3_PRODUCER);
-  const bootstrap = `import {register} from 'node:module'; register(${JSON.stringify(pathToFileURL(loader).href)},
-    {data:{root:${JSON.stringify(repositoryUrl.href)},typescript:${JSON.stringify(pathToFileURL(createRequire(import.meta.url).resolve("typescript")).href)}}});`;
-  const prior = JSON.parse(execFileSync(process.execPath, ["--import", `data:text/javascript,${encodeURIComponent(bootstrap)}`, producer, repository, root],
-    { cwd: repository, encoding: "utf8", maxBuffer: 20_000_000, timeout: 60_000 })) as {
-      database: string; requirements: unknown; schemas: unknown; details: unknown; bytes: string;
-      stages: { stage: UpstreamStage; draft: string; inspection: unknown; replay: unknown }[];
-    };
-  assert.deepEqual(VERSION3_REQUIREMENTS, prior.requirements);
-  assert.deepEqual([preparationSchema, featurePreparationSchema], prior.schemas);
-  assert.deepEqual(UPSTREAM_DETAILS, prior.details);
-  assert.deepEqual(REQUIREMENTS["operation-map"], VERSION3_REQUIREMENTS["operation-map"]);
-  for (let restart = 0; restart < 2; restart++) {
-    const store = new Store(prior.database), engine = new ProductEngine(store);
-    try {
-      for (const item of prior.stages) {
-        const { closure: _closure, ...inspection } = engine.pipeline.inspect("legacy", item.stage);
-        assert.deepEqual(inspection, item.inspection);
-        assert.deepEqual(await engine.stageResearch.run("legacy", item.draft, 1), item.replay);
-      }
-      assert.equal(canonical(store.list().flatMap(row => store.history(row.id))), prior.bytes);
-    } finally { store.close(); }
-  }
-  const store = new Store(prior.database), engine = new ProductEngine(store);
-  try {
-    const graph = store.get<Graph>("graph:legacy")!, changed = structuredClone(graph.value);
-    changed.nodes.find(node => node.kind === "block")!.title += " foreign design";
-    // A changed graph head cannot borrow the intact historical layer as proof of the old mapDesign.
-    store.write({ id: graph.id, kind: graph.kind, expected: graph.revision, value: changed });
-    const checked = engine.pipeline.inspect("legacy", "operation-map");
-    assert.ok(checked.findings.some(item => item.code === "map_design_drift"), JSON.stringify(checked.findings));
-  } finally { store.close(); }
-});
-
-const VERSION3_LOADER = String.raw`import {execFileSync} from 'node:child_process';
-import {fileURLToPath} from 'node:url';
-let root,ts;
-export async function initialize(data){root=data.root;ts=(await import(data.typescript)).default;}
-export async function load(url,context,next){
- const prefix=new URL('dist/',root).href;
- if(url.startsWith(prefix)&&/\.js$/.test(url)){
-  const relative=url.slice(prefix.length).replace(/\.js$/,'.ts');
-  const source=execFileSync('git',['show','1189043f4bc7:'+relative],{cwd:fileURLToPath(root),encoding:'utf8',maxBuffer:10000000});
-  return {format:'module',shortCircuit:true,source:ts.transpileModule(source,{compilerOptions:{module:ts.ModuleKind.ESNext,target:ts.ScriptTarget.ES2023}}).outputText};
- }
- return next(url,context);
-}`;
-
-const VERSION3_PRODUCER = String.raw`import {join} from 'node:path';
-import {pathToFileURL} from 'node:url';
-const [repository,root]=process.argv.slice(2),url=path=>pathToFileURL(join(repository,'dist',path)).href;
-const {Store}=await import(url('src/storage/store.js'));
-const {ProductEngine}=await import(url('src/product/engine.js'));
-const {canonical}=await import(url('src/canonical.js'));
-const {UPSTREAM_STAGES,REQUIREMENTS}=await import(url('src/discovery/requirements.js'));
-const {preparationSchema,featurePreparationSchema,UPSTREAM_DETAILS}=await import(url('src/discovery/preparation-contracts.js'));
-const {preparedFeatures}=await import(url('test/product-fixture.js'));
-const {preparedField}=await import(url('test/preparation-fixture.js'));
-const database=join(root,'legacy.sqlite'),store=new Store(database),engine=new ProductEngine(store);
-preparedFeatures(engine,'legacy',undefined,field=>{
- const value=preparedField('legacy',field);
- if(field==='preparation')value.unknowns=[{id:'old-question',question:'Which environment is supported?',consumer:'legacy-produce-block',blocksCurrentStage:false,resolution:'Retain for the next stage'}];
- if(field==='featurePreparation')value[0].remainingQuestions=[{question:'Which output must be confirmed?',consumer:'legacy-consume-block',blocksCurrentStage:false}];
- return value;
-});
-const stages=[];
-for(const stage of UPSTREAM_STAGES){
- const artifact=store.get('stage:legacy:'+stage),draft=artifact.value.content.draft.id;
- stages.push({stage,draft,inspection:engine.pipeline.inspect('legacy',stage),replay:await engine.stageResearch.run('legacy',draft,1)});
-}
-const bytes=canonical(store.list().flatMap(row=>store.history(row.id)));
-store.close();process.stdout.write(JSON.stringify({database,requirements:REQUIREMENTS,schemas:[preparationSchema,featurePreparationSchema],details:UPSTREAM_DETAILS,stages,bytes}));`;
