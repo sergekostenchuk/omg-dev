@@ -1,12 +1,11 @@
 import type test from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, existsSync } from "node:fs";
-import { execFileSync, spawn, spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createRequire } from "node:module";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 import { Store, type Revision, type Write } from "../src/storage/store.js";
 import { canonical, hashJson, type Json } from "../src/canonical.js";
 import { reference, type Ref } from "../src/pipeline/contracts.js";
@@ -888,64 +887,6 @@ function addressQuestions(f: Fixture, rows: readonly (readonly [id: string, kind
 const answerBatch = (routes: RoutesRecord) => routes.batches.find(batch => batch.model === "MC2" && batch.task === "input-field"
   && batch.items.some(item => item.target === "discovery:spare" && item.field === "answer"))!;
 
-/**
- * Runs a producer script with every engine module loaded from one exact commit, in its own process (the era check of
- * test/om-answers-gate.test.ts): the loader serves each module from Git and refuses an engine module outside the commit,
- * so a missed prefix cannot fall back to the current build and let the test pass vacuously.
- */
-function atCommit(f: { root: string; database: string }, commit: string, name: string, body: string, input: unknown): unknown {
-  const repository = fileURLToPath(new URL("../../", import.meta.url));
-  const loader = join(f.root, `${name}-loader.mjs`), producer = join(f.root, `${name}-producer.mjs`);
-  const argsFile = join(f.root, `${name}-input.json`), served = join(f.root, `${name}-served.log`);
-  const typescript = pathToFileURL(createRequire(import.meta.url).resolve("typescript")).href;
-  writeFileSync(served, "");
-  writeFileSync(loader, `import { execFileSync } from 'node:child_process';
-import { appendFileSync, realpathSync } from 'node:fs';
-import { fileURLToPath, pathToFileURL } from 'node:url';
-import ts from ${JSON.stringify(typescript)};
-let root, log, prefixes;
-export function initialize(data) {
-  root = data.root; log = data.log;
-  prefixes = [root, pathToFileURL(realpathSync(fileURLToPath(root)) + '/').href].map(base => new URL('dist/src/', base).href);
-}
-export async function load(url, context, next) {
-  const prefix = prefixes.find(item => url.startsWith(item));
-  if (prefix && /\\.js$/.test(url)) {
-    const relative = 'src/' + url.slice(prefix.length).replace(/\\.js$/, '.ts');
-    appendFileSync(log, relative + '\\n');
-    const source = execFileSync('git', ['show', ${JSON.stringify(commit)} + ':' + relative],
-      { cwd: fileURLToPath(root), encoding: 'utf8', maxBuffer: 10000000 });
-    return { format: 'module', shortCircuit: true, source: ts.transpileModule(source,
-      { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2023 } }).outputText };
-  }
-  if (url.startsWith('file:') && url.includes('/dist/src/') && !url.includes('/node_modules/'))
-    throw new Error('An engine module outside the era checkout: ' + url);
-  return next(url, context);
-}`);
-  writeFileSync(producer, `import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
-import { pathToFileURL } from 'node:url';
-const [repository, database, input] = process.argv.slice(2);
-const src = path => pathToFileURL(join(repository, 'dist/src', path)).href;
-const { Store } = await import(src('storage/store.js'));
-const { reference } = await import(src('pipeline/contracts.js'));
-const args = JSON.parse(readFileSync(input, 'utf8')), store = new Store(database);
-const take = result => { if (!result.ok) throw Error(JSON.stringify(result.refusal)); return result.value; };
-const out = value => process.stdout.write(JSON.stringify(value));
-try {
-${body}
-} finally { store.close(); }`);
-  writeFileSync(argsFile, JSON.stringify(input));
-  const bootstrap = `import { register } from 'node:module'; register(${JSON.stringify(pathToFileURL(loader).href)},
-    { data: { root: ${JSON.stringify(pathToFileURL(repository).href)}, log: ${JSON.stringify(served)} } });`;
-  const output: unknown = JSON.parse(execFileSync(process.execPath,
-    ["--import", `data:text/javascript,${encodeURIComponent(bootstrap)}`, producer, repository, f.database, argsFile],
-    { cwd: repository, encoding: "utf8", timeout: 180_000, maxBuffer: 10_000_000 }));
-  const loaded = readFileSync(served, "utf8").split("\n").filter(Boolean);
-  assert.ok(loaded.includes("src/storage/store.ts") && loaded.includes("src/om/run.ts"), `The producer ran on the modules of ${commit}: ${loaded.join(", ")}`);
-  return output;
-}
-
 /** LG05: the derived goal and completion plan a managed attempt of `block` names on these routes (completionPlanSources). */
 function managedPlan(routes: Revision<RoutesRecord>, block: string, batches?: readonly RouteBatch[]) {
   const selected = batches ?? routes.value.batches.filter(batch => batch.items.every(item => item.consumers.includes(block)));
@@ -1709,5 +1650,5 @@ async function policyDoor(t: test.TestContext, owner: boolean) {
   assert.ok(works.length > 0, "The works brief after the decision carries it");
 }
 
-export { project, adapterFixture, ok, refusal, runFixture, addressAll, usage, factsAll, assessor, refOf, mechanismSeries, blockSeries, actions, actionsSteps, ends, driveTo, drive, reasonsOf, blockBases, stopAnswer, cannotAnswer, untouched, stoppedBlockLine, secondRung, frameAnswer, OWN1_DECISION, decisionCalls, restWithDecisions, until, RacingStore, loadOperations, gardenPass, regatePolicy, nodeAnswer, worksFixture, worksAcceptance, factWorksPass, LostApplication, lostAfterClaim, heldAfterClaim, a6Survives, nodeRefusal, driveUntil, gapHeads, addressQuestions, answerBatch, atCommit, openPlanned, managedPlan, managedAwaitOwner, ownerAnswers, sameEnd, twoOwnerAnswers, advanceRun, regatedHold, defectedWork, lp3Need, lp3Order, lp3Blocked, lp3Pointers, LP3_UNPROVED, lp3Hiding, lp3Context, isRefOf, asCycleStart, asRunResult, lp4Configure, lp4Questions, lp4Sent, lp4Close, mp2Upper, mp2Rank, mp2Works, mp2WorkAnswer, twoArtifacts, threeArtifacts, g62Rejection, lp5ReplaceB1, lp5Kind, g51AmbiguousAnswer, lp6Line, lp6CurrentRounds, lp6Close, LP7_VALUES, lp7Routes, passRows, unavailableReview, policyDoor };
+export { project, adapterFixture, ok, refusal, runFixture, addressAll, usage, factsAll, assessor, refOf, mechanismSeries, blockSeries, actions, actionsSteps, ends, driveTo, drive, reasonsOf, blockBases, stopAnswer, cannotAnswer, untouched, stoppedBlockLine, secondRung, frameAnswer, OWN1_DECISION, decisionCalls, restWithDecisions, until, RacingStore, loadOperations, gardenPass, regatePolicy, nodeAnswer, worksFixture, worksAcceptance, factWorksPass, LostApplication, lostAfterClaim, heldAfterClaim, a6Survives, nodeRefusal, driveUntil, gapHeads, addressQuestions, answerBatch, openPlanned, managedPlan, managedAwaitOwner, ownerAnswers, sameEnd, twoOwnerAnswers, advanceRun, regatedHold, defectedWork, lp3Need, lp3Order, lp3Blocked, lp3Pointers, LP3_UNPROVED, lp3Hiding, lp3Context, isRefOf, asCycleStart, asRunResult, lp4Configure, lp4Questions, lp4Sent, lp4Close, mp2Upper, mp2Rank, mp2Works, mp2WorkAnswer, twoArtifacts, threeArtifacts, g62Rejection, lp5ReplaceB1, lp5Kind, g51AmbiguousAnswer, lp6Line, lp6CurrentRounds, lp6Close, LP7_VALUES, lp7Routes, passRows, unavailableReview, policyDoor };
 export type { Fixture, Verdict, Lp5State, Lp6Op, Reopened };
