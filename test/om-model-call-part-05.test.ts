@@ -28,7 +28,7 @@ import { completionE1, completionSnapshot, currentPacketWire, e4CannotAnswer, e4
 
 
 test('E4 node result conflict leaves no partial response/proposal/result, accounts observed usage and never dispatches twice', async t => {
-  const f = e4Fixture(t, 'node', 100_000, 0, 5000, true); f.steps([{ research: e4Node(f), usage }]);
+  const f = e4Fixture(t, 'node', 100_000, 5000, true); f.steps([{ research: e4Node(f), usage }]);
   const writeMany = f.store.writeMany.bind(f.store); let injected = false;
   const replace = () => {
     injected = true;
@@ -76,7 +76,7 @@ test('E4 node result conflict leaves no partial response/proposal/result, accoun
 test('E4 owner loss after authorization but before stdin preserves unknown delivery for product and analysis', async t => {
   for (const purpose of ['fact', 'stop-analysis'] as const) await t.test(purpose, async nested => {
     const product = purpose === 'fact';
-    const f = product ? e4Fixture(nested, 'fact', 100_000, 0, 30_000, true) : await e4ManagedAnalysisFixture(nested, 'stop-analysis', 30_000);
+    const f = product ? e4Fixture(nested, 'fact', 100_000, 30_000, true) : await e4ManagedAnalysisFixture(nested, 'stop-analysis', 30_000);
     ensureFixtureProject(f.store, f.project);
     const checkpoint = join(f.root, 'authorized.json');
     const research = product ? e4Fact(f as ReturnType<typeof e4Fixture>) : { cause: 'No request yet transferred', hypothesis: true };
@@ -106,7 +106,7 @@ test('E4 owner loss after authorization but before stdin preserves unknown deliv
 
 
 test('13 H1.0a local off-form stays open until G7; the exact complete close survives a new Store', async t => {
-  const f = e4Fixture(t, 'fact', 100_000, 0, 1000, true);
+  const f = e4Fixture(t, 'fact', 100_000, 1000, true);
   f.steps([{ research: { nonsense: true }, usage }]);
   const called = valueOf(await runModelCall(f.store, f.request));
   assert.equal(called.record.value.om.failure?.code, 'part_answer_invalid');
@@ -136,7 +136,7 @@ test('32 H1.0a cycle cursor recovery after G7 uses only the exact closed product
   for (const mode of ['off-form', 'interrupted', 'cannot-answer', 'assembly', 'parts-and-continuation'] as const) {
     await t.test(mode, async child => {
       const node = mode === 'assembly' || mode === 'parts-and-continuation';
-      const f = e4Fixture(child, node ? 'node' : 'fact', 100_000, 0, 5000, true);
+      const f = e4Fixture(child, node ? 'node' : 'fact', 100_000, 5000, true);
       let request = f.request;
       if (node) {
         const split = mode === 'parts-and-continuation';
@@ -210,7 +210,7 @@ test('32 H1.0a cycle cursor recovery after G7 uses only the exact closed product
 
 test('21 H1.0a MC2 complete parts require assembly, and assembly alone cannot impersonate an accepted achievement', async t => {
   for (const split of [false, true]) await t.test(split ? 'split with source child' : 'single direct part', async t => {
-    const f = e4Fixture(t, 'node', 100_000, 0, 1000, true);
+    const f = e4Fixture(t, 'node', 100_000, 1000, true);
     const config = split ? f.environment(currentPacketWire(f.packet.value.packet) - 1) : f.configured;
     const packet = split ? valueOf(writeQuestionPacket(f.store, { ...f.packetRequest, environment: reference(config) })).record : f.packet;
     const count = packet.value.plan!.assignments.length;
@@ -254,7 +254,7 @@ test('21 H1.0a MC2 complete parts require assembly, and assembly alone cannot im
 
 test('14 H1.0a physical technical and control terminals keep their own diagnostic through G7 and exact restart', async t => {
   for (const kind of ['interrupted','awaiting-owner','refused','mechanism'] as const) await t.test(`${kind==='awaiting-owner'?'16':'14'} ${kind}`,async t => {
-    const f=e4Fixture(t,kind==='mechanism'?'field':'fact',100_000,0,1000,true);
+    const f=e4Fixture(t,kind==='mechanism'?'field':'fact',100_000,1000,true);
     const action=kind==='awaiting-owner'?'need_owner':'cannot_answer';
     f.steps([kind==='interrupted' ? {exitCode:1,usage} : {research:{protocol:'$answerProtocol',requestId:'$requestId',action,
       questionIds:[f.batch.items[0]!.gap],reason:'A concrete external source is required',...(action==='need_owner'?{decision:'Choose the source'}:{})},usage}]);
@@ -277,7 +277,7 @@ test('14 H1.0a physical technical and control terminals keep their own diagnosti
 
 
 test('32 H1.0a direct assembly repeat restores a lost registry cursor without producing or paying twice',async t=>{
-  const f=e4Fixture(t,'node',100_000,0,1000,true);f.steps([{research:e4Node(f,f.packet as Revision<QuestionPacketRecord>),usage}]);
+  const f=e4Fixture(t,'node',100_000,1000,true);f.steps([{research:e4Node(f,f.packet as Revision<QuestionPacketRecord>),usage}]);
   const call=valueOf(await runModelCall(f.store,f.request));assert.ok(call.part);
   const request={project:f.project,results:[call.part.result]},write=f.store.writeMany.bind(f.store);
   let stopped=false;
@@ -300,7 +300,7 @@ test('32 H1.0a direct assembly repeat restores a lost registry cursor without pr
 
 
 test('34 H1.0a a completion ledger retains the exact journal context of a genuine mechanism origin analysis',async t=>{
-  const f=e4Fixture(t,'field',100_000,0,1000,true);
+  const f=e4Fixture(t,'field',100_000,1000,true);
   f.steps([{research:{protocol:'$answerProtocol',requestId:'$requestId',action:'cannot_answer',
     questionIds:[f.batch.items[0]!.gap],reason:'An external decision is required'},usage}]);
   valueOf(await runModelCall(f.store,f.request));
@@ -376,7 +376,7 @@ test('34 H1.0a a completion ledger retains the exact journal context of a genuin
 
 test('C31 H1.0b an applied source request can cease its continuation without a synthetic cycle terminal', async t => {
   const { writeCompletionCessation, readCompletionCessationAt } = await import('../src/om/model-call.js');
-  const f = e4Fixture(t, 'fact', 100_000, 0, 5000, true);
+  const f = e4Fixture(t, 'fact', 100_000, 5000, true);
   f.steps([{ research: e4NeedSource(f, [{ action: 'read', path: 'e4-source.txt', media: 'text/plain' }]), usage }]);
   const first = valueOf(await runModelCall(f.store, f.request)); assert.equal(first.outcome?.kind, 'need-source');
   const before = completionSnapshot(f), marker = first.record.value.om.completionOwner!;
@@ -399,7 +399,7 @@ test('C31 H1.0b an applied source request can cease its continuation without a s
 test('3 H1.0b equivalent configure after selected E1 preserves ordinary, cycle and continuation first claim', async t => {
   const { prepareCompletionCause, prepareCompletionCessation } = await import('../src/om/model-call.js');
   for (const mode of ['call', 'cycle', 'continuation'] as const) await t.test(mode, async child => {
-    const f = e4Fixture(child, 'fact', 100_000, 0, 5000, true);
+    const f = e4Fixture(child, 'fact', 100_000, 5000, true);
     let packet = f.packet;
     if (mode === 'continuation') {
       f.steps([{ research: e4NeedSource(f, [{ action: 'read', path: 'e4-source.txt', media: 'text/plain' }]), usage },
@@ -439,7 +439,7 @@ test('3 H1.0b equivalent configure after selected E1 preserves ordinary, cycle a
 
 
 test('35 H1.0b equivalent configuration grants no privilege to an unselected old candidate', t => {
-  const f = e4Fixture(t, 'fact', 100_000, 0, 5000, true), configured = f.environment();
+  const f = e4Fixture(t, 'fact', 100_000, 5000, true), configured = f.environment();
   const next = valueOf(writeQuestionPacket(f.store, { ...f.packetRequest, environment: reference(configured) })).record;
   const chosen = valueOf(recordCall(f.store, f.project, completionE1(f, next, configured)));
   f.environment(); f.restart(); const history = f.store.list();
@@ -452,7 +452,7 @@ test('35 H1.0b equivalent configuration grants no privilege to an unselected old
 
 
 test('H1.5 №2166 п.5 the direct transport is no way around E4: a registered E1 call of an ordinary question packet is refused by runModelTransport before any dispatch', async t => {
-  const f = e4Fixture(t, 'design', 100_000, 0, 5000, true);
+  const f = e4Fixture(t, 'design', 100_000, 5000, true);
   f.steps([{ research: h15CannotAnswer, usage }]);
   const payload = f.packet.value.packet as { requestId: string; purpose: 'model-design' | 'model-research'; questions: { id: string }[] };
   const attempt = f.series.value.attempts[0]!, assigned = new Set(payload.questions.map(question => question.id));

@@ -18,7 +18,7 @@ test('3 H1.0b staged ordinary roles agree at cessation, historical reading and p
     for (const changed of ['implementer', 'reviewer', 'both', 'common', 'none'] as const)
       for (const selected of (stage === 'claim' || stage === 'received' ? ['implementer', 'reviewer'] as const : [changed === 'implementer' ? 'reviewer' : 'implementer'] as const))
         await t.test(`${kind}/${stage}/${changed}/${selected}`, async child => {
-          const f = e4Fixture(child, kind, 100_000, 0, 5000, true);
+          const f = e4Fixture(child, kind, 100_000, 5000, true);
           f.steps([{ research: kind === 'fact' ? e4Fact(f) : e4Node(f), usage }]);
           const request = { ...f.request, role: selected };
           if (stage !== 'E2') valueOf(recordCall(f.store, f.project, completionE1(f)));

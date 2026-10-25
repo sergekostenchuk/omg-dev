@@ -3065,7 +3065,7 @@ test('MP1.1 rows 11–13: genuine E3 and delivered search are case-insensitive l
   for (const scope of ['path', 'source'] as const) await t.test(scope, async t => {
     const text = 'Alpha TWO Words\nA\nB\nA|B\nA.B\nA*B\nTwo separate words\n';
     let source!: Revision<any>;
-    const f = e4Fixture(t, 'node', 100_000, 0, 5000, true, true, false,
+    const f = e4Fixture(t, 'node', 100_000, 5000, true, true, false,
       (store: Store, project: string, root: string) => {
         writeFileSync(join(root, 'literal.txt'), text);
         source = new Evidence(store).file(project, 'literal', root, 'literal.txt', 'text/plain', 0);
@@ -3100,7 +3100,7 @@ test('MP1.1 rows 11–13: genuine E3 and delivered search are case-insensitive l
 });
 
 test('MP1.1 current managed correction → continuation → next part assembles in v2 and reopens without another send', async t => {
-  const f = e4Fixture(t, 'node', 100_000, 0, 5000, true, false);
+  const f = e4Fixture(t, 'node', 100_000, 5000, true, false);
   const whole = f.packet, capacity = packetWire(whole.value.packet) - 1, config = f.environment(capacity);
   const packetRequest = { ...f.packetRequest, environment: reference(config) };
   const packet = ok(writeQuestionPacket(f.store, packetRequest)).record;
@@ -3152,7 +3152,7 @@ test('MP1.1 current empty no-batch packet declares v2 and its cold read, prepare
 });
 
 test('MP1.1 current managed continuation keeps v2 across a compatible Environment revision in preparation and admission', async t => {
-  const f = e4Fixture(t, 'node', 100_000, 0, 5000, true), request = f.request;
+  const f = e4Fixture(t, 'node', 100_000, 5000, true), request = f.request;
   const binding = ok(readCompletionBinding(f.store, f.project, f.packetRequest.attempt!.series, f.packetRequest.attempt!.ordinal));
   assert.ok(binding); assert.deepEqual(binding.value.plan, { routes: reference(f.routes), batches: [f.batch.id] });
   f.steps([{ research: e4NeedSource(f, [{ action: 'read', path: 'e4-source.txt', media: 'text/plain' }]) }]);
@@ -3207,7 +3207,7 @@ function preparedSummary(result: OmResult<Sealed<{ record: Revision<QuestionPack
     writes: value.writes.map(write => ({ id: write.id, expected: write.expected, hash: hashJson(write.value) })) as unknown as Json };
 }
 test('PF5 current managed continuations derive each link once, preserve exact preparation and separate historical from current admission', async t => {
-  const f = e4Fixture(t, 'node', 100_000, 0, 5000, true);
+  const f = e4Fixture(t, 'node', 100_000, 5000, true);
   const binding = ok(readCompletionBinding(f.store, f.project, f.packetRequest.attempt!.series, f.packetRequest.attempt!.ordinal));
   assert.ok(binding);
   assert.deepEqual(binding.value.plan, { routes: reference(f.routes), batches: [f.batch.id] });

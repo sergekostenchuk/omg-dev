@@ -173,7 +173,7 @@ test('E4 control and malformed outcomes complete their attempt once, preserve un
     // LG07 (№10753 п.8): managed carriers — an attempt the managed E4 opens stays open until an explicit G7.
     // The need_owner line keeps one genuine no-progress ordinal through the paid managed prefix.
     const f = action === 'need_owner' ? await e4ManagedFixture(t, 'fact', { priorNoProgress: 1 })
-      : e4Fixture(t, 'fact', 100_000, 0, 1000, true), common = { protocol: '$answerProtocol', requestId: '$requestId', questionIds: [f.batch.items[0]!.gap] };
+      : e4Fixture(t, 'fact', 100_000, 1000, true), common = { protocol: '$answerProtocol', requestId: '$requestId', questionIds: [f.batch.items[0]!.gap] };
     f.steps([action === 'malformed' ? { research: { invalid: true }, usage }
       : action === 'process_failure' ? { rawStdout: '{broken', exitCode: 7 }
       : { research: { ...common, action, reason: 'Need a concrete source', ...(action === 'need_owner' ? { decision: 'Choose the source' } : {}) }, usage }]);
@@ -199,7 +199,7 @@ test('E4 control and malformed outcomes complete their attempt once, preserve un
 
 
 test('E4 cycle delivers all addressed read forms then answers once in the same attempt with immutable history', async t => {
-  const f = e4Fixture(t, 'fact', 100_000, 0, 5000, true), native = f.store.list('question').map(reference), originalInput = reference(f.input), originalGraph = reference(f.graph); // LG07: managed E4 carrier
+  const f = e4Fixture(t, 'fact', 100_000, 5000, true), native = f.store.list('question').map(reference), originalInput = reference(f.input), originalGraph = reference(f.graph); // LG07: managed E4 carrier
   const reads = [{ action: 'read', path: 'e4-source.txt', media: 'text/plain' },
     { action: 'read_source', source: reference(f.source), selector: { kind: 'text-range', start: 0, end: f.source.value.content.length } },
     { action: 'read_context', record: reference(f.input), pointer: '/input/questions/0/question' },
@@ -234,7 +234,7 @@ test('E4 cycle delivers all addressed read forms then answers once in the same a
 
 
 test('E4 no-progress preparation guards concurrent completion without a partial blocked packet or diagnostic', async t => {
-  const f = e4Fixture(t, 'fact', 100_000, 0, 1000, true), need = e4NeedSource(f, [{ action: 'read', path: 'e4-source.txt', media: 'text/plain' }]);
+  const f = e4Fixture(t, 'fact', 100_000, 1000, true), need = e4NeedSource(f, [{ action: 'read', path: 'e4-source.txt', media: 'text/plain' }]);
   f.steps([{ research: need }, { research: need }]);
   let packet = f.packet;
   let terminalRequest: QuestionPacketRequest | undefined;
@@ -268,7 +268,7 @@ test('E4 no-progress preparation guards concurrent completion without a partial 
 
 
 test('E4 cycle repeated unchanged reads refuse once while exact late replay adds no calls, deliveries or completions', async t => {
-  const f = e4Fixture(t, 'fact', 100_000, 0, 1000, true), read = { action: 'read', path: 'e4-source.txt', media: 'text/plain' };
+  const f = e4Fixture(t, 'fact', 100_000, 1000, true), read = { action: 'read', path: 'e4-source.txt', media: 'text/plain' };
   const need = e4NeedSource(f, [read, read]); f.steps([{ research: need }, { research: need }]);
   const cycle = valueOf(await runModelCycle(f.store, f.request));
   assert.equal(cycle.record.value.terminal, 'research-no-progress'); assert.ok(cycle.diagnostic);
@@ -289,7 +289,7 @@ test('E4 cycle repeated unchanged reads refuse once while exact late replay adds
 
 
 test('E4 cycle saves delivery overflow without a second dispatch or context truncation', async t => {
-  const f = e4Fixture(t, 'fact', 100_000, 0, 5000, true), config = f.environment(currentPacketWire(f.packet.value.packet) + 100); // LG07: managed E4 carrier
+  const f = e4Fixture(t, 'fact', 100_000, 5000, true), config = f.environment(currentPacketWire(f.packet.value.packet) + 100); // LG07: managed E4 carrier
   const packet = valueOf(writeQuestionPacket(f.store, { ...f.packetRequest, environment: reference(config) })).record;
   const request = { ...f.request, packet: reference(packet), dispatch: { ...f.request.dispatch, config: reference(config) } };
   writeFileSync(join(f.root, 'e4-source.txt'), 'UTF-8 '.repeat(20_000));
@@ -424,7 +424,7 @@ test('E4 analysis transport rejects another actual body and stale fresh-dispatch
 
 test('E4 cycle refuses missing coverage and conflicting definitions without accepting a partial node', async t => {
   for (const issue of ['coverage', 'conflict'] as const) {
-    const f = e4Fixture(t, 'node', 100_000, 0, 5000, true), config = f.environment(currentPacketWire(f.packet.value.packet) - 1); // LG07: managed E4 carrier
+    const f = e4Fixture(t, 'node', 100_000, 5000, true), config = f.environment(currentPacketWire(f.packet.value.packet) - 1); // LG07: managed E4 carrier
     const packet = valueOf(writeQuestionPacket(f.store, { ...f.packetRequest, environment: reference(config) })).record;
     assert.equal(packet.value.plan!.mode, 'parts'); assert.ok(packet.value.plan!.assignments.length > 1);
     const answers = packet.value.plan!.assignments.map((_, position) => e4Node(f, { ...packet,
@@ -482,7 +482,7 @@ test('E4 public persistence paths reject absent or malformed requests before rea
 test('E4 control completion cannot replace an outcome saved after the control response was received', async t => {
   // LG07: managed carrier — the competing completion is a lawful explicit G7 from a second Store over the same
   // database (the received refusal already proves the registry complete), not the retired standalone close.
-  const f = e4Fixture(t, 'fact', 100_000, 0, 1000, true);
+  const f = e4Fixture(t, 'fact', 100_000, 1000, true);
   f.steps([{ research: { protocol: '$answerProtocol', requestId: '$requestId', questionIds: [f.batch.items[0]!.gap],
     action: 'cannot_answer', reason: 'The requested information is unavailable' }, usage }]);
   const writeMany = f.store.writeMany.bind(f.store); let completed: Revision<unknown> | null = null;
@@ -518,7 +518,7 @@ test('E4 control completion cannot replace an outcome saved after the control re
 
 test('E4 restarts every durable cycle prefix with one physical send and one settlement for content and cannot_answer', async t => {
   for (const action of ['fact', 'cannot_answer'] as const) {
-    const baseline = e4Fixture(t, 'fact', 100_000, 0, 1000, true);
+    const baseline = e4Fixture(t, 'fact', 100_000, 1000, true);
     baseline.steps([{ research: action === 'fact' ? e4Fact(baseline) : e4CannotAnswer(baseline), usage }]);
     const baselineWrite = baseline.store.writeMany.bind(baseline.store), actualPhases: CycleCommitPhase[] = [];
     baseline.store.writeMany = ((writes, guards) => {
@@ -532,7 +532,7 @@ test('E4 restarts every durable cycle prefix with one physical send and one sett
     // at the authorized boundary is exercised by the driver/provider recovery tests below.
     for (const stopAfter of cycleCommitPhases.filter(phase => phase !== 'authorized')) {
       await t.test(`${action}: durable ${stopAfter}`, async nested => {
-        const f = e4Fixture(nested, 'fact', 100_000, 0, 1000, true);
+        const f = e4Fixture(nested, 'fact', 100_000, 1000, true);
         f.steps([{ research: action === 'fact' ? e4Fact(f) : e4CannotAnswer(f), usage }]);
         const writeMany = f.store.writeMany.bind(f.store), phases: CycleCommitPhase[] = [];
         let stopped = false;
@@ -615,7 +615,7 @@ test('E4 restarts every durable cycle prefix with one physical send and one sett
 test('E4 resumes saved source deliveries and continuation packets before content or cannot_answer without duplicate sources or sends', async t => {
   for (const action of ['fact', 'cannot_answer'] as const) for (const stopAfter of ['source', 'deliveries', 'continuation'] as const) {
     await t.test(`${action}: durable ${stopAfter}`, async nested => {
-      const f = e4Fixture(nested, 'fact', 100_000, 0, 1000, true);
+      const f = e4Fixture(nested, 'fact', 100_000, 1000, true);
       const read = { action: 'read', path: 'e4-source.txt', media: 'text/plain' };
       f.steps([{ research: e4NeedSource(f, [read]), usage },
         { research: action === 'fact' ? e4Fact(f) : e4CannotAnswer(f), usage }]);
@@ -668,7 +668,7 @@ test('E4 restarts a later node part after receipt or application and assembles o
   for (const action of ['node', 'cannot_answer'] as const) for (const stopAfter of ['received', 'applied', 'settled', 'assembly'] as const) {
     if (stopAfter === 'assembly' && action === 'cannot_answer') continue;
     await t.test(`${action}: later part ${stopAfter}`, async nested => {
-      const f = e4Fixture(nested, 'node', 100_000, 0, 1000, true), config = f.environment(currentPacketWire(f.packet.value.packet) - 1);
+      const f = e4Fixture(nested, 'node', 100_000, 1000, true), config = f.environment(currentPacketWire(f.packet.value.packet) - 1);
       const packet = valueOf(writeQuestionPacket(f.store, { ...f.packetRequest, environment: reference(config) })).record;
       assert.equal(packet.value.state, 'ready'); assert.equal(packet.value.plan!.mode, 'parts');
       const total = packet.value.plan!.assignments.length; assert.ok(total > 1);
@@ -727,7 +727,7 @@ test('E4 restarts a later node part after receipt or application and assembles o
 test('E4 public recovery closes a truly lost pre-spawn owner for products and analysis without sending or inventing usage', async t => {
   for (const purpose of ['fact', 'node', 'stop-analysis', 'origin-analysis'] as const) await t.test(purpose, async nested => {
     const product = purpose === 'fact' || purpose === 'node';
-    const f = product ? e4Fixture(nested, purpose, 100_000, 0, 30_000, true) : await e4ManagedAnalysisFixture(nested, purpose, 30_000);
+    const f = product ? e4Fixture(nested, purpose, 100_000, 30_000, true) : await e4ManagedAnalysisFixture(nested, purpose, 30_000);
     ensureFixtureProject(f.store, f.project);
     const checkpoint = join(f.root, 'claimed.json');
     const research = product ? (purpose === 'fact' ? e4Fact(f as ReturnType<typeof e4Fixture>) : e4Node(f as ReturnType<typeof e4Fixture>))
@@ -811,7 +811,7 @@ test('E4 public recovery closes a truly lost pre-spawn owner for products and an
 test('E4 actual owner and provider loss recover both product calls and analysis purposes through the public command', async t => {
   for (const purpose of ['fact', 'node', 'stop-analysis', 'origin-analysis'] as const) await t.test(purpose, async nested => {
     const product = purpose === 'fact' || purpose === 'node';
-    const f = product ? e4Fixture(nested, purpose, 100_000, 0, 30_000, true) : await e4ManagedAnalysisFixture(nested, purpose, 30_000);
+    const f = product ? e4Fixture(nested, purpose, 100_000, 30_000, true) : await e4ManagedAnalysisFixture(nested, purpose, 30_000);
     ensureFixtureProject(f.store, f.project);
     const checkpoint = join(f.root, 'provider.json');
     const research = product ? (purpose === 'fact' ? e4Fact(f as ReturnType<typeof e4Fixture>) : e4Node(f as ReturnType<typeof e4Fixture>))
@@ -882,7 +882,7 @@ test('E4 actual owner and provider loss recover both product calls and analysis 
 
 
 test('E4 competing public recoveries commit one terminal product transition and one A3 outcome', async t => {
-  const f = e4Fixture(t, 'fact', 100_000, 0, 30_000, true), checkpoint = join(f.root, 'claimed-race.json');
+  const f = e4Fixture(t, 'fact', 100_000, 30_000, true), checkpoint = join(f.root, 'claimed-race.json');
   f.steps([{ research: e4Fact(f), usage }]);
   const driver = fixtureDriver(t, f.database, f.root, 'call', f.request,
     { path: checkpoint, kind: 'model-call', matches: [{ path: ['execution', 'phase'], value: 'claimed' }] });
@@ -920,7 +920,7 @@ test('E4 competing public recoveries commit one terminal product transition and 
 
 
 test('E4 records real local supplier death while its owner survives as one interrupted MC2 attempt', async t => {
-  const f = e4Fixture(t, 'node', 100_000, 0, 30_000, true), checkpoint = join(f.root, 'child-only.json');
+  const f = e4Fixture(t, 'node', 100_000, 30_000, true), checkpoint = join(f.root, 'child-only.json');
   f.steps([{ research: e4Node(f), usage, pauseAfterRequest: checkpoint }]);
   const driver = fixtureDriver(t, f.database, f.root, 'call', f.request);
   const paused = await fixtureCheckpoint(checkpoint, driver.child);
@@ -958,7 +958,7 @@ test('E4 records real local supplier death while its owner survives as one inter
 test('E4 owner loss after spawn but before authorization proves no request transfer without claiming supplier termination', async t => {
   for (const purpose of ['fact', 'stop-analysis'] as const) await t.test(purpose, async nested => {
     const product = purpose === 'fact';
-    const f = product ? e4Fixture(nested, 'fact', 100_000, 0, 30_000, true) : await e4ManagedAnalysisFixture(nested, 'stop-analysis', 30_000);
+    const f = product ? e4Fixture(nested, 'fact', 100_000, 30_000, true) : await e4ManagedAnalysisFixture(nested, 'stop-analysis', 30_000);
     ensureFixtureProject(f.store, f.project);
     const checkpoint = join(f.root, 'spawned-uncommitted.json');
     const research = product ? e4Fact(f as ReturnType<typeof e4Fixture>) : { cause: 'Authorization not committed', hypothesis: true };
@@ -994,7 +994,7 @@ test('E4 owner loss after spawn but before authorization proves no request trans
 test('E4 failed dispatch authorization preserves a terminal physical outcome without transmitting for both transports', async t => {
   for (const purpose of ['fact', 'stop-analysis'] as const) await t.test(purpose, async nested => {
     const product = purpose === 'fact';
-    const f = product ? e4Fixture(nested, 'fact', 100_000, 0, 1000, true) : await e4ManagedAnalysisFixture(nested, 'stop-analysis');
+    const f = product ? e4Fixture(nested, 'fact', 100_000, 1000, true) : await e4ManagedAnalysisFixture(nested, 'stop-analysis');
     const exchangeCount = f.store.list('om-model-exchange').length, writeMany = f.store.writeMany.bind(f.store);
     f.store.writeMany = ((writes, guards) => {
       if (writes.some(write => write.kind === 'model-call'
@@ -1030,7 +1030,7 @@ test('E4 failed dispatch authorization preserves a terminal physical outcome wit
 
 
 test('C13 H1.0a G7 racing cycle registration retries as closed cursor recovery', async t => {
-  const f = e4Fixture(t, 'fact', 100_000, 0, 5000, true);
+  const f = e4Fixture(t, 'fact', 100_000, 5000, true);
   f.steps([{ research: { bad: true }, usage }]);
   valueOf(await runModelCall(f.store, f.request));
   const work = completionSnapshot(f);
@@ -1062,7 +1062,7 @@ test('C13 H1.0a G7 racing cycle registration retries as closed cursor recovery',
 
 test('15 H1.0a exact no-progress, blocked successor and invalid assembly discharge their root without local A3', async t => {
   for (const terminal of ['research-no-progress', 'blocked', 'parts-invalid'] as const) await t.test(terminal, async t => {
-    const f = e4Fixture(t, terminal === 'parts-invalid' ? 'node' : 'fact', 100_000, 0, 1000, true);
+    const f = e4Fixture(t, terminal === 'parts-invalid' ? 'node' : 'fact', 100_000, 1000, true);
     let request = f.request;
     if (terminal === 'parts-invalid') {
       const config = f.environment(currentPacketWire(f.packet.value.packet) - 1);
@@ -1101,7 +1101,7 @@ test('15 H1.0a exact no-progress, blocked successor and invalid assembly dischar
 
 
 test('C09 H1.0a a current-only assembly admission failure cannot manufacture a historical parts-invalid terminal',async t=>{
-  const f=e4Fixture(t,'node',100_000,0,1000,true);f.steps([{research:e4Node(f,f.packet as Revision<QuestionPacketRecord>),usage}]);
+  const f=e4Fixture(t,'node',100_000,1000,true);f.steps([{research:e4Node(f,f.packet as Revision<QuestionPacketRecord>),usage}]);
   valueOf(await runModelCall(f.store,f.request));
   const graph=f.store.get<Graph>(`graph:${f.project}`)!;
   new ProductEngine(f.store).graphs.save(f.project,graph.value,graph.revision,'fixture graph source refresh');
@@ -1117,7 +1117,7 @@ test('C09 H1.0a a current-only assembly admission failure cannot manufacture a h
 
 test('10 H1.0a exact late paid bytes settle one recovered dispatch after G7 without changing its terminal or completion',async t=>{
   const {spendReport}=await import('../src/om/spend-report.js');
-  const f=e4Fixture(t,'fact',100_000,0,30_000,true),checkpoint=join(f.root,'managed-late.json');
+  const f=e4Fixture(t,'fact',100_000,30_000,true),checkpoint=join(f.root,'managed-late.json');
   ensureFixtureProject(f.store,f.project);f.steps([{research:e4Fact(f),usage}]);
   const driver=fixtureDriver(t,f.database,f.root,'call',f.request,{path:checkpoint,kind:'om-model-exchange',matches:[],when:'before'});
   const pending=await fixtureCheckpoint(checkpoint,driver.child);
@@ -1142,7 +1142,7 @@ test('10 H1.0a exact late paid bytes settle one recovered dispatch after G7 with
 
 
 test('33 H1.0b CAS loss leaves a received response retryable without irreversible refusal or another physical expense', async t => {
-  const f = e4Fixture(t, 'fact', 100_000, 0, 5000, true); f.steps([{ research: e4Fact(f), usage }]);
+  const f = e4Fixture(t, 'fact', 100_000, 5000, true); f.steps([{ research: e4Fact(f), usage }]);
   const write = f.store.writeMany.bind(f.store); let conflict = false;
   f.store.writeMany = ((writes, guards) => {
     if (!conflict && writes.some(row => row.kind === 'model-call' && (row.value as OmModelCall).om?.application === 'applied')) {
@@ -1178,7 +1178,7 @@ test('33 H1.0b CAS loss leaves a received response retryable without irreversibl
 
 test('C28 H1.0b selected continuation uses one compatible admission before E2, direct E1 and cycle', async t => {
   for (const stage of ['before-E2', 'before-E1', 'cycle', 'E2-race', 'E1-race'] as const) await t.test(stage, async child => {
-    const f = e4Fixture(child, 'fact', 100_000, 0, 5000, true);
+    const f = e4Fixture(child, 'fact', 100_000, 5000, true);
     f.steps([{ research: e4NeedSource(f, [{ action: 'read', path: 'e4-source.txt', media: 'text/plain' }]), usage },
       { research: e4Fact(f), usage }]);
     const first = valueOf(await runModelCall(f.store, f.request));
@@ -1303,7 +1303,7 @@ test('S1.1 (№2012) the pending overlay of E4 is frozen only over proved reads:
 
 
 test('H1.5 №2164 E4 sends nothing for a design-decision answer batch: a ready packet is no right to pay, so runModelCall refuses before E1, the claim and the authorization', async t => {
-  const f = e4Fixture(t, 'design', 100_000, 0, 5000, true);
+  const f = e4Fixture(t, 'design', 100_000, 5000, true);
   assert.equal(f.packet.value.state, 'ready', 'E2 still calls the packet ready: the prohibition stands in E4');
   assert.deepEqual([f.batch.model, f.batch.task, f.batch.items.map(item => item.field)], ['MC2', 'input-field', ['answer']]);
   // The reviewer's probe (№2164): no producer of the pass answers it, so paying buys nothing; a later question is no

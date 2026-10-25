@@ -229,7 +229,7 @@ test('E4 analysis transport sends both real E1 purposes, preserves opaque A6 dat
 
 
 test('3 H1.0a managed opening fixes the complete root before E1 and MC1 reveals unpaid fact children without closing A3', async t => {
-  const f = e4Fixture(t, 'fact', 100_000, 0, 1000, true);
+  const f = e4Fixture(t, 'fact', 100_000, 1000, true);
   const binding = valueOf(readCompletionBinding(f.store, f.project, reference(f.series), 1));
   assert.ok(binding);
   const id = completionWorkId(f.project, binding.id);
@@ -292,8 +292,8 @@ test('C39 H1.0a technical diagnostics retain the stop and a real independent A6 
 
 
 test('C31 H1.0b equivalent configuration preserves the next exact MC2 part before its E1', async t => {
-  const measured = e4Fixture(t, 'node', 100_000, 0, 5000);
-  const f = e4Fixture(t, 'node', currentPacketWire(measured.packet.value.packet) - 1, 0, 5000, true);
+  const measured = e4Fixture(t, 'node', 100_000, 5000);
+  const f = e4Fixture(t, 'node', currentPacketWire(measured.packet.value.packet) - 1, 5000, true);
   assert.ok(f.packet.value.plan!.assignments.length > 1);
   const firstBody = e4Node(f); f.steps([{ research: firstBody, usage }]);
   const first = valueOf(await runModelCall(f.store, f.request)); assert.ok(first.part);
@@ -353,7 +353,7 @@ test('S1.1 the basis of a rejected application is collected through the common t
 
 
 test('H1.5 №2164 E4 sends nothing for a design-decision answer batch through runModelCycle either, the reviewer role included', async t => {
-  const f = e4Fixture(t, 'design', 100_000, 0, 5000, true);
+  const f = e4Fixture(t, 'design', 100_000, 5000, true);
   f.steps([{ research: h15CannotAnswer, usage }, { research: h15CannotAnswer, usage }]);
   const before = h15Heads(f.store);
   for (const request of [f.request, { ...f.request, role: 'reviewer' as const }]) {
@@ -372,7 +372,7 @@ test('H1.5 №2164 E4 sends nothing for a design-decision answer batch through r
 
 test('LP3 current blocked continuation resumes after call, deliveries, continuation or diagnostic with one paid call and exact replay', async t => {
   for (const stop of ['call', 'deliveries', 'continuation', 'diagnostic'] as const) await t.test('blocked after ' + stop, async t => {
-    const f = e4Fixture(t, 'fact', 100_000, 0, 5000, true);
+    const f = e4Fixture(t, 'fact', 100_000, 5000, true);
     const config = f.environment(currentPacketWire(f.packet.value.packet) + 100);
     const packetRequest = { ...f.packetRequest, environment: reference(config) };
     const packet = valueOf(writeQuestionPacket(f.store, packetRequest)).record;
@@ -579,7 +579,7 @@ test('MP3 row 18 (MP2 correction after reads): the next part carries the reads o
 
 
 test('PF3.1 rows 1, 33, 34: completion-effective is one derivation per exact closure — empty and non-empty additions, a repeat in this and the next operation, the real work and guards; a malformed closure is refused again, never normalized by its key', async t => {
-  const f = e4Fixture(t, 'fact', 100_000, 0, 1000, true);
+  const f = e4Fixture(t, 'fact', 100_000, 1000, true);
   const binding = valueOf(readCompletionBinding(f.store, f.project, reference(f.series), 1))!;
   const id = completionWorkId(f.project, binding.id);
   f.steps([{ research: e4Fact(f), usage }]);

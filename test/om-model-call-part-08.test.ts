@@ -34,7 +34,7 @@ import { MP3_EMPTY_SEARCH, MP3_NOTES, completionE1, completionSnapshot, currentP
 
 
 test('E4 mechanism field dispatch applies E3 decisions through D3 and does not manufacture accepted progress', async t => {
-  const f = e4Fixture(t, 'field', 100_000, 0, 5000, true);
+  const f = e4Fixture(t, 'field', 100_000, 5000, true);
   f.steps([{ research: { protocol: '$answerProtocol', requestId: '$requestId', action: 'answer',
     results: f.batch.items.map(item => ({ target: item.target, field: item.field, basis: item.record,
       value: { consumer: 'garden-consume-block', kind: 'repository-fact' } })) } }]);
@@ -51,7 +51,7 @@ test('E4 mechanism field dispatch applies E3 decisions through D3 and does not m
 
 
 test('E4 physical receipt survives an application CAS loss; a competing close is refused over the unfinished work', async t => {
-  const f = e4Fixture(t, 'node', 100_000, 0, 5000, true); f.steps([{ research: e4Node(f), usage }]);
+  const f = e4Fixture(t, 'node', 100_000, 5000, true); f.steps([{ research: e4Node(f), usage }]);
   const writeMany = f.store.writeMany.bind(f.store); let changed = false; const closed: ReturnType<typeof closeAttempt>[] = [];
   const seriesBefore = f.store.get(f.series.id)!;
   f.store.writeMany = ((writes, guards) => {
@@ -121,7 +121,7 @@ test('E4 physical receipt survives an application CAS loss; a competing close is
 test('E4 retains actual late transport evidence after lost-owner recovery and accounts it once for product and analysis', async t => {
   for (const purpose of ['fact', 'stop-analysis'] as const) await t.test(purpose, async nested => {
     const product = purpose === 'fact';
-    const f = product ? e4Fixture(nested, 'fact', 100_000, 0, 30_000, true) : await e4ManagedAnalysisFixture(nested, 'stop-analysis', 30_000);
+    const f = product ? e4Fixture(nested, 'fact', 100_000, 30_000, true) : await e4ManagedAnalysisFixture(nested, 'stop-analysis', 30_000);
     ensureFixtureProject(f.store, f.project);
     const checkpoint = join(f.root, 'late-receipt.json');
     const research = product ? e4Fact(f as ReturnType<typeof e4Fixture>) : { cause: 'Received local analysis evidence', hypothesis: true };
@@ -174,7 +174,7 @@ test('E4 retains actual late transport evidence after lost-owner recovery and ac
 
 test('20 H1.0b exact MC2 remainder cessation preserves produced parts and blocks materialization without hiding siblings', async t => {
   const { prepareCompletionCessation, writeCompletionCessation, readCompletionCessationAt } = await import('../src/om/model-call.js');
-  const measured = e4Fixture(t, 'node', 100_000, 0, 5000, true, true, true), f = e4Fixture(t, 'node', currentPacketWire(measured.packet.value.packet) - 1, 0, 5000, true, true, true);
+  const measured = e4Fixture(t, 'node', 100_000, 5000, true, true, true), f = e4Fixture(t, 'node', currentPacketWire(measured.packet.value.packet) - 1, 5000, true, true, true);
   assert.ok(f.packet.value.plan!.assignments.length > 1);
   f.steps([{ research: e4Node(f), usage }]);
   const first = valueOf(await runModelCall(f.store, f.request)); assert.ok(first.part);
@@ -214,7 +214,7 @@ test('20 H1.0b exact MC2 remainder cessation preserves produced parts and blocks
 
 
 test('35 H1.0b a racing different E1 choice writes exactly one plan and one unpaid call', t => {
-  const f = e4Fixture(t, 'fact', 100_000, 0, 5000, true), write = f.store.writeMany.bind(f.store);
+  const f = e4Fixture(t, 'fact', 100_000, 5000, true), write = f.store.writeMany.bind(f.store);
   let raced = false, winning: ReturnType<typeof completionE1> | null = null;
   f.store.writeMany = ((writes, guards) => {
     if (!raced && writes.some(row => row.kind === 'call-record')) {
@@ -242,7 +242,7 @@ test('35 H1.0b a racing different E1 choice writes exactly one plan and one unpa
 test('4 H1.0b changed preclaim Environment is a proved cause while corrupt replacement is an integrity refusal', async t => {
   const { prepareCompletionCause, writeCompletionCessation } = await import('../src/om/model-call.js');
   for (const kind of ['changed', 'corrupt'] as const) await t.test(kind, async child => {
-    const f = e4Fixture(child, 'fact', 100_000, 0, 5000, true);
+    const f = e4Fixture(child, 'fact', 100_000, 5000, true);
     const selected = valueOf(recordCall(f.store, f.project, completionE1(f))), work = completionSnapshot(f);
     const part = work.assignments.find(row => row.value.kind === 'part')!;
     if (kind === 'changed') f.environment(90_000);
@@ -265,7 +265,7 @@ test('4 H1.0b changed preclaim Environment is a proved cause while corrupt repla
 
 test('C31 H1.0b restored compatible environment cannot materialize or register a ceased continuation', async t => {
   const { writeCompletionCessation } = await import('../src/om/model-call.js');
-  const f = e4Fixture(t, 'fact', 100_000, 0, 5000, true);
+  const f = e4Fixture(t, 'fact', 100_000, 5000, true);
   f.steps([{ research: e4NeedSource(f, [{ action: 'read', path: 'e4-source.txt', media: 'text/plain' }]), usage }]);
   const first = valueOf(await runModelCall(f.store, f.request));
   const delivery = valueOf(deliverModelSources(f.store, { project: f.project, packet: f.request.packet, call: first.call, response: first.response! }));
@@ -291,7 +291,7 @@ test('C31 H1.0b restored compatible environment cannot materialize or register a
 
 
 test('MP1 field examples pass the genuine E3 parser with exact gap labels and permitted field values', t => {
-  const f = e4Fixture(t, 'field', 100_000, 0, 5000, true);
+  const f = e4Fixture(t, 'field', 100_000, 5000, true);
   const payload = f.packet.value.packet as Record<string, any>;
   assert.ok(payload.brief.examples.some((example: { action: string }) => example.action === 'answer'));
   const before = JSON.stringify(f.store.list());
@@ -324,7 +324,7 @@ test('MP2 (№2968 row 17) a correction that does not fit is the old blocked suc
 
 test('MP2 (№2968 regression 4) the one correction for an MC1 fact and for input fields: an unissued label is corrected once; the corrected fact still awaits its E5 assessment, the corrected fields are applied', async t => {
   await t.test('MC1 fact', async t => {
-    const f = e4Fixture(t, 'fact', 100_000, 0, 1000, true);
+    const f = e4Fixture(t, 'fact', 100_000, 1000, true);
     const refused = e4Fact(f); refused.results = refused.results.map(row => ({ ...row, questionId: 'Q999' }));
     f.steps([{ research: refused }, { research: e4Fact(f) }]);
     const cycle = valueOf(await mp2Cycle(f.store, f.request));
@@ -336,7 +336,7 @@ test('MP2 (№2968 regression 4) the one correction for an MC1 fact and for inpu
     assert.ok(facts.length > 0 && facts.every(row => !snapshot.resolved.some(ref => ref.id === row.id)), 'The fact still awaits E5; E3 is no assessment');
   });
   await t.test('input fields', async t => {
-    const f = e4Fixture(t, 'field', 100_000, 0, 1000, true);
+    const f = e4Fixture(t, 'field', 100_000, 1000, true);
     const answer = (basis: (item: typeof f.batch.items[number]) => unknown) => ({ protocol: '$answerProtocol', requestId: '$requestId', action: 'answer',
       results: f.batch.items.map(item => ({ target: item.target, field: item.field, basis: basis(item), value: { consumer: 'garden-consume-block', kind: 'repository-fact' } })) });
     f.steps([{ research: answer(() => 'G999') }, { research: answer(item => item.record) }]);
@@ -355,9 +355,9 @@ test('OBL1 №3773 five reads that each fit alone but not together: the continua
   const material = (store: Store, project: string) => {
     new Evidence(store).document(project, 'large-json', JSON.stringify(Object.fromEntries(Array.from({ length: 5 }, (_, i) => [`field${i}`, String(i).repeat(size)]))), 'application/json', 0);
   };
-  const measured = e4Fixture(t, 'fact', 100_000, 0, 5000, true, true, false, material);
+  const measured = e4Fixture(t, 'fact', 100_000, 5000, true, true, false, material);
   const capacity = currentPacketWire(measured.packet.value.packet) + 2 * size;
-  const f = e4Fixture(t, 'fact', capacity, 0, 5000, true, true, false, material);
+  const f = e4Fixture(t, 'fact', capacity, 5000, true, true, false, material);
   const source = f.store.get<Source>(`source:${f.project}:large-json`)!;
   const reads = Array.from({ length: 5 }, (_, i) => ({ action: 'read_source', source: reference(source), selector: { kind: 'json-pointer', pointer: `/field${i}` } }));
   f.steps([{ research: e4NeedSource(f, reads), usage }, { research: e4Fact(f), usage }]);

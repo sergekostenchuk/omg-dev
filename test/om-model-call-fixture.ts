@@ -163,7 +163,7 @@ export function e4Prefix(store: Store, kind: 'fact' | 'node' | 'field' | 'design
 
 
 
-export function e4Fixture(t: TestContext, kind: 'fact' | 'node' | 'field' | 'design' = 'fact', capacity = 100_000, priorNoProgress = 0, timeoutMs = 1000, managed = false, materialize = true, extraQuestion = false,
+export function e4Fixture(t: TestContext, kind: 'fact' | 'node' | 'field' | 'design' = 'fact', capacity = 100_000, timeoutMs = 1000, managed = false, materialize = true, extraQuestion = false,
   material?: (store: Store, project: string, root: string) => void, priorRefused = false) {
   // M5 addresses the fact for 'fact' and 'node' alike; 'field' leaves it unaddressed.
   const extra = extraQuestion || kind === 'design';
@@ -198,15 +198,11 @@ export function e4Fixture(t: TestContext, kind: 'fact' | 'node' | 'field' | 'des
   const firstLine = kind === 'field' ? { ...address, scope: gapRequest, predecessor: null, basis: null }
     : { ...address, slice: 'e4-fixture', predecessor: null, basis: null };
   valueOf(openSeries(store, firstLine as never));
-  for (let attempt = 1; attempt <= priorNoProgress; attempt++) {
-    valueOf(beginAttempt(store, kind === 'field' ? { ...address, attempt, goal, admission } as never : { ...address, attempt, goal } as never));
-    valueOf(completeAttempt(store, { ...address, attempt, outcome: { reason: 'result', achieved: [], cancelled: [], refusals: [] } } as never));
-  }
   // MP2 (№3153): the preceding attempt refused by the model itself (its E2 packet, E1 and the common E4 finish), so the
   // packets of the next attempt stand on a non-empty refusal journal.
   if (priorRefused) {
     assert.equal(kind, 'node');
-    const attempt = priorNoProgress + 1, refused = valueOf(beginAttempt(store, { ...address, attempt, goal } as never));
+    const attempt = 1, refused = valueOf(beginAttempt(store, { ...address, attempt, goal } as never));
     const packet = valueOf(writeQuestionPacket(store, { project, routes: reference(routes), batch: batch.id, environment: reference(configured),
       attempt: { series: reference(refused), ordinal: attempt }, previous: [] })).record;
     const payload = packet.value.packet as Record<string, Json>, assigned = new Set((payload.questions as { id: string }[]).map(item => item.id));
@@ -217,7 +213,7 @@ export function e4Fixture(t: TestContext, kind: 'fact' | 'node' | 'field' | 'des
     valueOf(finishModelAttempt(store, { project, packet: reference(packet), call: reference(call), response: null,
       code: 'cannot_answer', message: 'The node needs another design', reason: 'refused' }));
   }
-  const ordinal = priorNoProgress + (priorRefused ? 2 : 1);
+  const ordinal = priorRefused ? 2 : 1;
   const opening = { ...address, attempt: ordinal, goal, ...(kind === 'field' ? { admission } : {}),
     ...(managed ? { completion: { routes: reference(routes), batches: [batch.id] } } : {}) };
   const series = valueOf((managed ? managedOpenAttempt : beginAttempt)(store, opening as never));
@@ -276,7 +272,7 @@ async function payNoProgress(f: ManagedE4Fixture, script: Record<string, unknown
 }
 
 /**
- * Opt-in current carrier. The synchronous e4Fixture (including its old prefix flags) retains its era/defaults.
+ * Opt-in current carrier. The synchronous e4Fixture retains its era/defaults.
  * Each prior ordinal here owns the complete M6 batch, pays its real E4 work and closes at G7. Prefix calls remain
  * in sent()/the ledger; callers take their baseline after this preparation and attribute their own calls by Ref.
  */
@@ -287,7 +283,7 @@ export async function e4ManagedFixture(t: TestContext, kind: Parameters<typeof e
   const count = options.priorNoProgress ?? 0;
   assert.ok(Number.isSafeInteger(count) && count >= 0 && count + Number(options.priorRefused ?? false) < 3,
     'A current attempt must precede the first-rung stop');
-  const f: ManagedE4Fixture = e4Fixture(t, kind, options.capacity ?? 100_000, 0, options.timeoutMs ?? 5000, true, true,
+  const f: ManagedE4Fixture = e4Fixture(t, kind, options.capacity ?? 100_000, options.timeoutMs ?? 5000, true, true,
     options.extraQuestion ?? false, options.material);
   const script: Record<string, unknown>[] = [], prefix: Ref[] = [];
   const next = () => {
@@ -697,7 +693,7 @@ export function mp2Step(f: ReturnType<typeof e4Fixture>, step: { record: Ref }) 
 }
 
 
-export const mp2Managed = (t: TestContext, capacity = 100_000, retry = false) => e4Fixture(t, 'node', capacity, 0, 1000, true, true, false, undefined, retry);
+export const mp2Managed = (t: TestContext, capacity = 100_000, retry = false) => e4Fixture(t, 'node', capacity, 1000, true, true, false, undefined, retry);
 
 
 
@@ -730,7 +726,7 @@ export const MP3_LARGE = 'Large carried line.\n'.repeat(3000);
 
 
 export function mp3Cycle(t: TestContext, kind: 'fact' | 'node' = 'fact', capacity = 100_000, managed = false) {
-  const f = e4Fixture(t, kind, capacity, 0, 5000, managed, true, false, mp3Material);
+  const f = e4Fixture(t, kind, capacity, 5000, managed, true, false, mp3Material);
   return mp3Materials(f);
 }
 

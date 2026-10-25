@@ -24,7 +24,7 @@ import { MP3_NOTES, MP3_SCOPES, completionSnapshot, currentPacketWire, e4CannotA
 
 test('E4 current admission blocks stale packets, mismatched configs and masqueraded adapters without spawning', async t => {
   for (const change of ['stale', 'config', 'adapter'] as const) {
-    const f = e4Fixture(t, 'fact', 100_000, 0, 5000, true); f.steps([{ research: e4Fact(f) }]);
+    const f = e4Fixture(t, 'fact', 100_000, 5000, true); f.steps([{ research: e4Fact(f) }]);
     const request = structuredClone(f.request);
     if (change === 'stale') f.environment();
     else if (change === 'config') request.dispatch = { ...request.dispatch, config: reference(f.environment()) };
@@ -37,7 +37,7 @@ test('E4 current admission blocks stale packets, mismatched configs and masquera
 
 
 test('E4 narrowing the questions of an unchanged source read does not manufacture progress', async t => {
-  const f = e4Fixture(t, 'node', 100_000, 0, 5000, true);
+  const f = e4Fixture(t, 'node', 100_000, 5000, true);
   const need = e4NeedSource(f, [{ action: 'read', path: 'e4-source.txt', media: 'text/plain' }]);
   assert.ok(need.questionIds.length > 1);
   f.steps([{ research: need }, { research: { ...need, questionIds: need.questionIds.slice(0, 1) } }]);
@@ -49,7 +49,7 @@ test('E4 narrowing the questions of an unchanged source read does not manufactur
 
 
 test('E4 cycle assembles all node parts after a source continuation with exact coverage and no hidden final call', async t => {
-  const f = e4Fixture(t, 'node', 100_000, 0, 5000, true), config = f.environment(currentPacketWire(f.packet.value.packet) - 1);
+  const f = e4Fixture(t, 'node', 100_000, 5000, true), config = f.environment(currentPacketWire(f.packet.value.packet) - 1);
   const packet = valueOf(writeQuestionPacket(f.store, { ...f.packetRequest, environment: reference(config) })).record;
   assert.equal(packet.value.state, 'ready'); assert.equal(packet.value.plan!.mode, 'parts');
   const total = packet.value.plan!.assignments.length;
@@ -77,7 +77,7 @@ test('E4 cycle replay accounts a late receipt once before or after the cycle is 
   for (const kind of ['fact', 'node'] as const) for (const timing of ['before-cycle', 'after-cycle'] as const) {
     const replayPaths = kind === 'fact' && timing === 'after-cycle' ? ['cycle', 'public-recovery'] as const : ['cycle'] as const;
     for (const replayPath of replayPaths) await t.test(`${kind}: ${timing} via ${replayPath}`, async nested => {
-      const f = e4Fixture(nested, kind, 100_000, 0, 30_000, true), checkpoint = join(f.root, 'late-cycle.json');
+      const f = e4Fixture(nested, kind, 100_000, 30_000, true), checkpoint = join(f.root, 'late-cycle.json');
       f.steps([{ research: kind === 'fact' ? e4Fact(f) : e4Node(f), usage }]);
       const driver = fixtureDriver(nested, f.database, f.root, 'call', f.request,
         { path: checkpoint, kind: 'om-model-exchange', matches: [], when: 'before' });
@@ -157,7 +157,7 @@ test('E4 cycle replay accounts a late receipt once before or after the cycle is 
 
 
 test('33 H1.0a direct E1 cannot rename or replace the proved E2, and an unpaid admitted step resumes once',async t => {
-  const f=e4Fixture(t,'fact',100_000,0,1000,true);
+  const f=e4Fixture(t,'fact',100_000,1000,true);
   const payload=f.packet.value.packet as Record<string,Json> & {requestId:string;purpose:'model-research'};
   const request={call:payload.requestId,purpose:payload.purpose,basis:null,block:'garden-consume-block',
     series:reference(f.series),attempt:1,goal:f.series.value.attempts[0]!.goal,dispatch:f.request.dispatch,packet:payload,
@@ -185,7 +185,7 @@ test('33 H1.0a direct E1 cannot rename or replace the proved E2, and an unpaid a
 
 
 test('10 H1.0a recovery of a lost managed owner preserves unknown expense and closes only through explicit G7',async t => {
-  const f=e4Fixture(t,'fact',100_000,0,30_000,true), checkpoint=join(f.root,'managed-claimed.json');
+  const f=e4Fixture(t,'fact',100_000,30_000,true), checkpoint=join(f.root,'managed-claimed.json');
   ensureFixtureProject(f.store,f.project); f.steps([{research:e4Fact(f),usage}]);
   const driver=fixtureDriver(t,f.database,f.root,'call',f.request,
     {path:checkpoint,kind:'model-call',matches:[{path:['execution','phase'],value:'claimed'}]});
@@ -211,7 +211,7 @@ test('10 H1.0a recovery of a lost managed owner preserves unknown expense and cl
 test('C10 H1.0a E1 ledger races protect G7 and a closed owner invalidates its earlier claim guards',async t=>{
   const {prepareCloseAttempt}=await import('../src/om/repeat-gate.js');
   for(const first of ['E1','G7'] as const)await t.test(first,async child=>{
-    const f=e4Fixture(child,'fact',100_000,0,1000,true);f.steps([{research:{wrong:true},usage}]);
+    const f=e4Fixture(child,'fact',100_000,1000,true);f.steps([{research:{wrong:true},usage}]);
     valueOf(await runModelCall(f.store,f.request));const work=completionSnapshot(f);
     const address={project:f.project,block:'garden-produce-block',line:1};
     valueOf(openSeries(f.store,{...address,slice:'independent-call',predecessor:null,basis:null}));
@@ -257,7 +257,7 @@ test('C10 H1.0a E1 ledger races protect G7 and a closed owner invalidates its ea
 
 test('C03 H1.0a original managed opening protects all M6 sources in the same transaction',async t=>{
   const {prepareManagedBeginAttempt}=await import('../src/om/series.js');
-  const f=e4Fixture(t,'fact',100_000,0,5000,true);f.steps([{research:{wrong:true},usage}]);valueOf(await runModelCall(f.store,f.request));
+  const f=e4Fixture(t,'fact',100_000,5000,true);f.steps([{research:{wrong:true},usage}]);valueOf(await runModelCall(f.store,f.request));
   const work=completionSnapshot(f);
   valueOf(closeAttempt(f.store,{...seriesRequestOf(f.series.value),attempt:1,
     outcome:{reason:'off-form' as const,accepting:[],cancelling:[],refusals:work.refusals}}));
@@ -285,7 +285,7 @@ test('C03 H1.0a original managed opening protects all M6 sources in the same tra
 
 test('C47 H1.0b managed M5 completes its own ceased remainder without inventing block participation', async t => {
   const { writeCompletionCessation, readCompletionCessationAt } = await import('../src/om/model-call.js');
-  const f = e4Fixture(t, 'field', 100_000, 0, 5000, true), before = completionSnapshot(f);
+  const f = e4Fixture(t, 'field', 100_000, 5000, true), before = completionSnapshot(f);
   const root = before.assignments.find(row => row.value.kind === 'root')!;
   valueOf(writeAddressing(f.store, { project: f.project, input: reference(f.input), graph: reference(f.graph),
     decisions: [{ pending: structuredClone(inputDecisionWrite({ project: f.project, input: reference(f.input), graph: reference(f.graph), layers: [],
@@ -304,7 +304,7 @@ test('C47 H1.0b managed M5 completes its own ceased remainder without inventing 
 
 test('LP4 (№2887 row 4, row 9, §6.8, §6.9) a node whose only step ceased on its own ground is ceased by a cycle-step-ceased cause with its assembly remainder: E4 keeps refusing the cycle, the paid need_source is never sent again, the cause and the cessation read back exactly after a restart, and nothing else proves the cause', async t => {
   const { prepareCompletionCause, writeCompletionCessation, readCompletionCause, readCompletionCessationAt } = await import('../src/om/model-call.js');
-  const f = e4Fixture(t, 'node', 100_000, 0, 5000, true);
+  const f = e4Fixture(t, 'node', 100_000, 5000, true);
   f.steps([{ research: lp4Need(f, f.packet), usage }]);
   const { owner, cease } = await lp4CeasedStep(f), root = lp4Root(f);
   // Row 9: without a proved ground nothing is ceased — neither the step nor its root; a changed environment alone gives the root none.
@@ -367,7 +367,7 @@ test('MP2 (№2968 row 10) no correction for what is no repairable answer conten
   ];
   for (const [name, answer, managed] of cases) {
     await t.test(name, async t => {
-      const f = e4Fixture(t, 'node', 100_000, 0, 1000, managed);
+      const f = e4Fixture(t, 'node', 100_000, 1000, managed);
       f.steps([answer(f), { research: e4Node(f) }]);
       const cycle = await mp2Cycle(f.store, f.request);
       assert.equal(f.sent().length, 1, `${name}: one call, no correction`);

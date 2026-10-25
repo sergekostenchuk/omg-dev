@@ -23,7 +23,7 @@ import { MP3_NOTES, MP3_SCOPES, completionE1, completionSnapshot, currentPacketW
 
 
 test('E4 delivery writes guard source heads, and a repeat after restart returns the same deliveries without writes', async t => {
-  const f = e4Fixture(t, 'fact', 100_000, 0, 5000, true); f.steps([{ research: e4NeedSource(f, [{ action: 'read', path: 'e4-source.txt', media: 'text/plain' }]) }]);
+  const f = e4Fixture(t, 'fact', 100_000, 5000, true); f.steps([{ research: e4NeedSource(f, [{ action: 'read', path: 'e4-source.txt', media: 'text/plain' }]) }]);
   const call = valueOf(await runModelCall(f.store, f.request)); assert.ok(call.response);
   const basis = { project: f.project, packet: f.request.packet, call: call.call, response: call.response };
   const writeMany = f.store.writeMany.bind(f.store); let raced = false;
@@ -49,7 +49,7 @@ test('E4 delivery writes guard source heads, and a repeat after restart returns 
 
 test('E4 retains terminal evidence when environment or captured file changes during the physical call before E3 preparation', async t => {
   for (const change of ['environment', 'file'] as const) {
-    const f = e4Fixture(t, 'fact', 100_000, 0, 5000, true, true, false, (store, project, root) => {
+    const f = e4Fixture(t, 'fact', 100_000, 5000, true, true, false, (store, project, root) => {
       new Evidence(store).file(project, 'transport-file', root, 'e4-source.txt', 'text/plain', 0);
     }), reply = e4Fact(f);
     const file = f.store.get<import('../src/evidence/evidence.js').Source>(`source:${f.project}:transport-file`)!;
@@ -114,7 +114,7 @@ test('E4 retains terminal evidence when environment or captured file changes dur
 
 
 test('37 H1.0a direct local finish proves its diagnostic and repeats without current journal or A3 mutation',async t=>{
-  const f=e4Fixture(t,'fact',100_000,0,1000,true);f.steps([{research:{wrong:true},usage}]);
+  const f=e4Fixture(t,'fact',100_000,1000,true);f.steps([{research:{wrong:true},usage}]);
   const called=valueOf(await runModelCall(f.store,f.request));
   const binding=valueOf(readCompletionBinding(f.store,f.project,reference(f.series),1))!;
   const proof=valueOf(readManagedModelDiagnostic(f.store,binding,called.diagnostic!));
@@ -133,7 +133,7 @@ test('37 H1.0a direct local finish proves its diagnostic and repeats without cur
 test('3 H1.0b ordinary paid reviewer output binds only its own role when Environment changes', async t => {
   const { readCompletionCessationAt } = await import('../src/om/model-call.js');
   for (const changed of ['implementer', 'reviewer'] as const) await t.test(changed, async t => {
-    const f = e4Fixture(t, 'fact', 100_000, 0, 5000, true); f.steps([{ research: e4Fact(f), usage }]);
+    const f = e4Fixture(t, 'fact', 100_000, 5000, true); f.steps([{ research: e4Fact(f), usage }]);
     const request = { ...f.request, role: 'reviewer' as const };
     const write = f.store.writeMany.bind(f.store); let moved = false;
     f.store.writeMany = ((writes, guards) => {
@@ -165,7 +165,7 @@ test('3 H1.0b ordinary paid reviewer output binds only its own role when Environ
 
 
 test('C49 H1.0b ordinary E1 compatibility does not authorize a changed reviewer role at claim', async t => {
-  const f = e4Fixture(t, 'fact', 100_000, 0, 5000, true);
+  const f = e4Fixture(t, 'fact', 100_000, 5000, true);
   f.steps([{ research: e4NeedSource(f, [{ action: 'read', path: 'e4-source.txt', media: 'text/plain' }]), usage }, { research: e4Fact(f), usage }]);
   const first = valueOf(await runModelCall(f.store, f.request));
   const delivery = valueOf(deliverModelSources(f.store, { project: f.project, packet: f.request.packet, call: first.call, response: first.response! }));
@@ -187,9 +187,9 @@ test('C49 H1.0b ordinary E1 compatibility does not authorize a changed reviewer 
 
 test('C31 H1.0b selected MC2 E2 without E1 keeps every still compatible role', async t => {
   const { prepareCompletionCause, writeCompletionCessation, readCompletionCause, readCompletionCessationAt } = await import('../src/om/model-call.js');
-  const measured = e4Fixture(t, 'node', 100_000, 0, 5000, true);
+  const measured = e4Fixture(t, 'node', 100_000, 5000, true);
   for (const changed of ['implementer', 'reviewer', 'both', 'common', 'none'] as const) await t.test(changed, async child => {
-    const f = e4Fixture(child, 'node', currentPacketWire(measured.packet.value.packet) - 1, 0, 5000, true);
+    const f = e4Fixture(child, 'node', currentPacketWire(measured.packet.value.packet) - 1, 5000, true);
     const firstBody = e4Node(f); f.steps([{ research: firstBody, usage }]);
     const first = valueOf(await runModelCall(f.store, f.request)); assert.ok(first.part);
     const packet = valueOf(writeQuestionPacket(f.store, { ...f.packetRequest, previous: [{ packet: f.request.packet, ...first.part! }] })).record;
@@ -227,7 +227,7 @@ test('C31 H1.0b selected MC2 E2 without E1 keeps every still compatible role', a
 
 
 test('H1.5 №2166 п.5 a changed basis between the choice and the claim does not open the prohibition: the saved packet stays refused, and the packet of the new environment is refused for the same question', async t => {
-  const f = e4Fixture(t, 'design', 100_000, 0, 5000, true);
+  const f = e4Fixture(t, 'design', 100_000, 5000, true);
   f.steps([{ research: h15CannotAnswer, usage }]);
   // The environment is measured into the packet: a new capacity is another basis of the same batch.
   const changed = f.environment(120_000);
@@ -247,7 +247,7 @@ test('H1.5 №2166 п.5 a changed basis between the choice and the claim does no
 
 test('LP4 (№2887 row 3) a root with a direct cause of its own is ceased by that cause: the new ground never replaces it', async t => {
   const { prepareCompletionCause, writeCompletionCessation } = await import('../src/om/model-call.js');
-  const f = e4Fixture(t, 'node', 100_000, 0, 5000, true, true, true);
+  const f = e4Fixture(t, 'node', 100_000, 5000, true, true, true);
   f.steps([{ research: lp4Need(f, f.packet), usage }]);
   const { owner, cease } = await lp4CeasedStep(f), root = lp4Root(f);
   f.environment(90_000); cease();
@@ -267,7 +267,7 @@ test('LP4 (№2887 row 3) a root with a direct cause of its own is ceased by tha
 test('LP4 (№2887 row 5, §6.4) the other steps of a node whose step ceased, with no ground of their own (the environment configured back as it was), are ceased by the new cause with their own remainders: an unmaterialized part — expansion; a continuation inside the part materialized without a claim — not-dispatched; received and unapplied — application with its response and usage kept; with an applied need_source — continuation; a live call stays the common recovery\'s; the old cycle stays refused', async t => {
   const { prepareCompletionCause, writeCompletionCessation } = await import('../src/om/model-call.js');
   await t.test('expansion', async t => {
-    const f = e4Fixture(t, 'node', 100_000, 0, 5000, true), capacity = currentPacketWire(f.packet.value.packet) - 1, config = f.environment(capacity);
+    const f = e4Fixture(t, 'node', 100_000, 5000, true), capacity = currentPacketWire(f.packet.value.packet) - 1, config = f.environment(capacity);
     const packet = valueOf(writeQuestionPacket(f.store, { ...f.packetRequest, environment: reference(config) })).record;
     assert.ok(packet.value.plan!.assignments.length > 1);
     const request = { ...f.request, packet: reference(packet), dispatch: { ...f.request.dispatch, config: reference(config) } };
@@ -290,7 +290,7 @@ test('LP4 (№2887 row 5, §6.4) the other steps of a node whose step ceased, wi
     assert.equal(f.sent().length, 1);
   });
   for (const variant of ['not-dispatched', 'application', 'continuation', 'live'] as const) await t.test(`continuation inside the part: ${variant}`, async t => {
-    const f = e4Fixture(t, 'node', 100_000, 0, 30_000, true), checkpoint = join(f.root, 'lp4-live.json');
+    const f = e4Fixture(t, 'node', 100_000, 30_000, true), checkpoint = join(f.root, 'lp4-live.json');
     const need = { research: lp4Need(f, f.packet), usage };
     f.steps([need, variant === 'live' ? { ...need, pauseAfterRequest: checkpoint } : need]);
     const { first, owner, cease } = await lp4CeasedStep(f);
@@ -358,7 +358,7 @@ test('LP4 (№2887 row 5, §6.4) the other steps of a node whose step ceased, wi
 
 test('LP4 (№2887 §6.7) a work moved by another Store between the preparation of a cycle-step-ceased cessation and its write — the other step ceased there — refuses that write as a whole; the write prepared afresh stands', async t => {
   const { prepareCompletionCessation, writeCompletionCessation } = await import('../src/om/model-call.js');
-  const f = e4Fixture(t, 'node', 100_000, 0, 5000, true), capacity = currentPacketWire(f.packet.value.packet) - 1, config = f.environment(capacity);
+  const f = e4Fixture(t, 'node', 100_000, 5000, true), capacity = currentPacketWire(f.packet.value.packet) - 1, config = f.environment(capacity);
   const packet = valueOf(writeQuestionPacket(f.store, { ...f.packetRequest, environment: reference(config) })).record;
   const request = { ...f.request, packet: reference(packet), dispatch: { ...f.request.dispatch, config: reference(config) } };
   f.steps([{ research: lp4Need(f, packet), usage }]);

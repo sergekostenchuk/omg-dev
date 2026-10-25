@@ -70,7 +70,7 @@ h.update=(d,e)=>{globalThis.__hash1Digested.push({b:String(d),s:new Error().stac
 
 
 test('E4 missing addressed file can be supplied and resumed without redispatching the saved source request', async t => {
-  const f = e4Fixture(t, 'fact', 100_000, 0, 5000, true);
+  const f = e4Fixture(t, 'fact', 100_000, 5000, true);
   f.steps([{ research: e4NeedSource(f, [{ action: 'read', path: 'later.txt', media: 'text/plain' }]) }, { research: e4Fact(f) }]);
   const missing = await runModelCycle(f.store, f.request);
   assert.equal(missing.ok, false); if (!missing.ok) assert.equal(missing.refusal.code, 'model_read_unavailable');
@@ -84,7 +84,7 @@ test('E4 missing addressed file can be supplied and resumed without redispatchin
 
 test('E4 preserves received exchange when another Store replaces a required record during dispatch or application', async t => {
   for (const phase of ['before-form', 'application'] as const) for (const kind of ['fact', 'node'] as const) {
-    const f = e4Fixture(t, kind, 100_000, 0, 5000, true);
+    const f = e4Fixture(t, kind, 100_000, 5000, true);
     f.steps([{ research: kind === 'node' ? e4Node(f) : e4Fact(f), usage }]);
     const get = f.store.get.bind(f.store), writeMany = f.store.writeMany.bind(f.store);
     // The retired standalone route let the competitor completeAttempt over unpaid work — '26 H1.0a' proves that
@@ -151,7 +151,7 @@ test('E4 preserves received exchange when another Store replaces a required reco
 
 
 test('26 H1.0a raw A3 and empty G7 cannot close an unpaid managed root', t => {
-  const f = e4Fixture(t, 'fact', 100_000, 0, 1000, true);
+  const f = e4Fixture(t, 'fact', 100_000, 1000, true);
   const request = { ...seriesRequestOf(f.series.value), attempt: 1,
     outcome: { reason: 'off-form' as const, achieved: [], cancelled: [], refusals: [] } };
   const raw = completeAttempt(f.store, request as never);
@@ -167,7 +167,7 @@ test('26 H1.0a raw A3 and empty G7 cannot close an unpaid managed root', t => {
 
 test('9 H1.0a durable running, received and unapplied work retain the barrier and reuse the original dispatch',async t => {
   for (const phase of ['running','received','applied','missing-work'] as const) await t.test(`${({running:9,received:11,applied:12,'missing-work':32})[phase]} ${phase}`,async t => {
-    const f=e4Fixture(t,'fact',100_000,0,1000,true); f.steps([{research:{nonsense:true},usage}]);
+    const f=e4Fixture(t,'fact',100_000,1000,true); f.steps([{research:{nonsense:true},usage}]);
     const write=f.store.writeMany.bind(f.store); let stopped=false;
     f.store.writeMany=((writes,guards)=>{
       const reaches=writes.some(row=>row.kind==='model-call' && (row.value as OmModelCall).om?.application===(phase==='missing-work'?'applied':phase));
@@ -230,7 +230,7 @@ test('34 H1.0a analysis of a stopped managed ordinal remains a separate transpor
 
 
 test('33 H1.0b equivalent reconfiguration after receipt applies the same answer with a fresh environment guard',async t=>{
-  const f=e4Fixture(t,'fact',100_000,0,1000,true);f.steps([{research:e4Fact(f),usage}]);
+  const f=e4Fixture(t,'fact',100_000,1000,true);f.steps([{research:e4Fact(f),usage}]);
   const original=f.store.writeMany.bind(f.store);let moved=false;
   f.store.writeMany=((writes,guards)=>{
     const result=original(writes,guards);
@@ -253,7 +253,7 @@ test('33 H1.0b equivalent reconfiguration after receipt applies the same answer 
 test('35 H1.0b candidate E2 materializations preserve one executable plan selected atomically with E1', async t => {
   const { readCompletionPacketAt } = await import('../src/om/model-call.js');
   for (const kind of ['fact', 'node'] as const) await t.test(kind, async child => {
-    const f = e4Fixture(child, kind, 100_000, 0, 5000, true), initial = completionSnapshot(f);
+    const f = e4Fixture(child, kind, 100_000, 5000, true), initial = completionSnapshot(f);
     assert.equal(initial.assignments.length, 1); assert.equal(initial.complete, false);
     const configured = f.environment(90_000), packet = valueOf(writeQuestionPacket(f.store,
       { ...f.packetRequest, environment: reference(configured) })).record;
@@ -283,7 +283,7 @@ test('35 H1.0b candidate E2 materializations preserve one executable plan select
 
 test('32 H1.0b exact accepted frame ends a required absence and ceases only the selected unclaimed assignment', async t => {
   const { prepareCompletionCause, writeCompletionCessation, readCompletionCause, readCompletionCessationAt } = await import('../src/om/model-call.js');
-  const f = e4Fixture(t, 'fact', 100_000, 0, 5000, true);
+  const f = e4Fixture(t, 'fact', 100_000, 5000, true);
   valueOf(recordCall(f.store, f.project, completionE1(f)));
   const before = completionSnapshot(f), assignment = before.assignments.find(row => row.value.kind === 'part')!;
   const frameRequest = structuredClone(f.gapRequest.sources.operations.frame);
@@ -319,7 +319,7 @@ test('32 H1.0b exact accepted frame ends a required absence and ceases only the 
 
 
 test('34 H1.0b equivalent preclaim admission guards the current Environment against a second Store', async t => {
-  const f = e4Fixture(t, 'fact', 100_000, 0, 5000, true);
+  const f = e4Fixture(t, 'fact', 100_000, 5000, true);
   const selected = valueOf(recordCall(f.store, f.project, completionE1(f)));
   f.environment(); f.steps([{ research: e4Fact(f), usage }]);
   const write = f.store.writeMany.bind(f.store); let raced = false;
@@ -349,7 +349,7 @@ test('34 H1.0b equivalent preclaim admission guards the current Environment agai
 test('S1.1 the collected application basis alone proves the stale class: a dispatch adapter that moved during the application is a stale relevant source; the refusal derives the same cold, hot, warmed and after restart', async t => {
   // The saved om-model-application-rejection record was the standalone variant of this property. A managed call
   // instead refuses with the derived class and keeps the immutable received receipt and settled accounting.
-  const f = e4Fixture(t, 'fact', 100_000, 0, 5000, true);
+  const f = e4Fixture(t, 'fact', 100_000, 5000, true);
   f.steps([{ research: e4Fact(f), usage }]);
   const adapter = f.request.dispatch.adapter, writeMany = f.store.writeMany.bind(f.store);
   let moved: Revision<unknown> | null = null;
@@ -401,7 +401,7 @@ test('S1.1 the collected application basis alone proves the stale class: a dispa
 
 // Current E3 rejects cross-domain labels before delivery; MP2 allows exactly one correction.
 test('LP3 current E3 rejects a context search label before any delivery, repeats one paid call exactly, and settles one failed correction; lawful source search and context reading still deliver', async t => {
-  const f = e4Fixture(t, 'fact', 100_000, 0, 5000, true);
+  const f = e4Fixture(t, 'fact', 100_000, 5000, true);
   const need = e4NeedSource(f, [{ action: 'read', path: 'e4-source.txt', media: 'text/plain' },
     { action: 'search', within: reference(f.input), query: 'question' }]);
   f.steps([{ research: need, usage }, { research: need, usage }]);
@@ -436,7 +436,7 @@ test('LP3 current E3 rejects a context search label before any delivery, repeats
   assert.deepEqual(valueOf(await runModelCycle(f.store, f.request)).record, cycle.record);
   assert.deepEqual(f.store.list(), saved); assert.equal(f.sent().length, 2);
 
-  const g = e4Fixture(t, 'fact', 100_000, 0, 5000, true);
+  const g = e4Fixture(t, 'fact', 100_000, 5000, true);
   const contextRead = { action: 'read_context', record: reference(g.input), pointer: '/input/questions/0/question' };
   const sourceRead = { action: 'search', within: reference(g.source), query: 'UTF' };
   g.steps([{ research: e4NeedSource(g, [contextRead, sourceRead]), usage }, { research: e4Fact(g), usage }]);
@@ -454,7 +454,7 @@ test('LP3 current E3 rejects a context search label before any delivery, repeats
 
 
 test('LP3 current E3 refusal cannot be assigned reads-invalid, and a lawful need-source cannot be closed with a fabricated read refusal', async t => {
-  const f = e4Fixture(t, 'fact', 100_000, 0, 5000, true);
+  const f = e4Fixture(t, 'fact', 100_000, 5000, true);
   f.steps([{ research: e4NeedSource(f, [{ action: 'search', within: reference(f.input), query: 'question' }]), usage }]);
   const call = valueOf(await runModelCall(f.store, f.request));
   assert.deepEqual([call.record.value.om.failure?.code, call.record.value.om.failure?.at.field], ['answer_label_unknown', 'reads/0/within']);
@@ -466,7 +466,7 @@ test('LP3 current E3 refusal cannot be assigned reads-invalid, and a lawful need
   const foreign = finishModelAttempt(f.store, { ...basis, code: read.refusal.code, message: read.refusal.message, reason: 'refused', evidence: [reference(f.source)] });
   assert.ok(!foreign.ok && foreign.refusal.code === 'completion_invalid');
   assert.deepEqual(f.store.list(), before, 'Nothing is written');
-  const g = e4Fixture(t, 'fact', 100_000, 0, 5000, true);
+  const g = e4Fixture(t, 'fact', 100_000, 5000, true);
   g.steps([{ research: e4NeedSource(g, [{ action: 'search', within: reference(g.source), query: 'UTF' }]), usage }]);
   const lawful = valueOf(await runModelCall(g.store, g.request));
   assert.equal(lawful.outcome?.kind, 'need-source', 'The positive control was genuinely admitted by current E3');
