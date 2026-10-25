@@ -18,7 +18,7 @@ import { isRef, reference, uniqueRefs } from "../src/pipeline/contracts.js";
 import { ProductEngine } from "../src/product/engine.js";
 import type { EarlyStageInstruction, EarlyStageOutcome } from "../src/product/early-stage-driver.js";
 import { preparedField } from "./preparation-fixture.js";
-import { answerDiscoveryFixture, preparedFeatures, refinedLayers } from "./product-fixture.js";
+import { answerDiscoveryFixture } from "./product-fixture.js";
 import { Store, type Revision, type TransactionGuard, type Write } from "../src/storage/store.js";
 import type { Environment } from "../src/runtime/environment.js";
 
@@ -1288,9 +1288,15 @@ test("DRY6-02 return 1: the cited Source changes after the stop cancelled B — 
 
 test("ENV1 DRV1 hands accepted features to OM through the same admission as om-start: a workspace without Git refuses both alike before any B1, pass or call", async t => {
   const f = fixture(t), project = "garden";
-  preparedFeatures(f.engine, project, gardenGraph());
+  prepareOmFixtureStages(f.engine, project, gardenGraph());
   const { trace } = f.configure(project);
-  refinedLayers(f.engine, project);
+  // Upstream stages only: no research phase, no B1 and no OM frame of level 2 or 3, before and after both entries.
+  const stagesOnly = (when: string) => {
+    assert.deepEqual(f.store.list("phase"), [], `${when}: no research phase`);
+    for (const id of [`om-input:${project}`, `om-frame:${project}:2`, `om-frame:${project}:3`])
+      assert.equal(f.store.get(id), null, `${when}: ${id}`);
+  };
+  stagesOnly("prepared");
   rmSync(join(f.root, "repo", ".git"), { recursive: true, force: true });
   const driven = await f.engine.execute({ type: "early-stage-run", project, maxTurns: 10, maxCalls: 10 }) as EarlyStageOutcome;
   const direct = await f.engine.execute({ type: "om-start", project }) as { ok: boolean; refusal?: { code: string; at: { target: string; field?: string } } };
@@ -1300,4 +1306,5 @@ test("ENV1 DRV1 hands accepted features to OM through the same admission as om-s
     "One admission for both entries");
   assert.equal(f.store.get(`om-input:${project}`), null, "No B1");
   assert.equal(f.calls(trace).length, 0, "No call");
+  stagesOnly("after both entries");
 });
