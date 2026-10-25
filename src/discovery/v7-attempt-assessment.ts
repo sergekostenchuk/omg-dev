@@ -11,6 +11,7 @@ import { readResearchAttemptBinding, readResearchConsumerTurn } from "./response
 import type { ManagedResearchTurn } from "./research-consumer-transition.js";
 import { proveClaimAddress, resolveClaimAddress, type ClaimAddress, type ResolvedClaim } from "./claim-address.js";
 import { readDiscoveryConditionDecision, type DiscoveryConditionDecision } from "./discovery-outcome.js";
+import { variantOwnerActContent } from "./variant-scope.js";
 import type { Source } from "../evidence/evidence.js";
 import { DISCOVERY_ASSESSMENT_CONTRACT, V7_ATTEMPT_PACKET_CONTRACT, V7_PROGRESS_BASELINE_CONTRACT,
   type VersionedDiscoveryAttemptsAssessment, DISCOVERY_ASSESSMENT_CONTRACT_V2, DISCOVERY_ASSESSMENT_CONTRACT_V3, type V7AttemptPacket, type V7AttemptPacketEntry, type V7Novelty,
@@ -485,12 +486,24 @@ function authorityRef(basis: Record<string, Json>): unknown {
 }
 
 /** The owner-decision content: only an exact, proven owner act — a v2 Discovery condition decision of the local owner
- * authority with its saved session and grant. A grant, a session, a historical caller choice or any other record is
- * not a performed decision. */
+ * authority with its saved session and grant, or a variant owner act proven by its own door with its decision/state
+ * pair (the semantic projection lives in variant-scope.ts). A grant, a session, a historical caller choice, a paid
+ * model decision or any other record is not a performed owner act. */
 function ownerActScope(store: Store, basis: Record<string, Json>, project: string, field: string): Record<string, Json> {
   const ref = authorityRef(basis);
   const record = isRef(ref) ? readExact<DiscoveryConditionDecision>(store, ref) : null;
-  if (record === null || record.kind !== "discovery-condition-decision" || !obj(record.value)
+  if (record === null)
+    noveltyInvalid(field, "the authority is not a proven owner act", { ref: ref ?? null });
+  if (record.kind === "discovery-variant-owner-decision") {
+    try {
+      return variantOwnerActContent(store, project, ref as Ref);
+    } catch (error) {
+      if (error instanceof EngineError)
+        noveltyInvalid(field, "the authority is not a proven owner act", { ref: ref as Ref, cause: error.code });
+      throw error;
+    }
+  }
+  if (record.kind !== "discovery-condition-decision" || !obj(record.value)
     || record.value.contract !== "discovery-condition-decision/v2" || record.value.projectId !== project)
     noveltyInvalid(field, "the authority is not a proven owner act", { ref: ref ?? null });
   const value = record.value;

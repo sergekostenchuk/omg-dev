@@ -1,4 +1,5 @@
 import { EngineError } from '../errors.js';
+import type { Json } from '../canonical.js';
 import { isRef, reference, type Ref } from '../pipeline/contracts.js';
 import { uniqueTransactionGuards } from '../runtime/environment.js';
 import { Store, type Revision } from '../storage/store.js';
@@ -7,6 +8,7 @@ import { readProjectMode } from '../product/project-mode.js';
 import { readVariantGeneration, readVariantModelDecision,
   type ProvenVariantGeneration, type ProvenVariantModelDecision } from './response-recovery.js';
 import { decodeVariantScope, readVariantScopeStructural, readVariantStateStructural, variantStateId,
+  VARIANT_OWNER_DECISION_CONTRACT,
   type VariantOwnerDecision, type VariantModelDecision, type VariantScope, type VariantState } from './variant-decision.js';
 import { VARIANT_SCOPE_CONTRACT, variantInvalid, variantRecordId, variantSame } from './discovery-variants.js';
 
@@ -143,4 +145,27 @@ export function readCurrentVariantScope(store: Store, project: string, draft: Re
   const published = store.get<VariantScope>(variantRecordId(VARIANT_SCOPE_KIND, value));
   if (!published) scopeRequired('scope', 'The scope of the current choice is not published for the requiring path', reference(head));
   return { ...readVariantScope(store, project, reference(published)), state };
+}
+
+/** The accepted N(text) rule of the content keys (the rule of normalizeClaimText): NFC, CRLF/CR → LF, outer trim. */
+function reasonText(text: string): string {
+  return text.normalize('NFC').replace(/\r\n?/g, '\n').trim();
+}
+
+/** 4P.2 (codex-omg2 №12112, the DR4 decision 6): the semantic projection of a proven variant owner act — the act form,
+ * the project and draft, the exact set and the choose/member or reject_all outcome with its normalized reason. The
+ * material is taken only after readVariantOwnerDecision by the full Ref: the proven decision/state pair with its
+ * authority. Grant/session, times, calls, CAS, the previous chain, the operation and today's heads are service — a new
+ * lawful act of the same choice keeps the projection; a different member, set, draft or reason changes it. */
+export function variantOwnerActContent(store: Store, project: string, ref: Ref): Record<string, Json> {
+  requireStore(store, project);
+  if (!isRef(ref)) scopeInvalid('decision', 'A variant owner act is named by its exact Ref');
+  const proven = readVariantOwnerDecision(store, project, ref);
+  const value = proven.decision.value, outcome = value.outcome;
+  return { form: VARIANT_OWNER_DECISION_CONTRACT, project, draft: value.draft as unknown as Json,
+    set: value.set as unknown as Json,
+    outcome: outcome.kind === 'choose'
+      ? { kind: 'choose', member: outcome.member as unknown as Json }
+      : { kind: 'reject_all' },
+    reason: reasonText(outcome.reason) };
 }
