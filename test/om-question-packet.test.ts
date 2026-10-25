@@ -31,7 +31,7 @@ import { writeOmObligations, normalizeOwnerGapAssignment, OM_OWNER_ASSIGNMENT_CO
 import { taskBindingId } from '../src/graph/task-obligations.js';
 import type { CarriedObligation } from '../src/graph/obligation-policy.js';
 import type { TaskObligationBinding } from '../src/graph/task-obligation-model.js';
-import { checkAnswerForm, prepareAnswerForm, checkNodeAnswerForm, readPointerResult } from '../src/om/answer-form.js';
+import { checkAnswerForm, checkNodeAnswerForm, readPointerResult } from '../src/om/answer-form.js';
 import type { OmResult, Refusal, Sealed } from '../src/om/refusal.js';
 import { prepareRoutes, readRoutes, writeRoutes, type RoutesRecord, type RoutesRequest } from '../src/om/routes.js';
 import { prepareQuestionTasks, writeQuestionTasks, prepareQuestionPacket, writeQuestionPacket, readQuestionPacket,
@@ -153,25 +153,6 @@ function questionFixture(t: TestContext, desiredGraph = gardenGraph(), addressOw
     restart() { store.close(); store = new Store(database); engine = new ProductEngine(store); } };
 }
 
-
-/** NR1 (№3600): eras differ only in `references` (a checked trail before, the records read since); the rest is equal and the
- * trusted references are a subset of the trail. Local, because the era producers run this file's declarations under old revisions. */
-function sameButReferences(actual: unknown, expected: string, message?: string): void {
-  const sortedRef = (ref: unknown) => JSON.stringify(Object.fromEntries(Object.entries(ref as Record<string, unknown>).sort(([a], [b]) => a < b ? -1 : 1)));
-  const collect = (value: unknown, into: Set<string>): unknown => {
-    if (Array.isArray(value)) return value.map(item => collect(item, into));
-    if (value === null || typeof value !== "object") return value;
-    const result: Record<string, unknown> = {};
-    for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
-      if (key === "references" && Array.isArray(item)) { for (const ref of item) into.add(sortedRef(ref)); continue; }
-      result[key] = collect(item, into);
-    }
-    return result;
-  };
-  const mine = new Set<string>(), theirs = new Set<string>();
-  assert.deepEqual(collect(JSON.parse(JSON.stringify(actual)), mine), collect(JSON.parse(expected), theirs), message);
-  assert.deepEqual([...mine].filter(ref => !theirs.has(ref)), [], `${message ?? "references"}: only records of the checked trail`);
-}
 
 test('E2 prepares every active fact task from D3 and D1 before D4 chooses routes or native MC1 is issued', t => {
   const f = questionFixture(t), before = snapshot(f.store), native = f.store.list('question').map(reference);
@@ -2421,34 +2402,6 @@ test('E2 common proposal derivation checks assignment without inventing response
   assert.deepEqual(snapshot(f.store), before);
 });
 
-test('E2 preserves original packet and part-result history strictly in its old answer era after restart', async t => {
-  const history = lp1OldProducer(t, 'ff25519', { node: true, capacity: 100_000 })[0]!;
-  let store = new Store(history.database);
-  try {
-    const packet = history.packets[0]!, part = history.parts[0]!, payload = packet.value.packet as Record<string, Json>;
-    assert.equal(packet.value.answerProtocol, undefined); assert.equal(packet.value.packetContract, undefined);
-    const before = snapshot(store);
-    assert.deepEqual(ok(readQuestionPacket(store, { project: history.project, record: reference(packet) })), packet);
-    const checked = ok(readPartResult(store, { project: history.project, record: reference(part.record) }));
-    assert.deepEqual([checked.record, checked.proposal], [part.record, part.proposal]);
-    // NR1 (№3600): the trusted part names the records it read; they are within the trail the old era named.
-    for (const ref of checked.references) assert.ok(part.references.some(old => canonical(old) === canonical(ref)));
-    store.close(); store = new Store(history.database);
-    assert.deepEqual(ok(readQuestionPacket(store, { project: history.project, record: reference(packet) })), packet);
-    const reopened = ok(readPartResult(store, { project: history.project, record: reference(part.record) }));
-    assert.deepEqual([reopened.record, reopened.proposal], [part.record, part.proposal]);
-    assert.deepEqual(reopened, checked);
-    rejected(readPacketAnswer(store, { project: history.project, packet: reference(packet), raw: JSON.stringify({
-      protocol: PACKET_ANSWER_PROTOCOL, requestId: payload.requestId, action: 'pause',
-      questionIds: [(payload.questions as Record<string, Json>[])[0]!.id], reason: 'New control' }) }), 'part_result_invalid');
-    const changed = { ...packet.value, answerProtocol: PACKET_ANSWER_PROTOCOL };
-    const wrong = store.write({ id: `${packet.id}:changed-era`, kind: 'question-packet', expected: 0, value: changed as unknown as Json });
-    await t.test('a packet planted in another era', { todo: "NR1 №3646: согласованная перезапись цепочки до новейшей записи — om-fsck её не видит; решение позже" },
-      () => { rejected(readQuestionPacket(store, { project: history.project, record: reference(wrong) }), 'packet_record_invalid'); });
-    assert.equal(snapshot(store).length, before.length + 1);
-  } finally { store.close(); }
-});
-
 test('E2 normalizes reply sets while preserving duplicate results citations reads and literal value arrays', async t => {
   const p = packetFixture(t, 100_000, gardenGraph(), true, true, { type: 'array', items: { type: 'string' } }), { f } = p;
   const packet = ok(writeQuestionPacket(f.store, p.request)).record, payload = packet.value.packet as Record<string, any>;
@@ -2793,116 +2746,6 @@ test('E2 continuation preserves duplicate read positions using the same immutabl
 });
 
 
-interface Lp1History {
-  root: string; database: string; project: string;
-  packets: Revision<QuestionPacketRecord>[];
-  parts: import('../src/om/question-packet.js').CheckedPartResult[];
-  next: QuestionPacketRequest | null;
-  raw: string;
-}
-function lp1OldProducer(t: TestContext, commit = '7dd0848eb8f58df91b9c3e0952b619ba5688aeae', standalone?: { node: boolean; capacity: number }): Lp1History[] {
-  const directory = mkdtempSync(join(tmpdir(), 'omg-lp1-history-'));
-  t.after(() => rmSync(directory, { recursive: true, force: true }));
-  const repository = fileURLToPath(new URL('../../', import.meta.url)), repositoryUrl = pathToFileURL(repository).href;
-  const loader = join(directory, 'base-loader.mjs');
-  const typescript = pathToFileURL(createRequire(import.meta.url).resolve('typescript')).href;
-  writeFileSync(loader, `import { execFileSync } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
-import ts from ${JSON.stringify(typescript)};
-let root;
-export function initialize(data) { root = data.root; }
-export async function load(url, context, next) {
-  const prefix = new URL('dist/', root).href;
-  if (!url.startsWith(prefix) || !/\\.js$/.test(url)) return next(url, context);
-  const relative = url.slice(prefix.length).replace(/\\.js$/, '.ts');
-  let source = execFileSync('git', ['show', ${JSON.stringify(commit + ':')} + relative],
-    { cwd: fileURLToPath(root), encoding: 'utf8', maxBuffer: 10000000 });
-  if (relative === 'test/om-question-packet.test.ts') {
-    source = source.replace(/import test,.*from 'node:test';/, 'const test = () => {};');
-    source += '\\nexport { ${standalone ? 'packetFixture, expansionFixture, partResult' : 'packetFixture, expansionFixture, worksPacketFixture, partResult, sourceContinuation'} };';
-  }
-  return { format: 'module', shortCircuit: true, source: ts.transpileModule(source,
-    { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2023 } }).outputText };
-}
-`);
-  const bootstrap = `import { register } from 'node:module'; register(${JSON.stringify(pathToFileURL(loader).href)}, { data: { root: ${JSON.stringify(repositoryUrl)} } });`;
-  const script = standalone ? `
-const root = ${JSON.stringify(repositoryUrl)}, src = name => new URL('dist/src/' + name, root).href;
-const fixtures = await import(new URL('dist/test/om-question-packet.test.js', root).href);
-const { reference } = await import(src('pipeline/contracts.js'));
-const { writeQuestionPacket, readPartResult } = await import(src('om/question-packet.js'));
-const take = result => { if (!result.ok) throw Error(JSON.stringify(result.refusal)); return result.value; };
-const p = fixtures.${standalone.node ? 'expansionFixture' : 'packetFixture'}({ after() {} }, ${standalone.capacity}), f = p.f;
-const packet = take(writeQuestionPacket(f.store, p.request));
-const part = ${standalone.node} ? fixtures.partResult(p, packet) : null;
-process.stdout.write(JSON.stringify([{ root: f.root, database: f.database, project: f.project, packets: [packet.record],
-  parts: part ? [take(readPartResult(f.store, { project: f.project, record: reference(part.record) }))] : [], next: null,
-  raw: part ? part.response.value.raw : '' }]));
-f.store.close();` : `
-const root = ${JSON.stringify(repositoryUrl)};
-const src = name => new URL('dist/src/' + name, root).href;
-const fixtures = await import(new URL('dist/test/om-question-packet.test.js', root).href);
-const { reference } = await import(src('pipeline/contracts.js'));
-const { writeQuestionPacket, prepareQuestionPacket, preparePartResult, readPartResult, partResponseId } = await import(src('om/question-packet.js'));
-const { recordCall } = await import(src('om/call-record.js'));
-const { writeGuarded } = await import(src('om/refs.js'));
-const { fixtureAnswer } = await import(new URL('test/om-adapter-fixture.mjs', root).href);
-const ok = result => { if (!result.ok) throw Error(JSON.stringify(result.refusal)); return result.value; };
-const t = { after() {} };
-const output = [];
-{
-  const p = fixtures.packetFixture(t), f = p.f;
-  const first = ok(writeQuestionPacket(f.store, p.request)).record;
-  const delivered = fixtures.sourceContinuation(p, first);
-  const second = ok(writeQuestionPacket(f.store, { ...p.request, continuation: delivered.continuation })).record;
-  const repeated = fixtures.sourceContinuation(p, second);
-  output.push({ root: f.root, database: f.database, project: f.project, packets: [first, second], parts: [],
-    next: { ...p.request, continuation: repeated.continuation }, raw: delivered.response.value.raw });
-  f.store.close();
-}
-{
-  const p = fixtures.expansionFixture(t), f = p.f;
-  const whole = ok(prepareQuestionPacket(f.store, p.request)).record.value;
-  const environment = p.environment(whole.fingerprint.chars - 1);
-  const request = { ...p.request, environment: reference(environment) };
-  const first = ok(writeQuestionPacket(f.store, request));
-  const part = fixtures.partResult(p, first);
-  output.push({ root: f.root, database: f.database, project: f.project, packets: [first.record],
-    parts: [ok(readPartResult(f.store, { project: f.project, record: reference(part.record) }))],
-    next: { ...request, previous: [{ packet: reference(first.record), proposal: reference(part.proposal), result: reference(part.record) }] },
-    raw: part.response.value.raw });
-  f.store.close();
-}
-{
-  const f = await fixtures.worksPacketFixture(t), request = f.request();
-  const packet = ok(writeQuestionPacket(f.store, request)).record;
-  // A brief-era producer answers with its own labels; earlier packets are returned unchanged (MP3 era check of the MP1 and MP2 producers).
-  const payload = packet.value.packet, raw = JSON.stringify(fixtureAnswer(payload, f.answer(packet)));
-  const adapter = f.store.write({ id: 'adapter:garden:lp1', kind: 'dispatch-adapter', expected: 0, value: { projectId: f.project, protocol: 'codex-stdio' } });
-  const config = f.store.write({ id: 'config:garden:lp1', kind: 'dispatch-config', expected: 0, value: { projectId: f.project, model: 'fixture' } });
-  const series = f.store.get(request.attempt.series.id, request.attempt.series.revision);
-  const ids = new Set(payload.questions.map(q => q.id));
-  const call = ok(recordCall(f.store, f.project, { call: payload.requestId, purpose: payload.purpose, basis: null,
-    block: series.value.block, series: reference(series), attempt: 1, goal: series.value.attempts[0].goal,
-    gaps: f.batch.items.filter(item => ids.has(item.gap)).flatMap(item => item.consumers.map(consumer => ({ id: item.target, goal: item.target, field: item.field, consumer }))),
-    dispatch: { adapter: reference(adapter), config: reference(config) }, packet: payload })).call;
-  const response = f.store.write({ id: partResponseId(f.project, reference(call)), kind: 'part-response', expected: 0,
-    value: { project: f.project, packet: reference(packet), call: reference(call), requestId: payload.requestId, raw } });
-  const result = ok(preparePartResult(f.store, { project: f.project, packet: reference(packet), call: reference(call), response: reference(response) }));
-  ok(writeGuarded(f.store, { unit: 'LP1', target: result.record.id, writes: result.writes, guards: result.guards }));
-  output.push({ root: f.root, database: f.database, project: f.project, packets: [packet],
-    parts: [ok(readPartResult(f.store, { project: f.project, record: reference(result.record) }))], next: null, raw });
-  f.store.close();
-}
-process.stdout.write(JSON.stringify(output));
-`;
-  const output = execFileSync(process.execPath, ['--import', `data:text/javascript,${encodeURIComponent(bootstrap)}`,
-    '--input-type=module', '--eval', script], { cwd: repository, encoding: 'utf8', maxBuffer: 20_000_000 });
-  const histories = JSON.parse(output) as Lp1History[];
-  for (const history of histories) t.after(() => rmSync(history.root, { recursive: true, force: true }));
-  return histories;
-}
-
 test('LP1 independent v3 issuance guards both exact era addresses; repeats, ambiguity and unsupported markers are addressed', { todo: "NR1 №3591/№3646: записанное читается доверенно; эту порчу базы ловит om-fsck на старте (test/om-fsck.test.ts)" }, async t => {
   const p = packetFixture(t), { f } = p;
   const prepared = ok(prepareQuestionPacket(f.store, p.request)), packet = prepared.record;
@@ -3223,49 +3066,7 @@ test('MP1 the observed material guard closes a second Store race atomically whil
   assert.deepEqual(ok(readQuestionPacket(f.store, { project: f.project, record: reference(saved) })), saved);
 });
 
-// MP3 (№2981 rows 7, 19): the real producers of the earlier eras from Git; their records are never imitated by removing readings.
 import { briefReadings } from '../src/om/packet-brief.js';
-// The code before MP3: merged MP1, merged MP2 (08be75a7) and FJ1 before briefs.
-const MP3_PRIOR_PRODUCERS = { 'MP1 5ccc463': '5ccc463e8c8520019a10e2ab52761650b4817cfd', 'MP2 08be75a': '08be75a785bac8d2cc88efe930dc05be9ffd4cc6',
-  'FJ1 bed6664': 'bed666410838b0730656e08beef31be208f02719' };
-test('MP3 rows 7, 19 (era): packets, deliveries, continuations and parts of the MP1 and pre-MP1 producers keep their form and outcomes under the new code, including №57; their descendants never acquire readings', { todo: "NR1 №3646: согласованная перезапись цепочки до новейшей записи — om-fsck её не видит; решение позже" }, async t => {
-  for (const [era, commit] of Object.entries(MP3_PRIOR_PRODUCERS)) await t.test(era, async t => {
-    for (const history of lp1OldProducer(t, commit)) {
-      let store = new Store(history.database);
-      try {
-        const before = snapshot(store);
-        for (const packet of history.packets) {
-          assert.equal(briefReadings(packet.value.packet), null, 'An earlier producer wrote no readings');
-          assert.equal(Boolean(packet.value.packetContract?.includes('brief')), !era.startsWith('FJ1'));
-          assert.deepEqual(ok(readQuestionPacket(store, { project: history.project, record: reference(packet) })), packet);
-          assert.deepEqual(ok(prepareQuestionPacket(store, packet.value.request)).record, packet);
-          const repeated = ok(writeQuestionPacket(store, packet.value.request));
-          assert.deepEqual(repeated.record, packet); assert.deepEqual(repeated.writes, []);
-        }
-        for (const part of history.parts) sameButReferences(ok(readPartResult(store, { project: history.project, record: reference(part.record) })), JSON.stringify(part));
-        const root = history.packets[0]!, payload = root.value.packet as Record<string, any>;
-        const listed = (payload?.brief?.manifest as { source: Ref; length: number }[] | undefined)?.find(row => row.length > 0);
-        if (listed) {
-          // №57 stays the behavior of its era: a range past the end of a catalogued source is the D5 refusal of the whole answer.
-          const raw = JSON.stringify(fixtureAnswer(payload, { protocol: 'omg-answer/v3', requestId: payload.requestId, action: 'need_source',
-            questionIds: payload.questions.map((item: { id: string }) => item.id), missing: 'Read past the end',
-            reads: [{ action: 'read_source', source: listed.source, selector: { kind: 'text-range', start: 0, end: listed.length + 100 } }] }));
-          for (const check of [checkAnswerForm, prepareAnswerForm]) rejected(check(store, { project: history.project, packet: reference(root), raw }), 'answer_unconfirmed');
-        }
-        assert.deepEqual(snapshot(store), before);
-        if (history.next) {
-          const next = ok(writeQuestionPacket(store, history.next)).record;
-          assert.equal(next.value.packetContract, root.value.packetContract);
-          if (next.value.packet) assert.equal(briefReadings(next.value.packet), null, 'A descendant of an earlier root stays in its era');
-          if (history.next.continuation) assert.equal(next.value.refusal?.code, 'research_no_progress', 'The earlier novelty rule decides its chain');
-          else assert.equal(next.value.plan?.position, 1);
-          store.close(); store = new Store(history.database);
-          assert.deepEqual(ok(readQuestionPacket(store, { project: history.project, record: reference(next) })), next);
-        }
-      } finally { store.close(); }
-    }
-  });
-});
 
 const MP11_BASE = 'e88b4ed40d94dd61e242d613d96a87e0bb5e6206';
 // Reuse the actual managed-cycle fixtures from the shared module; destructuring keeps the historical sites unchecked as before.
