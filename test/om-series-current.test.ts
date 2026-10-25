@@ -2202,3 +2202,94 @@ test("Q4-F5 (№2568-2): a late corrupt revision named by the exact basis refuse
   assert.throws(() => prepareSeriesLineAdmission(f.store, project, reference(admitted)), corrupt,
     'A basis naming the corrupt revision reads it and refuses');
 });
+
+// SERIES-membership-shape-refusal (№13975). The walk over the project's own lines consumes of every saved line its block, its line
+// and, for a root, the absence of a predecessor. A line that cannot be consumed is refused where it stands — series_invalid at
+// its address, with the field it lacks — and the walk writes nothing. Foreign and mechanism lines are never decoded.
+const lineId = (line: number, owner = block) => `repair-series:${project}:${line}:${owner}`;
+const otherRoot = 'garden-other-block';
+const viewOf = (store: Store): Store => captureView(store, { rows: new Map() }).view;
+function refusedAt(result: OmResult<unknown>, id: string, field: string) {
+  const refusal = refusedWith(result, 'series_invalid');
+  assert.equal(refusal.at.target, id);
+  assert.equal(refusal.at.field, field);
+}
+const damagedLines: [name: string, id: string, value: (admitted: Revision<RepairSeries>) => Json, field: string][] = [
+  ['an empty line', lineId(3), () => null, 'series'],
+  ['a text', lineId(3), () => 'text', 'series'],
+  ['a number', lineId(3), () => 7, 'series'],
+  ['a list', lineId(3), () => [], 'series'],
+  ['a list holding a line', lineId(3), () => [{ block, line: 3 }], 'series'],
+  ['a line without a block', lineId(3), () => ({ line: 3 }), 'block'],
+  ['a line with an empty block', lineId(3), () => ({ block: '', line: 3 }), 'block'],
+  ['a line whose block is no text', lineId(3), () => ({ block: 7, line: 3 }), 'block'],
+  ['a line without a line number', lineId(3), () => ({ block }), 'line'],
+  ['a line numbered by text', lineId(3), () => ({ block, line: '3' }), 'line'],
+  ['a line numbered zero', lineId(3), () => ({ block, line: 0 }), 'line'],
+  ['a line numbered by a fraction', lineId(3), () => ({ block, line: 1.5 }), 'line'],
+  ['a root without a predecessor', lineId(1, otherRoot), () => ({ block: otherRoot, line: 1 }), 'predecessor'],
+  ['a root whose predecessor is no reference', lineId(1, otherRoot), () => ({ block: otherRoot, line: 1, predecessor: block }), 'predecessor'],
+  ['a root with a real predecessor to walk', lineId(1, otherRoot), admitted => ({ block: otherRoot, line: 1,
+    predecessor: { id: admitted.id, revision: admitted.revision, hash: admitted.hash } }), 'predecessor'],
+];
+
+for (const [name, id, value, field] of damagedLines)
+  test(`SERIES-membership-shape-refusal ${name}: the own walk refuses it as series_invalid on ${field}, on the Store and through a view, and writes nothing`, t => {
+    const f = fixture(t); f.series();
+    const admitted = head(f);
+    ok(prepareSeriesLineAdmission(f.store, project, reference(admitted)));
+    f.store.write({ id, kind: 'repair-series', expected: 0, value: value(admitted) });
+    const written = snapshot(f.store);
+    for (const store of [f.store, viewOf(f.store)]) {
+      refusedAt(prepareSeriesLineAdmission(store, project, reference(admitted)), id, field);
+      refusedAt(readSeriesMembership(store, { project }), id, field);
+    }
+    assert.deepEqual(snapshot(f.store), written);
+  });
+
+test("SERIES-membership-shape-refusal: lawful roots, a damaged mechanism line and a foreign project's damaged line never refuse the own walk, on the Store and through a view", t => {
+  const f = fixture(t); f.series(); f.series(independent);
+  const admitted = head(f);
+  f.store.write({ id: `repair-series:${project}:mechanism:1:M5:addressing`, kind: 'repair-series', expected: 0, value: null });
+  f.store.write({ id: `repair-series:foreign:3:${block}`, kind: 'repair-series', expected: 0, value: null });
+  const written = snapshot(f.store);
+  for (const store of [f.store, viewOf(f.store)])
+    assert.equal(ok(prepareSeriesLineAdmission(store, project, reference(admitted))).participation, 'legacy');
+  assert.deepEqual(snapshot(f.store), written);
+});
+
+test("SERIES-membership-shape-refusal: the membership of a managed project is read over lawful lines, ignores a foreign damaged line and refuses a damaged own line at its address", t => {
+  const f = product(fixture(t));
+  const membership = ok(readSeriesMembership(f.store, { project }));
+  f.store.write({ id: `repair-series:foreign:3:${block}`, kind: 'repair-series', expected: 0, value: null });
+  for (const store of [f.store, viewOf(f.store)]) assert.deepEqual(ok(readSeriesMembership(store, { project })), membership);
+  const id = lineId(3);
+  f.store.write({ id, kind: 'repair-series', expected: 0, value: null });
+  const written = snapshot(f.store);
+  for (const store of [f.store, viewOf(f.store)]) refusedAt(readSeriesMembership(store, { project }), id, 'series');
+  assert.deepEqual(snapshot(f.store), written);
+});
+
+test("SERIES-membership-shape-refusal: a storage read that fails while the own lines are read propagates as it is — the enumeration, the line itself, the list of a view — and is no series_invalid", t => {
+  const f = fixture(t); f.series();
+  const admitted = head(f), id = lineId(3);
+  f.store.write({ id, kind: 'repair-series', expected: 0, value: { projectId: project, block, line: 3,
+    predecessor: { id: admitted.id, revision: admitted.revision, hash: admitted.hash } } });
+  const written = snapshot(f.store), failure = new Error('the storage failed while the own lines were read');
+  const failing = (fails: (method: string, mode: string, read: string | undefined) => boolean): StoreObserver => ({
+    begin: () => ({}), write: () => {}, untraced: () => {},
+    end: (_token, _source, method, mode, read) => { if (fails(method, mode, read)) throw failure; } });
+  const reads: [store: Store, fails: (method: string, mode: string, read: string | undefined) => boolean][] = [
+    [f.store, (method, mode) => method === 'identities' && mode === 'prefix'],
+    [f.store, (method, _mode, read) => method === 'get' && read === id],
+    [viewOf(f.store), (method, _mode, read) => method === 'list' && read === 'repair-series'],
+  ];
+  for (const [store, fails] of reads) {
+    const previous = observeStore(failing(fails));
+    try {
+      assert.throws(() => prepareSeriesLineAdmission(store, project, reference(admitted)), error => error === failure);
+      assert.throws(() => readSeriesMembership(store, { project }), error => error === failure);
+    } finally { observeStore(previous); }
+  }
+  assert.deepEqual(snapshot(f.store), written);
+});

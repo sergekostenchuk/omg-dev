@@ -18,6 +18,7 @@ import {
   type AttemptGoal, type RepairSeries, type AnyRepairSeries, type MechanismAdmission,
   type CompletionAssignment, type CompletionOwner, type CompletionWork,
 } from "../src/om/series.js";
+import { prepareSeriesLineAdmission } from "../src/om/series.js";
 import { recordRefusal, unitRefusalNamespace, UNIT_REFUSAL_KIND } from "../src/om/refusal-journal.js";
 import {
   closeAttempt, liftOriginHold, openAttempt, originDecisionNamespace, prepareManagedClaim,
@@ -2400,4 +2401,29 @@ test('MP1 E1 measures the sent Cyrillic/non-BMP text while binding the complete 
     addressed(recordCall(f.store, f.project, { ...input, packet: broken }), 'packet_invalid');
     assert.deepEqual(f.store.list().map(reference), before);
   }
+});
+
+/**
+ * SERIES-membership-shape-refusal (№13975): the walk over the project's own lines refuses a saved line that holds no record where
+ * it stands. A lawful call is admitted on a separate carrier of the same world first, so the refusal below is the line's and no
+ * broken own input's; the empty line stands on line 3 of the own block, with no mask on line 2.
+ */
+test("E1 an empty own series line on line 3 refuses the lawful call with call_series_unresolved and the direct admission with series_invalid, again after a new Store, and writes nothing", t => {
+  const proof = ordinary(t, "empty-line-proof");
+  assert.equal(deliveredOf(recordCall(proof.store, PROJECT, lawful(proof))).repeated, false);
+  assert.ok(lawfulCall(proof));
+  const f = ordinary(t, "empty-line"), line = seriesId(PROJECT, f.block, 3);
+  assert.equal(lawfulCall(f), null); assert.equal(heldLedger(f), null);
+  f.store.write({ id: line, kind: "repair-series", expected: 0, value: null });
+  const written = f.store.list().map(reference);
+  const refusedOn = (store: Store): void => {
+    addressed(recordCall(store, PROJECT, lawful(f)), "call_series_unresolved");
+    const direct = refusalOf(prepareSeriesLineAdmission(store, PROJECT, reference(f.series)));
+    assert.equal(direct.code, "series_invalid"); assert.equal(direct.at.target, line); assert.equal(direct.at.field, "series");
+    assert.equal(heldCall({ store }, lawful(f).call), null); assert.equal(heldLedger({ store }), null);
+    assert.deepEqual(store.list().map(reference), written);
+  };
+  refusedOn(f.store);
+  const reopened = new Store(f.path); t.after(() => reopened.close());
+  refusedOn(reopened);
 });

@@ -2449,6 +2449,17 @@ function checkedMembership(store: Store, project: string, ref: Ref): Revision<Se
     () => { mechanismCheck(false, ref.id, 'membership', 'Membership history may not depend on itself'); throw new Error('Unreachable'); });
 }
 interface CapturedMembership { record: Revision<SeriesMembership> | null; value: SeriesMembership; series: Revision<RepairSeries>[] }
+/**
+ * What the membership selection consumes of a saved own line, said before any field of it is read: a record that names its
+ * block and its line and, for a root, has no predecessor to walk. A line that cannot be consumed is refused where it stands.
+ */
+function requireSelectableLine(line: Revision<RepairSeries>): void {
+  const { id, value } = line;
+  mechanismCheck(mechanismObject(value), id, 'series', 'A saved series line holds a record');
+  mechanismCheck(isText(value.block), id, 'block', 'A saved series line names its block');
+  mechanismCheck(Number.isSafeInteger(value.line) && value.line >= 1, id, 'line', 'A saved series line stands on a line counted from one');
+  mechanismCheck(value.line !== 1 || value.predecessor === null, id, 'predecessor', 'A root line has no predecessor to walk');
+}
 function captureMembership(store: Store, project: string): CapturedMembership {
   // Reading absence before enumeration is essential: the following expected=0 write arbitrates registration/bootstrap.
   const captured = store.get<SeriesMembership>(seriesMembershipId(project));
@@ -2467,6 +2478,7 @@ function captureMembership(store: Store, project: string): CapturedMembership {
   for (const raw of lines) {
     if (raw.id.startsWith(`${REPAIR_SERIES_KIND}:${project}:mechanism:`)) continue;
     const series = mechanismTake(readAnySeriesAt(store, project, reference(raw))) as Revision<RepairSeries>;
+    requireSelectableLine(series);
     if (series.value.line === 1) roots.push({ block: series.value.block, root: rootOf(store, project, series) });
     const prior = current.get(series.value.block);
     if (!prior || series.value.line > prior.value.line) current.set(series.value.block, series);
