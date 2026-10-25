@@ -274,14 +274,7 @@ async function partialProjection(store: Store, project: string, handoffRef: Ref)
   const draft = dossierExact<DiscoveryDraft>(store, route.draft, 'discovery-draft');
   const questions = provePlanQuestions(store, draft, route.plan);
   const frame = dossierExact<ResearchAnswer>(store, route.frame, 'research-answer');
-  const acceptance = store.get<DiscoveryAcceptanceAct>(discoveryAcceptanceActId(project, draft.id, 'frame', route.frame), 1);
-  if (!acceptance || !isRef(acceptance.value.questionAfter)) invalid('frame', 'The exact frame has no saved acceptance');
-  const question = dossierExact<Question>(store, acceptance.value.questionAfter, 'question');
-  if (!savedAcceptanceAct(store, draft, question, 'frame', route.frame, frame.value.value))
-    invalid('frame', 'The frame does not belong to this exact draft');
-  const issued = proveIssuedAnswer(store, draft, { question, foreign: false, answered: true, answerRef: route.frame, field: 'frame' },
-    frame as unknown as Revision<Record<string, Json>>, { verifyIssuedQuestion: true });
-  if (!issued.ok || !provenAcceptance(issued.proof.provenance)) invalid('frame', 'The frame has no proven accepted origin');
+  proveDossierFrame(store, project, draft, route.frame);
   const grounds = new Map<string, Ref>([[canonical(handoffRef), handoffRef]]);
   const keep = (link: Ref) => { grounds.set(canonical(link), link); };
   const attempts = new Map<string, ReturnType<typeof proveAttempt>>();
@@ -350,10 +343,64 @@ async function partialProjection(store: Store, project: string, handoffRef: Ref)
       }
     }
   }
+  const material = projectDossierMaterials(store, project, draft, frame, route.plan,
+    [...attempts.values()].map(p => reference(p.attempt)), [...assessments.values()].map(reference),
+    route.stop ? handoffBoundary(store, handoffRef) : null);
+  for (const link of material.grounds) keep(link);
+  const { materials, axes, unknowns } = material;
+  const code = route.reason === 'early_limit' ? 'budget' : route.reason as 'reject_all' | 'no_variants';
+  const value = decodeDossierManifest({ contract: DOSSIER_MANIFEST_CONTRACT, projectId: project, draft: route.draft,
+    frame: route.frame, plan: route.plan, completeness: 'partial', reasons: [{ code,
+      message: route.stop?.message ?? `The proven variant handoff ends with ${code}`,
+      grounds: [handoffRef, ...[...grounds.values()].filter(r => !dossierSame(r, handoffRef)).sort((a,b) => canonical(a).localeCompare(canonical(b)))] }],
+    axes, unknowns, contradictions: material.contradictions });
+  const refs = material.assessments;
+  const contradictions = checkDossierContradictionEvidence(store, value, questions.map(q => q.planQuestionId), { assessments: refs });
+  return { value, handoff, materials, assessments: refs, contradictions };
+}
+
+/** The common accepted-frame proof for either dossier route. */
+export function proveDossierFrame(store: Store, project: string, draft: Revision<DiscoveryDraft>, frameRef: Ref): Revision<ResearchAnswer> {
+  const frame = dossierExact<ResearchAnswer>(store, frameRef, 'research-answer');
+  const acceptance = store.get<DiscoveryAcceptanceAct>(discoveryAcceptanceActId(project, draft.id, 'frame', frameRef), 1);
+  if (!acceptance || !isRef(acceptance.value.questionAfter)) invalid('frame', 'The exact frame has no saved acceptance');
+  const question = dossierExact<Question>(store, acceptance.value.questionAfter, 'question');
+  if (!savedAcceptanceAct(store, draft, question, 'frame', frameRef, frame.value.value))
+    invalid('frame', 'The frame does not belong to this exact draft');
+  const issued = proveIssuedAnswer(store, draft, { question, foreign: false, answered: true, answerRef: frameRef, field: 'frame' },
+    frame as unknown as Revision<Record<string, Json>>, { verifyIssuedQuestion: true });
+  if (!issued.ok || !provenAcceptance(issued.proof.provenance)) invalid('frame', 'The frame has no proven accepted origin');
+  return frame;
+}
+
+/** Common 6.3 material projection. Paid MR and applied classifications remain
+ * distinct; both sides of explicit relations and addressed unknowns survive. */
+export function projectDossierMaterials(store: Store, project: string, draft: Revision<DiscoveryDraft>,
+  frame: Revision<ResearchAnswer>, plan: Ref, attemptRefs: Ref[], assessmentRefs: Ref[], boundary: number | null) {
+  const questions = provePlanQuestions(store, draft, plan);
+  const grounds = new Map<string, Ref>();
+  const keep = (link: Ref) => { grounds.set(canonical(link), link); };
+  const attempts = new Map<string, ReturnType<typeof proveAttempt>>();
+  const assessments = new Map<string, Revision<PaidDiscoveryAttemptsAssessment>>();
+  function attempt(link: Ref) {
+    if (attempts.has(canonical(link))) return;
+    const proof = proveAttempt(store, link), value = proof.attempt.value;
+    if (value.project !== project || value.draft.id !== draft.id || !dossierSame(value.planAnswer, plan)
+      || !questions.some(q => q.planQuestionId === value.planQuestionId)) invalid('materials', 'Material belongs to another draft or exact plan');
+    if (boundary !== null && !store.getAtEvent(boundary, link.id, link.revision)) invalid('materials', 'Material lies beyond the saved cut');
+    attempts.set(canonical(link), proof); keep(link);
+  }
+  for (const link of attemptRefs) attempt(link);
+  for (const link of assessmentRefs) {
+    const paid = readDiscoveryAssessment(store, project, link), packet = paid.value.subject.packet;
+    if (!dossierSame(packet.planAnswer, plan) || !questions.some(q => q.planQuestionId === packet.planQuestionId))
+      invalid('assessments', 'The paid classification belongs to another exact plan');
+    assessments.set(canonical(link), paid); keep(link);
+    for (const entry of packet.entries) { attempt(entry.attempt); keep(entry.binding); }
+  }
   const materials: ProvenPartialDossier['materials'] = [];
   // MR is paid evidence even before P. Only P present at the saved handoff
   // classifies material; a later recovery must not rewrite this exact cut.
-  const boundary = route.stop ? handoffBoundary(store, handoffRef) : null;
   if (boundary !== null) {
     const states = new Set<string>();
     for (const paid of assessments.values()) {
@@ -430,15 +477,8 @@ async function partialProjection(store: Store, project: string, handoffRef: Ref)
         blocking: questions.some(q => ids.includes(q.planQuestionId) && (q.question as Record<string, Json>).class === 'blocking'), resolution: { state: 'open' } });
     }
   }
-  const code = route.reason === 'early_limit' ? 'budget' : route.reason as 'reject_all' | 'no_variants';
-  const value = decodeDossierManifest({ contract: DOSSIER_MANIFEST_CONTRACT, projectId: project, draft: route.draft,
-    frame: route.frame, plan: route.plan, completeness: 'partial', reasons: [{ code,
-      message: route.stop?.message ?? `The proven variant handoff ends with ${code}`,
-      grounds: [handoffRef, ...[...grounds.values()].filter(r => !dossierSame(r, handoffRef)).sort((a,b) => canonical(a).localeCompare(canonical(b)))] }],
-    axes, unknowns, contradictions: [...pairs.values()].sort((a,b) => a.id.localeCompare(b.id)) });
-  const refs = [...classifications.values()].sort((a,b) => canonical(a).localeCompare(canonical(b)));
-  const contradictions = checkDossierContradictionEvidence(store, value, questions.map(q => q.planQuestionId), { assessments: refs });
-  return { value, handoff, materials, assessments: refs, contradictions };
+  return { materials, axes, unknowns, contradictions: [...pairs.values()].sort((a,b) => a.id.localeCompare(b.id)),
+    assessments: [...classifications.values()].sort((a,b) => canonical(a).localeCompare(canonical(b))), grounds: [...grounds.values()] };
 }
 
 export async function readPartialDossier(store: Store, project: string, at: Ref): Promise<ProvenPartialDossier> {

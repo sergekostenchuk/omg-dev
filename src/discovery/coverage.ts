@@ -4,7 +4,7 @@ import { isRef, reference, type Ref } from '../pipeline/contracts.js';
 import { Store } from '../storage/store.js';
 import { V7_PLAN_SUBJECT_CONTRACT, type V7PlanSubject } from './v7-managed-attempt.js';
 import { proveClaimAddress, type ClaimAddress } from './claim-address.js';
-import { claimContentKey, v7ProgressStateId } from './v7-attempt-assessment.js';
+import { attemptAccountKey, claimContentKey, v7ProgressStateId } from './v7-attempt-assessment.js';
 import { readVariantScope } from './variant-scope.js';
 import { proveAttempt, provePlanQuestions, type V7PlanQuestion } from './v7-plan-questions.js';
 import { readV7ProgressStateAt } from './v7-progress.js';
@@ -148,6 +148,19 @@ function servesPlanQuestion(claim: Record<string, unknown>, planAnswer: Ref, pla
  * is a read-only projection over the named proven grounds: it writes nothing, pays nothing, authorizes no dispatch,
  * and a later head never rewrites an earlier projection. */
 export function computeMissingCoverage(store: Store, project: string, scope: Ref, planAnswer: Ref): CoverageComputation {
+  return computeCoverage(store, project, scope, planAnswer);
+}
+
+/** The same 5.1 proof at an immutable journal cut. The cut selects inventory and
+ * operative P only; it confers neither acceptance nor sufficiency. */
+export function computeMissingCoverageAt(store: Store, project: string, scope: Ref, planAnswer: Ref,
+  boundary: number): CoverageComputation {
+  store.identitiesAtEvent(boundary); // Validate the committed cut even when its inventory is empty.
+  return computeCoverage(store, project, scope, planAnswer, boundary);
+}
+
+function computeCoverage(store: Store, project: string, scope: Ref, planAnswer: Ref,
+  boundary?: number): CoverageComputation {
   if (!(store instanceof Store) || typeof project !== 'string' || project.length === 0)
     invalid('store', 'A coverage computation requires its Store and project');
   if (!isRef(scope)) invalid('scope', 'The coverage names the exact Ref of its proven variant scope');
@@ -158,7 +171,12 @@ export function computeMissingCoverage(store: Store, project: string, scope: Ref
   if (draft === null || draft.kind !== 'discovery-draft' || draft.hash !== value.draft.hash)
     invalid('scope', 'The scope names its exact draft revision');
   const questions = provePlanQuestions(store, draft, planAnswer);
-  const attempts = store.list<V7Attempt>(V7_ATTEMPT_KIND)
+  const attempts = (boundary === undefined ? store.list<V7Attempt>(V7_ATTEMPT_KIND)
+    : store.identitiesAtEvent(boundary, V7_ATTEMPT_KIND).map(row => {
+      const exact = store.getAtEvent<V7Attempt>(boundary, row.id, row.revision);
+      if (!exact || canonical(reference(exact)) !== canonical({ id: row.id, revision: row.revision, hash: row.hash })) invalid('attempt', 'The historical inventory lost an exact attempt');
+      return exact;
+    }))
     .filter(row => row.value?.project === project && row.value?.contract === V7_ATTEMPT_CONTRACT
       && row.value.planQuestionId !== undefined && isRef(row.value.planAnswer)
       && canonical(row.value.planAnswer) === canonical(planAnswer));
@@ -169,6 +187,15 @@ export function computeMissingCoverage(store: Store, project: string, scope: Ref
     for (const row of attempts.filter(item => item.value.planQuestionId === question.planQuestionId)) {
       // A structural candidate only: every ground below proves itself through its own door.
       const proof = proveAttempt(store, reference(row));
+      if (boundary !== undefined) {
+        const account = store.getAtEvent<{ application: Ref }>(boundary, attemptAccountKey(proof.attempt.value, reference(row)), 1);
+        // Later paid/application recovery cannot retroactively classify an earlier snapshot.
+        if (!account) continue;
+        const application = isRef(account.value.application)
+          ? store.getAtEvent(boundary, account.value.application.id, account.value.application.revision) : null;
+        if (!application || canonical(reference(application)) !== canonical(account.value.application))
+          invalid('application', 'The historical account lost its exact application at this cut');
+      }
       const claims = proof.claims ?? [];
       for (const [index, raw] of claims.entries()) {
         if (!object(raw)) continue;
@@ -196,7 +223,7 @@ export function computeMissingCoverage(store: Store, project: string, scope: Ref
     // Acceptance alone is material, never sufficiency: a cell closes only on a proven applied transition to closed
     // whose saved sufficiency names this plan question's own criterion and depth, and whose bases stand on this
     // member's own variant ground — the applied chain is proven by the MR/P door, the paid assessment by its own.
-    const sufficiency = provenSufficiency(store, project, planAnswer, question, grounds);
+    const sufficiency = provenSufficiency(store, project, planAnswer, question, grounds, boundary);
     const covered = sufficiency !== null;
     return { cell, key: coverageCellKey(cell), covered, grounds, common, sufficiency,
       missing: covered ? null : grounds.length > 0
@@ -213,9 +240,9 @@ export function computeMissingCoverage(store: Store, project: string, scope: Ref
  * the head — a later open/unknown decision supersedes an earlier closed one, and plain acceptances are walked through.
  * The head state is proven by readV7ProgressStateAt — which re-derives the whole application, its prior chain and
  * every account and event from the paid assessment — and each applied assessment is proven paid by its own reader. */
-function operativeDecision(store: Store, project: string, stateId: string):
+function operativeDecision(store: Store, project: string, stateId: string, boundary?: number):
   { transition: V7QuestionTransition | null; assessment: Ref } | null {
-  const head = store.get(stateId);
+  const head = boundary === undefined ? store.get(stateId) : store.getAtEvent(boundary, stateId);
   if (head === null) return null;
   let state: Ref = reference(readV7ProgressStateAt(store, reference(head)));
   while (true) {
@@ -240,11 +267,11 @@ function operativeDecision(store: Store, project: string, stateId: string):
  * it — leaves the cell uncovered with its material grounds; a closing on common or a foreign member substitutes
  * nothing. */
 function provenSufficiency(store: Store, project: string, planAnswer: Ref, question: V7PlanQuestion,
-  grounds: AppliedCoverageGround[]): AppliedSufficiency | null {
+  grounds: AppliedCoverageGround[], boundary?: number): AppliedSufficiency | null {
   if (grounds.length === 0) return null;
   const groundAddresses = new Set(grounds.map(ground => canonical(ground.claim)));
   const decision = operativeDecision(store, project,
-    v7ProgressStateId({ project, planAnswer, planQuestionId: question.planQuestionId }));
+    v7ProgressStateId({ project, planAnswer, planQuestionId: question.planQuestionId }), boundary);
   if (decision === null || decision.transition === null) return null;
   const transition = decision.transition, assessment = decision.assessment;
   const own = question.question as Record<string, Json>;

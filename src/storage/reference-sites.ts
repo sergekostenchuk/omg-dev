@@ -329,6 +329,10 @@ const RECORD_REFERENCE_SEMANTICS: readonly RecordReferenceSemantics[] = [
     ["axes", KEY, "claims", INDEX, "container"], ["unknowns", INDEX, "claim", "container"],
     ["contradictions", INDEX, "sides", INDEX, "claim", "container"], ["contradictions", INDEX, "sides", INDEX, "assessment"],
     ["contradictions", INDEX, "resolution", "grounds", INDEX]] },
+  { kind: "discovery-selected-dossier", contract: "discovery-selected-dossier/v1", data: [], refs: [
+    ["draft"], ["frame"], ["plan"], ["scope"], ["set"], ["member"], ["decision"], ["manifest"], ["boundary", "record"],
+    ["inventory", "attempts", INDEX], ["inventory", "assessments", INDEX], ["inventory", "applications", INDEX],
+    ["inventory", "states", INDEX], ["inventory", "accounts", INDEX]] },
   // DR2b 2b.1-F: the interpretations set declares its exact grounds and links only — the brief source, the
   // frame proposal revision and the previous set; meanings, consequences and support selectors are data.
   { kind: "frame-interpretations", contract: "frame-interpretations/v1", data: [], refs: [
