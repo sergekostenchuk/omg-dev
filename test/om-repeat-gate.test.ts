@@ -3693,6 +3693,157 @@ function e51OrdinaryG3(f: ReturnType<typeof e51Fixture>): ClaimedRefusal {
     { gate: "G3", code: `graph_invalid:e51:${next()}`, goal: f.attemptGoal.result });
 }
 
+test("LG07 rg-rest-independent: own complete E5 and a real G5 rejection retain every source of the managed composition", async t => {
+  const { prepareWorksSources, writeWorksAcceptance } = await import("../src/om/atomic-gate.js");
+  const { readWorkRejectionAt } = await import("../src/om/frame-accept.js");
+  const { readPartAssembly } = await import("../src/om/model-call.js");
+  for (const shape of ["negative", "mixed", "technical"] as const) await t.test(shape, async child => {
+    const verdicts = shape === "mixed" ? ["supported", "insufficient"] as const
+      : shape === "negative" ? ["insufficient", "insufficient"] as const : ["off-form", "off-form"] as const;
+    const block = "garden-consume-block", subject = "garden-consume-work";
+    const f = worksFixture(child, false, 2, graph => {
+      const work = graph.nodes.find(node => node.id === subject)!;
+      work.code = work.code.map(item => ({ ...item, access: "read" as const }));
+    });
+    deliveredOf(startRun(f.store, { project }));
+    const answered = new Set<string>(), assessed: string[] = [];
+    let stopped = false;
+    for (let index = 0; index < 300; index++) {
+      const advanced = deliveredOf(await advanceRun(f.store, f.request));
+      const state = advanced.record.value.state as { phase: string; step?: { action: string; request: { packet?: Ref; block?: string } } };
+      const key = state.phase === "step" ? JSON.stringify(state.step!.request) : "";
+      if (state.phase === "step" && state.step!.action === "close" && state.step!.request.block === block) { stopped = true; break; }
+      if (state.phase === "step" && state.step!.action === "cycle" && state.step!.request.packet && !answered.has(key)) {
+        answered.add(key);
+        const saved = state.step!.request.packet, packet = f.store.get<QuestionPacketRecord>(saved.id, saved.revision)!;
+        const routes = f.store.get<RoutesRecord>(packet.value.request.routes.id, packet.value.request.routes.revision)!;
+        const batch = routes.value.batches.find(row => row.id === packet.value.request.batch)!;
+        if (batch.model !== "MC1") f.answer(saved);
+        else {
+          const source = f.store.get<{ content: string }>(`source:${project}:brief`)!;
+          f.push({ research: { protocol: "$answerProtocol", requestId: "$requestId", action: "answer",
+            results: batch.items.map(item => ({ questionId: item.gap, value: { answer: "UTF-8" }, citations: [{ source: reference(source),
+              selector: { kind: "text-range", start: 0, end: source.value.content.length } }] })) }, usage });
+        }
+      } else if (state.phase === "step" && state.step!.action === "assess" && !answered.has(key)) {
+        answered.add(key); const verdict = verdicts[assessed.length]!;
+        assert.ok(verdict, "Every fact is paid once"); assessed.push(verdict); f.push(assessor(verdict));
+      }
+      if (["waiting", "complete", "unable"].includes(state.phase)) { stopped = true; break; }
+    }
+    assert.ok(stopped);
+    assert.deepEqual(assessed, [...verdicts]);
+    const series = f.store.get<RepairSeries>(seriesId(project, block, 1))!;
+    assert.equal(series.value.attempts[0]!.outcome, null);
+    const binding = deliveredOf(readCompletionBinding(f.store, project, reference(series), 1))!;
+    const plan = f.store.get<RoutesRecord>(binding.value.plan.routes.id, binding.value.plan.routes.revision)!;
+    const batches = plan.value.batches.filter(row => binding.value.plan.batches.includes(row.id));
+    assert.deepEqual(binding.value.plan.batches, plan.value.batches.filter(row => row.items.every(item => item.consumers.includes(block)))
+      .map(row => row.id).sort(), "The first attempt declares every M6 batch of its block before any E1");
+    assert.ok(batches.some(row => row.model === "MC1") && batches.some(row => row.task === "node-expansion" && row.level === 3));
+    assert.deepEqual(binding.value.goal.questions, batches.flatMap(row => row.items)
+      .map(item => gapLineKey(project, item.target, item.field)).sort());
+    const work = deliveredOf(readCompletionWorkAt(f.store, project,
+      reference(f.store.get(completionWorkId(project, binding.id))!)));
+    assert.equal(work.complete, true);
+    assert.ok(work.answers?.complete, "The full registered check has run");
+    const assemblies = f.store.list("om-part-assembly").map(record => deliveredOf(readPartAssembly(f.store, { project, record: reference(record) })))
+      .filter(row => row.proposal.value.level === 3);
+    const results = assemblies.map(row => ({ kind: "assembly" as const, record: reference(row.record) }));
+    assert.ok(results.length >= 2, "The group's actual L3 assemblies supply G5");
+    assert.ok(assemblies.some(row => row.proposal.value.nodes.some(node => node.id === subject)));
+    const sources = deliveredOf(prepareWorksSources(f.store, { project, results }));
+    const accepting = { series: reference(series), ordinal: 1,
+      obligations: batches.filter(row => row.task === "node-expansion" && row.level === 3).flatMap(row => row.items.map(item => item.target)).sort() };
+    // The registered checks and paid assemblies are complete. Invoke the public G5 producer for its independent
+    // candidate refusal before G7; this failed candidate cannot accept a layer, whatever the E5 verdicts were.
+    const acceptanceRequest = { project, results, sources: [...sources.sources], environment: f.request.dispatch.config, binding: accepting };
+    const sent = f.sent().length;
+    const rejected = deliveredOf(writeWorksAcceptance(f.store, acceptanceRequest));
+    assert.equal(rejected.state, "rejected");
+    const rejection = f.store.list("om-work-rejection").at(-1)!;
+    const proof = deliveredOf(readWorkRejectionAt(f.store, { project, record: reference(rejection) }));
+    assert.deepEqual(proof.record, reference(rejection));
+    assert.deepEqual(proof.binding, accepting);
+    assert.deepEqual([...proof.results].sort((a, b) => a.record.id.localeCompare(b.record.id)),
+      [...results].sort((a, b) => a.record.id.localeCompare(b.record.id)));
+    const journal = deliveredOf(readJournalAt(f.store, project, proof.journal));
+    const row = journal.value.rows.find(item => item.code === "work_write_scope_unbounded" && item.origin.subject === subject)!;
+    assert.ok(row, JSON.stringify(journal.value.rows.map(row => [row.code, row.origin.subject])));
+    assert.deepEqual(row.source, proof.diagnostic);
+    const diagnostic = f.store.get<{ gate: string }>(proof.diagnostic.id, proof.diagnostic.revision)!;
+    assert.deepEqual([diagnostic.kind, diagnostic.value.gate, reference(diagnostic)], [UNIT_REFUSAL_KIND, "G5", proof.diagnostic]);
+    const own = assemblies.find(item => item.proposal.value.nodes.some(node => node.id === subject))!;
+    assert.ok(work.products.some(ref => canonical(ref) === canonical(reference(own.record))), "The rejected assembly belongs to this exact attempt's registry");
+    assert.ok(row.origin.sources.some(source => source.role === "proposal" && canonical(source.ref) === canonical(reference(own.proposal))));
+    assert.deepEqual([...row.origin.sources.map(source => source.role)].sort(), ["base", "derived", "environment", "proposal"]);
+    for (const source of row.origin.sources) {
+      const record = f.store.get(source.ref.id, source.ref.revision)!;
+      assert.deepEqual(reference(record), source.ref);
+      if (source.role === "environment") assert.deepEqual(source.ref, f.request.dispatch.config);
+      else {
+        const definitions = deliveredOf(readDefinitions(f.store, { project, source })).definitions;
+        if (["proposal", "derived"].includes(source.role)) assert.ok(definitions.includes(subject));
+        if (source.role === "base") assert.ok(!definitions.includes(subject));
+      }
+    }
+    const terminals = f.store.list<AssessmentResultRecord>(ASSESSMENT_RESULT_KIND);
+    assert.equal(terminals.length, verdicts.length);
+    assert.deepEqual(terminals.map(row => row.value.verdict).sort(), [...verdicts].sort());
+    for (const terminal of terminals) assert.ok(work.products.some(ref => canonical(ref) === canonical(reference(terminal))),
+      "Every E5 terminal belongs to this exact attempt's work");
+    const supported = terminals.flatMap(row => row.value.accepted ? [row.value.accepted] : []);
+    assert.equal(work.refusals.length, shape === "negative" ? 2 : shape === "mixed" ? 1 : 0);
+    for (const terminal of terminals.filter(row => row.value.verdict === "insufficient")) {
+      const source = reference(f.store.get(assessmentRefusalId(project, reference(terminal)))!);
+      assert.ok(work.refusals.some(claim => journal.value.rows.some(saved => saved.id === claim.row && canonical(saved.source) === canonical(source))));
+    }
+    const g5 = { row: row.id, name: row.code, goal: row.goal };
+    const at = { project, block, line: 1, attempt: 1 };
+    if (shape !== "technical") {
+      const before = mechanismSnapshot(f.store);
+      for (const close of [prepareCloseAttempt, closeAttempt]) {
+        const missing = refusalOf<unknown>(close(f.store, { ...at, outcome: refusedBy(g5) }));
+        assert.deepEqual([missing.code, missing.at.field], ["completion_invalid", shape === "mixed" ? "accepting" : "refusals"]);
+        assert.deepEqual(mechanismSnapshot(f.store), before);
+        assert.equal(f.sent().length, sent);
+      }
+    } else {
+      assert.equal(work.technical.length, 2, "Both E5 terminals are genuinely technical before the substantive G5 refusal");
+    }
+    const claim = deliveredOf(prepareManagedClaim(f.store, { ...at, outcome: refusedBy(g5) })).outcome;
+    assert.equal(claim.reason, shape === "mixed" ? "result" : "refused");
+    assert.deepEqual([...claim.accepting].sort((a, b) => a.id.localeCompare(b.id)), [...supported].sort((a, b) => a.id.localeCompare(b.id)));
+    assert.deepEqual([...claim.refusals].sort((a, b) => a.row.localeCompare(b.row)), [...work.refusals, g5].sort((a, b) => a.row.localeCompare(b.row)));
+    const request = { ...at, outcome: claim }, prepared = deliveredOf(prepareCloseAttempt(f.store, request));
+    const other = new Store(f.database);
+    const closed = deliveredOf(closeAttempt(other, request)); other.close();
+    assert.deepEqual(closed, prepared.value);
+    const afterWinner = mechanismSnapshot(f.store);
+    assert.equal(refusalOf(writeGuarded(f.store, { unit: UNIT, target: series.id, writes: prepared.writes, guards: prepared.guards })).code, "input_stale");
+    assert.deepEqual(mechanismSnapshot(f.store), afterWinner);
+    assert.equal(f.sent().length, sent);
+    assert.deepEqual([routeOf(closed, g5.row).class, routeOf(closed, g5.row).addressee, routeOf(closed, g5.row).toModel],
+      ["proposal", `node:${subject}`, true]);
+    assert.deepEqual(closed.routed.map(item => item.row).sort(), claim.refusals.map(item => item.row).sort());
+    const completed = f.store.get<RepairSeries>(series.id)!;
+    assert.equal(completed.value.attempts[0]!.outcome!.reason, claim.reason);
+    assert.equal(completed.value.attempts[0]!.outcome!.achieved.length, supported.length);
+    assert.equal(completed.value.withoutProgress, shape === "mixed" ? 0 : 1);
+    assert.equal(f.store.get("om-frame:garden:3"), null, "A rejected G5 accepts no layer");
+    for (const cold of [false, true]) {
+      if (cold) f.restart();
+      assert.deepEqual(deliveredOf(closeAttempt(f.store, request)), closed);
+      const repeated = deliveredOf(writeWorksAcceptance(f.store, acceptanceRequest));
+      assert.equal(repeated.state, "unchanged");
+      assert.deepEqual(repeated.record, rejected.record);
+      assert.deepEqual(deliveredOf(readWorkRejectionAt(f.store, { project, record: reference(rejection) })), proof);
+      assert.deepEqual(mechanismSnapshot(f.store), afterWinner);
+      assert.equal(f.sent().length, sent);
+    }
+  });
+});
+
 test("E5.1 requires its full negative or mixed set even when direct G7 is given only a valid G3 refusal", async t => {
   for (const shape of ["negative", "mixed"] as const) await t.test(shape, async child => {
     const f = e51Fixture(child, shape === "mixed");
