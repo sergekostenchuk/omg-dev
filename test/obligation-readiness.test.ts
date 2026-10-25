@@ -18,7 +18,8 @@ import { readinessObligations } from '../src/graph/obligation-readiness.js';
 import { obligationHandoff } from '../src/graph/obligation-handoff.js';
 import { taskBindingId } from '../src/graph/task-obligations.js';
 import type { Graph } from '../src/graph/model.js';
-import { hashJson } from '../src/canonical.js';
+import { canonical, hashJson } from '../src/canonical.js';
+import { checkedPlanDerivation, EXTERNAL_INPUT_DERIVATION, type MachinePlan } from '../src/compiler/model.js';
 
 function fixture(t: test.TestContext, { exit = 0, certifies = true } = {}) {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'omg-readiness-'))), workspace = join(root, 'repo'); mkdirSync(workspace);
@@ -86,8 +87,19 @@ test('R3 requires actual declared confirmation and retains future result debt wi
   assert.deepEqual(JSON.parse(context.text).criteria.researchObligations, task.researchObligations);
   const { hash: _hash, ...body } = structuredClone(plan.value);
   delete body.tasks.find(item => item.id === task.id)!.researchObligations;
-  const forged = f.store.write({ id: 'plan:p:missing-task-obligations', kind: 'plan', expected: 0, value: { ...body, hash: hashJson(body) } });
-  assert.throws(() => f.engine.compiler.read(forged.id), { code: 'plan_derivation_mismatch' });
+  // Explicit negative plan: a current envelope cannot replace its missing task obligations.
+  const hash = hashJson(body), forged = f.store.write<MachinePlan>({ id: `plan:p:external-inputs-v1:${hash}`,
+    kind: 'plan', expected: 0, value: { ...body, hash } });
+  assert.equal(checkedPlanDerivation(forged), EXTERNAL_INPUT_DERIVATION);
+  const snapshot = (store: Store) => canonical(store.list().map(head => ({ head, history: store.history(head.id) })));
+  const before = snapshot(f.store), cold = new Store(f.store.path); t.after(() => cold.close());
+  for (const store of [f.store, cold]) {
+    const compiler = new ProductEngine(store).compiler;
+    assert.deepEqual(compiler.read(plan.id), plan);
+    assert.equal(snapshot(store), before);
+    assert.throws(() => compiler.read(forged.id), { code: 'plan_derivation_mismatch' });
+    assert.equal(snapshot(store), before);
+  }
   assert.equal(f.store.list('task-run').length, 0, 'A plan assigning future work is accepted before its implementation');
   assert.equal(f.store.list('model-call').length, 0, 'R3 and compilation launch no new probe or model call');
 });

@@ -6,7 +6,7 @@ import { canonical, hashJson, type Json } from '../src/canonical.js';
 import { deriveTasks } from '../src/compiler/derive.js';
 import { requireBasis } from '../src/compiler/basis.js';
 import { resolveArtifact } from '../src/compiler/inputs.js';
-import type { MachinePlan } from '../src/compiler/model.js';
+import { checkedPlanDerivation, EXTERNAL_INPUT_DERIVATION, type MachinePlan } from '../src/compiler/model.js';
 import { requirePlanTaskObligations } from '../src/execution/task-obligations.js';
 import { EngineError } from '../src/errors.js';
 import { ensureWorktree } from '../src/execution/worktree.js';
@@ -291,7 +291,7 @@ function planWithIncompleteProvenance(store: Store, feasibility: Revision<OmFeas
   const researchObligations = handoff ? requireTaskObligations(store, project, graph.value, handoff) : undefined;
   const derived = deriveTasks(project, graph.hash, graph.value,
     (producer, artifact) => resolveArtifact(store, project, graph.value, base, producer, artifact),
-    { version: 2, owner: path => owners.latest(path), ...(researchObligations ? { researchObligations } : {}) });
+    { version: 2, externalInputs: EXTERNAL_INPUT_DERIVATION, owner: path => owners.latest(path), ...(researchObligations ? { researchObligations } : {}) });
   const stageId = `stage:${project}:om-g2`;
   // This is the malformed-input boundary: consistent checksums do not establish M8 provenance.
   // No validator or reader is replaced, and these writes do not claim public stage acceptance.
@@ -300,10 +300,12 @@ function planWithIncompleteProvenance(store: Store, feasibility: Revision<OmFeas
       content: { feasibility: reference(feasibility) } as unknown as Json, inputs: [], proofs: [] } });
   const guards = uniqueRefs([reference(stage), reference(feasibility), graphRef, feasibility.value.environment,
     ...feasibility.value.inputs, ...derived.guards]);
-  const body = { version: 2 as const, projectId: project, graph: graphRef, environment: feasibility.value.environment,
+  const body = { version: 2 as const, derivation: EXTERNAL_INPUT_DERIVATION, projectId: project, graph: graphRef, environment: feasibility.value.environment,
     stage: reference(stage), feasibility: reference(feasibility), base, guards, tasks: derived.tasks, graphSnapshot: graph.value };
   const value: MachinePlan = { ...body, hash: hashJson(body) };
-  return store.write<MachinePlan>({ id: `plan:${project}:${value.hash}`, kind: 'plan', expected: 0, value });
+  const plan = store.write<MachinePlan>({ id: `plan:${project}:external-inputs-v1:${value.hash}`, kind: 'plan', expected: 0, value });
+  assert.equal(checkedPlanDerivation(plan), EXTERNAL_INPUT_DERIVATION, 'A valid current envelope is not proof of its deliberately damaged M8');
+  return plan;
 }
 
 test('G1.1 Compiler read and current gate reject incomplete M8 provenance by the shared historical reader', async t => {
@@ -317,13 +319,16 @@ test('G1.1 Compiler read and current gate reject incomplete M8 provenance by the
       const plan = planWithIncompleteProvenance(f.store, changed);
       for (const restart of [false, true]) {
         if (restart) f.restart();
-        const before = heads(f.store), engine = new ProductEngine(f.store);
-        assert.throws(() => requireBasis(f.store, plan.value), errorCode('feasibility_record_invalid'));
-        assert.throws(() => requirePlanTaskObligations(f.store, plan.value), errorCode('feasibility_record_invalid'));
-        assert.throws(() => engine.compiler.read(plan.id), errorCode('feasibility_record_invalid'));
-        for (const allowHistorical of [false, true])
-          assert.throws(() => engine.compiler.gate(f.project, reference(plan), allowHistorical), errorCode('feasibility_record_invalid'));
-        assert.deepEqual(heads(f.store), before);
+        const snapshot = () => canonical(f.store.list().map(head => ({ head, history: f.store.history(head.id) })));
+        const before = snapshot(), engine = new ProductEngine(f.store);
+        assert.equal(checkedPlanDerivation(plan), EXTERNAL_INPUT_DERIVATION);
+        const doors = [() => requireBasis(f.store, plan.value), () => requirePlanTaskObligations(f.store, plan.value),
+          () => engine.compiler.read(plan.id), ...[false, true].map(allowHistorical =>
+            () => engine.compiler.gate(f.project, reference(plan), allowHistorical))];
+        for (const invoke of doors) {
+          assert.throws(invoke, errorCode('feasibility_record_invalid'));
+          assert.equal(snapshot(), before);
+        }
       }
     });
 });
