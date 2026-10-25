@@ -1,17 +1,12 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
-import { execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { createRequire } from 'node:module';
-import { fileURLToPath, pathToFileURL } from 'node:url';
 import { discoveryBasisCatalogue, discoveryContext } from '../src/discovery/discovery-outcome.js';
 import type { ResearchAssessment } from '../src/discovery/research-model.js';
 import type { Environment } from '../src/runtime/environment.js';
 import type { Question, DiscoveryDraft } from '../src/discovery/discovery.js';
 import type { Revision } from '../src/storage/store.js';
 import type { ProductEngine } from "../src/product/engine.js";
-import { UPSTREAM_STAGES, VERSION5_REQUIREMENTS } from "../src/discovery/requirements.js";
+import { UPSTREAM_STAGES } from "../src/discovery/requirements.js";
+import { EngineError } from "../src/errors.js";
 import { reference, stageId, type StageArtifact } from "../src/pipeline/contracts.js";
 import { exampleGraph } from "./graph-fixture.js";
 import type { Graph } from "../src/graph/model.js";
@@ -23,7 +18,8 @@ import { designOf } from "../src/graph/builder.js";
 import { deriveLayerFixture } from "./layer-design-fixture.js";
 
 const upstreamEra = new AsyncLocalStorage<string>();
-/** Scope a neighboring fixture without changing its default for other tests. */
+/** Scope a neighboring fixture without changing its default for other tests. The scope names an upstream era that no fixture builds
+ * any more: inside it a call that states no era of its own is refused (product_fixture_era_unsupported); an explicit "" builds the current stages. */
 export function withHistoricalUpstream<T>(commit: string, fixture: () => T): T {
   return upstreamEra.run(commit, fixture);
 }
@@ -68,7 +64,9 @@ export function currentUpstreamFixtureValue(engine: ProductEngine, project: stri
 export function preparedFeatures(engine: ProductEngine, project: string, graph: Graph = exampleGraph(project),
   valueFor: (field: string) => Json = field => preparedField(project, field), historicalCommit?: string) {
   const era = historicalCommit ?? upstreamEra.getStore();
-  if (era) return historicalFeatures(engine, project, graph, valueFor, era);
+  // A named era is not built any more, and it must never silently turn into the current one.
+  if (era) throw new EngineError("product_fixture_era_unsupported",
+    "The product fixture builds only the current upstream; a non-empty era, explicit or inherited, is not supported", { target: "/era" });
   engine.execute({ type: "create-project", project, title: project });
   const source = engine.discovery.evidence.document(project, "brief", `A brief for ${project}`, "text/plain", 0);
   graph = enrichedGraph(graph, project, valueFor("preparation"), valueFor("conceptSections"));
@@ -120,55 +118,4 @@ export function answerDiscoveryFixture(engine: ProductEngine, project: string, d
     verdict:'supported',reasons:[],researcher:'fixture-author',assessor:'fixture-assessor',environment:reference(environment)};
   const saved=engine.store.write({id:`research-assessment:${hashJson(assessment)}`,kind:'research-assessment',expected:0,value:assessment});
   return engine.discovery.researched(question.id,question.revision,reference(saved));
-}
-
-/** Explicit era only: the old producer owns both its code and upstream records. */
-function historicalFeatures(engine: ProductEngine, project: string, graph: Graph,
-  valueFor: (field: string) => Json, commit: string): void {
-  const repository = fileURLToPath(new URL('../../', import.meta.url));
-  const root = mkdtempSync(join(tmpdir(), 'omg-upstream-era-'));
-  const loader = join(root, 'loader.mjs'), producer = join(root, 'producer.mjs');
-  const values = Object.fromEntries([...new Set(Object.values(VERSION5_REQUIREMENTS).flat()
-    .filter(spec => spec.kind !== 'fact' && spec.field !== 'mapDesign').map(spec => spec.field))]
-    .map(field => [field, valueFor(field)]));
-  try {
-    writeFileSync(loader, String.raw`import {execFileSync} from 'node:child_process';
-import {fileURLToPath} from 'node:url';
-let root, commit, ts;
-export async function initialize(data) {
-  root = data.root; commit = data.commit; ts = (await import(data.typescript)).default;
-}
-export async function load(url, context, next) {
-  const prefix = new URL('dist/', root).href;
-  if (url.startsWith(prefix) && /\.js$/.test(url)) {
-    const relative = url.slice(prefix.length).replace(/\.js$/, '.ts');
-    if (relative.startsWith('src/') || relative.startsWith('test/')) {
-      const source = execFileSync('git', ['show', commit + ':' + relative],
-        {cwd:fileURLToPath(root),encoding:'utf8',maxBuffer:10000000});
-      return {format:'module',shortCircuit:true,source:ts.transpileModule(source,
-        {compilerOptions:{module:ts.ModuleKind.ESNext,target:ts.ScriptTarget.ES2023}}).outputText};
-    }
-  }
-  return next(url, context);
-}`);
-    writeFileSync(producer, String.raw`import {readFileSync} from 'node:fs';
-import {pathToFileURL} from 'node:url';
-import {join} from 'node:path';
-const args=JSON.parse(readFileSync(0,'utf8'));
-const url=path=>pathToFileURL(join(args.repository,'dist',path)).href;
-const {Store}=await import(url('src/storage/store.js'));
-const {ProductEngine}=await import(url('src/product/engine.js'));
-const {preparedFeatures}=await import(url('test/product-fixture.js'));
-const store=new Store(args.database);
-try {
-  preparedFeatures(new ProductEngine(store),args.project,args.graph,field=>args.values[field]);
-} finally {store.close();}
-`);
-    const bootstrap = `import {register} from 'node:module'; register(${JSON.stringify(pathToFileURL(loader).href)},
-      {data:${JSON.stringify({root:pathToFileURL(repository).href,commit,
-        typescript:pathToFileURL(createRequire(import.meta.url).resolve('typescript')).href})}});`;
-    execFileSync(process.execPath, ['--import', `data:text/javascript,${encodeURIComponent(bootstrap)}`, producer],
-      {cwd:repository,input:JSON.stringify({repository,database:engine.store.path,project,graph,values}),
-        encoding:'utf8',timeout:180_000,maxBuffer:10_000_000});
-  } finally { rmSync(root, {recursive:true,force:true}); }
 }
