@@ -89,10 +89,12 @@ function script(stubDir: string, steps: Record<string, unknown>[], database: str
 }
 
 /** The engine modules the garden recipe uses. */
-const RECIPE = { Store, ProductEngine, reference, gardenGraph, preparedFeatures, preparedField, UPSTREAM_STAGES, projectGraph, writeOmInput,
+const RECIPE_MODULES = { Store, ProductEngine, reference, gardenGraph, preparedFeatures, preparedField, UPSTREAM_STAGES, projectGraph, writeOmInput,
   writeAddressing, inputDecisionWrite, writeHorizon, writeGaps, prepareQuestionTasks, writeRoutes, openSeries, beginAttempt, completeAttempt,
-  gapLineKey, gapLineExpectedResult, writeQuestionPacket, runModelCycle, prepareFrameProposals, writeFileSync, mkdirSync, symlinkSync, mkdtempSync,
+  openAttempt, readCompletionBinding, gapLineKey, gapLineExpectedResult, writeQuestionPacket, runModelCycle, prepareFrameProposals,
+  writeFileSync, mkdirSync, symlinkSync, mkdtempSync,
   join, tmpdir, execPath: process.execPath, STUB };
+const RECIPE: typeof RECIPE_MODULES & { assert: typeof assert } = { ...RECIPE_MODULES, assert };
 type RecipeModules = typeof RECIPE;
 interface GardenData {
   root: string; database: string; stubDir: string; outside: string; environment: Ref; adapter: Ref;
@@ -185,6 +187,21 @@ async function gardenRecipe(m: RecipeModules, root: string, plan: 'facts' | 'fie
       m.openSeries(store, { project, block, line: 1, slice: `pr1-${block}`, predecessor: null, basis: null } as never);
       return ok(m.beginAttempt(store, { project, block, line: 1, attempt: 1, goal: goalOf(batch) } as never));
     };
+    // The producer opens through the current managed gate on the plan of its own whole level-2 expansion batch;
+    // consumers keep the standalone blockSeries above.
+    const managedProduceSeries = (batch: (typeof batches)[number]) => {
+      m.assert.ok(batch.task === 'node-expansion' && batch.level === 2 && batch.node === 'garden-produce-block'
+        && batch.items.length > 0 && batch.items.every(item => item.consumers.includes('garden-produce-block')),
+        'The producer batch is the own whole level-2 node-expansion of garden-produce-block');
+      m.openSeries(store, { project, block: 'garden-produce-block', line: 1, slice: 'pr1-garden-produce-block', predecessor: null, basis: null } as never);
+      const plan = { routes: m.reference(routes), batches: [batch.id] };
+      const series = ok(m.openAttempt(store, { project, block: 'garden-produce-block', line: 1, attempt: 1, goal: goalOf(batch),
+        completion: plan } as never));
+      const binding = ok(m.readCompletionBinding(store, project, m.reference(series), 1));
+      m.assert.ok(binding?.value, 'The managed producer attempt holds its completion binding');
+      m.assert.deepEqual(binding!.value!.plan, plan, 'The binding holds the exact completion plan');
+      return series;
+    };
     const data: GardenData = { root, database, stubDir, outside, environment: m.reference(configured), adapter: m.reference(adapter), packets: {}, calls: {}, answers: {},
       batches: {}, questions: {} };
     const node = (name: string) => batches.find(batch => batch.task === 'node-expansion' && batch.node === name)!;
@@ -208,8 +225,13 @@ async function gardenRecipe(m: RecipeModules, root: string, plan: 'facts' | 'fie
       ok(await m.runModelCycle(store, callOf(m.reference(factPacket))));
       data.questions.fact = fact.items.map(item => item.gap);
       data.packets.fact = m.reference(factPacket); data.calls.fact = omCalls().filter(id => !data.calls.factRefused!.includes(id));
-      const produceSeries = blockSeries('garden-produce-block', produce);
+      const factPayments = omCalls().map(id => store.get<Record<string, unknown>>(id)!);
+      m.assert.ok(factPayments.length > 0, 'The fact payments are already recorded');
+      const produceSeries = managedProduceSeries(produce);
       const nodePacket = packetOf(produce, m.reference(produceSeries), 1);
+      m.assert.equal(nodePacket.value.state, 'ready');
+      m.assert.deepEqual(nodePacket.value.request.attempt, { series: m.reference(produceSeries), ordinal: 1 });
+      m.assert.deepEqual(omCalls().map(id => store.get(id)!), factPayments, 'The producer opening changes no recorded fact payments');
       steps([{ research: { protocol: '$answerProtocol', requestId: '$requestId', action: 'need_source', questionIds: produce.items.map(item => item.gap),
         missing: 'The supported encoding', reads: [{ action: 'read', path: 'e4-source.txt', media: 'text/plain' }] }, usage },
       { research: nodeAnswer(produce, 'probe', false), usage }]);
@@ -226,12 +248,19 @@ async function gardenRecipe(m: RecipeModules, root: string, plan: 'facts' | 'fie
       const field = batches.find(batch => batch.model === 'MC2' && batch.task === 'input-field' && batch.items.some(item => item.target === 'discovery:encoding'))!;
       const produce = node('garden-produce-block'), consume = node('garden-consume-block');
       data.batches = { field: field.id, produce: produce.id, consume: consume.id };
-      const produceSeries = blockSeries('garden-produce-block', produce), consumeSeries = blockSeries('garden-consume-block', consume);
-      data.packets.produce = m.reference(packetOf(produce, m.reference(produceSeries), 1));
+      const produceSeries = managedProduceSeries(produce), consumeSeries = blockSeries('garden-consume-block', consume);
+      const producePacket = packetOf(produce, m.reference(produceSeries), 1);
+      m.assert.equal(producePacket.value.state, 'ready');
+      m.assert.deepEqual(producePacket.value.request.attempt, { series: m.reference(produceSeries), ordinal: 1 });
+      data.packets.produce = m.reference(producePacket);
       data.packets.consume = m.reference(packetOf(consume, m.reference(consumeSeries), 1));
       // The same producer assignment under a later environment whose adapter path is relative: one more point of one frame.
       const relative = m.reference(environment(['stub.mjs', stubDir], 100_000));
-      data.packets.produceRelative = m.reference(packetOf(produce, m.reference(produceSeries), 1, relative));
+      const produceRelativePacket = packetOf(produce, m.reference(produceSeries), 1, relative);
+      m.assert.equal(produceRelativePacket.value.state, 'ready');
+      m.assert.deepEqual(produceRelativePacket.value.request.attempt, { series: m.reference(produceSeries), ordinal: 1 });
+      m.assert.equal(omCalls().length, 0, 'Two unpaid packets of one producer');
+      data.packets.produceRelative = m.reference(produceRelativePacket);
       const owner = { project, owner: { kind: 'mechanism', mechanism: 'M5:addressing' }, line: 1 };
       m.openSeries(store, { ...owner, scope: gapRequest, predecessor: null, basis: null } as never);
       const mechanism = ok(m.beginAttempt(store, { ...owner, attempt: 1, goal: goalOf(field),
