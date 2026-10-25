@@ -39,7 +39,6 @@ import type { CarriedObligation } from '../src/graph/obligation-policy.js';
 import { recordCall } from '../src/om/call-record.js';
 import { openAttempt as managedOpenAttempt, closeAttempt, prepareManagedClaim, type OriginHold } from '../src/om/repeat-gate.js';
 import { Environments } from '../src/runtime/environment.js';
-import { unitRefusalNamespace, UNIT_REFUSAL_KIND, recordRefusal } from '../src/om/refusal-journal.js';
 import { Evidence, Source } from '../src/evidence/evidence.js';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { setTimeout as fixtureDelay } from 'node:timers/promises';
@@ -458,52 +457,6 @@ export function e4NeedSource(f: Pick<ReturnType<typeof e4Fixture>, 'batch'>, rea
     questionIds: f.batch.items.map(item => item.gap), missing: 'Need the addressed source data', reads };
 }
 
-
-
-export function e4AnalysisFixture(t: TestContext, purpose: 'stop-analysis' | 'origin-analysis', timeoutMs = 1000) {
-  const root = mkdtempSync(join(tmpdir(), 'omg-e4-analysis-')), path = join(root, 'state.sqlite');
-  let store = new Store(path);
-  t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
-  const project = 'analysis', block = 'analyzed-block', address = { project, block, line: 1 };
-  const goal = { key: 'analysis-fixture-goal', questions: ['Address one contract'], result: 'A supported contract' };
-  valueOf(openSeries(store, { ...address, slice: 'analysis-slice', predecessor: null, basis: null }));
-  let series = valueOf(beginAttempt(store, { ...address, attempt: 1, goal })) as Revision<RepairSeries>;
-  let basis: {kind: 'series-stop';series: Ref;attempt: number} | {kind: 'origin-hold';hold: Ref};
-  if (purpose === 'stop-analysis') {
-    for (const attempt of [1, 2, 3]) {
-      if (attempt > 1) valueOf(beginAttempt(store, { ...address, attempt, goal }));
-      series = valueOf(completeAttempt(store, { ...address, attempt,
-        outcome: { reason: 'result', achieved: [], cancelled: [], refusals: [] } })) as Revision<RepairSeries>;
-    }
-    basis = { kind: 'series-stop', series: reference(series), attempt: 3 };
-  } else {
-    const refusal = store.write({ id: `${unitRefusalNamespace(project)}analysis-source`, kind: UNIT_REFUSAL_KIND, expected: 0,
-      value: { gate: 'G3', refusals: [{ code: 'unrecognized_fixture_refusal', goal: goal.key, remedy: 'Identify the exact origin',
-        origin: { name: 'artifact_missing', stage: 'layer-check', subject: 'artifact:fixture', sources: [] } }] } });
-    const journal = valueOf(recordRefusal(store, { project, source: reference(refusal) }));
-    const row = journal.value.rows[0]!;
-    const closed = valueOf(closeAttempt(store, { ...address, attempt: 1,
-      outcome: { reason: 'refused', accepting: [], cancelling: [], refusals: [{ row: row.id, name: row.code, goal: row.goal }] } }));
-    assert.equal(closed.holds.length, 1);
-    series = store.get<RepairSeries>(series.id)!; basis = { kind: 'origin-hold', hold: closed.holds[0]! };
-  }
-  const scenario = join(root, 'scenario.json'), trace = join(root, 'trace.jsonl');
-  const command = { executable: process.execPath, args: [fixturePath, '--scenario', scenario, '--trace', trace] };
-  const environment = new Environments(store).configure(project, { workspace: root, implementer: { actor: 'analysis-executor', model: 'fixture', effort: 'high', command },
-    reviewer: { actor: 'analysis-reviewer', model: 'fixture', effort: 'high', command }, fullCheck: command, timeoutMs }, 0);
-  const adapter = store.write({ id: `adapter:${project}`, kind: 'dispatch-adapter', expected: 0, value: { protocol: 'codex-stdio' } });
-  const packet = { task: 'Diagnose the named ground', note: 'No fabricated A6 protocol', basis } as unknown as Json;
-  const reviewGoal = { key: purpose, questions: ['What caused this ground?'], result: 'A cause or explicit hypothesis with an addressed change' };
-  const admitted = valueOf(recordCall(store, project, { call: `e4:${purpose}`, purpose, basis, block,
-    gaps: [{ id: purpose, goal: purpose, field: 'cause-and-change', consumer: 'A6:stop-analysis' }], series: reference(series),
-    attempt: purpose === 'stop-analysis' ? 3 : 1, goal: reviewGoal,
-    dispatch: { adapter: reference(adapter), config: reference(environment) }, packet }));
-  const request: ModelTransportRequest = { project, call: reference(admitted.call), packet, role: 'reviewer' };
-  writeFileSync(scenario, JSON.stringify({ steps: [{ research: { cause: 'fixture observation', hypothesis: true }, usage, confirmed }] }));
-  return { root, database: path, scenario, trace, project, packet, request, series, address, environment,
-    get store() { return store; }, restart() { store.close(); store = new Store(path); },
-    sent() { return existsSync(trace) ? readFileSync(trace, 'utf8').trim().split('\n').filter(Boolean) : []; } };
-}
 
 
 /** A6 transport with a genuine paid managed stop, or the block G5 hold produced by a regated works pass. */
