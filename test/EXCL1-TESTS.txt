@@ -3,7 +3,6 @@
 # npm test гоняет всё; неизвестный, дублирующийся или вне-прогоновый ключ останавливает check:backend до запуска.
 # Реестр: ~/REPORTS/review/omg-excl1-design_191026.md (описи omg-legacy-inv-{A,B,C,D,D2-cw}_191026.md).
 
-assessment-session-resume.test.ts :: D8.3 reads byte-identical assessment history from the whole b603c2b producer after two restarts without dispatch # вид 1: эра b603c2b
 discovery-v6-era.test.ts :: DS1.2e the released v5 requirement literal and all schema/prompt bytes stay exact # вид 1: старая форма/маршрут
 discovery-v6-era.test.ts :: DS2 genuine pre-DS2 v6 keeps unfinished and paid work, accepted summary and B1 exact closure after restart # поддерживаемое издание v6 до DS2; исторический Git-производитель, исключён из check:backend
 discovery.test.ts :: D8.4.2-2 P2-1 (№2276-1): a K of the accepted D8.4e producer (c60be08, UUID answer) keeps its full contract; the new producer alone writes the managed address # вид 1: эра c60be08
@@ -17,7 +16,6 @@ execution.test.ts :: AT3a return №4141 P2-1: the live form of task 1 — a nee
 om-answers-gate.test.ts :: H1.5 ERA: G4b records written by the code of the base commit are read by the new code with the same result, and the new preparation derives that very record # вид 1: эра 479b307f, 7c7d3ccc
 om-answers-gate.test.ts :: FA1 an E5 intent of the era before the verdict form is admitted and its supported verdict applied by today's E5 as saved, never assessment_source_stale # вид 1: эра 7c7d3ccc, d519a603
 om-answers-gate.test.ts :: PF1 (№2797-6 row 8, -7) a G4b batch read through one shared overlay prepares byte for byte what the base d519a60 prepares in its own process — two new sources in one batch, a late delivery mixing a stored source with a new one, and the evaluation linked with the close — result, writes, guards and their order; the written evaluation and delivery repeat without a write # вид 1: эра 7c7d3ccc, d519a603
-om-legacy-route-closure.test.ts :: G1.3 complete daa81a530cae history and new plan era preserve native semantics and exact dependent references # вид 1: эра daa81a5
 om-model-call-part-06.test.ts :: E4 direct continuation refuses repeated knowledge atomically before a third dispatch and replays after restart # вид 1: эра 7c7d3cc
 om-model-call-part-06.test.ts :: 1 H1.0a standalone physical history retains its original completion and never acquires an owner # вид 1: эра 7c7d3cc
 om-model-call-part-06.test.ts :: 4 H1.0a an existing standalone opening cannot be adopted even before any physical call # вид 1: эра 7c7d3cc
