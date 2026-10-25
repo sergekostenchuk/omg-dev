@@ -93,8 +93,22 @@ console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,u
       { store: f.store, draftId: calibration.id, questionId: calibration.value.questions[0]!, purpose: `variant-${kind}` });
   }
   writeFileSync(wire, '');
-  const run = (limit = 8, store = f.store, restoreOnly = false) => new Researcher(store, new Discovery(store), new ProductEngine(store).environments)
-    .run('p', v.draft.id, limit, undefined, { producerPolicy: { discovery: 7 }, restoreOnly });
+  // Keep these producer tests at the handoff boundary now that the runner has a recipient.
+  // Only the new handoff tail is cut; paid production and its identity/CAS stay real.
+  const run = async (limit = 8, store = f.store, restoreOnly = false) => {
+    const write = store.writeMany.bind(store);
+    store.writeMany = ((writes, guards) => {
+      if (writes.some(w => w.kind === DOSSIER_MANIFEST_KIND))
+        throw new EngineError('partial_recipient_cut', 'Exercise the standalone producer after the real handoff');
+      return write(writes, guards);
+    }) as typeof store.writeMany;
+    try { return await new Researcher(store, new Discovery(store), new ProductEngine(store).environments)
+      .run('p', v.draft.id, limit, undefined, { producerPolicy: { discovery: 7 }, restoreOnly }); }
+    catch (error) {
+      if (!(error instanceof EngineError) || error.code !== 'partial_recipient_cut') throw error;
+      return store.list<import('../src/discovery/research-model.js').ResearchRun>('research-run').find(r => r.value.draftId === v.draft.id)!;
+    } finally { store.writeMany = write; }
+  };
   const wires = () => readFileSync(wire, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line));
   const generationCalls = () => wires().filter(row => row.subject.variantSubject);
   const nextEdition = (store = f.store) => {

@@ -1,3 +1,5 @@
+import { readVariantHandoff, discoveryInspection } from '../src/discovery/discovery-outcome.js';
+import { readPartialDossier } from '../src/discovery/dossier-manifest.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync, writeFileSync } from 'node:fs';
@@ -128,10 +130,19 @@ test('4R.1: bypass buys a separate model choice after generation and pauses at t
 
 test('4R.1: no_variants is its own paid result and cold fixed point, never completed Discovery', async t => {
   const f = await setup(t); f.configure({ none: true }); const result = await f.run(2);
-  assert.equal(result.value.pauseCode, 'research_no_variants', JSON.stringify(result.value));
+  assert.equal(result.value.pauseCode, 'research_dossier_assessment_unavailable', JSON.stringify(result.value));
+  const pause = JSON.parse(result.value.error!), handoff = await readVariantHandoff(f.store, 'p', pause.handoff);
+  const dossier = await readPartialDossier(f.store, 'p', pause.dossier);
+  assert.equal(handoff.record.value.reason, 'no_variants');
+  assert.deepEqual(handoff.record.value.result, reference(f.store.list('discovery-variant-none')[0]!));
+  assert.equal(handoff.record.value.projectId, 'p'); assert.equal(handoff.record.value.draft.id, f.v.draft.id);
+  assert.deepEqual(reference(dossier.handoff), pause.handoff); assert.deepEqual(dossier.record.value.draft, handoff.record.value.draft);
+  assert.equal(dossier.record.value.projectId, 'p'); assert.equal(dossier.record.value.completeness, 'partial');
+  assert.equal(discoveryInspection(f.store, f.store.get<DiscoveryDraft>(f.v.draft.id)!).outcome.state, 'researching');
+  assert.equal(f.store.list('stage-artifact').length, 0);
   assert.equal(f.store.list('discovery-variant-set').length, 0); assert.equal(f.store.list('discovery-variant-none').length, 1);
-  assert.equal(f.generationCalls().length, 1); const before = history(f.store);
-  assert.deepEqual(await f.run(2, f.open(), true), result); assert.deepEqual(history(f.store), before);
+  assert.equal(f.generationCalls().length, 1); const before = history(f.store), wire = f.wires();
+  assert.deepEqual(await f.run(2, f.open(), true), result); assert.deepEqual(history(f.store), before); assert.deepEqual(f.wires(), wire);
 });
 
 test('4R.1: call allowance and restoreOnly stop before buying generation; a later explicit allowance sends it once', async t => {
@@ -200,10 +211,29 @@ test('4R.1: a new accepted edition of the same Question restores old paid genera
 test('4R.1: common research budget stops new generation after actual paid assessment usage consumes the research reserve', async t => {
   const f = await setup(t); f.configure({ assessorTokens: V7_STAGE_TOKEN_CEILING - 1000 });
   const result = await f.run(2);
-  assert.equal(result.value.pauseCode, 'research_variant_handoff_unavailable', JSON.stringify(result.value));
-  assert.equal(JSON.parse(result.value.error!).reason, 'early_limit');
-  assert.equal(f.generationCalls().length, 0); const ready = variantSnapshotReadiness(f.store, 'p');
+  assert.equal(result.value.pauseCode, 'research_dossier_assessment_unavailable', JSON.stringify(result.value));
+  const pause = JSON.parse(result.value.error!);
+  assert.equal(pause.reason, 'early_limit');
+  const handoff = await readVariantHandoff(f.store, 'p', pause.handoff), dossier = await readPartialDossier(f.store, 'p', pause.dossier);
+  assert.equal(handoff.record.value.reason, 'early_limit'); assert.equal(handoff.record.value.projectId, 'p');
+  assert.equal(handoff.record.value.draft.id, f.v.draft.id); assert.equal(handoff.record.value.snapshot, null);
+  assert.deepEqual(reference(dossier.handoff), pause.handoff); assert.deepEqual(dossier.record.value.draft, handoff.record.value.draft);
+  assert.equal(dossier.record.value.projectId, 'p'); assert.equal(dossier.record.value.completeness, 'partial');
+  assert.equal(dossier.record.value.reasons[0]!.code, 'budget');
+  for (const ground of handoff.record.value.stop!.grounds)
+    assert.ok(dossier.record.value.reasons[0]!.grounds.some(r => canonical(r) === canonical(ground)));
+  assert.equal(f.generationCalls().length, 0); assert.equal(f.store.list('discovery-variant-snapshot').length, 0);
+  const ready = variantSnapshotReadiness(f.store, 'p');
   assert.equal(ready.status, 'ready'); if (ready.status === 'ready') assert.equal(ready.generationAllowed, false);
+  assert.ok(ready.budget?.exhausted); assert.ok(ready.budget.measured >= V7_STAGE_TOKEN_CEILING - 1000);
+  const ledger = f.store.get(ready.budget.ledger.id, ready.budget.ledger.revision)!;
+  assert.equal(ledger.kind, 'research-budget-ledger'); assert.deepEqual(reference(ledger), ready.budget.ledger);
+  assert.ok(handoff.record.value.stop!.grounds.some(r => canonical(r) === canonical(ready.budget!.ledger)));
+  const before = history(f.store), wire = f.wires();
+  const paid = () => f.store.list().filter(r => ['model-call', 'research-budget-ledger'].includes(r.kind)).flatMap(r => f.store.history(r.id));
+  const calls = paid();
+  assert.deepEqual(await f.run(1, f.open(), true), result); assert.deepEqual(history(f.store), before);
+  assert.deepEqual(paid(), calls); assert.deepEqual(f.wires(), wire);
 });
 
 for (const decoration of ['variant kind', 'variantSubject'] as const) {

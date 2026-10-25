@@ -1,3 +1,4 @@
+import { readPartialDossier } from "../discovery/dossier-manifest.js";
 import { readVariantHandoff, discoveryInspection } from '../discovery/discovery-outcome.js';
 import { canonical, digest, type Json } from "../canonical.js";
 import { Discovery } from "../discovery/discovery.js";
@@ -14,7 +15,7 @@ import type { Revision, TransactionGuard, Write } from "../storage/store.js";
 import { storeView } from "../storage/store-view.js";
 import { continuePass, startPass, type PassOutcome } from "../om/run-driver.js";
 import { readRun } from "../om/run.js";
-import { acquireRunExecution, admitRunControl, releaseRunExecution, RunControlGate, RunControlLost, type RunExecution } from "../om/run-control.js";
+import { acquireRunExecution, admitRunControl, releaseRunExecution, readRunControl, RunControlGate, RunControlLost, type RunExecution } from "../om/run-control.js";
 import type { Refusal } from "../om/refusal.js";
 import type { Project, StageContent, ProductEngine } from "./engine.js";
 import type { StageResearchResult } from "./stage-research.js";
@@ -25,7 +26,7 @@ export type EarlyStageEnd = "stage_paused" | "needs_owner" | "conditional" | "no
   | "om_waiting" | "om_stopped" | "om_busy" | "om_refused";
 
 /** DRY6-01: a stage paused on a refused original assessment carries its exact machine door (reopen of the assessed question). */
-export interface EarlyStageReason { code: string; target: string; message: string; field?: string; door?: AssessmentRefusalDoor; handoff?: Ref; next?: 'deep' | 'dossier' }
+export interface EarlyStageReason { code: string; target: string; message: string; field?: string; door?: AssessmentRefusalDoor; handoff?: Ref; dossier?: Ref; completeness?: 'partial'; next?: 'deep' | 'dossier' | 'dossier-assessment' }
 export interface EarlyStageBudget {
   maxTurns: number; turnsUsed: number; turnsRemaining: number;
   maxCalls: number; callsMade: number; callsRemaining: number;
@@ -116,6 +117,28 @@ export class EarlyStageDriver {
     try {
       inspected = this.#inspectInput(request);
       if (inspected && !("binding" in inspected)) this.#ensureProject(project, inspected);
+      // An addressed completed partial result is a read, not a new execution lease.
+      // Prove its saved outputs before acquiring control so malformed addresses and
+      // hot/cold fixed points leave even control history unchanged.
+      const current = !inspected || 'binding' in inspected ? this.#currentStage(project) : null;
+      const draft = current?.stage === 'discovery' && !current.blocked
+        ? this.#savedDraft(project, current.stage, current.artifact, request.draftId,
+          inspected && 'binding' in inspected ? inspected.refs : []).draft : null;
+      const run = draft ? readResearchRun(this.engine.store, project, draft.id) : null;
+      if (draft?.value.projectId === project && draft.value.stage === 'discovery' && draft.value.contractVersion === 7
+        && (run?.value.pauseCode === 'research_dossier_assessment_unavailable' || run?.value.pauseCode === 'research_partial_dossier_pending')) {
+        const control = readRunControl(this.engine.store, { project });
+        const artifact = current!.artifact;
+        if (control.ok && !control.value.stopped && artifact?.value.status !== 'accepted') {
+          const restored = run.value.pauseCode === 'research_partial_dossier_pending'
+            ? await this.engine.researcher.run(project, draft.id, 1, undefined, { restoreOnly: true }) : run;
+          const early = await this.#stageOutcome(project, 'discovery', reference(draft), {
+            status: 'paused', stage: artifact ? reference(artifact) : null, research: reference(restored),
+            feedback: null, findings: [], turnsUsed: 0 });
+          return this.#result(project, early.end, early.stage, early.draft, early.candidates, early.stageResult,
+            early.reason, 0, maxTurns, maxCalls, 0, null);
+        }
+      }
     }
     catch (error) {
       const early = this.#entryFailure(project, error, 0);
@@ -625,17 +648,33 @@ export class EarlyStageDriver {
     const finding = result.reason;
     if (stage === 'discovery' && result.status === 'paused' && result.research) {
       const run = this.engine.store.get<import('../discovery/research-model.js').ResearchRun>(result.research.id, result.research.revision);
-      let address: unknown;
-      try { address = JSON.parse(run?.value.error ?? 'null')?.handoff; } catch { /* A diagnostic pause carries no authority. */ }
-      if (run?.value.pauseCode === 'research_variant_handoff_unavailable')
+      let saved: any;
+      try { saved = JSON.parse(run?.value.error ?? 'null'); } catch { /* A diagnostic pause carries no authority. */ }
+      const address: unknown = saved?.handoff;
+      const partial = run?.value.pauseCode === 'research_dossier_assessment_unavailable';
+      if (partial || run?.value.pauseCode === 'research_partial_dossier_pending'
+        || run?.value.pauseCode === 'research_variant_handoff_unavailable')
         requireCondition(isRef(address), 'discovery_variant_handoff_invalid', 'The saved handoff pause lost its exact address');
       if (isRef(address)) {
         const handoff = (await readVariantHandoff(this.engine.store, project, address)).record;
-        requireCondition(canonical(handoff.value.draft) === canonical(draft), 'discovery_variant_handoff_invalid', 'The stage paused on another draft handoff');
+        requireCondition(partial ? handoff.value.draft.id === draft.id : canonical(handoff.value.draft) === canonical(draft),
+          'discovery_variant_handoff_invalid', 'The stage paused on another draft handoff');
+        let partialReason: EarlyStageReason | null = null;
+        if (partial) {
+          requireCondition(isRef(saved?.dossier), 'discovery_dossier_invalid', 'The saved partial result lost its exact dossier');
+          const dossier = await readPartialDossier(this.engine.store, project, saved.dossier);
+          requireCondition(canonical(reference(dossier.handoff)) === canonical(address)
+            && canonical(dossier.record.value.draft) === canonical(handoff.value.draft),
+            'discovery_dossier_invalid', 'The partial dossier belongs to another handoff or draft');
+          partialReason = { code: 'research_dossier_assessment_unavailable', target: 'dossier-assessment',
+            message: 'The saved partial dossier awaits assessment', handoff: reference(handoff),
+            dossier: reference(dossier.record), completeness: 'partial', next: 'dossier-assessment' };
+        } else requireCondition(run?.value.pauseCode !== 'research_partial_dossier_pending',
+          'discovery_dossier_invalid', 'The partial dossier publication is not complete');
         const { guards: _guards, findings: _findings, ...discovery } = discoveryInspection(this.engine.store,
           this.engine.store.get<DiscoveryDraft>(draft.id, draft.revision)!).outcome;
-        return { ...this.#base(project, 'stage_paused', stage, draft, [], { ...result, discovery },
-          { code: 'research_variant_handoff_unavailable', target: handoff.value.next,
+        return { ...this.#base(project, 'stage_paused', stage, partial ? handoff.value.draft : draft, [], { ...result, discovery },
+          partialReason ?? { code: 'research_variant_handoff_unavailable', target: handoff.value.next,
             message: `The saved Discovery handoff awaits ${handoff.value.next}`, handoff: reference(handoff), next: handoff.value.next }),
           turnsUsed: result.turnsUsed ?? 0, handoff: false };
       }

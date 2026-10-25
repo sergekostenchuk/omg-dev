@@ -5,6 +5,7 @@ import { VARIANT_SUBJECT_CONTRACT, type VariantExecutionSession } from "./discov
 import { variantStateId, readVariantStateStructural } from "./variant-decision.js";
 import { readVariantOwnerDecision } from "./discovery-decision.js";
 import { publishVariantScope, readCurrentVariantScope } from "./variant-scope.js";
+import { producePartialDossier, readPartialDossier } from "./dossier-manifest.js";
 import { readProjectMode } from "../product/project-mode.js";
 import { REQUEST_MANIFEST_CONTRACT, CONTEXT_PREPARATION_CONTRACT } from "./request-parts.js";
 import { currentPlan, v7CheckpointPrefixes, planAttemptSelection, planOwnerSubject, rejectedPlanOwnerRequest, provePlanQuestions, selectV7AnalystRecovery } from "./v7-plan-questions.js";
@@ -17,7 +18,7 @@ import { stageNeighbors, usesStageNeighbors, STAGE_NEIGHBOR_CONTEXT, STAGE_NEIGH
 import { earlyResearchStage, earlyResearchFailure, earlyResearchCorrection, deliveredConceptSections, RESULT_CAPACITY_REFUSAL,
   requireEscalationReply, EARLY_RESEARCH_OUTCOME } from './early-research-outcome.js';
 import { producerContractEra, type ProducerPolicy, type UpstreamStage } from './requirements.js';
-import { discoveryContext, discoveryInspection, publishVariantHandoff, type DiscoveryOutcome } from './discovery-outcome.js';
+import { discoveryContext, discoveryInspection, publishVariantHandoff, readVariantHandoff, type DiscoveryOutcome } from './discovery-outcome.js';
 import { savedSynthesisMaterials, savedV7SynthesisMaterials } from "./saved-synthesis.js";
 import { readResearchContext, researchContextReadEra } from "./research-limits.js";
 import { planningForQuestion, planningForPlanSubject } from "./research-routing.js";
@@ -1608,7 +1609,7 @@ export class Researcher {
    * a new decision goes through the same managed admission/reservation as a direct B.2 client. */
   private async advanceV7VariantChoice(project: string, generation: ProvenVariantGeneration,
     variants: ReturnType<Researcher["restoreV7Variants"]>, allowNew: boolean, allowance: boolean,
-    signal: AbortSignal | undefined, beforeSend: () => void): Promise<void> {
+    signal: AbortSignal | undefined, beforeSend: () => void, receivePartial: (handoff: Ref, details?: object) => Promise<never>): Promise<void> {
     const result = generation.publication.result, session = generation.session;
     const mode = readProjectMode(this.store, project);
     requireCondition(generation.state, "research_variant_context_stale",
@@ -1627,7 +1628,7 @@ export class Researcher {
       requireCondition(generation.state && canonical(reference(state)) === canonical(generation.state),
         "research_variant_context_stale", "The no_variants publication does not own today's selection");
       const handoff = await publishVariantHandoff(this.store, project, { draft: session.value.draft, result: result.ref, decision: null, scope: null });
-      pause("research_no_variants", "The paid negative result awaits its dossier consumer", { reason: "no_variants", next: "dossier", handoff: reference(handoff.record) });
+      await receivePartial(reference(handoff.record));
     }
     if (state.value.decision) {
       const ref = state.value.decision, kind = this.store.get(ref.id, ref.revision)?.kind;
@@ -1650,6 +1651,9 @@ export class Researcher {
         scope = reference(current.scope);
       }
       const handoff = await publishVariantHandoff(this.store, project, { draft: session.value.draft, result: result.ref, decision: ref, scope });
+      if (handoff.record.value.next === "dossier") await receivePartial(reference(handoff.record),
+        { result: result.ref, draft: session.value.draft, set: result.ref, mode: choice.decision.value.mode,
+          decision: ref, selection: applied, scope });
       pause("research_variant_handoff_unavailable", "The saved handoff awaits its addressed consumer",
         { draft: session.value.draft, set: result.ref, mode: choice.decision.value.mode,
           decision: ref, selection: applied, scope, handoff: reference(handoff.record), reason: outcome.kind, next: outcome.kind === "choose" ? "deep" : "dossier" });
@@ -1658,8 +1662,7 @@ export class Researcher {
       "research_variant_context_stale", "The generation lost its proven undecided selection");
     if (variantSnapshotReadiness(this.store, project).budget?.exhausted) {
       const handoff = await publishVariantHandoff(this.store, project, { draft: session.value.draft, result: result.ref, decision: null, scope: null, earlyLimit: true });
-      pause("research_variant_handoff_unavailable", "The saved stage-budget limit awaits its dossier consumer",
-        { reason: "early_limit", next: "dossier", handoff: reference(handoff.record) });
+      await receivePartial(reference(handoff.record));
     }
     const previous = variants.decisions.filter(choice => canonical(choice.decision.value.set) === canonical(result.ref));
     if (mode.mode === "questions") pause("research_variant_owner_required", "An explicit owner choice of this exact set is required",
@@ -1708,7 +1711,59 @@ export class Researcher {
       "research_consumer_intent_invalid", "The research run belongs to another draft");
     requireCondition(run?.value.status !== "running" || processStart(run.value.owner.pid) !== run.value.owner.started,
       "research_busy", "This draft already has an active researcher");
+    // The pause carries exact durable addresses. Its historical replay precedes today's
+    // selection and cannot activate a new paid step after a mode or plan revision.
+    let savedPartial: { handoff: Ref; [field: string]: unknown } | null = null;
+    if (run?.value.pauseCode === "research_dossier_assessment_unavailable"
+      || run?.value.pauseCode === "research_partial_dossier_pending") {
+      let saved: any;
+      try { saved = JSON.parse(run.value.error ?? "null"); } catch { /* Refuse below. */ }
+      requireCondition(isRef(saved?.handoff), "discovery_variant_handoff_invalid", "The partial result lost its exact handoff");
+      const proof = await readVariantHandoff(this.store, project, saved.handoff);
+      requireCondition(proof.record.value.draft.id === draftId, "discovery_variant_handoff_invalid", "The partial result names another draft");
+      savedPartial = saved;
+      if (run.value.pauseCode === "research_dossier_assessment_unavailable") {
+        requireCondition(isRef(saved.dossier), "discovery_dossier_invalid", "The partial result lost its exact dossier");
+        const dossier = await readPartialDossier(this.store, project, saved.dossier);
+        requireCondition(canonical(reference(dossier.handoff)) === canonical(saved.handoff)
+          && canonical(dossier.record.value.draft) === canonical(proof.record.value.draft),
+          "discovery_dossier_invalid", "The partial result belongs to another handoff or draft");
+        if (options.restoreOnly || producerContractEra("discovery", options.producerPolicy) !== 7) return run;
+        // An explicit new invocation may follow a newer real choice/plan. The old
+        // dossier is still proved above; the ordinary loop admits the new route.
+        const plan = currentPlan(this.store, project);
+        const selection = this.store.get<import('./variant-decision.js').VariantState>(variantStateId(project, draftId));
+        if (canonical(plan.planAnswer) === canonical(proof.record.value.plan)
+          && canonical(selection?.value.result ?? null) === canonical(proof.record.value.result)
+          && canonical(selection?.value.decision ?? null) === canonical(proof.record.value.decision)) return run;
+        savedPartial = null;
+      }
+    }
+    let partialPending = false;
+    const receivePartial = async (handoff: Ref, display: object = {}): Promise<never> => {
+      const proof = await readVariantHandoff(this.store, project, handoff);
+      requireCondition(proof.record.value.draft.id === draftId && proof.record.value.next === "dossier"
+        && proof.record.value.choice === null && proof.record.value.scope === null
+        && (proof.record.value.reason !== "early_limit" || proof.record.value.decision === null),
+        "discovery_dossier_invalid", "The negative recipient requires this draft's proven pre-choice route");
+      requireCondition(run, "discovery_dossier_invalid", "The handoff needs its original research run");
+      const details = { ...display, handoff, reason: proof.record.value.reason, next: "dossier" };
+      const pending = canonical({ ...details, code: "research_partial_dossier_pending",
+        message: "The saved handoff awaits its partial dossier" });
+      if (run.value.pauseCode !== "research_partial_dossier_pending" || run.value.error !== pending)
+        run = this.save(run, { status: "paused", owner, pauseCode: "research_partial_dossier_pending", error: pending });
+      // This checkpoint survives either publication cut. A failed recipient must not
+      // replace it with a diagnostic that loses the exact handoff.
+      partialPending = true;
+      const dossier = await producePartialDossier(this.store, project, handoff);
+      const message = canonical({ ...details, code: "research_dossier_assessment_unavailable",
+        dossier: reference(dossier.record), completeness: "partial", message: "The partial dossier awaits assessment" });
+      run = this.save(run, { status: "paused", owner, pauseCode: "research_dossier_assessment_unavailable", error: message });
+      partialPending = false;
+      throw new EngineError("research_dossier_assessment_unavailable", message);
+    };
     try {
+      if (savedPartial) await receivePartial(savedPartial.handoff, savedPartial);
       for (;;) {
         const variants = this.restoreV7Variants(project, draftId);
         const synthesis = this.v7SynthesisRecovery(project, draftId);
@@ -1993,7 +2048,7 @@ export class Researcher {
         const advanceChoice = async () => this.advanceV7VariantChoice(project, generations[0]!, variants, allowNew, used < limit, signal, () => {
           if (run!.value.status !== "running") run = this.save(run!, { status: "running", owner, ownerQuestion: null, error: null, pauseCode: null });
           used++;
-        });
+        }, receivePartial);
         if (generations.length && run) { await advanceChoice(); continue; }
         const readiness = variantSnapshotReadiness(this.store, project);
         if (readiness.budget?.exhausted) {
@@ -2005,8 +2060,7 @@ export class Researcher {
               [reference(plan.draft), reference(plan.question)])[0]!;
           }
           const handoff = await publishVariantHandoff(this.store, project, { draft: reference(plan.draft), result: null, decision: null, scope: null, earlyLimit: true });
-          throw new EngineError("research_variant_handoff_unavailable", canonical({ code: "research_variant_handoff_unavailable",
-            handoff: reference(handoff.record), reason: "early_limit", next: "dossier", message: "The saved stage-budget limit awaits its dossier consumer" }));
+          await receivePartial(reference(handoff.record));
         }
         // Prove saved operations and readiness first. A cold refusal preserves the exact
         // addressed pause even if other questions remain uncovered; it claims no readiness.
@@ -2123,6 +2177,7 @@ export class Researcher {
           options.contextContract && mode !== "planning" ? { contextContract: options.contextContract } : {});
       }
     } catch (error) {
+      if (partialPending) throw error;
       const current = this.store.get<ResearchRun>(id) ?? run;
       if (!current) throw error;
       if (error instanceof EngineError && ["revision_conflict", "input_stale"].includes(error.code)

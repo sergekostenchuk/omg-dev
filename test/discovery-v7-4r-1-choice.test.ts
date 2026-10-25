@@ -107,11 +107,13 @@ async function fixed(f: Awaited<ReturnType<typeof setup>>, result: Revision<impo
 }
 for (const kind of ['choose', 'reject_all'] as const) test(`4R.1 choice: public bypass generation -> separate paid ${kind} -> addressed handoff pause and cold fixed point`, async t => {
   const f = await setup(t, undefined, 'bypass'); f.configure({ reject: kind === 'reject_all' });
-  const result = await f.run(3); assert.equal(result.value.pauseCode, 'research_variant_handoff_unavailable', JSON.stringify(result.value));
+  const result = await f.run(3); assert.equal(result.value.pauseCode, kind === 'choose' ? 'research_variant_handoff_unavailable' : 'research_dossier_assessment_unavailable', JSON.stringify(result.value));
   assert.equal(result.value.status, 'paused'); assert.equal(subjectCalls(f, 'proposal').length, 1); assert.equal(subjectCalls(f, 'decision').length, 1);
   const decision = f.store.list<VariantModelDecision>('discovery-variant-model-decision')[0]!, proof = readVariantModelDecision(f.store, 'p', reference(decision));
   assert.ok(proof.state); assert.equal(decision.value.outcome.kind, kind);
-  const pause = JSON.parse(result.value.error!); assert.deepEqual(pause.decision, reference(decision)); assert.equal(pause.reason, kind);
+  const pause = JSON.parse(result.value.error!);
+  if (kind === 'reject_all') { assert.ok(pause.dossier); assert.equal(pause.completeness, 'partial'); }
+  assert.deepEqual(pause.decision, reference(decision)); assert.equal(pause.reason, kind);
   assert.deepEqual(pause.result, decision.value.set); assert.deepEqual(pause.selection, proof.state);
   if (kind === 'choose') assert.deepEqual(pause.scope, reference(readCurrentVariantScope(f.store, 'p', decision.value.draft).scope));
   else { assert.equal(pause.scope, null); assert.equal(f.store.list('discovery-variant-scope').length, 0); }
@@ -121,7 +123,7 @@ for (const kind of ['choose', 'reject_all'] as const) test(`4R.1 choice: questio
   const f = await setup(t), door = await f.run(3);
   assert.equal(door.value.pauseCode, 'research_variant_owner_required'); assert.equal(subjectCalls(f, 'decision').length, 0);
   const scope = choiceScope(f, kind), act = owner(f.store, scope), paid = money(f.store), sent = f.wires(), mode = reference(f.store.get('project-mode:p')!);
-  const result = await f.run(1, f.open(), true); assert.equal(result.value.pauseCode, 'research_variant_handoff_unavailable', JSON.stringify(result.value));
+  const result = await f.run(1, f.open(), true); assert.equal(result.value.pauseCode, kind === 'choose' ? 'research_variant_handoff_unavailable' : 'research_dossier_assessment_unavailable', JSON.stringify(result.value));
   assert.deepEqual(JSON.parse(result.value.error!).decision, reference(act.decision)); assert.deepEqual(readVariantOwnerDecision(f.store, 'p', reference(act.decision)).state, act.state);
   assert.deepEqual(money(f.store), paid); assert.deepEqual(f.wires(), sent); assert.deepEqual(reference(f.store.get('project-mode:p')!), mode);
   assert.equal(f.store.list('discovery-variant-scope').length, kind === 'choose' ? 1 : 0); await fixed(f, result);
@@ -293,7 +295,8 @@ test('4R.1 choice: a real model -> owner override -> owner revise stays current 
 test('4R.1 choice: actual paid generation exhausts the research reserve and saves early_limit without buying the next choice', async t => {
   const f = await setup(t, undefined, 'bypass'); f.configure({ proposalTokens: V7_STAGE_TOKEN_CEILING - V7_COMPLETION_RESERVE - 23 });
   const result = await f.run(3);
-  assert.equal(result.value.pauseCode, 'research_variant_handoff_unavailable', JSON.stringify(result.value));
+  assert.equal(result.value.pauseCode, 'research_dossier_assessment_unavailable', JSON.stringify(result.value));
+  assert.ok(JSON.parse(result.value.error!).dossier);
   assert.equal(JSON.parse(result.value.error!).reason, 'early_limit');
   assert.equal(subjectCalls(f, 'proposal').length, 1); assert.equal(subjectCalls(f, 'decision').length, 0);
   const set = f.store.list<VariantSet>('discovery-variant-set')[0]!; assert.ok(readVariantGeneration(f.store, 'p', reference(set)));
