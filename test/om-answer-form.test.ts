@@ -28,7 +28,8 @@ import { OM_OWNER_ASSIGNMENT_CONTRACT, OM_OWNER_ASSIGNMENT_KIND, normalizeOwnerG
 import { writeOmInput, readOmInput, withHistoricalReads } from '../src/om/input.js';
 import { normalizePartAnswer, prepareQuestionTasks, writeQuestionPacket, type PartProposalBody, derivePartProposal, packetReadPath, PACKET_ANSWER_PROTOCOL } from '../src/om/question-packet.js';
 import { writeRoutes, type RoutedBatch } from '../src/om/routes.js';
-import { openSeries, beginAttempt, type AttemptGoal } from '../src/om/series.js';
+import { openSeries, readCompletionBinding, type AttemptGoal } from '../src/om/series.js';
+import { openAttempt } from '../src/om/repeat-gate.js';
 import { writeGuarded } from '../src/om/refs.js';
 import { Evidence } from '../src/evidence/evidence.js';
 import type { OmResult, Sealed } from '../src/om/refusal.js';
@@ -107,7 +108,14 @@ function fixture(t: TestContext, schema: Json = valueForm, multiple = false, mat
     const goal: AttemptGoal = { key: `form:${batch.task}`, questions: batch.items.map(item => gapLineKey(project, item.target, item.field)),
       result: gapLineExpectedResult(project, batch.items[0]!.target, batch.items[0]!.field) };
     ok(openSeries(store, { project, block, line: 1, slice: `form:${batch.task}`, predecessor: null, basis: null }));
-    const series = ok(beginAttempt(store, { project, block, line: 1, attempt: 1, goal }));
+    const completion = { routes: reference(routes), batches: [batch.id] };
+    const series = ok(openAttempt(store, { project, block, line: 1, attempt: 1, goal, completion }));
+    const binding = ok(readCompletionBinding(store, project, reference(series), 1));
+    assert.ok(binding, 'The E3 packet owns a managed completion binding');
+    assert.deepEqual(binding.value.plan, completion);
+    assert.deepEqual(binding.value.goal, { ...goal, questions: [...goal.questions].sort() });
+    assert.equal(series.value.attempts[0]!.outcome, null);
+    assert.equal(series.value.attempts[0]!.verdict, null);
     return ok(writeQuestionPacket(store, { project, routes: reference(routes), batch: batch.id,
       environment: reference(environment), attempt: { series: reference(series), ordinal: 1 }, previous: [] })).record;
   }
