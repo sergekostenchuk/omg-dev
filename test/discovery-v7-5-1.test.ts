@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { join } from 'node:path';
 import { hashJson, type Json } from '../src/canonical.js';
 import { reference, type Ref } from '../src/pipeline/contracts.js';
 import { EngineError } from '../src/errors.js';
@@ -28,6 +30,7 @@ import { DISCOVERY_CLAIMS_CONTRACT } from '../src/discovery/v7-contracts.js';
 import { VariantChoiceSessions, issueVariantChoiceInvitation, ProjectModeSessions, issueProjectModeInvitation } from '../src/product/owner-authority.js';
 import { setProjectMode } from '../src/product/project-mode.js';
 import { researchSetup, produce, rand, validPlan, questionOf } from './discovery-v7-fixture.js';
+import { ResearchSources } from '../src/discovery/research-sources.js';
 import { answerDiscoveryFixture } from './product-fixture.js';
 import type { OmResult } from '../src/om/refusal.js';
 
@@ -349,14 +352,13 @@ test('5.1: a later applied open or unknown decision supersedes an earlier own cl
 test('5.1: a hidden or damaged application of the applied chain is a typed refusal, never a negative answer', async t => {
   const f = await paid(t), [member] = f.set.value.members;
   const claimed = await claimAttempt(f, 'q-industry', [hypothesisClaim(f, 'q-industry', 'The chosen variant bounds the industry risk', [member!])]);
-  applyDiscoveryAssessment(f.store, f.project, reference(await assess(f, 'q-industry', [claimed], true, true)));
+  const applied = applyDiscoveryAssessment(f.store, f.project, reference(await assess(f, 'q-industry', [claimed], true, true)));
   const report = computeMissingCoverage(f.store, f.project, reference(f.published.scope), f.v.planAnswer);
   assert.equal(report.cells.find(cell => cell.cell.subject.planQuestionId === 'q-industry')!.covered, true);
-  // An explicit negative: hide the exact application of the applied chain in a new Store; proveClaimAddress refuses
-  // discovery_progress_conflict and the computation must keep that refusal, never swallow it into an empty negative.
-  const application = report.cells.find(cell => cell.cell.subject.planQuestionId === 'q-industry')!.sufficiency!.assessment;
-  const paidRecord = f.store.get(application.id, application.revision)!;
-  const appRef = (paidRecord.value as unknown as { application: Ref }).application;
+  // An explicit negative: hide the exact v7-progress-application of THIS applied chain (the record proving the
+  // claim's applied classification) in a new Store. proveClaimAddress refuses discovery_progress_conflict and the
+  // computation must keep that refusal, never swallow it into an empty negative — the regression of the old swallow.
+  const appRef = applied.applications[0]!;
   const cold = new Store(f.store.path); t.after(() => cold.close());
   const get = cold.get.bind(cold);
   cold.get = ((id: string, revision?: number) => id === appRef.id && revision === appRef.revision ? null : get(id, revision)) as typeof cold.get;
@@ -365,7 +367,86 @@ test('5.1: a hidden or damaged application of the applied chain is a typed refus
   try { computeMissingCoverage(cold, f.project, reference(f.published.scope), f.v.planAnswer); }
   catch (error) { caught = error; }
   assert.ok(caught instanceof EngineError, 'the computation refuses');
-  assert.ok(['discovery_progress_conflict', 'assessment_invalid', 'research_context_application_invalid'].includes((caught as EngineError).code),
-    `the typed refusal, got ${(caught as EngineError).code}`);
+  assert.equal((caught as EngineError).code, 'discovery_progress_conflict', 'the exact door refusal, not another layer');
   assert.deepEqual(history(cold), before, 'the refusal writes nothing');
+});
+
+test('5.1: a real fact with an unsatisfied methodology requirement never closes — the accepted material stays uncovered material', async t => {
+  const f = await paid(t), [member] = f.set.value.members;
+  // A real measured fact scoped to the chosen member (the p-2 closure contract): its paid methodology row declares
+  // single_confirmation, while the saved closing requirement demands independentConfirmation — the door refuses.
+  const source = f.discovery.evidence.document(f.project, 'measurement',
+    JSON.stringify({ fact: 'A saved measurement is 42', published: '2026-10-21', version: '3.1' }), 'application/json', 0);
+  const factClaim: Json = { id: 'fact-measured', kind: 'fact', text: 'A saved measurement is 42', axis: 'industry',
+    planQuestions: [{ planAnswer: asJson(f.v.planAnswer), planQuestionId: 'q-industry' }],
+    scope: { variants: asJson([member!]) },
+    basis: { source: { ref: asJson({ id: source.id, revision: source.revision, hash: source.hash }),
+      range: { start: 0, end: source.value.content.length }, valueHash: hashJson(source.value.content) },
+      limit: 'Single measurement', asOf: 'Dated saved report' } } as unknown as Json;
+  const claimed = await claimAttempt(f, 'q-industry', [factClaim]);
+  const claim: ClaimAddress = addressOf(f, claimed, 0);
+  // A performed local refutation search, exactly the p-2 contract shape.
+  execFileSync('git', ['init', '--quiet', f.root]);
+  writeFileSync(join(f.root, 'measurement.txt'), 'Original measurement only.');
+  execFileSync('git', ['-C', f.root, 'add', 'measurement.txt']);
+  writeFileSync(f.settings, JSON.stringify({ tokens: 10, reply: { action: 'search', query: 'counterargument' } }));
+  const m = f.prepare(), response = await m.invoke();
+  const execution = (await import('../src/discovery/response-recovery.js')).readResearchConsumerExecution(f.store, f.project, reference(m.intent));
+  assert.equal(execution.kind, 'response');
+  const { projectPaidTurnAdmission, managedTurnId } = await import('../src/discovery/research-consumer-transition.js');
+  const { prepareResearchConsumerApplication } = await import('../src/discovery/response-recovery.js');
+  const projected = projectPaidTurnAdmission(m.run.value, { runId: m.run.id, intent: reference(m.intent), response,
+    question: reference(m.question), owner: m.run.value.owner, limit: 100, context: m.context, subject: m.selected });
+  const id = managedTurnId(m.run.id, m.number);
+  const turnApplication = prepareResearchConsumerApplication(f.store, reference(m.intent), reference(execution.call), [
+    { id: m.run.id, kind: m.run.kind, expected: m.run.revision, value: projected.run },
+    { id, kind: 'research-turn', expected: 0, value: projected.turn }],
+    [reference(m.run), reference(f.environment), { id, absent: true }]);
+  f.store.writeMany(turnApplication.writes, turnApplication.guards);
+  const turn = f.store.get<any>(id)!;
+  const result = new ResearchSources(f.store, f.project, f.environment.value.workspace).searchCaptured('counterargument', turn);
+  f.store.writeMany([result.capture, { id, kind: 'research-turn', expected: turn.revision, value: result.turn }], result.guards);
+  const trace = { turn: reference(f.store.get<any>(id)!), capture: result.captureRef };
+  // The paid assessment: acceptance with a closed sufficiency demanding independent confirmation the methodology
+  // does not provide (single_confirmation with its explicit limitation).
+  const packet = projectAttemptPacket(f.store, { project: f.project, planAnswer: f.v.planAnswer, planQuestionId: 'q-industry',
+    entries: [{ attempt: claimed.attempt, binding: claimed.binding }] });
+  const reply = { verdict: 'supported', reasons: ['Paid assessment'], return: null,
+    novelty: { attempts: [{ attempt: claimed.attempt, reason: 'Exact result' }],
+      accepted: [{ claim, reason: 'The measured fact covers the chosen variant' }], rejected: [],
+      newContent: [{ claim, reason: 'New variant ground' }], duplicates: [], noProgress: [],
+      transition: { outcome: 'closed', bases: [{ claim }], reason: 'The measurement answers the saved criterion',
+        sufficiency: { criterion: 'Named basis answering q-industry', requiredDepth: 'deep',
+          reason: 'The criterion concerns the saved measurement only',
+          methodologyRequirements: [{ claim, dated: true, versioned: true, independentConfirmation: true,
+            reason: 'The criterion requires independent confirmation of the measurement' }] } } },
+    methodology: { contract: 'assessment-methodology/v1', policy: 'assessment-methodology-policy/v2', facts: [{
+      claim, significance: { kind: 'blocking', reason: 'Plan basis' },
+      sources: [{ source: { id: source.id, revision: source.revision, hash: source.hash }, role: 'primary', reason: 'Original report',
+        evidence: [{ source: { id: source.id, revision: source.revision, hash: source.hash }, selector: { kind: 'json-pointer', pointer: '/fact' } }],
+        original: { id: source.id, revision: source.revision, hash: source.hash }, originalReason: 'Original report', limitation: 'This original covers one deployment only',
+        publicationDate: { status: 'known', value: '2026-10-21',
+          evidence: [{ source: { id: source.id, revision: source.revision, hash: source.hash }, selector: { kind: 'json-pointer', pointer: '/published' } }] },
+        eventDate: { status: 'unknown', reason: 'Not dated' },
+        version: { status: 'known', value: '3.1',
+          evidence: [{ source: { id: source.id, revision: source.revision, hash: source.hash }, selector: { kind: 'json-pointer', pointer: '/version' } }] },
+        retrievedAt: null }],
+      temporalApplicability: { status: 'established', scope: 'Content of the saved report', reason: 'This statement concerns the saved bytes',
+        evidence: [{ source: { id: source.id, revision: source.revision, hash: source.hash }, selector: { kind: 'json-pointer', pointer: '/fact' } }] },
+      corroboration: { status: 'single_confirmation', reason: 'One report', limitation: 'No independent confirmation' },
+      refutation: { status: 'performed', reason: 'Executed the named local search', traces: [trace], counterarguments: [], limitations: [] } }] } };
+  writeFileSync(f.settings, JSON.stringify({ tokens: 10, reply }));
+  const paidClosing = await assessAttemptsWithRequirements(f.store, packet, v7ProgressBaseline(f.store, packet), f.environment, f.root);
+  // The methodology requirement is unsatisfied: the paid closing never applies — the lawful negative.
+  refuses(() => applyDiscoveryAssessment(f.store, f.project, reference(paidClosing)), 'discovery_novelty_invalid');
+  const report = computeMissingCoverage(f.store, f.project, reference(f.published.scope), f.v.planAnswer);
+  const industry = report.cells.find(cell => cell.cell.subject.planQuestionId === 'q-industry')!;
+  assert.equal(industry.covered, false, 'an accepted fact without its applied methodologically sufficient closure covers nothing');
+  assert.equal(industry.missing!.code, 'coverage_no_applied_grounds');
+  assert.equal(industry.grounds.length, 0, 'the unapplied acceptance is not an applied ground');
+  const cold = new Store(f.store.path); t.after(() => cold.close());
+  const before = history(f.store), accounting = money(f.store), sent = f.wires().length;
+  assert.deepEqual(computeMissingCoverage(cold, f.project, reference(f.published.scope), f.v.planAnswer), report,
+    'the same missing answer cold');
+  assert.deepEqual(history(f.store), before); assert.deepEqual(money(f.store), accounting); assert.equal(f.wires().length, sent);
 });
