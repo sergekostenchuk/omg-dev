@@ -4230,9 +4230,19 @@ export function requireVariantDecisionAdmission(store:Store,project:string,subje
   const state=readVariantStateStructural(store,project,proven.session.value.draft.id,subject.expectedSelection).record.value;
   const decided=store.list<{set?:Ref}>('discovery-variant-model-decision').concat(store.list<{set?:Ref}>('discovery-variant-owner-decision'))
     .some(row=>variantSame(row.value.set,subject.set));
-  const bought=store.list<ResearchConsumerIntent>('research-consumer-intent').some(row=>row.value.kind==='variant-decision'
-    && row.value.state!=='refused' && row.value.owner?.id!==sessionId && variantSame(row.value.cursor?.variantSubject?.set,subject.set)
-    && (row.value.state!=='prepared' || !Array.isArray(row.value.guards) || transactionGuardsCurrent(store,row.value.guards)));
+  const bought=store.list<ResearchConsumerIntent>('research-consumer-intent').some(row=>{
+    // Select competing purchases by their immutable admission, before a new session can be written. A damaged head
+    // cannot hide an already paid choice by changing its set (or kind); only this set's originals need proof here.
+    const original=store.get<ResearchConsumerIntent>(row.id,1);
+    if(original?.value?.kind!=='variant-decision' || original.value.projectId!==project
+      || !variantSame(original.value.cursor?.variantSubject?.set,subject.set)) return false;
+    const first=readResearchConsumerIntent(store,reference(original)),current=readResearchConsumerIntent(store,reference(row));
+    if(!variantSame(first.value.owner,current.value.owner)
+      || !variantSame(first.value.cursor.variantSubject,current.value.cursor.variantSubject))
+      consumerInvalid(row.id,'The competing decision head changed its original execution subject');
+    return current.value.state!=='refused' && current.value.owner.id!==sessionId
+      && (current.value.state!=='prepared' || transactionGuardsCurrent(store,current.value.guards));
+  });
   if(!variantSame(state.set,subject.set) || state.decision!==null || decided || bought)
     throw new EngineError('discovery_variant_decision_exists','This set is already decided or being decided; another mode, actor or selection buys no new choice');
   if(variantStateId(project,proven.session.value.draft.id)!==subject.expectedSelection.id)

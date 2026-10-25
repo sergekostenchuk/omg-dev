@@ -385,3 +385,22 @@ test('4B.2: the historical reader proves every named output in full in warm and 
   }
   assert.deepEqual(history(f.store), before);
 });
+
+for (const corruption of ['set', 'set-and-context', 'kind'] as const)
+  test(`4B2-01: a paid intent head with changed ${corruption} refuses another identity before any session, hot and cold`, async t => {
+    const f = await setup(t), bypass = f.setMode('bypass', reference(f.questions)); f.reply(choose('v1'));
+    const paid = await f.pay(f.decisionInput(reference(bypass))), initial = f.store.get(paid.id, 1)!;
+    const subject = { ...paid.value.cursor.variantSubject, set: reference(f.saved) };
+    // Explicit negative corruption of the head only: the original admission and its real paid call stay intact.
+    const value = corruption === 'kind' ? { ...paid.value, kind: 'analyst' as const }
+      : { ...paid.value, cursor: { ...paid.value.cursor, variantSubject: subject,
+        ...(corruption === 'set-and-context' ? { context: { ...paid.value.cursor.context, variantSubject: subject } } : {}) } };
+    f.store.write({ id: paid.id, kind: paid.kind, expected: paid.revision, value });
+    const before = history(f.store), money = accounting(f.store), sent = f.wires().length;
+    const other = f.decisionInput(reference(bypass), reference(f.state1), f.environment.value.reviewer);
+    for (const store of [f.store, f.open()]) {
+      await assert.rejects(runVariantSession(store, other), code('research_consumer_intent_invalid'));
+      assert.deepEqual(history(store), before); assert.deepEqual(accounting(store), money);
+      assert.deepEqual(store.get(paid.id, 1), initial); assert.equal(f.wires().length, sent);
+    }
+  });
