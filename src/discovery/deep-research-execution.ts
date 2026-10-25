@@ -12,7 +12,7 @@ import type { ResearchRun } from './research-model.js';
 import { researchCall } from './research-protocol.js';
 import { completeResearchAttemptTurn, deepResearchApplication, findResearchConsumerIntent,
   prepareResearchConsumerApplication, prepareResearchConsumerIntent, readDeepResearchResult, readManagedDeepPreparation,
-  readResearchConsumerExecution, readResearchConsumerIntent, requireDeepConsumerBinding, consumerIntentContext,
+  readResearchConsumerExecution, readResearchConsumerIntent, requireDeepConsumerBinding, consumerIntentContext, staleUnpaidDeepAdmission,
   type ProvenDeepResearchResult, type ResearchConsumerIntent } from './response-recovery.js';
 
 export { readDeepResearchResult, type ProvenDeepResearchResult } from './response-recovery.js';
@@ -47,10 +47,18 @@ function savedPosition(store: Store, input: DeepResearchInput, actor: string, dr
   if (!previous) return { ...at, previous: null };
   const checked = readResearchConsumerIntent(store, reference(previous));
   const proof = requireDeepConsumerBinding(store, checked);
-  if (!proof || canonical(reference(proof.preparation)) !== canonical(input.deepPreparation)
+  if (!proof) invalid('This run position does not belong to a proven deep admission');
+  if (canonical(reference(proof.preparation)) !== canonical(input.deepPreparation)
     || checked.value.role.actor !== actor || checked.value.cursor.turn !== at.turn
-    || (input.owner && canonical(checked.value.owner) !== canonical(input.owner)))
+    || (input.owner && canonical(checked.value.owner) !== canonical(input.owner))) {
+    if (staleUnpaidDeepAdmission(store, checked)) return { ...at, previous: null };
+    // This position has already begun its physical operation. Recover that
+    // exact paid subject first, even when today's requested scope differs.
+    if (checked.value.state !== 'prepared' && checked.value.role.actor === actor
+      && checked.value.owner.id === at.id && checked.value.cursor.turn === at.turn)
+      return { ...at, previous: checked };
     invalid('This run position already belongs to another exact deep admission');
+  }
   return { ...at, previous: checked };
 }
 

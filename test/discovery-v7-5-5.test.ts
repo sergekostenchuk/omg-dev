@@ -532,3 +532,110 @@ test('5.5 a prepared head cannot erase its immutable deep identity through the c
     assert.equal(all(store), before); assert.deepEqual(money(store), account); assert.equal(f.wires().length, sent);
   }
 });
+
+function linkedInput(f: Ready): DeepResearchInput {
+  const baseline = v7ProgressBaseline(f.store, { project: 'p', planAnswer: f.v.planAnswer, planQuestionId: 'q-industry' });
+  assert.equal(baseline.state.kind, 'state');
+  const state = f.store.get<any>((baseline.state as { ref: Ref }).ref.id)!;
+  return { ...f.input, owner: reference(f.store.get<ResearchRun>(state.value.summary.cursor.run)!) };
+}
+function revisedPreparation(f: Ready) {
+  const previous = f.store.get(f.scopeRecord.value.decision.id, f.scopeRecord.value.decision.revision)!;
+  const state = f.store.get(variantStateId('p', f.draft.id))!;
+  const scope: VariantChoiceScope = { ...f.scope!, operation: 'revise', previous: reference(previous), expectedSelection: reference(state),
+    outcome: { ...f.scope!.outcome, reason: 'A lawful owner revision before the next deep position' } };
+  const act = answerVariantChoice(f.store, scope, mint(f.store, scope).authority);
+  const published = publishVariantScope(f.store, 'p', reference(act.decision)).scope;
+  return produceDeepPreparation(f.store, 'p', inputFor(f, published)).record;
+}
+for (const cold of [false, true]) test(`5.345-01 stale unpaid linked admission after owner revise ${cold ? 'cold' : 'hot'}`, async t => {
+  const f = await ready(t), first = linkedInput(f), old = prepareDeepResearch(f.store, first);
+  const history = f.store.history(old.id), preparation = revisedPreparation(f);
+  const input: DeepResearchInput = { ...first, deepPreparation: reference(preparation) };
+  const store = cold ? new Store(f.store.path) : f.store; if (cold) t.after(() => store.close());
+  const before = all(store), account = money(store), sent = f.wires().length;
+  assert.equal(await resumeDeepResearch(store, 'p', reference(old), { restoreOnly: true, allowance: 0 }), null);
+  assert.equal(await runDeepResearch(store, input, { restoreOnly: true, allowance: 0 }), null);
+  await assert.rejects(runDeepResearch(store, input, { allowance: 0 }), { code: 'research_turns_exhausted' });
+  assert.equal(all(store), before); assert.deepEqual(money(store), account); assert.equal(f.wires().length, sent);
+  const oldCalls = new Set(store.list('model-call').map(row => row.id));
+  const result = (await runDeepResearch(store, input, { allowance: 1 }))!;
+  assert.deepEqual(reference(result.preparation.preparation), reference(preparation));
+  assert.notEqual(result.intent.id, old.id); assert.equal(result.intent.value.key, old.value.key);
+  assert.equal(result.intent.value.generation, old.value.generation + 1);
+  assert.deepEqual(result.intent.value.previous, reference(old));
+  assert.deepEqual(result.intent.value.owner, old.value.owner);
+  assert.deepEqual(store.history(old.id), history); assert.equal(f.wires().length, sent + 1);
+  assert.deepEqual(store.list('model-call').filter(row => !oldCalls.has(row.id)).map(row => row.id), [result.call.id]);
+  const run = store.get<ResearchRun>(first.owner!.id)!, origin = store.get<ResearchRun>(first.owner!.id, first.owner!.revision)!;
+  assert.equal(run.value.turns, origin.value.turns + 1); assert.equal(run.value.limit, origin.value.limit);
+  const saved = all(store), paid = money(store), wire = f.wires().length, fresh = new Store(store.path); t.after(() => fresh.close());
+  assert.deepEqual(await runDeepResearch(fresh, input, { restoreOnly: true, allowance: 0 }), result);
+  assert.equal(await resumeDeepResearch(fresh, 'p', reference(old), { restoreOnly: true, allowance: 0 }), null);
+  assert.equal(all(fresh), saved); assert.deepEqual(money(fresh), paid); assert.equal(f.wires().length, wire);
+});
+
+test('5.345-01 a damaged stale preparation binding cannot permit another generation', async t => {
+  const f = await ready(t), first = linkedInput(f), old = prepareDeepResearch(f.store, first), preparation = revisedPreparation(f);
+  const value = structuredClone(old.value); value.cursor.context.deepCell.criterion = 'A substituted historical cell';
+  f.store.write({ id: old.id, kind: old.kind, expected: old.revision, value });
+  const input = { ...first, deepPreparation: reference(preparation) }, before = all(f.store), account = money(f.store), sent = f.wires().length;
+  const cold = new Store(f.store.path); t.after(() => cold.close());
+  for (const store of [f.store, cold]) {
+    await assert.rejects(runDeepResearch(store, input, { allowance: 1 }), { code: 'research_consumer_intent_invalid' });
+    assert.equal(all(store), before); assert.deepEqual(money(store), account); assert.equal(f.wires().length, sent);
+  }
+});
+
+test('5.345-01 a begun old position recovers its paid preparation before a new requested scope', async t => {
+  const f = await ready(t), first = linkedInput(f), sent = f.wires().length, undo = cut(f, 'before');
+  await assert.rejects(runDeepResearch(f.store, first), /deep application cut/); undo();
+  const old = deepIntents(f).find(row => row.value.cursor.run === first.owner!.id)!;
+  assert.equal(old.value.state, 'running'); assert.ok(old.value.call);
+  const preparation = revisedPreparation(f), input = { ...first, deepPreparation: reference(preparation) };
+  const state = f.store.get(variantStateId('p', f.draft.id)), account = money(f.store), wires = f.wires().length;
+  const result = (await runDeepResearch(f.store, input, { restoreOnly: true, allowance: 0 }))!;
+  assert.equal(result.intent.id, old.id); assert.deepEqual(reference(result.preparation.preparation), first.deepPreparation);
+  assert.deepEqual(f.store.get(variantStateId('p', f.draft.id)), state);
+  assert.deepEqual(money(f.store), account); assert.equal(f.wires().length, wires); assert.equal(wires, sent + 1);
+  const before = all(f.store), cold = new Store(f.store.path); t.after(() => cold.close());
+  assert.deepEqual(await runDeepResearch(cold, input, { restoreOnly: true, allowance: 0 }), result);
+  assert.equal(all(cold), before); assert.deepEqual(money(cold), account); assert.equal(f.wires().length, wires);
+});
+
+test('5.345-01 competing current admissions share one successor generation and one purchase', async t => {
+  const f = await ready(t), first = linkedInput(f), old = prepareDeepResearch(f.store, first), history = f.store.history(old.id);
+  const preparation = revisedPreparation(f), input = { ...first, deepPreparation: reference(preparation) };
+  const other = new Store(f.store.path); t.after(() => other.close());
+  let competing: Revision<ResearchConsumerIntent> | null = null, expected: string | null = null;
+  const sent = f.wires().length, account = money(f.store);
+  const undo = intercept(f.store, (writes, guards, write) => {
+    if (writes.some(w => w.kind === 'research-consumer-intent' && (w.value as ResearchConsumerIntent).generation === old.value.generation + 1)) {
+      assert.ok(guards.some(guard => canonical(guard) === canonical(reference(old))));
+      competing = prepareDeepResearch(other, input); expected = all(other);
+    }
+    return write();
+  });
+  assert.throws(() => prepareDeepResearch(f.store, input), EngineError); undo();
+  assert.ok(competing); assert.ok(expected); assert.equal(all(f.store), expected);
+  assert.deepEqual(money(f.store), account); assert.equal(f.wires().length, sent);
+  assert.deepEqual(f.store.history(old.id), history);
+  const result = (await runDeepResearch(f.store, input))!;
+  assert.equal(result.intent.id, (competing as Revision<ResearchConsumerIntent>).id);
+  assert.equal(f.wires().length, sent + 1);
+  const before = all(f.store), paid = money(f.store), wires = f.wires().length;
+  assert.deepEqual(await runDeepResearch(other, input, { restoreOnly: true, allowance: 0 }), result);
+  assert.equal(all(other), before); assert.deepEqual(money(other), paid); assert.equal(f.wires().length, wires);
+});
+
+test('5.345-01 a current unpaid admission cannot be replaced by another valid cell at the same position', async t => {
+  const f = await ready(t), first = linkedInput(f), old = prepareDeepResearch(f.store, first);
+  const preparation = produceDeepPreparation(f.store, 'p', inputFor(f, f.scopeRecord, 'q-market')).record;
+  const before = all(f.store), account = money(f.store), sent = f.wires().length;
+  const cold = new Store(f.store.path); t.after(() => cold.close());
+  for (const store of [f.store, cold]) {
+    await assert.rejects(runDeepResearch(store, { ...first, deepPreparation: reference(preparation) }), { code: 'discovery_deep_execution_invalid' });
+    assert.equal(all(store), before); assert.deepEqual(money(store), account); assert.equal(f.wires().length, sent);
+    assert.deepEqual(store.get(old.id), old);
+  }
+});

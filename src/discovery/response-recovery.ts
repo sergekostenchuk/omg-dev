@@ -1702,10 +1702,13 @@ export function prepareResearchConsumerIntent(store: Store, input: ResearchConsu
     consumerInvalid('research-consumer-intent', 'Retry permits must be exact saved terminal references');
   const scoped = earlyResearchStage(store.get<DiscoveryDraft>(input.draft.id, input.draft.revision)?.value.stage);
   const previous = findResearchConsumerIntent(store, input.projectId, input.kind, input.key, scoped ? input.draft.id : undefined);
-  const replacing = !!previous && retryableResearchConsumerRefusal(store, previous)
+  const retryingRefusal = !!previous && retryableResearchConsumerRefusal(store, previous)
     && permits.some(permit => canonical(permit) === canonical(reference(previous)));
+  const replacingDeep = !!previous && deepPreparationRef(input.cursor) !== null
+    && staleUnpaidDeepAdmission(store, previous);
+  const replacing = retryingRefusal || replacingDeep;
   let currentRefusedCall: Ref | null = null;
-  if (replacing) {
+  if (retryingRefusal) {
     const terminalRef = previous.value.refusal!.call;
     const terminal = store.get<ModelCall>(terminalRef.id, terminalRef.revision);
     const head = store.get<ModelCall>(terminalRef.id);
@@ -1796,7 +1799,12 @@ export function prepareResearchConsumerIntent(store: Store, input: ResearchConsu
   toCompact();
   consumerShape(value, 'research-consumer-intent');
   requireEscalationNeighbors(store, value, 'research-consumer-intent');
-  if (previous && !sameLogicalConsumerStep(previous.value, value))
+  if (previous && !(replacingDeep
+    ? previous.value.projectId === value.projectId && previous.value.kind === value.kind
+      && previous.value.rootKey === value.rootKey && previous.value.owner.id === value.owner.id
+      && previous.value.draft.id === value.draft.id && previous.value.question.id === value.question.id
+      && previous.value.cursor.run === value.cursor.run && previous.value.cursor.turn === value.cursor.turn
+    : sameLogicalConsumerStep(previous.value, value)))
     consumerInvalid(previous.id, 'A retry generation changed the original logical step');
   const id = researchConsumerIntentId(value.projectId, value.kind, value.key, generation);
   if (previous && !replacing) {
@@ -1820,7 +1828,8 @@ export function prepareResearchConsumerIntent(store: Store, input: ResearchConsu
   // that already exist; the intent's saved guards never name a record of
   // this batch.
   return writeVariantDecisionIntent(store, value, [...preparationWrites, { id, kind: 'research-consumer-intent', expected: 0, value }],
-    uniqueTransactionGuards([...value.guards, ...preparationGuards, ...(replacing ? [reference(previous!), currentRefusedCall!] : []),
+    uniqueTransactionGuards([...value.guards, ...preparationGuards, ...(replacing ? [reference(previous!)] : []),
+      ...(currentRefusedCall ? [currentRefusedCall] : []),
       { id, absent: true }]));
 }
 function variantDecisionIntentAdmission(store: Store, value: ResearchConsumerIntent): Ref[] {
@@ -4367,6 +4376,21 @@ export function readProvenVariantSet(store:Store,project:string,ref:Ref):ProvenV
 
 // 5.5: deep is an exact subject of the existing analyst lifecycle. The
 // immutable admission decides its era, even if a later cursor loses the field.
+/** A superseded unpaid admission releases its logical position through the
+ * existing intent generation chain. Prove its original subject before asking
+ * whether it is current: damaged history is never a stale-admission permit.
+ * The new generation guards this exact prepared head, so an intervening
+ * physical reservation wins instead of sharing the position with a new buy. */
+export function staleUnpaidDeepAdmission(store: Store, intent: Revision<ResearchConsumerIntent>): boolean {
+  const proof = requireDeepConsumerBinding(store, intent);
+  if (!proof || intent.value.state !== 'prepared') return false;
+  try { requireCurrentDeepPreparation(store, intent.value.projectId, reference(proof.preparation)); }
+  catch (error) {
+    if (error instanceof EngineError && error.code === 'discovery_deep_preparation_stale') return true;
+    throw error;
+  }
+  return false;
+}
 export function requireDeepConsumerBinding(store: Store, intent: Revision<ResearchConsumerIntent>): ProvenDeepPreparation | null {
   const savedOrigin = store.get<ResearchConsumerIntent>(intent.id, 1);
   if (!savedOrigin && intent.revision !== 1 && (Object.hasOwn(intent.value.cursor, 'deepPreparation')
