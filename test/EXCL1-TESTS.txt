@@ -35,9 +35,6 @@ om-run-part-02.test.ts :: LP4 (№2902, rows 3/4) a saved cycle whose step cease
 preparation.test.ts :: B1.1 real version 3 producer preserves schemas, accepted stage history and mapDesign validation after restart # вид 1: эра 1189043f
 research.test.ts :: RS2 exact Git ecd00625 producer keeps history and packet bytes and recovers its paid pending read # вид 1: эра ecd00625
 research.test.ts :: RS3 №4414 era: the base engine 8b665772 (from Git, its own process) saved the codex-stdio envelope failure as its terminal research_provider_failed; the new code reads it in its era and DS1 requires upgrade before a new paid generation # вид 1: эра 8b665772
-storage.test.ts :: the complete ee3fd4c Store producer retains records, hashes and history after restart # вид 1: эра ee3fd4c
-storage.test.ts :: PF4 (№3523): the engine before PF4 (3e8aa784) opens and writes a database with the extension and reads snapshots with and without it; a check this engine saved notices what the old engine wrote, and one it did not touch stays # вид 1: эра 3e8aa78, 3e8aa784
-store-view.test.ts :: PF3 row 16: the versions the base code 5929ea25 wrote read cold, warm and after reopen exactly as that code reads them # вид 1: эра 5929ea25
 om-model-call-part-06.test.ts :: LP3 legacy reads-invalid: a context Ref admitted by the old E3 resumes after call or diagnostic without another send # вид 1: старый E3 допускал context Ref в search; только два reads-invalid окна (№6978)
 om-achievements.test.ts :: LP7 rows 23, 24: one answer to the joined input fields proves exactly the LP6 keys the split routing proves by parts, state components included; an answer of some proves only theirs, and their rest is joined again on the next B1 # вид 1, найден GUARD1
 om-spend-report.test.ts :: E6 reads unchanged E1 bytes from the complete 0da9006 producer after restart # вид 1, найден GUARD1
