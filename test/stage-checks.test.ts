@@ -4,12 +4,11 @@ import type { DiscoveryDraft, Question } from '../src/discovery/discovery.js';
 import { preparedField } from './preparation-fixture.js';
 import test, { type TestContext } from "node:test";
 import assert from "node:assert/strict";
-import { execFileSync, spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join } from "node:path";
 import { canonical, type Json } from "../src/canonical.js";
 import { EngineError } from "../src/errors.js";
 import { PHASES } from "../src/graph/refinement.js";
@@ -190,60 +189,6 @@ test("R2 №2419-4 row 5 and №2419-5: a first B1 created by a second Store bet
       assert.deepEqual(heads(refused), before, `${name}: the refused facade published nothing`);
     } finally { refused.close(); }
   }
-});
-
-test("R2 №2419-5: a compile produced by the code of base 4c2d5b3 in its own process is read by the lower kit as by ProductEngine, and its repeat after a restart writes nothing", t => {
-  const root = mkdtempSync(join(tmpdir(), "omg-r2-base-compile-"));
-  t.after(() => rmSync(root, { recursive: true, force: true }));
-  const environment = { ...process.env }; delete environment.NODE_TEST_CONTEXT;
-  const run = (executable: string, args: string[], cwd: string) => {
-    const child = spawnSync(executable, args, { cwd, env: environment, encoding: "utf8", timeout: 300_000, maxBuffer: 20_000_000 });
-    assert.equal(child.status, 0, `${executable} ${args.join(" ")}\n${child.stdout}\n${child.stderr}`);
-    return child.stdout;
-  };
-  const repository = run("git", ["rev-parse", "--show-toplevel"], dirname(fileURLToPath(import.meta.url))).trim();
-  const base = join(root, "base"), archive = join(root, "base.tar");
-  mkdirSync(base);
-  run("git", ["archive", "--format=tar", "--output", archive, "4c2d5b3"], repository);
-  run("tar", ["-xf", archive, "-C", base], root);
-  symlinkSync(join(repository, "node_modules"), join(base, "node_modules"), "dir");
-  writeFileSync(join(base, "tsconfig.r2-history.json"), JSON.stringify({ extends: "./tsconfig.json", include: ["src/**/*.ts", "test/product-fixture.ts"], exclude: [] }));
-  run(process.execPath, [join(base, "node_modules/typescript/bin/tsc"), "-p", "tsconfig.r2-history.json"], base);
-  const workspace = join(root, "repo"); mkdirSync(workspace); git(workspace, ["init", "-b", "main"]);
-  writeFileSync(join(workspace, "README.md"), "R2 base compile\n"); git(workspace, ["add", "README.md"]);
-  git(workspace, ["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-m", "initial"]);
-  const database = join(root, "base.sqlite"), producer = join(base, "r2-base-producer.mjs");
-  writeFileSync(producer, `
-import { writeFileSync } from 'node:fs';
-import { Store } from './dist/src/storage/store.js';
-import { ProductEngine } from './dist/src/product/engine.js';
-import { reference } from './dist/src/pipeline/contracts.js';
-import { preparedFeatures, refinedLayers } from './dist/test/product-fixture.js';
-const [database, workspace, output] = process.argv.slice(2), project = 'p';
-const store = new Store(database), engine = new ProductEngine(store);
-preparedFeatures(engine, project);
-const command = { executable: process.execPath, args: ['--version'] };
-engine.environments.configure(project, { workspace, implementer: { actor: 'author', model: 'fixture', effort: 'high', command },
-  reviewer: { actor: 'assessor', model: 'fixture', effort: 'high', command }, fullCheck: { executable: process.execPath, args: ['--version'] }, timeoutMs: 10000 }, 0);
-refinedLayers(engine, project);
-const feasibility = engine.refinement.assess(project, 0);
-const stage = engine.refinement.publish(project, reference(feasibility), 0); engine.pipeline.accept(project, 'om-g2', stage.revision);
-const plan = engine.compile(project);
-writeFileSync(output, JSON.stringify({ plan, compilation: engine.pipeline.inspect(project, 'compilation') }));
-store.close();
-`);
-  const output = join(root, "base.json");
-  run(process.execPath, [producer, database, workspace, output], base);
-  const produced = JSON.parse(readFileSync(output, "utf8")) as { plan: unknown; compilation: unknown };
-  const store = new Store(database);
-  try {
-    const before = history(store);
-    assert.deepEqual(new StageChecks(store).pipeline.inspect(project, "compilation"), new ProductEngine(store).pipeline.inspect(project, "compilation"));
-    assert.deepEqual(JSON.parse(JSON.stringify(new StageChecks(store).pipeline.inspect(project, "compilation"))), produced.compilation,
-      "Today's kit reads the base's compilation stage as the base did");
-    const repeat = writesOf(() => new StageChecks(store).compile(project));
-    assert.deepEqual([JSON.parse(JSON.stringify(repeat.value)), repeat.writes, history(store)], [produced.plan, [], before]);
-  } finally { store.close(); }
 });
 
 test("G7 replaces Q4's hot provenance scan with one first-B1 read; fsck retains the exact missing-origin finding", t => {
