@@ -90,6 +90,24 @@ export function sameAssessmentSubject(a: unknown, b: unknown): boolean {
 export const DOSSIER_TRANSPORT_DELIVERY = { contract:'dossier-assessment-transport/v1', dispatch:'unavailable',
   instruction:'Read the complete exact dossier before assessment; managed dossier assessment is not connected.' } as const;
 /** Explicit result-transport era. Markerless preparation/archives retain their read_context-only meaning. */
+export const DOSSIER_SESSION_TRANSPORT = 'dossier-session-transport/v1' as const;
+export interface DossierSessionTransport { contract: typeof DOSSIER_SESSION_TRANSPORT; session: Ref; application: string; step: number }
+export function dossierSessionTransport(container: unknown): DossierSessionTransport | null {
+  if (!container || typeof container !== 'object' || !Object.hasOwn(container,'managedDossier')) return null;
+  const marker=(container as any).managedDossier;
+  requireCondition(marker && typeof marker==='object' && !Array.isArray(marker)
+    && Object.keys(marker).sort().join(',')==='application,contract,session,step'
+    && marker.contract===DOSSIER_SESSION_TRANSPORT && isRef(marker.session)
+    && marker.session.id.startsWith('dossier-session:v1:') && Number.isSafeInteger(marker.step)
+    && marker.step>=0 && marker.step+1===marker.session.revision
+    && marker.application===`dossier-application:v1:${hashJson([marker.session.id,marker.session.revision])}`,
+    'discovery_dossier_session_invalid','The managed dossier needs its exact versioned session cursor');
+  return marker;
+}
+export function dossierTransportDelivery(container: unknown) {
+  return dossierSessionTransport(container) ? {contract:DOSSIER_SESSION_TRANSPORT,dispatch:'managed-dossier-session',
+    instruction:'Read every required exact dossier and schema page before a terminal dossier assessment.'} : DOSSIER_TRANSPORT_DELIVERY;
+}
 export const DOSSIER_RESULT_TRANSPORT = 'dossier-result-transport/v1' as const;
 export const DOSSIER_REPLY_FORMS = Object.freeze(['dossier_supported', 'dossier_return', 'read_context', 'assessment_checkpoint'] as const);
 export function dossierResultTransport(container: unknown): boolean {
@@ -181,6 +199,8 @@ export function requireDossierReplyCapacity(packet: DossierAssessmentPacket, sav
   requireCondition(object(mandatory) && object(mandatory.subject),
     'research_capacity_invalid','The dossier result minimum lost its subject projection');
   const declaration=dossierReplyContract(packet);
+  requireCondition(canonical(dossierSessionTransport(saved.bindings))===canonical(dossierSessionTransport(mandatory.subject)),
+    'discovery_dossier_session_invalid','The dossier result minimum and capacity must name the same managed cursor');
   requireDossierSubjectBinding(saved.bindings,packet.subject);
   requireCondition(saved.bindings.projectId===packet.subject.projectId
     && isRef(saved.bindings.draft) && saved.bindings.draft.id===packet.basis.draft.ref.id
@@ -192,7 +212,7 @@ export function requireDossierReplyCapacity(packet: DossierAssessmentPacket, sav
     && mandatory.subject?.dossierResultTransport===DOSSIER_RESULT_TRANSPORT
     && canonical(mandatory.subject?.dossierReplyContract)===canonical({contract:declaration.contract,
       result:declaration.result,subject:declaration.subject,schemaHash:hashJson(declaration.schema)})
-    && canonical(mandatory.subject?.assessmentDelivery)===canonical(DOSSIER_TRANSPORT_DELIVERY),
+    && canonical(mandatory.subject?.assessmentDelivery)===canonical(dossierTransportDelivery(mandatory.subject)),
     'discovery_dossier_transport_invalid','Reply capacity belongs to this exact versioned dossier contract');
   const physical=mandatory.subject.responseOutputLimit?.replyChars;
   requireCondition(physical===null || Number.isSafeInteger(physical) && physical>0,
@@ -207,7 +227,7 @@ export function packetDossierSubject(container: unknown): DossierAssessmentSubje
   if (!container || typeof container !== 'object') return null;
   const body = container as Record<string, any>;
   if (!Object.hasOwn(body, 'dossierSubject')) {
-    requireCondition(!['dossierPacket','dossierResultTransport','dossierReplyContract'].some(key=>Object.hasOwn(body,key)), 'discovery_dossier_transport_invalid',
+    requireCondition(!['dossierPacket','dossierResultTransport','dossierReplyContract','managedDossier'].some(key=>Object.hasOwn(body,key)), 'discovery_dossier_transport_invalid',
       'Dossier material cannot lose its explicit subject');
     return null;
   }
@@ -222,6 +242,9 @@ export function packetDossierSubject(container: unknown): DossierAssessmentSubje
 }
 export function requireDossierTransportContext(container: unknown, required = false) {
   dossierResultTransport(container);
+  const managed=dossierSessionTransport(container);
+  requireCondition(!managed || dossierResultTransport(container),
+    'discovery_dossier_session_invalid','Managed dossier dispatch needs the accepted result transport era');
   const subject = packetDossierSubject(container);
   requireCondition(!required || subject, 'discovery_dossier_transport_invalid', 'The dossier subject is required');
   if (subject) {
@@ -230,7 +253,7 @@ export function requireDossierTransportContext(container: unknown, required = fa
       && (!Object.hasOwn(body,'role') || body.role === 'assessor' || body.role === 'dossier-assessor'),
     'discovery_dossier_transport_invalid', 'Dossier context cannot declare another transport role');
     requireCondition(!Object.hasOwn(body,'assessmentDelivery')
-      || canonical(body.assessmentDelivery) === canonical(DOSSIER_TRANSPORT_DELIVERY),
+      || canonical(body.assessmentDelivery) === canonical(dossierTransportDelivery(body)),
     'discovery_dossier_transport_invalid', 'The dossier delivery contract cannot be substituted');
     requireCondition(!['subject','assessmentSubject','variantSubject','deepPreparation','deepCell','deepScope',
       'assessmentSession','assessmentState','question','questions','responseContract','dispatchMode',
@@ -576,8 +599,10 @@ export const FOUNDATION_FIELDS = ['core','map','researchScope','mapStatus','allo
   'fields','sourceCatalogue','inventory','catalogue','prerequisites','operationMap','objective','problem','actors',
   'constraints','specificationConstraints','concept','requirements','nodes','files','records','value','previousProposal','currentProposal'] as const;
 // This row serializes attempts; successful model-call records establish delivery.
-interface ContinuationState { projectId: string; question: string; purpose: string; actor: string; activeCall: string; attempts: number; subject?: V7PlanSubject; assessmentKey?: string; variantSubject?: VariantSubject; draft?: Ref; questionRef?: Ref; deepPreparation?: Ref }
+interface DossierContinuation { subject: DossierAssessmentSubject; session: string }
+interface ContinuationState { dossier?: DossierContinuation; projectId: string; question: string; purpose: string; actor: string; activeCall: string; attempts: number; subject?: V7PlanSubject; assessmentKey?: string; variantSubject?: VariantSubject; draft?: Ref; questionRef?: Ref; deepPreparation?: Ref }
 export interface ContinuationPacketState {
+  dossier?: DossierContinuation;
   initial: boolean; state: Revision<ContinuationState> | null; id: string; priorCalls: number;
   basis: Ref | null; latest: Ref | null; callGuards: ReadGuard[]; attempts: number;
   projectId: string; question: Revision<Question>; draft: Revision<DiscoveryDraft>; purpose: string; actor: string; subject: V7PlanSubject | null; assessmentSubject: AssessmentTransportSubject | null; variantSubject?: VariantSubject | null; deepPreparation?: Ref | null;
@@ -588,8 +613,8 @@ export function continuationState(store: Store, projectId: string, draftId: stri
   variantSubject?: null, deepPreparation?: null): LegacyContinuationPacketState;
 export function continuationState(store: Store, projectId: string, draftId: string, questionId: string, purpose: string,
   actor: string, subject: V7PlanSubject | null, assessmentSubject: AssessmentTransportSubject | null,
-  variantSubject: VariantSubject | null, deepPreparation?: Ref | null): ContinuationPacketState;
-export function continuationState(store: Store, projectId: string, draftId: string, questionId: string, purpose: string, actor: string, subject: V7PlanSubject | null = null, assessmentSubject: AssessmentTransportSubject | null = null, variantSubject: VariantSubject | null = null, deepPreparation: Ref | null = null): ContinuationPacketState {
+  variantSubject: VariantSubject | null, deepPreparation?: Ref | null, dossier?: DossierContinuation): ContinuationPacketState;
+export function continuationState(store: Store, projectId: string, draftId: string, questionId: string, purpose: string, actor: string, subject: V7PlanSubject | null = null, assessmentSubject: AssessmentTransportSubject | null = null, variantSubject: VariantSubject | null = null, deepPreparation: Ref | null = null, dossier?: DossierContinuation): ContinuationPacketState {
   const draft=store.get<DiscoveryDraft>(draftId),question=store.get<Question>(questionId);
   requireCondition(draft?.kind==='discovery-draft' && question?.kind==='question' && draft.value.projectId===projectId
     && question.value.projectId===projectId && question.value.draftId===draftId && draft.value.questions.includes(questionId),
@@ -598,19 +623,21 @@ export function continuationState(store: Store, projectId: string, draftId: stri
   if (variantSubject) variantTransportGuards(projectId, draftId, variantSubject);
   const deep = deepTransportSubject(purpose, deepPreparation, subject, variantSubject, assessmentSubject);
   const assessmentKey = assessmentSubjectKey(assessmentSubject);
-  const id=`continuation-state:${hashJson(variantSubject ? ['variant/v1',projectId,reference(draft),reference(question),variantSubject,purpose,actor] : assessmentSubject ? [projectId,assessmentSubject,purpose,actor] : subject ? (deep ? [projectId,subject,purpose,actor,'deep/v1',deep] : [projectId,subject,purpose,actor]) : [projectId,questionId,purpose,actor])}`;
+  const id=`continuation-state:${hashJson(dossier ? ['dossier/v1',projectId,dossier,actor] : variantSubject ? ['variant/v1',projectId,reference(draft),reference(question),variantSubject,purpose,actor] : assessmentSubject ? [projectId,assessmentSubject,purpose,actor] : subject ? (deep ? [projectId,subject,purpose,actor,'deep/v1',deep] : [projectId,subject,purpose,actor]) : [projectId,questionId,purpose,actor])}`;
   const state=store.get<ContinuationState>(id);
   const calls=(deep ? deepIdentityCalls(store,deep,purpose,actor) : store.list<ModelCall>('model-call')).filter(c=>c.value.projectId===projectId
     && ((c.value as unknown as {assessmentKey?:string}).assessmentKey ?? null) === assessmentKey
     && callAddressesSubject(c.value as unknown as Record<string,unknown>, reference(question), subject) && c.value.purpose===purpose && c.value.requested.actor===actor
     && canonical(packetVariantSubject(c.value)) === canonical(variantSubject)
     && canonical(packetDeepPreparation(c.value)) === canonical(deep)
+    && canonical(packetDossierSubject(c.value))===canonical(dossier?.subject??null)
+    && (!dossier || (c.value as any).managedDossier?.session?.id===dossier.session)
     && (!variantSubject || !Object.hasOwn(c.value,'subject') && !Object.hasOwn(c.value,'assessmentSubject')
       && c.value.draftId === draftId && variantCallMatches(store,c,projectId,reference(draft),reference(question),purpose,actor,variantSubject)))
     .sort((a,b)=>a.value.startedAt-b.value.startedAt||a.id.localeCompare(b.id));
   requireCondition(!calls.some(c=>c.value.status==='running'),'continuation_call_active',
     'This question/role has an unfinished invocation; recover its actual outcome before another dispatch');
-  if(state) requireCondition((state.value.assessmentKey ?? null) === assessmentKey && state.kind==='continuation-state' && state.value.question===questionId
+  if(state) requireCondition(canonical(state.value.dossier??null)===canonical(dossier??null) && (state.value.assessmentKey ?? null) === assessmentKey && state.kind==='continuation-state' && state.value.question===questionId
     && canonical(packetVariantSubject(state.value)) === canonical(variantSubject)
     && canonical(packetDeepPreparation(state.value)) === canonical(deep)
     && (!variantSubject || isRef(state.value.draft) && isRef(state.value.questionRef) && canonical(state.value.draft) === canonical(reference(draft)) && canonical(state.value.questionRef) === canonical(reference(question)))
@@ -629,16 +656,17 @@ export function continuationState(store: Store, projectId: string, draftId: stri
       &&isRef(original.value.question)&&original.value.question.id===questionId
       &&sameAssessmentSubject(readArchiveBody(store, original).body, assessmentSubject ? {assessmentSubject} : {})
       &&sameSubject(packetPlanSubject(original.value),subject)
-      &&canonical(packetDeepPreparation(readArchiveBody(store, original).body))===canonical(deep),'continuation_foreign','Delivered foundation belongs to another question');
+      &&canonical(packetDeepPreparation(readArchiveBody(store, original).body))===canonical(deep)
+      &&canonical(packetDossierSubject(readArchiveBody(store,original).body))===canonical(dossier?.subject??null),'continuation_foreign','Delivered foundation belongs to another question');
   }
-  return {initial:delivered.length===0,state,id,priorCalls:delivered.length,attempts:calls.length,
+  return {...(dossier?{dossier}:{}),initial:delivered.length===0,state,id,priorCalls:delivered.length,attempts:calls.length,
     basis:archives[0]??null,latest:archives.at(-1)??null,callGuards:calls.map(reference),projectId,question,draft,purpose,actor,subject,assessmentSubject,...(variantSubject?{variantSubject}:{}) ,...(deep?{deepPreparation:deep}:{})};
 }
 export function continuationDispatch(state: LegacyContinuationPacketState, callId: string): {writes: Write[]; guards: ReadGuard[]};
 export function continuationDispatch(state: ContinuationPacketState, callId: string): {writes: Write[]; guards: TransactionGuard[]};
 export function continuationDispatch(state: ContinuationPacketState, callId: string): { writes: Write[]; guards: TransactionGuard[] } {
   return {writes:[{id:state.id,kind:'continuation-state',expected:state.state?.revision??0,
-    value:{projectId:state.projectId,question:state.question.id,purpose:state.purpose,actor:state.actor,
+    value:{projectId:state.projectId,question:state.question.id,purpose:state.purpose,actor:state.actor,...(state.dossier?{dossier:state.dossier}:{}),
       activeCall:callId,attempts:state.attempts+1,...(state.variantSubject?{variantSubject:state.variantSubject,draft:reference(state.draft),questionRef:reference(state.question)}:{}),...(state.deepPreparation?{deepPreparation:state.deepPreparation}:{}),...(state.assessmentSubject?{assessmentKey:assessmentSubjectKey(state.assessmentSubject)}:{}),...(state.subject?{subject:state.subject}:{})}}],guards:[reference(state.question),reference(state.draft),...state.draft.value.inputs,...state.callGuards,
       ...(state.variantSubject?variantTransportGuards(state.projectId,state.draft.id,state.variantSubject):[]),
       ...(state.deepPreparation?[state.deepPreparation]:[])]};
@@ -708,13 +736,13 @@ export function selectedQuestion(question: Revision<Question>, body: Record<stri
   return { question: { id: question.id, ...structuredClone(spec) }, schemaPointer: pointer };
 }
 
-export function continuationMetadata(state: ContinuationPacketState, archive: Ref, store: Store) {
+export function continuationMetadata(state: ContinuationPacketState, archive: Ref, store: Store, staged?: Map<string,Revision<any>>) {
   const foundation = state.basis ?? archive;
   if (state.variantSubject) for (const ref of [foundation, archive])
     requireVariantArchive(store,ref,state.projectId,reference(state.draft),reference(state.question),state.purpose,state.actor,state.variantSubject);
   if (state.deepPreparation) for (const ref of [foundation, archive])
     requireDeepArchive(store,ref,state.projectId,state.deepPreparation);
-  const original = store.get<{ projectId: string; draft: Ref; question: Ref; subject?:V7PlanSubject }>(foundation.id, foundation.revision);
+  const original = staged?.get(foundation.id) ?? store.get<{ projectId: string; draft: Ref; question: Ref; subject?:V7PlanSubject }>(foundation.id, foundation.revision);
   // DRS1a2: the saved foundation record and its restored body are separate —
   // the record proves the address and metadata, the body comes by its contract.
   let body: Record<string, unknown> | null = null;
@@ -723,7 +751,8 @@ export function continuationMetadata(state: ContinuationPacketState, archive: Re
   requireCondition(original?.kind === 'research-context' && original.hash === foundation.hash
     && original.value?.projectId === state.projectId && isRef(original.value.draft) && original.value.draft.id === state.draft.id
     && isRef(original.value.question) && original.value.question.id === state.question.id
-    && body !== null && sameAssessmentSubject(body,state.assessmentSubject?{assessmentSubject:state.assessmentSubject}:{}) && sameSubject(packetPlanSubject(original.value),state.subject),
+    && body !== null && (!state.dossier || canonical(packetDossierSubject(body))===canonical(state.dossier.subject)
+      && dossierSessionTransport(body)?.session.id===state.dossier.session) && sameAssessmentSubject(body,state.assessmentSubject?{assessmentSubject:state.assessmentSubject}:{}) && sameSubject(packetPlanSubject(original.value),state.subject),
   'continuation_foreign', `[${foundation.id}] The exact foundation archive is unavailable`);
   return {...(state.variantSubject?variantTransportFields(state.projectId,reference(state.draft),reference(state.question),state.purpose,state.actor,state.variantSubject):{}),...(state.deepPreparation?deepTransportFields(state.deepPreparation):{}),...(state.assessmentSubject?{assessmentKey:assessmentSubjectKey(state.assessmentSubject)}:{}),kind:state.initial?'initial':'continuation',role:state.purpose,question:state.subject?.planQuestionId??state.question.id,...(state.subject?{subject:state.subject}:{}),
     foundation,current:archive,previousCalls:state.priorCalls,

@@ -1,6 +1,6 @@
 import { researchCapacityProjection } from './early-research-outcome.js';
 import type { DossierAssessmentPacket } from './research-model.js';
-import { DOSSIER_TRANSPORT_DELIVERY, DOSSIER_RESULT_TRANSPORT, dossierReplyContract, dossierResultTransport, packetDossierSubject, requireDossierSubjectBinding, proveDossierTransportContext } from './continuation-packet.js';
+import { dossierTransportDelivery, DOSSIER_RESULT_TRANSPORT, dossierReplyContract, dossierResultTransport, packetDossierSubject, requireDossierSubjectBinding, proveDossierTransportContext } from './continuation-packet.js';
 import { withHistoricalReads } from '../history/proofs.js';
 import type { VariantSubject } from './discovery-variants.js';
 import { sameSubject, type V7PlanSubject } from './v7-managed-attempt.js';
@@ -111,7 +111,7 @@ function structuredCatalogue(inventory: any, archive: Ref, maxChars: number): Re
 }
 
 function conclusionSources(body: Record<string, any>, archive: Ref, questionId: string): AddressedOriginal[] {
-  for (const field of ['synthesisNotes', 'assessmentNotes', 'checkpoints', 'previousProposal']) {
+  for (const field of ['synthesisNotes', 'assessmentNotes', 'dossierNotes', 'checkpoints', 'previousProposal']) {
     if (body[field] !== undefined) return [{ record: archive, pointer: `/body/${field}`, value: body[field] }];
   }
   return (Array.isArray(body['history']) ? body['history'] : []).flatMap((turn: any, index: number) =>
@@ -138,7 +138,7 @@ export function workingContext(store: Store, projectId: string, draftId: string,
 export async function prepareDossierContextPacker(store: Store, projectId: string, context: unknown) {
   const packet = await proveDossierTransportContext(store, projectId, context);
   const normalized = { ...(context as Record<string, unknown>), dossierSubject: packet.subject, dossierPacket: packet, purpose:'dossier-assessor',
-    assessmentDelivery: DOSSIER_TRANSPORT_DELIVERY,
+    assessmentDelivery: dossierTransportDelivery(context),
     ...(dossierResultTransport(context) ? {dossierResultTransport:DOSSIER_RESULT_TRANSPORT, dossierReplyContract:dossierReplyContract(packet)} : {}) };
   const writes = new Map<string, Write>(), records = new Map<string, Revision<any>>();
   const guards: TransactionGuard[] = [];
@@ -158,6 +158,7 @@ export async function prepareDossierContextPacker(store: Store, projectId: strin
   return { packet: structuredClone(packet), context: structuredClone(normalized),
     pack: (draftId: string, questionId: string, body: unknown, limit: number, options: WorkingOptions) =>
       packWorkingContext(store, projectId, draftId, questionId, body, limit, options, packet, stage, records),
+    staged: () => ({writes:[...writes.values()],guards,records}),
     commit: () => { if (writes.size) store.writeMany([...writes.values()], guards); } };
 }
 
@@ -509,7 +510,7 @@ function packWorkingContext(store: Store, projectId: string, draftId: string, qu
     const fullHistory = Object.hasOwn(initial, 'history') ? initial.history : undefined;
     if (fullHistory !== undefined) delete initial.history;
     const addressed = addressArchivedMaterials(initial, reference(archive),
-      exactArchivedFields(initial, ['dossierPacket', 'dossierReplyContract', 'fields', 'discoveryContext', 'discoveryBasisCatalogue',
+      exactArchivedFields(initial, ['dossierPacket', 'dossierReplyContract', 'dossierNotes', 'fields', 'discoveryContext', 'discoveryBasisCatalogue',
         'prerequisites', 'operationMap', 'inventory', 'consumerFeedback', 'request', 'sourceCatalogue']),
       maxChars, materialRecord);
     packContextWorkspace(initial,maxChars,options.contextChars,undefined,
@@ -622,7 +623,7 @@ function packWorkingContext(store: Store, projectId: string, draftId: string, qu
     if (!packet.materialDelivery) serveArchivedMaterial(packet, addressed, maxChars);
     return finish(packet);
   }
-  const mandatory = [...(variantFields?Object.keys(variantFields):[]),"dossierSubject","dossierPacket","dossierResultTransport","dossierReplyContract","assessmentDelivery","deepPreparation","deepCell","deepScope","variantSubject", "assessmentSubject", "resultCapacity", "assessmentContextContract", "stageNeighbors", "discoveryContext", "discoveryBasisCatalogue", "webResearch", "answerContext", "contextWorkspace", "savedEvidence", "conclusions", "conclusionCitations", "conclusionRefs", "conclusionUnresolved", "conclusionEncoding", "contextControls", "contextCorrection", "currentRead", "originals", "corrections", "request", "candidate", "proposalChanges", "purpose", "sources", "questions", "prerequisites", "operationMap", "researchMissing", "fields", "mapStatusFindings", "mapStatus", "researchScope", "role", "stage", "level", "consumer", "contextEncoding", "allowedConsumers", "gapFields", "graphBase",
+  const mandatory = [...(variantFields?Object.keys(variantFields):[]),"managedDossier","dossierNotes","dossierSubject","dossierPacket","dossierResultTransport","dossierReplyContract","assessmentDelivery","deepPreparation","deepCell","deepScope","variantSubject", "assessmentSubject", "resultCapacity", "assessmentContextContract", "stageNeighbors", "discoveryContext", "discoveryBasisCatalogue", "webResearch", "answerContext", "contextWorkspace", "savedEvidence", "conclusions", "conclusionCitations", "conclusionRefs", "conclusionUnresolved", "conclusionEncoding", "contextControls", "contextCorrection", "currentRead", "originals", "corrections", "request", "candidate", "proposalChanges", "purpose", "sources", "questions", "prerequisites", "operationMap", "researchMissing", "fields", "mapStatusFindings", "mapStatus", "researchScope", "role", "stage", "level", "consumer", "contextEncoding", "allowedConsumers", "gapFields", "graphBase",
     "core", "map", "draft", "question", "value", "representation", "consumerFeedback", "assessmentState", "openGaps", "failures", "unresolvedEvidence", "dispatchMode", "readPlanStatus", "sourceCatalogue", "sourceLocations", "bases", "runtimeProofs", "synthesisState", "synthesisNotes", "previousProposalRef"];
   if(body['assessmentState']) mandatory.splice(mandatory.indexOf("value"),1);
   const ordered = options.common && !options.continuation
@@ -637,7 +638,7 @@ function packWorkingContext(store: Store, projectId: string, draftId: string, qu
   // Defaults preserve the action protocol's collection shapes, not completeness.
   Object.assign(packet, { readings: [], directReadings: [], history: [], observations: [], checkpoints: [] });
   const addressedCore = addressArchivedMaterials(packet, reference(archive),
-    exactArchivedFields(packet, ['dossierPacket', 'dossierReplyContract', 'fields', 'discoveryContext', 'discoveryBasisCatalogue', 'stageNeighbors',
+    exactArchivedFields(packet, ['dossierPacket', 'dossierReplyContract', 'dossierNotes', 'fields', 'discoveryContext', 'discoveryBasisCatalogue', 'stageNeighbors',
       'prerequisites', 'operationMap', 'inventory', 'request', 'consumerFeedback',
       'answerContext', 'currentRead', 'originals', 'corrections', 'researchScope',
       'mapStatus', 'mapStatusFindings', 'readPlanStatus', 'openGaps', 'failures', 'sourceCatalogue',

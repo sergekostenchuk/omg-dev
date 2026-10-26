@@ -1,3 +1,9 @@
+import { requireDossierAssessmentSubject } from './dossier-assessment.js';
+import { requireDossierReplyCapacity, dossierSessionTransport, dossierTransportDelivery, DOSSIER_SESSION_TRANSPORT, DOSSIER_RESULT_TRANSPORT } from './continuation-packet.js';
+import { resumeDossierResearchCall, prepareDossierResearchEnvelope } from './research-protocol.js';
+import { readCapacityProjection, checkDossierResearchReply } from './early-research-outcome.js';
+import { resolveRoleMode } from '../runtime/environment.js';
+import type { DossierAssessmentSubject, DossierAssessmentProjection } from './research-model.js';
 import { packetAssessmentSubject, assessmentQuestionContract, type AssessmentTransportSubject } from './continuation-packet.js';
 import { proveAttemptPacket, checkDiscoveryAssessmentForm } from './v7-attempt-assessment.js';
 import { prepareResearchEnvelope } from './research-protocol.js';
@@ -1552,4 +1558,272 @@ function proveSessionOrigin(store: Store, record: Revision<Application>, before:
   const prior = proveAppliedAssessment(store, previous, before);
   if (!same(app.guards, uniqueTransactionGuards([...previous.value.guards, ...prior.guards])))
     applicationInvalid(record.id, 'The continuation lost the inputs read by its prior application');
+}
+
+
+/** A saved dossier is its own assessor subject; this era never enters the attempts state machine. */
+export const DOSSIER_SESSION = 'dossier-session/v1' as const;
+export const DOSSIER_APPLICATION = 'dossier-application/v1' as const;
+const DOSSIER_PROMPT='Assess the exact saved dossier using its dossier-assessment-result/v1 schema. Read every required original and both sides; return supported or an addressed return, or read_context/assessment_checkpoint.';
+export interface DossierAssessmentSession {
+  [key:string]:unknown;
+  contract:typeof DOSSIER_SESSION; projectId:string; subject:DossierAssessmentSubject;
+  binding:{draft:Ref;question:Ref;environment:Ref;inputs:Ref[]}; role:RoleBinding; dispatch:Environment;
+  profile:Ref|null; prompt:string; step:number; offset:0; notes:Json[]; workspace:ContextWorkspace;
+  previous:Ref|null; application:string; result:DossierAssessmentProjection|null;
+}
+export interface DossierAssessmentApplication {
+  [key:string]:unknown;
+  contract:typeof DOSSIER_APPLICATION; projectId:string; session:Ref; context:Record<string,any>;
+  prompt:string; role:RoleBinding; dispatch:Environment; profile:Ref|null; guards:TransactionGuard[];
+  state:'prepared'|'running'|'applied'; call:Ref|null; received:Ref|null; after:Ref|null;
+}
+const dossierSessionId=(subject:DossierAssessmentSubject)=>`dossier-session:v1:${hashJson([DOSSIER_SESSION,subject])}`;
+const dossierApplicationId=(session:Ref)=>`dossier-application:v1:${hashJson([session.id,session.revision])}`;
+function dossierRequire(condition:unknown,message:string):asserts condition { requireCondition(condition,'discovery_dossier_session_invalid',message); }
+function dossierExact<T>(store:Store,ref:Ref,kind:string):Revision<T> {
+  const row=exact<T>(store,ref,kind);
+  dossierRequire(hashJson(row.value as never)===row.hash,'The exact dossier source body changed');
+  return row;
+}
+function dossierMarker(session:Ref) {
+  return {contract:DOSSIER_SESSION_TRANSPORT,session,application:dossierApplicationId(session),step:session.revision-1};
+}
+function dossierContext(session:Revision<DossierAssessmentSession>) {
+  return {dossierSubject:session.value.subject,dossierResultTransport:DOSSIER_RESULT_TRANSPORT,
+    managedDossier:dossierMarker(reference(session)),dossierNotes:session.value.notes,
+    contextWorkspace:session.value.workspace.entries.map(entry=>entry.result)};
+}
+/** Leaf proof shared with the physical reader. It never calls that reader or the full session history. */
+export function readDossierDispatchAdmission(store:Store, applicationRef:Ref) {
+  const application=dossierExact<DossierAssessmentApplication>(store,applicationRef,'assessment-application'),app=application.value;
+  dossierRequire(application.revision===1 && app.contract===DOSSIER_APPLICATION && isRef(app.session),
+    'The dossier application needs its immutable prepared origin');
+  const session=dossierExact<DossierAssessmentSession>(store,app.session,'assessment-session'),value=session.value;
+  dossierRequire(value.contract===DOSSIER_SESSION && value.projectId===app.projectId && value.result===null && object(value.subject)
+    && session.id===dossierSessionId(value.subject) && value.application===application.id
+    && application.id===dossierApplicationId(reference(session)) && value.step===session.revision-1
+    && value.offset===0 && Array.isArray(value.notes) && object(value.workspace)
+    && Array.isArray(value.workspace.entries), 'The dossier session lost its own exact cursor');
+  const packet=app.context?.dossierPacket;
+  dossierRequire(object(packet) && object(packet.basis) && object(packet.basis.draft) && isRef(packet.basis.draft.ref) && same(packet.subject,value.subject),'The dossier admission lost its saved complete packet');
+  const first=dossierExact<DossierAssessmentSession>(store,{id:session.id,revision:1,hash:store.get(session.id,1)?.hash??''},'assessment-session');
+  for(const key of ['contract','projectId','subject','binding','role','dispatch','profile','prompt'])
+    dossierRequire(same(value[key],first.value[key]),'The original dossier runtime or subject changed');
+  dossierRequire(first.value.step===0 && first.value.previous===null && first.value.result===null
+    && same(first.value.notes,[]) && same(first.value.workspace,contextWorkspace()),'The dossier origin is not an initial session');
+  const binding=value.binding;
+  dossierRequire(object(binding) && isRef(binding.draft) && isRef(binding.question) && isRef(binding.environment)
+    && Array.isArray(binding.inputs) && binding.inputs.every(isRef),'The dossier lost its exact research binding');
+  const draft=dossierExact<DiscoveryDraft>(store,binding.draft,'discovery-draft'),question=dossierExact<Question>(store,binding.question,'question');
+  const environment=dossierExact<Environment>(store,binding.environment,'environment');
+  const profile=value.profile===null?undefined:dossierExact<ReaderPilot>(store,value.profile,'reader-pilot');
+  dossierRequire(draft.id===packet.basis.draft.ref.id && draft.value.projectId===app.projectId
+    && question.id===packet.basis.plan?.value?.question && question.value.projectId===app.projectId && question.value.draftId===draft.id && draft.value.questions.includes(question.id)
+    && same(draft.value.inputs,binding.inputs) && environment.value.projectId===app.projectId
+    && same(value.dispatch,environment.value) && same(value.role,resolveRoleMode('reviewer',environment.value.reviewer,'research'))
+    && (!profile || profile.value.projectId===app.projectId)
+    && same(app.role,value.role) && same(app.dispatch,value.dispatch) && same(app.profile,value.profile)
+    && app.prompt===value.prompt && app.state==='prepared' && app.call===null && app.received===null && app.after===null
+    && Array.isArray(app.guards) && same(uniqueTransactionGuards(app.guards),app.guards),
+    'The dossier application differs from its admitted project, runtime or profile');
+  dossierRequire([binding.draft,binding.question,binding.environment,...binding.inputs,...(value.profile?[value.profile]:[])]
+    .every(ref=>app.guards.some(guard=>same(guard,ref))),'The dossier admission lost a mandatory original guard');
+  const marker=dossierSessionTransport(app.context);
+  dossierRequire(marker && same(marker,dossierMarker(reference(session))) && same(app.context.dossierSubject,value.subject)
+    && same(app.context.dossierPacket,packet) && same(app.context.dossierNotes,value.notes)
+    && same(app.context.contextWorkspace??[],value.workspace.entries.map(entry=>entry.result))
+    && same(app.context.assessmentDelivery,dossierTransportDelivery(app.context)),
+    'The dossier application lost its exact subject, material or delivery cursor');
+  // One accepted reply checker proves the entire saved capacity, not a caller declaration.
+  requireDossierReplyCapacity(packet as any,app.context.resultCapacity,(record,pointer)=>readCapacityProjection(store,record,pointer));
+  dossierRequire(same(app.context.resultCapacity.bindings.managedDossier,marker),
+    'Dossier capacity must retain this exact managed cursor');
+  return {application,session,packet,draft,question,environment,profile,context:app.context,
+    role:value.role,dispatch:value.dispatch,prompt:value.prompt};
+}
+async function dossierPhysicalOutcome(store:Store, admission:Awaited<ReturnType<typeof readDossierDispatchAdmission>>, received:Ref) {
+  const {session,draft,question,application}=admission;
+  const running=dossierExact<DossierAssessmentApplication>(store,{id:application.id,revision:2,hash:store.get(application.id,2)?.hash??''},'assessment-application');
+  dossierRequire(isRef(running.value.call) && same(running.value,{...application.value,state:'running',call:running.value.call}),
+    'The dossier reservation did not bind one exact physical call');
+  const initial=dossierExact<ModelCall>(store,running.value.call,'model-call');
+  const outcome=readResearchExecution(store,session.value.projectId,received,session,draft,question,admission.role,session.value.profile);
+  requirePhysicalIdentity(initial,outcome.call);
+  dossierRequire(outcome.kind==='response','A non-response cannot evaluate a dossier');
+  return outcome;
+}
+async function advanceDossierSession(store:Store,admission:Awaited<ReturnType<typeof readDossierDispatchAdmission>>,
+  paid:Awaited<ReturnType<typeof dossierPhysicalOutcome>>) {
+  const {session,application,draft,question}=admission,current=session.value;
+  const checked=await checkDossierResearchReply(store,current.projectId,current.subject,application.value.context.resultCapacity,paid.payload);
+  let workspace=current.workspace,notes=current.notes,result:DossierAssessmentProjection|null=null;
+  if(checked.terminal) {
+    requireCompleteContextPacket(workspace,paid.subject);
+    result=checked.projection;
+    workspace=contextProgress(workspace,paid.subject);
+  } else if(checked.kind==='read_context') {
+    const action=researchAction(checked.normalized);
+    dossierRequire(action.action==='read_context','A dossier lookup must retain its exact address');
+    const addresses=paid.subject.working?.materialAddresses??[];
+    dossierRequire((same(action.record,paid.archive) && (action.pointer==='/body/dossierPacket'
+      || action.pointer==='/body/dossierReplyContract') || addresses.some((address:any)=>same(address.record,action.record)
+        && (action.pointer===address.pointer || action.pointer.startsWith(address.pointer+'/')))),
+      'The requested page is not an address of this paid dossier');
+    const lookup=readResearchContextOutcomeAt(store,draft,question,action,admission.profile?.value.maxRequestChars??300000,'bounded');
+    workspace=addContextLookup(workspace,lookup,paid.subject.contextWorkspace,undefined,paid.subject);
+  } else {
+    notes=[...notes,{archive:paid.archive,response:checked.normalized} as unknown as Json];
+    workspace=contextProgress(workspace,paid.subject);
+  }
+  return {...current,step:current.step+1,workspace,notes,result,previous:reference(application),
+    application:result?application.id:dossierApplicationId({id:session.id,revision:session.revision+1,hash:''})} satisfies DossierAssessmentSession;
+}
+/** Historical proof of every application in the saved chain, using the same projector as live application. */
+export async function readDossierAssessmentSessionAt(store:Store,project:string,sessionRef:Ref) {
+  const session=dossierExact<DossierAssessmentSession>(store,sessionRef,'assessment-session');
+  dossierRequire(session.value.projectId===project && session.value.contract===DOSSIER_SESSION
+    && session.id===dossierSessionId(session.value.subject),'The dossier session is foreign or unknown');
+  let previous=dossierExact<DossierAssessmentSession>(store,{id:session.id,revision:1,hash:store.get(session.id,1)?.hash??''},'assessment-session');
+  const origin=previous.value;
+  dossierRequire(origin.result===null && origin.previous===null && origin.step===0 && origin.offset===0
+    && same(origin.notes,[]) && same(origin.workspace,contextWorkspace()) && origin.application===dossierApplicationId(reference(previous))
+    && object(origin.binding) && isRef(origin.binding.environment) && isRef(origin.binding.draft) && isRef(origin.binding.question),
+    'The dossier origin is not its declared initial state');
+  const runtime=dossierExact<Environment>(store,origin.binding.environment,'environment');
+  const draft=dossierExact<DiscoveryDraft>(store,origin.binding.draft,'discovery-draft');
+  const question=dossierExact<Question>(store,origin.binding.question,'question');
+  dossierRequire(runtime.value.projectId===project && draft.value.projectId===project && question.value.projectId===project
+    && question.value.draftId===draft.id && draft.value.questions.includes(question.id) && same(origin.binding.inputs,draft.value.inputs)
+    && same(origin.dispatch,runtime.value) && same(origin.role,resolveRoleMode('reviewer',runtime.value.reviewer,'research'))
+    && origin.prompt===DOSSIER_PROMPT
+    && (origin.profile===null || isRef(origin.profile)),'The original dossier runtime or binding is foreign');
+  if(origin.profile) dossierExact<ReaderPilot>(store,origin.profile,'reader-pilot');
+  const initial=readDossierDispatchAdmission(store,reference(dossierExact<DossierAssessmentApplication>(store,
+    {id:origin.application,revision:1,hash:store.get(origin.application,1)?.hash??''},'assessment-application')));
+  const steps:{after:Revision<DossierAssessmentSession>;applied:Revision<DossierAssessmentApplication>;
+    admission:ReturnType<typeof readDossierDispatchAdmission>;paid:Awaited<ReturnType<typeof dossierPhysicalOutcome>>}[]=[];
+  for(let revision=2;revision<=session.revision;revision++) {
+    const after=dossierExact<DossierAssessmentSession>(store,{id:session.id,revision,hash:store.get(session.id,revision)?.hash??''},'assessment-session');
+    dossierRequire(isRef(after.value.previous),'The dossier session lost an applied predecessor');
+    const prepared=dossierExact<DossierAssessmentApplication>(store,after.value.previous,'assessment-application');
+    const applied=dossierExact<DossierAssessmentApplication>(store,{id:prepared.id,revision:3,hash:store.get(prepared.id,3)?.hash??''},'assessment-application');
+    const admission=await readDossierDispatchAdmission(store,reference(dossierExact<DossierAssessmentApplication>(store,
+      {id:applied.id,revision:1,hash:store.get(applied.id,1)?.hash??''},'assessment-application')));
+    dossierRequire(same(admission.session,previous) && applied.revision===3 && applied.value.state==='applied'
+      && isRef(applied.value.received) && same(applied.value.after,reference(after)),
+      'The session revision is not the exact result of its physical application');
+    const paid=await dossierPhysicalOutcome(store,admission,applied.value.received);
+    steps.push({after,applied,admission,paid});
+    previous=after;
+  }
+  const packet=await requireDossierAssessmentSubject(store,project,origin.subject);
+  dossierRequire(origin.binding.draft.id===packet.basis.draft.ref.id
+    && question.id===(packet.basis.plan.value as any).question && same(initial.packet,packet),
+    'The initial dossier application lost its proven packet or binding');
+  // Establish every required physical origin before reprojecting any prefix.
+  // Missing late sources cannot trigger repeated replay of an otherwise valid prefix.
+  for(const {after,applied,admission,paid} of steps) {
+    const value=await advanceDossierSession(store,admission,paid);
+    const running=dossierExact<DossierAssessmentApplication>(store,{id:applied.id,revision:2,hash:store.get(applied.id,2)?.hash??''},'assessment-application');
+    dossierRequire(same(after.value,value) && same(applied.value,{...running.value,state:'applied',
+      after:reference(after),received:reference(paid.call)}),'The saved dossier projection differs from its exact paid response');
+  }
+  const application=session.value.previous?store.get<DossierAssessmentApplication>(session.value.previous.id,3):null;
+  return {session,result:session.value.result,application:application?reference(application):null};
+}
+export async function proveDossierDispatchAdmission(store:Store,applicationRef:Ref) {
+  const admission=readDossierDispatchAdmission(store,applicationRef);
+  const packet=await requireDossierAssessmentSubject(store,admission.session.value.projectId,admission.session.value.subject);
+  dossierRequire(same(packet,admission.packet),'The saved dossier packet differs from its producer');
+  await readDossierAssessmentSessionAt(store,admission.session.value.projectId,reference(admission.session));
+  return admission;
+}
+/** One public managed door. Saved positions restore before consulting today's role or profile. */
+export async function runDossierAssessmentSession(store:Store,project:string,subject:unknown,
+  environment?:Revision<Environment>,pilot?:Revision<ReaderPilot>,signal?:AbortSignal,options:{restoreOnly?:boolean;allowance?:number}={}) {
+  const packet=await requireDossierAssessmentSubject(store,project,subject),id=dossierSessionId(packet.subject);
+  dossierRequire(options.allowance===undefined || Number.isSafeInteger(options.allowance) && options.allowance>=0,'The dossier allowance must be a nonnegative integer');
+  let used=0;
+  let session=store.get<DossierAssessmentSession>(id);
+  if(options.restoreOnly) dossierRequire(session,'There is no saved dossier position to restore');
+  if(!session) {
+    requireCondition(options.allowance!==0,'research_call_allowance','No new dossier call is allowed');
+    dossierRequire(environment && object(environment.value) && environment.value.projectId===project,'A new dossier session needs its exact runtime');
+    environment=dossierExact<Environment>(store,reference(environment),'environment');
+    const draft=store.get<DiscoveryDraft>(packet.basis.draft.ref.id),question=store.get<Question>((packet.basis.plan.value as any).question);
+    dossierRequire(draft?.kind==='discovery-draft' && question?.kind==='question','The dossier needs its current saved research binding');
+    const role=resolveRoleMode('reviewer',environment.value.reviewer,'research');
+    const value:DossierAssessmentSession={contract:DOSSIER_SESSION,projectId:project,subject:packet.subject,
+      binding:{draft:reference(draft),question:reference(question),environment:reference(environment),inputs:draft.value.inputs},
+      role,dispatch:environment.value,profile:pilot?reference(dossierExact<ReaderPilot>(store,reference(pilot),'reader-pilot')):null,
+      prompt:DOSSIER_PROMPT,
+      step:0,offset:0,notes:[],workspace:contextWorkspace(),previous:null,application:'',result:null};
+    value.application=dossierApplicationId({id,revision:1,hash:''});
+    session={id,kind:'assessment-session',revision:1,hash:hashJson(value as never),value};
+  }
+  for(;;) {
+    const saved=store.get<DossierAssessmentSession>(id);
+    session=saved??session!;
+    if(saved) {
+      const historical=await readDossierAssessmentSessionAt(store,project,reference(saved));
+      if(historical.result) return historical;
+    }
+    let application=store.get<DossierAssessmentApplication>(session.value.application);
+    if(application) application=dossierExact<DossierAssessmentApplication>(store,reference(application),'assessment-application');
+    if(options.restoreOnly && (!application || application.value.state==='prepared'
+      || application.value.state==='running' && application.value.call && store.get<ModelCall>(application.value.call.id)?.value.status==='running'))
+      return readDossierAssessmentSessionAt(store,project,reference(session));
+    if(!application) {
+      requireCondition(options.allowance===undefined || used<options.allowance,'research_call_allowance','No new dossier call is allowed');
+      const value=session.value,binding=value.binding;
+      const draft=dossierExact<DiscoveryDraft>(store,binding.draft,'discovery-draft'),question=dossierExact<Question>(store,binding.question,'question');
+      const runtime=dossierExact<Environment>(store,binding.environment,'environment');
+      const profile=value.profile?dossierExact<ReaderPilot>(store,value.profile,'reader-pilot'):undefined;
+      const effective=new Environments(store).effective(project);
+      const guards=uniqueTransactionGuards([...effective.guards,...effective.admissionGuards,reference(draft),reference(question),
+        reference(runtime),...draft.value.inputs,...(profile?[reference(profile)]:[])]);
+      const built=await prepareDossierResearchEnvelope(value.role,value.dispatch,value.prompt,dossierContext(session),
+        {store,draftId:draft.id,questionId:question.id,purpose:'dossier-assessor',...(profile?{pilot:profile}:{})},undefined,undefined,true);
+      const archive=built.archives.records.get(built.subject.working.archive.id)??dossierExact<any>(store,built.subject.working.archive,'research-context');
+      const app:DossierAssessmentApplication={contract:DOSSIER_APPLICATION,projectId:project,session:reference(session),
+        context:archive.value.body,prompt:value.prompt,role:value.role,dispatch:value.dispatch,profile:value.profile,
+        guards,state:'prepared',call:null,received:null,after:null};
+      store.writeMany([...(saved?[]:[{id:session.id,kind:session.kind,expected:0,value:session.value}]),
+        ...built.archives.writes,{id:session.value.application,kind:'assessment-application',expected:0,value:app}],
+        uniqueTransactionGuards([...(saved?[reference(session)]:[]),...guards,...built.archives.guards]));
+      application=store.get<DossierAssessmentApplication>(session.value.application)!;
+    }
+    const admission=await proveDossierDispatchAdmission(store,reference(dossierExact<DossierAssessmentApplication>(store,
+      {id:application.id,revision:1,hash:store.get(application.id,1)?.hash??''},'assessment-application')));
+    if(application.value.state==='prepared') {
+      requireCondition(options.allowance===undefined || used<options.allowance,'research_call_allowance','No new dossier call is allowed');
+      await researchCall(admission.role,admission.dispatch,admission.prompt,admission.context,signal,
+        {store,draftId:admission.draft.id,questionId:admission.question.id,purpose:'dossier-assessor',session:reference(session),
+          application:reference(application),...(admission.profile?{pilot:admission.profile}:{}),
+          prepareCall:call=>({writes:[{id:application!.id,kind:application!.kind,expected:application!.revision,
+            value:{...application!.value,state:'running',call:pendingRef(call)}}],
+            guards:uniqueTransactionGuards([reference(session!),reference(application!),...application!.value.guards])})});
+      used++;
+      continue;
+    }
+    dossierRequire(application.value.state==='running' && isRef(application.value.call),'The dossier application lost its reserved position');
+    const head=store.get<ModelCall>(application.value.call.id);
+    dossierRequire(head,'The reserved dossier call disappeared');
+    const call=dossierExact<ModelCall>(store,reference(head),'model-call');
+    if(call.value.status==='running') {
+      requireCondition(options.allowance===undefined || used<options.allowance,'research_call_allowance','No new dossier call is allowed');
+      await resumeDossierResearchCall(store,reference(admission.application),signal);
+      used++;
+      continue;
+    }
+    const paid=await dossierPhysicalOutcome(store,admission,reference(call));
+    const value=await advanceDossierSession(store,admission,paid),write:Write={id:session.id,kind:session.kind,expected:session.revision,value};
+    const applied:Write={id:application.id,kind:application.kind,expected:application.revision,
+      value:{...application.value,state:'applied',after:pendingRef(write),received:reference(paid.call)}};
+    // Historical source revisions are immutable proof, not today's admission heads.
+    // Only the owned position and the selected physical receipt may race this application.
+    store.writeMany([write,applied],uniqueTransactionGuards([reference(session),reference(application),reference(call),paid.request,
+      paid.response!,paid.archive]));
+  }
 }

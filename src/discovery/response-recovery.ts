@@ -77,7 +77,7 @@ import { expandLayerDelta, type LayerDelta } from './layer-delta.js';
 import { derivePaidReaderResult, readerApplicationAdmission, readReaderResultAt, readSavedReaderBundleResult } from './reader.js';
 import { findAcceptedPaidAnswerChain } from './research-continuation.js';
 import { queueOriginOf, queuedChildReached } from './reading-plan.js';
-import { paidOriginId, paidSessionId, limitedAssessmentRetryScope, assessmentRolePrompt, readAssessmentDispatchAdmission, readAssessmentApplicationOutcomeAt } from './assessment-session.js';
+import { paidOriginId, paidSessionId, limitedAssessmentRetryScope, assessmentRolePrompt, readAssessmentDispatchAdmission, readDossierDispatchAdmission, DOSSIER_SESSION, readAssessmentApplicationOutcomeAt } from './assessment-session.js';
 import { readResearchAssessmentAt, assessmentBindingId } from './research-assessment.js';
 import { ATTEMPT_BINDING_CONTRACT, ATTEMPT_BINDING_FIELDS, ATTEMPT_BINDING_KIND, addressedQuestionId, attemptBindingId,
   callAddressesSubject, planSubjectOf, sameSubject, questionDispatchId, type ResearchAttemptBinding, type V7PlanSubject } from './v7-managed-attempt.js';
@@ -3563,7 +3563,10 @@ function researchExecution(store: Store, project: string, callRef: Ref,
     return saved;
   };
   session = exact(session, ['synthesis-session', 'assessment-session'], 'response_recovery_session_stale');
-  const applicationEra = assessmentSessionEra(session);
+  const dossier = session.kind === 'assessment-session' && session.id.startsWith('dossier-session:v1:');
+  requireCondition(!dossier || session.value.contract === DOSSIER_SESSION && !onlyResponse,
+    'discovery_dossier_session_invalid', 'Only the managed exact dossier session may read its physical execution');
+  const applicationEra = dossier || assessmentSessionEra(session);
   draft = exact(draft, ['discovery-draft'], 'response_recovery_binding_stale');
   question = exact(question, ['question'], 'response_recovery_binding_stale');
   const binding = responseSessionBinding(session);
@@ -3574,7 +3577,7 @@ function researchExecution(store: Store, project: string, callRef: Ref,
     && canonical(draft.value.inputs) === canonical(binding.inputs) && inputs.every(ref => {
       const saved = store.get(ref.id, ref.revision); return saved && saved.hash === ref.hash;
     }), 'response_recovery_binding_stale', 'The archived session must retain its exact research binding');
-  const synthesis = session.kind === 'synthesis-session', purpose = synthesis ? 'analyst' : 'assessor';
+  const synthesis = session.kind === 'synthesis-session', purpose = synthesis ? 'analyst' : dossier ? 'dossier-assessor' : 'assessor';
   const call = store.get<ModelCall>(callRef.id, callRef.revision);
   // DR3a3-S5: a v3 step's call is addressed to its session's plan-question and
   // plan answer (the formula C writes); a v2 step's to its Question id with no
@@ -3588,7 +3591,7 @@ function researchExecution(store: Store, project: string, callRef: Ref,
     && call.value.purpose === purpose && object(call.value.requested) && canonical(call.value.requested) === canonical(role)
     && canonical(call.value.profile ?? null) === canonical(profile),
   'response_recovery_call_foreign', 'The succeeded call must belong to this exact consumer, profile and role');
-  const controlTerminal = !onlyResponse && !synthesis ? assessmentControlTerminal(store, call) : null;
+  const controlTerminal = !onlyResponse && !synthesis && !dossier ? assessmentControlTerminal(store, call) : null;
   requireCondition(object(call.value.request) && (controlTerminal ? call.value.response === null : object(call.value.response))
     && object(call.value.packet),
     'response_recovery_wire_missing', 'The complete paid request, response and context archive must exist');
@@ -3658,10 +3661,32 @@ function researchExecution(store: Store, project: string, callRef: Ref,
     && savedWorkspace.entries.every(entry => object(entry) && object(entry.result)),
   'research_context_invalid', 'Saved context workspace is invalid');
   const workspace = contextWorkspace(session.value.workspace, session.value['focus']);
+  const appRef = !synthesis && applicationEra ? call.value.assessmentApplication : undefined;
+  const state = synthesis ? { offset: session.value['offset'], materialOffset: session.value['materialOffset'] ?? 0 }
+    : dossier ? {} : { offset: session.value['offset'], candidateOffset: session.value['candidateOffset'] ?? 0, total: JSON.stringify(body.observations).length };
+  if (dossier) {
+    requireCondition(isRef(appRef), 'discovery_dossier_session_invalid', 'The dossier call lost its prepared application');
+    const admission = readDossierDispatchAdmission(store, appRef!);
+    const claim = store.get<ModelCall>(call.id, 1), running = store.get<Record<string, any>>(appRef!.id, 2);
+    requireCondition(canonical(reference(admission.session)) === canonical(reference(session))
+      && canonical(admission.role) === canonical(role) && canonical(admission.profile ? reference(admission.profile) : null) === canonical(profile)
+      && claim && running?.kind === 'assessment-application' && hashJson(running.value) === running.hash
+      && canonical(running.value) === canonical({...admission.application.value,state:'running',call:reference(claim)})
+      && canonical(archive.draft) === canonical(binding.draft) && canonical(archive.question) === canonical(binding.question)
+      && Object.entries(admission.context).every(([key,value]) => Object.hasOwn(body,key) && canonical(body[key]) === canonical(value))
+      && ['dossierSubject','managedDossier','resultCapacity','assessmentDelivery'].every(key =>
+        canonical(body[key]) === canonical(request.subject[key]))
+      && canonical((call.value as unknown as Record<string,unknown>).dossierSubject) === canonical(body.dossierSubject)
+      && canonical((call.value as unknown as Record<string,unknown>).managedDossier) === canonical(body.managedDossier)
+      && canonical(body.dossierNotes) === canonical(session.value.notes)
+      && canonical(body.contextWorkspace ?? []) === canonical(workspace.entries.map(entry => entry.result))
+      && !workspace.blocked && request.prompt === admission.prompt
+      && !Object.hasOwn(body,'assessmentSession') && !Object.hasOwn(body,'assessmentSubject')
+      && !Object.hasOwn(request.subject,'assessmentSession') && !Object.hasOwn(request.subject,'assessmentSubject'),
+      'discovery_dossier_session_invalid', 'The paid dossier differs from its exact admitted subject, cursor, runtime or capacity');
+  } else {
   requireCondition(synthesis ? Array.isArray(body.synthesisMaterials) : Array.isArray(body.observations) && Object.hasOwn(body, 'value'),
     'response_recovery_context_stale', 'Recovery needs the actual archived materials or candidate and observations');
-  const state = synthesis ? { offset: session.value['offset'], materialOffset: session.value['materialOffset'] ?? 0 }
-    : { offset: session.value['offset'], candidateOffset: session.value['candidateOffset'] ?? 0, total: JSON.stringify(body.observations).length };
   requireCondition(canonical(archive.draft) === canonical(binding.draft) && canonical(archive.question) === canonical(binding.question)
     && body[synthesis ? 'synthesisSession' : 'assessmentSession'] === session.id
     && object(body[synthesis ? 'synthesisState' : 'assessmentState']) && Array.isArray(body[synthesis ? 'synthesisNotes' : 'assessmentNotes'])
@@ -3670,7 +3695,7 @@ function researchExecution(store: Store, project: string, callRef: Ref,
     && canonical(body.contextWorkspace ?? []) === canonical(workspace.entries.map(entry => entry.result))
     && !workspace.blocked,
   'response_recovery_cursor_stale', 'The archived cursor, notes, materials context or workspace was already changed');
-  const appRef = !synthesis && applicationEra ? call.value.assessmentApplication : undefined;
+  }
   const declared = packetAssessmentSubject(body), wireSubject = packetAssessmentSubject(request.subject);
   // The original T/A physical producer persists assessmentKey. It also exposes
   // a lost wire subject; calls from the older assessment era need no new read.
@@ -3775,7 +3800,7 @@ function researchExecution(store: Store, project: string, callRef: Ref,
         && canonical(request.subject.readings ?? []) === canonical(supplied.filter((item: any) => item.kind === 'reader').map((item: any) => item.value)),
       'response_recovery_page_foreign', 'The complete material page must match its archived values');
     }
-  } else {
+  } else if (!dossier) {
     const evidence = request.subject.evidencePage, candidate = request.subject.candidatePage;
     const evidenceText = JSON.stringify(body.observations), candidateText = JSON.stringify(body.value);
     requireCondition(object(evidence) && object(candidate) && evidence.offset === session.value['offset'] && evidence.total === evidenceText.length

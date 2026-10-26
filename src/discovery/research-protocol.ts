@@ -1,9 +1,13 @@
-import { packetDossierSubject, requireDossierTransportContext } from './continuation-packet.js';
+import { dossierSessionTransport, dossierTransportDelivery, packetDossierSubject, requireDossierTransportContext } from './continuation-packet.js';
 import { prepareDossierContextPacker } from './working-context.js';
+import { requireDossierTransportArchive } from './continuation-packet.js';
+import { readArchiveBody } from './request-parts.js';
+import { contextValue } from './working-context.js';
+import { requirePacketMaterialDelivery } from './research-delivery.js';
 import { researchCapacityInput, resultCapacityFrom, requireResultCapacity, researchResultEnvelopeLimit } from './early-research-outcome.js';
 import { baselineGuards } from './v7-attempt-assessment.js';
 import { planSubjectOf, sameSubject, type V7PlanSubject } from './v7-managed-attempt.js';
-import { assessmentRolePrompt, readAssessmentDispatchAdmission } from './assessment-session.js';
+import { proveDossierDispatchAdmission, assessmentRolePrompt, readAssessmentDispatchAdmission } from './assessment-session.js';
 import { FINAL_SYNTHESIS_INSTRUCTION } from './synthesis-controls.js';
 
 /** DR3a3-S2 (codex-omg №7690 решение 2): the final synthesis of a v7
@@ -47,9 +51,9 @@ import { budgetUsage, reserveResearchCall, type BudgetSegment, type CallEstimate
 import type { DiscoveryDraft, Question } from "./discovery.js";
 import { randomUUID } from "node:crypto";
 import { runProcess } from "../runtime/process.js";
-import { isProcessStopRefusal, writeProcessStopWitness } from "../runtime/process-identity.js";
+import { processStart, evaluateProcessStopWitnesses, isProcessStopRefusal, writeProcessStopWitness } from "../runtime/process-identity.js";
 import type { Environment, RoleBinding } from "../runtime/environment.js";
-import { resolveRoleMode, uniqueTransactionGuards } from '../runtime/environment.js';
+import { Environments, resolveRoleMode, uniqueTransactionGuards } from '../runtime/environment.js';
 import { EngineError, requireCondition } from "../errors.js";
 import type { Store, Revision, Write, TransactionGuard } from "../storage/store.js";
 import type { ModelCall } from "../runtime/model-usage.js";
@@ -92,7 +96,7 @@ export interface ResearchCallAudit {
   contextContract?: typeof ARCHIVE_PARTS_CONTRACT;
 }
 type AssessmentReservation = { kind: 'replay-only' } | {
-  kind: 'application'; session: Revision<RecoverableContextSession>; application: Revision<Record<string, any>>;
+  kind: 'application' | 'dossier'; session: Revision<RecoverableContextSession>; application: Revision<Record<string, any>>;
 };
 const recordValue = (value: unknown): value is Record<string, any> => value !== null && typeof value === 'object' && !Array.isArray(value);
 function applicationAuditInvalid(message: string): never {
@@ -101,6 +105,23 @@ function applicationAuditInvalid(message: string): never {
 
 /** This is the atomic transport seam, not another assessment state machine.
  * The saved session selects the era before optional callback fields can do so. */
+async function dossierAssessmentReservation(audit: ResearchCallAudit | undefined, role: RoleBinding, environment: Environment, context: unknown): Promise<AssessmentReservation> {
+  const managed=dossierSessionTransport(context);
+  requireCondition(managed && audit && isRef(audit.session) && isRef(audit.application)
+    && typeof audit.prepareCall==='function' && !audit.consumerIntent && !audit.previewIntent
+    && audit.purpose==='dossier-assessor','discovery_dossier_dispatch_unavailable',
+    'A dossier send requires its exact managed session and application');
+  const admission=await proveDossierDispatchAdmission(audit.store,audit.application);
+  requireCondition(canonical(reference(admission.session))===canonical(audit.session)
+    && canonical(admission.context)===canonical(context) && canonical(admission.role)===canonical(role)
+    && canonical(admission.dispatch)===canonical(environment) && admission.draft.id===audit.draftId
+    && admission.question.id===audit.questionId && canonical(admission.session.value.profile)===canonical(audit.pilot?reference(audit.pilot):null),
+    'discovery_dossier_session_invalid','The dispatch must preserve its original dossier admission');
+  const current=new Environments(audit.store).effective(environment.projectId);
+  requireCondition([...current.guards,...current.admissionGuards].every(guard=>admission.application.value.guards.some(saved=>canonical(saved)===canonical(guard))),
+    'discovery_dossier_session_invalid','The new dossier send lost its mandatory current runtime guards');
+  return {kind:'dossier',session:admission.session,application:admission.application};
+}
 function assessmentReservation(audit: ResearchCallAudit | undefined, role: RoleBinding, environment: Environment, context: unknown): AssessmentReservation | null {
   const namedSession = recordValue(context) ? context.assessmentSession : undefined;
   const namesNewSession = typeof namedSession === 'string'
@@ -187,7 +208,7 @@ function assessmentReservation(audit: ResearchCallAudit | undefined, role: RoleB
 function preparedAssessmentCall(reservation: AssessmentReservation | null, call: Write, original: string,
   prepared: { writes: Write[]; guards: TransactionGuard[] } | undefined): void {
   if (!reservation) return;
-  if (reservation.kind !== 'application') applicationAuditInvalid('Operator recovery cannot reserve another physical call');
+  if (reservation.kind !== 'application' && reservation.kind !== 'dossier') applicationAuditInvalid('Operator recovery cannot reserve another physical call');
   try {
     if (!recordValue(prepared) || !Array.isArray(prepared.writes) || !Array.isArray(prepared.guards)
       || prepared.writes.length !== 1 || canonical(call) !== original)
@@ -223,7 +244,7 @@ export function prepareResearchEnvelope(role: RoleBinding, environment: Environm
  * and the same measured wire builder and addressed material delivery. */
 export async function prepareDossierResearchEnvelope(role: RoleBinding, environment: Environment, prompt: string,
   context: unknown, audit: Pick<ResearchCallAudit, 'store' | 'draftId' | 'questionId' | 'purpose' | 'pilot'>,
-  capacity?: Record<string, any>, requestId = '00000000-0000-0000-0000-000000000000') {
+  capacity?: Record<string, any>, requestId = '00000000-0000-0000-0000-000000000000', stageArchives = false) {
   requireCondition(audit?.store && audit.purpose === 'dossier-assessor' && audit.questionId,
     'discovery_dossier_transport_invalid', 'Dossier preflight needs its explicitly separate audited purpose');
   const prepared = await prepareDossierContextPacker(audit.store, environment.projectId, context);
@@ -236,17 +257,24 @@ export async function prepareDossierResearchEnvelope(role: RoleBinding, environm
   const input = researchCapacityInput({ operation:prepared.packet.subject.identity, generation:0,
     bindings: { projectId:environment.projectId, draft:reference(draft), question:reference(question),
       dossierSubject:prepared.packet.subject }, role:'assessor', purpose:'dossier-assessor', actionMode:'dossier-preflight',
-    limit:researchResultEnvelopeLimit(environment), physicalReplyLimit:audit.pilot?.value.physicalLimits?.maxReplyChars ?? null,
+    limit:researchResultEnvelopeLimit(environment,audit.pilot?.value), physicalReplyLimit:audit.pilot?.value.physicalLimits?.maxReplyChars ?? null,
     prompt, binding:role, draft:draft.value,
     question, context:prepared.context });
+  const managed=dossierSessionTransport(prepared.context);
+  if(managed) {
+    input.bindings={...input.bindings,managedDossier:managed};
+    const minimum=input.mandatoryEnvelope.subject as Record<string,unknown>;
+    minimum.managedDossier=managed;
+    minimum.assessmentDelivery=dossierTransportDelivery(prepared.context);
+  }
   const admitted = capacity === undefined ? resultCapacityFrom(input) : requireResultCapacity(capacity, input, audit.store);
   requireCondition(!Object.hasOwn(context as object, 'resultCapacity')
     || canonical((context as any).resultCapacity) === canonical(admitted),
   'discovery_dossier_transport_invalid', 'Caller context cannot substitute the exact dossier capacity');
   const built = buildResearchEnvelope(role, environment, prompt, prepared.context, audit, admitted, requestId, undefined, prepared);
   requireCondition(recordValue(built.subject), 'discovery_dossier_transport_invalid', 'Dossier envelope needs a structured subject');
-  prepared.commit();
-  return { ...built, subject:built.subject };
+  if (!stageArchives) prepared.commit();
+  return { ...built, subject:built.subject, archives:prepared.staged() };
 }
 
 function buildResearchEnvelope(role: RoleBinding, environment: Environment, prompt: string,
@@ -285,14 +313,16 @@ function buildResearchEnvelope(role: RoleBinding, environment: Environment, prom
   const deepPreparation = packetDeepPreparation(context);
   if (deepPreparation && capacity !== undefined) requireCondition(canonical(packetDeepPreparation(capacity.bindings ?? {})) === canonical(deepPreparation),
     'research_deep_subject_invalid', 'The saved capacity must bind its exact deep preparation');
-  const packetState = !dossier && audit?.questionId && draft ? continuationState(audit.store, environment.projectId, audit.draftId,
-    audit.questionId, audit.purpose, role.actor, planSubject, assessmentSubject, variantSubject, deepPreparation) : null;
+  const managedDossier=dossierSessionTransport(context);
+  const packetState = (!dossier || managedDossier) && audit?.questionId && draft ? continuationState(audit.store, environment.projectId, audit.draftId,
+    audit.questionId, audit.purpose, role.actor, planSubject, assessmentSubject, variantSubject, deepPreparation,
+      managedDossier?{subject:dossier!.packet.subject,session:managedDossier.session.id}:undefined) : null;
   const consolidating = (context as any)?.dispatchMode === 'consolidation';
   const controls = (context as any)?.contextControls;
   const finalizing = !consolidating && controls?.mode === 'finalization';
   const finalInstruction = planSubject ? V7_FINAL_SYNTHESIS_INSTRUCTION : FINAL_SYNTHESIS_INSTRUCTION;
   const envelope = { protocol: "omg-agent/v1", requestId, mode: "research", model: role.model,
-    effort: role.effort, ...(role.speed ? { speed: role.speed } : {}), prompt: consolidating ? ((context as any)?.consolidation?.tightening ? TIGHTENING_INSTRUCTION : '') + CONSOLIDATION_INSTRUCTION : finalizing ? finalInstruction : packetState && !packetState.initial ? continuationPrompt(audit!.purpose, prompt) + (audit!.purpose === 'analyst' && !planSubject ? COMPACT_CHECKPOINT_INSTRUCTION : '') : prompt };
+    effort: role.effort, ...(role.speed ? { speed: role.speed } : {}), prompt: consolidating ? ((context as any)?.consolidation?.tightening ? TIGHTENING_INSTRUCTION : '') + CONSOLIDATION_INSTRUCTION : finalizing ? finalInstruction : packetState && !packetState.initial && !dossier ? continuationPrompt(audit!.purpose, prompt) + (audit!.purpose === 'analyst' && !planSubject ? COMPACT_CHECKPOINT_INSTRUCTION : '') : prompt };
   const packingContext = capacity === undefined ? context : { ...context as Record<string, unknown>, resultCapacity: capacity };
   const requestLimit = capacity === undefined ? audit?.pilot?.value.maxRequestChars ?? DEFAULT_RESEARCH_REQUEST_CHARS
     : capacity.envelopeLimitChars;
@@ -309,7 +339,7 @@ function buildResearchEnvelope(role: RoleBinding, environment: Environment, prom
         ...(audit!.pilot ? { extractedChars: audit!.pilot.value.maxRequestChars } : {}),
         ...(audit!.contextContract ? { contextContract: audit!.contextContract } : {}) })
       : packingContext && typeof packingContext === 'object' && !Array.isArray(packingContext) ? { ...packingContext } : packingContext;
-    if (packetState) (packed as any).continuation = continuationMetadata(packetState, (packed as any).working.archive, audit!.store);
+    if (packetState) (packed as any).continuation = continuationMetadata(packetState, (packed as any).working.archive, audit!.store, dossier?.staged().records);
     if (packed && typeof packed === 'object') (packed as Record<string, unknown>).responseOutputLimit = outputLimit;
     return packed;
   };
@@ -385,9 +415,9 @@ async function dispatchResearchCall(role: RoleBinding, environment: Environment,
   recoveryDispatchBoundary();
   const dossier = requireDossierTransportContext(context, audit?.purpose === 'dossier-assessor');
   const capacityDossier = packetDossierSubject((context as any)?.resultCapacity?.bindings);
-  requireCondition(!capacityDossier, 'discovery_dossier_dispatch_unavailable',
+  requireCondition(!capacityDossier || dossier && dossierSessionTransport(context) && audit, 'discovery_dossier_dispatch_unavailable',
     'Dossier result admission cannot authorize a raw physical call');
-  requireCondition(!dossier, 'discovery_dossier_dispatch_unavailable',
+  requireCondition(!dossier || dossierSessionTransport(context) && audit?.application && audit?.session, 'discovery_dossier_dispatch_unavailable',
     'Dossier transport preflight does not authorize a physical call before managed dossier session/application');
   requireCondition(!packetAssessmentSubject(context) || !audit?.consumerIntent,
     'discovery_assessment_subject_invalid', 'An analyst intent cannot authorize or replay an attempts assessment');
@@ -484,7 +514,11 @@ async function dispatchResearchCall(role: RoleBinding, environment: Environment,
       'research_consumer_intent_invalid', 'The unsent intent must preserve its exact original prompt and consumer context');
     }
   }
-  const assessment = assessmentReservation(audit, role, environment, context);
+  // Preserve the synchronous legacy admission boundary: yielding here lets a
+  // competing legacy call reach its continuation barrier before its owner CAS.
+  const assessment = dossier || dossierSessionTransport(context) || audit?.purpose==='dossier-assessor'
+    ? await dossierAssessmentReservation(audit,role,environment,context)
+    : assessmentReservation(audit,role,environment,context);
   const assessmentSubject = packetAssessmentSubject(context);
   requireCondition(!assessmentSubject || assessment?.kind === 'application' && !consumerIntent,
     'discovery_assessment_subject_invalid', 'Attempts assessment dispatch needs its exact saved application');
@@ -562,7 +596,7 @@ async function dispatchResearchCall(role: RoleBinding, environment: Environment,
   const requestId = randomUUID();
   const callId = consumerIntent ? `model-call:consumer:v1:${requestId}` : `model-call:${requestId}`;
   const capacity = consumerIntent?.value.cursor.resultCapacity
-    ?? (assessment?.kind === 'application' ? assessment.application.value.context.resultCapacity : undefined);
+    ?? (assessment?.kind === 'application' || assessment?.kind === 'dossier' ? assessment.application.value.context.resultCapacity : undefined);
   // G5a (№6218): the saved admission is trusted — its capacity was computed and
   // proved once when the producer wrote the prepared revision. The actual prompt
   // is still compared to that saved declaration below; nothing is recomputed.
@@ -595,8 +629,10 @@ async function dispatchResearchCall(role: RoleBinding, environment: Environment,
     const { contextContract: _caller, ...rest } = audit;
     packAudit = consumerIntent?.value.contract === CONSUMER_INTENT_V2 ? { ...rest, contextContract: ARCHIVE_PARTS_CONTRACT } : rest;
   }
-  const { packetState, subject, envelope, input, requestLimit } = prepareResearchEnvelope(role, environment,
-    prompt, context, packAudit, capacity, requestId, requestContract);
+  const dossierEnvelope=dossier
+    ? await prepareDossierResearchEnvelope(role,environment,prompt,context,packAudit!,capacity,requestId,true) : null;
+  const { packetState, subject, envelope, input, requestLimit } = dossierEnvelope
+    ?? prepareResearchEnvelope(role, environment,prompt,context,packAudit,capacity,requestId,requestContract);
   if (capacity !== undefined) requireCondition(researchCapacityProjection(capacity, audit?.store).prompt === envelope.prompt,
     'research_capacity_invalid', 'The actual role prompt differs from its predeclared result admission');
   audit?.onContext?.(subject as Record<string, any>);
@@ -626,8 +662,16 @@ async function dispatchResearchCall(role: RoleBinding, environment: Environment,
     stageRemaining = stageSegment.value.limit - stageSegment.value.completionReserve! - usage.measured - usage.reserved;
     if (usage.measured > stageSegment.value.limit)
       stageFailure('discovery_budget_overrun', 'Actual stage usage forbids another paid send');
-    try { stageEstimate = estimateCliCall(audit.store, environment.projectId, role, audit.purpose, input.length,
-      packetState?.initial === false ? 'continuation' : 'initial'); }
+    try {
+      try { stageEstimate=estimateCliCall(audit.store,environment.projectId,role,audit.purpose,input.length,
+        packetState?.initial===false?'continuation':'initial'); }
+      catch(error) {
+        if(assessment?.kind!=='dossier' || !(error instanceof EngineError) || error.code!=='budget_estimate_missing') throw error;
+        stageEstimate=estimateCliCall(audit.store,environment.projectId,role,'assessor',input.length,
+          packetState?.initial===false?'continuation':'initial');
+        stageEstimate={...stageEstimate,explanation:'Managed dossier bootstrap from measured assessor calls. '+stageEstimate.explanation};
+      }
+    }
     catch (error) {
       if (error instanceof EngineError && error.code === 'budget_estimate_missing') stageFailure(error.code, error.message);
       throw error;
@@ -641,10 +685,14 @@ async function dispatchResearchCall(role: RoleBinding, environment: Environment,
     throw error;
   }
   const progressContext = (subject as any)?.contextControls ? {...context as Record<string,any>,contextControls:(subject as any).contextControls} : context;
-  const progress=packetState?(contextDeep?deepInvocationProgress(audit!.store,contextDeep,audit!.purpose,role.actor,reference(consumerIntent!))
+  const progress=packetState&&!dossier?(contextDeep?deepInvocationProgress(audit!.store,contextDeep,audit!.purpose,role.actor,reference(consumerIntent!))
     :invocationProgress(audit!.store,audit!.questionId!,audit!.purpose,progressContext as Record<string,any>,planSubject,role.actor,assessmentSubject,variantSubject)):null;
   const reservation: { writes: Write[]; guards: TransactionGuard[] } = !stagePlan && audit?.pilot
     ? pilotDispatch(audit.store, audit.pilot, callId, input.length) : { writes: [], guards: [] };
+  if(dossierEnvelope) {
+    reservation.writes.push(...dossierEnvelope.archives.writes);
+    reservation.guards.push(...dossierEnvelope.archives.guards);
+  }
   if (stagePlan && stageEstimate && audit && draft) {
     // The closing-kind whitelist is empty until DR6/DR7. No caller/model field
     // (role, purpose, finalization mode or attempt end) grants completion funds.
@@ -690,7 +738,7 @@ async function dispatchResearchCall(role: RoleBinding, environment: Environment,
     reservation.guards.push(...manifestReservationResult.guards);
   }
   if (packetState) {
-    const questionCounterId=`question-dispatch:${hashJson(variantSubject ? ['variant/v1',environment.projectId,audit!.draftId,audit!.questionId!,variantSubject,audit!.purpose,role.actor] : assessmentSubject ? [environment.projectId,assessmentSubject] : planSubject ? (contextDeep ? [environment.projectId,planSubject,'deep/v1',contextDeep] : [environment.projectId,planSubject]) : audit!.questionId!)}`;
+    const questionCounterId=`question-dispatch:${hashJson(dossier ? ['dossier/v1',environment.projectId,dossier,dossierSessionTransport(context)!.session.id] : variantSubject ? ['variant/v1',environment.projectId,audit!.draftId,audit!.questionId!,variantSubject,audit!.purpose,role.actor] : assessmentSubject ? [environment.projectId,assessmentSubject] : planSubject ? (contextDeep ? [environment.projectId,planSubject,'deep/v1',contextDeep] : [environment.projectId,planSubject]) : audit!.questionId!)}`;
     const questionCounter=audit!.store.get<{projectId:string;question:string;serial:number;subject?:V7PlanSubject;assessmentKey?:string}>(questionCounterId);
     requireCondition(!questionCounter||(questionCounter.kind==='question-dispatch'&&questionCounter.value.projectId===environment.projectId
       &&questionCounter.value.question===audit!.questionId&&(questionCounter.value.assessmentKey??null)===assessmentSubjectKey(assessmentSubject)&&sameSubject(packetPlanSubject(questionCounter.value),planSubject)
@@ -718,6 +766,7 @@ async function dispatchResearchCall(role: RoleBinding, environment: Environment,
       ...(assessmentSubject?{assessmentKey:assessmentSubjectKey(assessmentSubject)}:{}),
       ...(variantSubject?{variantSubject}:{}),
       ...(contextDeep?{deepPreparation:contextDeep}:{}),
+      ...(dossier?{dossierSubject:dossier,managedDossier:dossierSessionTransport(context)}:{}),
       ...(ownership ?? {}),
       ...(audit?.application ? { assessmentApplication: audit.application } : {}),
       ...(consumerIntent ? { consumerIntent: reference(consumerIntent) } : {}),
@@ -748,6 +797,14 @@ async function dispatchResearchCall(role: RoleBinding, environment: Environment,
     if (error instanceof RunControlLost) throw new EngineError(error.refusal.code, error.refusal.message, error.refusal.at);
     throw error;
   }
+  return executeResearchPhysicalCall(role,environment,input,requestId,call,signal,audit,control,stageSegment,consumerIntent);
+}
+
+/** One physical implementation for a fresh reservation and an original owner's exact claimed dossier. */
+async function executeResearchPhysicalCall(role:RoleBinding, environment:Environment, input:string, requestId:string,
+  call:Revision<ModelCall>|null, signal:AbortSignal|undefined, audit:ResearchCallAudit|undefined,
+  control:RunControlGate|null, stageSegment:Revision<BudgetSegment>|null,
+  consumerIntent:ReturnType<typeof readResearchConsumerIntent>|null) {
   const claimed = call ? reference(call) : null;
   let patch: Partial<ModelCall> = {};
   let rawResponse: string | null = null;
@@ -878,4 +935,70 @@ async function dispatchResearchCall(role: RoleBinding, environment: Environment,
         refuseResearchConsumerIntent(audit.store, reference(consumerIntent));
     }
   }
+}
+
+/** Resume only an exact un-authorized reservation of this still-live owner. A different process never inherits it. */
+export async function resumeDossierResearchCall(store:Store,applicationRef:Ref,signal?:AbortSignal) {
+  recoveryDispatchBoundary();
+  const admitted=await proveDossierDispatchAdmission(store,applicationRef);
+  const app=store.get<any>(applicationRef.id,2),claim=recordValue(app?.value)&&isRef(app.value.call)?store.get<ModelCall>(app.value.call.id,app.value.call.revision):null;
+  requireCondition(app?.kind==='assessment-application' && recordValue(app.value) && hashJson(app.value)===app.hash && claim && recordValue(claim.value)
+    && canonical(app.value)==canonical({...admitted.application.value,state:'running',call:reference(claim)})
+    && canonical(reference(claim))===canonical(app.value.call) && hashJson(claim.value as never)===claim.hash
+    && store.get(claim.id) !== null && canonical(reference(store.get(claim.id)!))===canonical(reference(claim))
+    && claim.value.status==='running' && executionOf(claim.value)?.phase==='claimed'
+    && claim.value.ownerProcess?.pid===process.pid && claim.value.ownerProcess.started===processStart(process.pid)
+    && canonical(executionOf(claim.value)!.owner)===canonical(claim.value.ownerProcess)
+    && canonical(claim.value.requested)===canonical(admitted.role)
+    && canonical(claim.value.profile??null)===canonical(admitted.session.value.profile)
+    && canonical(claim.value.assessmentApplication)===canonical(applicationRef)
+    && canonical((claim.value as any).managedDossier)===canonical(admitted.context.managedDossier)
+    && canonical((claim.value as any).dossierSubject)===canonical(admitted.session.value.subject)
+    && claim.value.projectId===admitted.session.value.projectId && claim.value.draftId===admitted.draft.id
+    && claim.value.questionId===admitted.question.id && claim.value.purpose==='dossier-assessor',
+    'discovery_dossier_session_invalid','Only the original live owner may resume its exact un-authorized dossier reservation');
+  for(const witness of evaluateProcessStopWitnesses(store,claim.id))
+    requireCondition(witness.state==='ended','model_call_process_uncertain','An unresolved spawned provider prevents a dossier retry');
+  const ref=claim.value.request.record;
+  const request=isRef(ref)?store.get<any>(ref.id,ref.revision):null;
+  requireCondition(request?.kind==='model-request' && canonical(reference(request))===canonical(ref)
+    && request.hash===hashJson(request.value) && request.value.projectId===claim.value.projectId
+    && request.value.draftId===claim.value.draftId && typeof request.value.text==='string'
+    && digest(request.value.text)===claim.value.request.hash && request.value.text.length===claim.value.request.chars
+    && Buffer.byteLength(request.value.text)===claim.value.request.bytes && isRef(claim.value.packet?.archive),
+    'response_recovery_wire_invalid','The dossier reservation lost its exact request and archive');
+  const archive=await requireDossierTransportArchive(store,claim.value.projectId,claim.value.packet!.archive,admitted.session.value.subject);
+  const body=readArchiveBody(store,store.get<any>(claim.value.packet!.archive.id,claim.value.packet!.archive.revision)!).body;
+  requireCondition(canonical(body)===canonical(admitted.context),'discovery_dossier_session_invalid','The reserved archive changed its admitted body');
+  let wire:any;try{wire=JSON.parse(request.value.text);}catch{throw new EngineError('response_recovery_wire_invalid','The saved dossier request must be complete JSON');}
+  requireCondition(recordValue(wire) && wire.protocol==='omg-agent/v1' && wire.requestId===claim.value.requestId && wire.mode==='research'
+    && wire.prompt===admitted.prompt && wire.model===admitted.role.model && wire.effort===admitted.role.effort
+    && (wire.speed??'inherited')===(admitted.role.speed??'inherited')
+    && canonical(wire.subject?.working?.archive)===canonical(claim.value.packet!.archive)
+    && ['managedDossier','dossierSubject','resultCapacity','assessmentDelivery'].every(key=>canonical(wire.subject[key])===canonical(admitted.context[key]))
+    && request.value.text.length<=admitted.context.resultCapacity.envelopeLimitChars
+    && (!admitted.profile?.value.physicalLimits || request.value.text.length<=admitted.profile.value.physicalLimits.maxRequestChars)
+    && canonical(wire.subject.responseOutputLimit)===canonical(researchCapacityProjection(admitted.context.resultCapacity,store).subject.responseOutputLimit)
+    && archive,
+    'response_recovery_wire_foreign','The saved dossier request no longer matches its exact admitted runtime or limits');
+  requirePacketMaterialDelivery(wire.subject,claim.value.packet!.archive,(ref,pointer)=>{
+    const row=store.get<any>(ref.id,ref.revision);
+    requireCondition(row?.kind==='research-context' && canonical(reference(row))===canonical(ref)
+      && hashJson(row.value)===row.hash && row.value.projectId===claim.value.projectId
+      && canonical(row.value.draft)===canonical(admitted.session.value.binding.draft)
+      && canonical(row.value.question)===canonical(admitted.session.value.binding.question),
+      'context_reference_foreign','A reserved dossier page lost its exact research binding');
+    return contextValue({body:readArchiveBody(store,row).body},pointer);
+  });
+  requireContextDelivery(admitted.context.contextWorkspace,wire.subject);
+  requireInvocationAllowance();
+  const control=earlyResearchStage(admitted.draft.value.stage)?new RunControlGate(store,claim.value.projectId):null;
+  try{control?.admit();}catch(error){if(error instanceof RunControlLost)throw new EngineError(error.refusal.code,error.refusal.message,error.refusal.at);throw error;}
+  const segmentRef=claim.value.budget?.segment;
+  const segment=isRef(segmentRef)?store.get<BudgetSegment>(segmentRef.id,segmentRef.revision):null;
+  requireCondition(!segmentRef || segment?.kind==='research-budget' && canonical(reference(segment))===canonical(segmentRef),
+    'research_budget_invalid','The existing dossier reservation lost its budget segment');
+  return executeResearchPhysicalCall(admitted.role,admitted.dispatch,request.value.text,claim.value.requestId,claim,signal,
+    {store,draftId:admitted.draft.id,questionId:admitted.question.id,purpose:'dossier-assessor',session:reference(admitted.session),
+      application:applicationRef,...(admitted.profile?{pilot:admitted.profile}:{})},control,segment,null);
 }
