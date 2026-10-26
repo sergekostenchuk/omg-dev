@@ -1626,6 +1626,16 @@ function rawDrop(database: string, id: string): void {
     raw.prepare("DELETE FROM heads WHERE entity_id=?").run(id);
   } finally { raw.close(); }
 }
+/** A physical edit of the database announces itself to no Store: one that has already proved something from the rows keeps the proof of the
+ * rows as they were (a kept proof holds while the committed events do not touch what it read). The edit is therefore read by a Store that
+ * kept no proof, over a database whose saved proofs are emptied too: the rows are then the only truth and every reader derives from them. */
+function coldStore(t: test.TestContext, database: string): Store {
+  const raw = new DatabaseSync(database);
+  try { raw.exec("DELETE FROM proof_links; DELETE FROM proof_cache; DELETE FROM proof_nodes"); } finally { raw.close(); }
+  const store = new Store(database);
+  t.after(() => store.close());
+  return store;
+}
 /** A copy of a reader result at its own recomputed content address with a substituted body. */
 function forgedCopy(store: Store, record: Revision<ReaderResult>, patch: Partial<ReaderResult>): Revision<ReaderResult> {
   const value = { ...record.value, ...patch };
@@ -1723,16 +1733,18 @@ test("D8.4.1 S3: a copy with a recomputed address and substituted coverage/obser
       observation: page, assessment: null, error: null, status: "completed", question: reference(f.question) } });
   const bundle = bundleTurn(f.store, f.result, f.question, "fixture-turn-s3-lost");
   rawDrop(f.database, f.result.id);
-  assert.throws(() => readPilotContext(f.store, f.draft, reference(f.result), "/observations/0", Number.MAX_SAFE_INTEGER), readerInvalid, "(3) lost");
-  assert.throws(() => pilotContext(f.store, f.draft, f.question), readerInvalid, "(5) a direct read of a lost result is a refusal, not false");
-  assert.throws(() => latestFocus(f.store, [bundle], f.question), readerInvalid, "(6) lost material");
-  assert.throws(() => latestFocus(f.store, [contextTurn], f.question), readerInvalid, "(6) lost page result");
-  assert.throws(() => workingSelections(f.store, [contextTurn], f.question), readerInvalid, "(7) no fallback context from a lost result");
+  const lost = coldStore(t, f.database);
+  assert.throws(() => readPilotContext(lost, f.draft, reference(f.result), "/observations/0", Number.MAX_SAFE_INTEGER), readerInvalid, "(3) lost");
+  assert.throws(() => pilotContext(lost, f.draft, f.question), readerInvalid, "(5) a direct read of a lost result is a refusal, not false");
+  assert.throws(() => latestFocus(lost, [bundle], f.question), readerInvalid, "(6) lost material");
+  assert.throws(() => latestFocus(lost, [contextTurn], f.question), readerInvalid, "(6) lost page result");
+  assert.throws(() => workingSelections(lost, [contextTurn], f.question), readerInvalid, "(7) no fallback context from a lost result");
   // A lost basis (the exact pilot revision) of an intact result is the same refusal.
   const g = await readingFixture(t);
   rawRewrite(g.database, g.result.value.pilot.id, g.result.value.pilot.revision, { ...g.pilot.value, maxCalls: 99 });
-  assert.throws(() => reusableReaderRanges(g.store, "p", g.supplied()), readerInvalid, "(1) lost basis");
-  assert.throws(() => pilotContext(g.store, g.draft, g.question), readerInvalid, "(4) lost basis");
+  const lostBasis = coldStore(t, g.database);
+  assert.throws(() => reusableReaderRanges(lostBasis, "p", g.supplied()), readerInvalid, "(1) lost basis");
+  assert.throws(() => pilotContext(lostBasis, g.draft, g.question), readerInvalid, "(4) lost basis");
 });
 
 test("D8.4.1 S1/S3 for combined and reused results: proven through the common reader's own rules, a substituted part or origin refuses", async t => {
@@ -1815,9 +1827,10 @@ test("D8.4.1-2 (№2332-2): a rewritten projectId behind a saved Ref is the comm
   const page = readPilotContext(f.store, f.draft, ref, "/observations/0", Number.MAX_SAFE_INTEGER);
   retainPilotRead(f.store, "p", f.question.id, { action: "read_context", record: ref, pointer: "/observations/0" }, page);
   rawRewrite(f.database, f.result.id, f.result.revision, { ...f.result.value, projectId: "foreign" });
-  assert.throws(() => readReaderResultAt(f.store, "p", ref), readerInvalid);
-  assert.throws(() => readPilotContext(f.store, f.draft, ref, "/observations/0", Number.MAX_SAFE_INTEGER), readerInvalid, "(3) the corrupt claim is not a foreign result");
-  assert.throws(() => pilotContext(f.store, f.draft, f.question), readerInvalid, "(5) the direct read does not hide the lost basis as stale");
+  const corrupt = coldStore(t, f.database);
+  assert.throws(() => readReaderResultAt(corrupt, "p", ref), readerInvalid);
+  assert.throws(() => readPilotContext(corrupt, f.draft, ref, "/observations/0", Number.MAX_SAFE_INTEGER), readerInvalid, "(3) the corrupt claim is not a foreign result");
+  assert.throws(() => pilotContext(corrupt, f.draft, f.question), readerInvalid, "(5) the direct read does not hide the lost basis as stale");
   rawRewrite(f.database, f.result.id, f.result.revision, f.result.value);
   // The genuine result of project p read by a draft of another project: proven as p's result, refused as foreign.
   const foreignDraft = { ...f.draft, value: { ...f.draft.value, projectId: "foreign" } };
@@ -1838,9 +1851,10 @@ test("review (№2332): missing question is reader_result_invalid in priorReader
   const page = readPilotContext(g.store, g.draft, ref, "/observations/0", Number.MAX_SAFE_INTEGER);
   retainPilotRead(g.store, "p", g.question.id, { action: "read_context", record: ref, pointer: "/observations/0" }, page);
   rawRewrite(g.database, g.result.id, g.result.revision, { ...g.result.value, projectId: "foreign" });
-  assert.throws(() => readReaderResultAt(g.store, "p", ref), readerInvalid);
-  assert.throws(() => readPilotContext(g.store, g.draft, ref, "/observations/0", Number.MAX_SAFE_INTEGER), readerInvalid);
-  assert.throws(() => pilotContext(g.store, g.draft, g.question), readerInvalid);
+  const corrupt = coldStore(t, g.database);
+  assert.throws(() => readReaderResultAt(corrupt, "p", ref), readerInvalid);
+  assert.throws(() => readPilotContext(corrupt, g.draft, ref, "/observations/0", Number.MAX_SAFE_INTEGER), readerInvalid);
+  assert.throws(() => pilotContext(corrupt, g.draft, g.question), readerInvalid);
 });
 
 // ---------------------------------------------------------------------------
