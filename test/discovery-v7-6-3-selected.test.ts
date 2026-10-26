@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { canonical, hashJson, type Json } from '../src/canonical.js';
 import { reference, type Ref } from '../src/pipeline/contracts.js';
@@ -58,10 +60,9 @@ const generation = () => ({ action: 'variants', variants: [1, 2].map(i => ({ key
 
 /** The real paid line of 4B.1/4O.2: two assessed plan questions, the variant snapshot, real project modes and the real
  * paid generation of a two-member set with its first state. */
-async function paid(t: test.TestContext, answer: unknown = generation()) {
-  const f = await researchSetup(t, { adapter: 'reply', prefix: 'omg-5-5-' }), project = 'p', runs = new Map<string, string>();
-  await f.engine.execute({ type: 'create-project', project, title: 'Selected variant scope' });
-  const prepare = (selected = f.subject()) => {
+type Turnable = Awaited<ReturnType<typeof researchSetup>> & { runs: Map<string, string> };
+function prepareTurn(f: Turnable, selected = f.subject()) {
+    const project = 'p', runs = f.runs;
     const context = { history: [], readings: [] };
     const draft = f.store.get<DiscoveryDraft>(f.v.draft.id)!, question = f.store.get<Question>(f.v.plan.id)!;
     const old = runs.get(selected.planAnswer.hash), run = old ? f.store.get<ResearchRun>(old)! : f.store.write<ResearchRun>({
@@ -74,8 +75,12 @@ async function paid(t: test.TestContext, answer: unknown = generation()) {
     const intent = prepareResearchConsumerIntent(f.store, input), invoke = () => researchCall(f.environment.value.implementer, f.environment.value, f.prompt, context, undefined,
       { store: f.store, draftId: draft.id, questionId: question.id, purpose: 'analyst', consumerIntent: reference(intent), requestContract: REQUEST_MANIFEST_CONTRACT });
     return { run, number, intent, input, invoke, question, draft, selected, context };
-  };
-  const g = { ...f, prepare };
+}
+async function paid(t: { after(fn: () => void): void }, answer: unknown = generation()) {
+  const base = await researchSetup(t as test.TestContext, { adapter: 'reply', prefix: 'omg-5-5-' }), project = 'p';
+  await base.engine.execute({ type: 'create-project', project, title: 'Selected variant scope' });
+  const f = { ...base, runs: new Map<string, string>() } as Turnable;
+  const g = { ...f, prepare: (selected = f.subject()) => prepareTurn(g, selected) };
   for (const question of ['q-industry', 'q-market']) {
     const entry = await produce(g, undefined, question), packet = projectAttemptPacket(f.store, { project, planAnswer: f.v.planAnswer, planQuestionId: question, entries: [entry] });
     const reply = { verdict: 'supported', reasons: ['Paid sweep'], return: null, novelty: { attempts: [{ attempt: entry.attempt, reason: 'Exact result' }], accepted: [], rejected: [], newContent: [], duplicates: [], noProgress: [{ attempt: entry.attempt, reason: 'No source' }], transition: null },
@@ -177,13 +182,50 @@ function unchanged(f: Paid, store: Store, action: () => unknown, refuses = false
   assert.equal(all(store), before); assert.deepEqual(money(store), calls); assert.deepEqual(f.wires(), wires);
   return result;
 }
-async function setup(t: test.TestContext, model = false) {
+async function built(t: { after(fn: () => void): void }, model = false) {
   const f = await paid(t);
   const decision = model ? await modelChoose(f) : selected(f).act.decision;
   const scope = publishVariantScope(f.store, 'p', reference(decision)).scope;
   return { ...f, scopeRecord: scope, input: { scope: reference(scope), plan: f.v.planAnswer } };
 }
-type Selected = Awaited<ReturnType<typeof setup>>;
+type Selected = Awaited<ReturnType<typeof built>>;
+// A world is built once by the real producers; every test then restores its exact bytes in place (its records name the
+// world's root) and opens Stores of its own. Tests of one file run one after another, so no test sees another's writes.
+const worldRoots: string[] = [];
+process.once('exit', () => { for (const root of worldRoots) rmSync(root, { recursive: true, force: true }); });
+const WORLD_FILES = ['state.sqlite', 'state.sqlite-wal', 'state.sqlite-shm', 'reply.json', 'wire.ndjson'];
+const worlds = new Map<string, { world: Selected; snapshot: string; entries: unknown }>();
+function rebind<T extends Selected>(t: test.TestContext, world: T): T {
+  const stores: Store[] = [], open = () => { const db = new Store(world.path); stores.push(db); return db; };
+  const store = open();
+  t.after(() => { for (const db of stores) db.close(); });
+  const g = { ...world, store, engine: new ProductEngine(store), discovery: new Discovery(store), open, runs: new Map(world.runs) } as T;
+  (g as any).prepare = (selected = g.subject()) => prepareTurn(g as unknown as Turnable, selected);
+  return g;
+}
+async function world<E>(t: test.TestContext, key: string, model: boolean, extend: (f: Selected) => Promise<E>,
+  from?: string): Promise<Selected & { entries: E }> {
+  let cached = worlds.get(key);
+  if (!cached) {
+    // A derived world continues the exact restored bytes of its base world in that world's own root.
+    const closing: (() => void)[] = [], scratch = { after: (fn: () => void) => closing.push(fn) } as unknown as test.TestContext;
+    const f = from ? await world(scratch, from, model, async () => null) : await built({ after: () => {} }, model), entries = await extend(f);
+    if (!from) worldRoots.push(f.root);
+    f.store.close(); for (const close of closing) close();
+    const snapshot = mkdtempSync(join(tmpdir(), 'omg-63selected-snap-')); worldRoots.push(snapshot);
+    for (const file of WORLD_FILES) if (existsSync(join(f.root, file))) copyFileSync(join(f.root, file), join(snapshot, file));
+    cached = { world: f, snapshot, entries: structuredClone(entries) };
+    worlds.set(key, cached);
+  }
+  for (const file of WORLD_FILES) {
+    rmSync(join(cached.world.root, file), { force: true });
+    if (existsSync(join(cached.snapshot, file))) copyFileSync(join(cached.snapshot, file), join(cached.world.root, file));
+  }
+  return { ...rebind(t, cached.world), entries: structuredClone(cached.entries) as E };
+}
+/** The selected owner/model world, optionally with both managed deep cells completed. */
+const setup = (t: test.TestContext, model = false) => world(t, model ? 'model' : 'owner', model, async () => null);
+const completed = (t: test.TestContext, model = false) => world(t, model ? 'model-complete' : 'owner-complete', model, complete, model ? 'model' : 'owner');
 function claim(f: Selected, question: string, axis: string, text: string, variants: 'common' | Ref[] = [f.scopeRecord.value.member]): Json {
   return { id: `h-${rand()}`, kind: 'hypothesis', text, axis,
     planQuestions: [{ planAnswer: f.v.planAnswer, planQuestionId: question }], scope: { variants },
@@ -238,7 +280,7 @@ function revise(f: Selected, store = f.store) {
 }
 
 for (const model of [false, true]) test(`6.3 selected: real ${model ? 'model' : 'owner'} choose → two managed deep cells → applied sufficiency → immutable cold snapshot`, async t => {
-  const f = await setup(t, model); await complete(f);
+  const f = await completed(t, model);
   const moneyBefore = money(f.store), wires = f.wires();
   const first = produceSelectedDossier(f.store, 'p', f.input);
   assert.equal(first.verification, 'complete'); assert.equal(first.repeated, false);
@@ -267,7 +309,7 @@ for (const model of [false, true]) test(`6.3 selected: real ${model ? 'model' : 
 
 for (const cold of [false, true])
 test(`6.3 selected: ${cold ? 'cold' : 'hot'} foreign frame Question head cannot publish either half of a new snapshot`, async t => {
-  const f = await setup(t); await complete(f);
+  const f = await completed(t);
   const frameAnswer = f.store.get<ResearchAnswer>(f.v.frameRef.id, f.v.frameRef.revision)!;
   const original = f.store.get<Question>(frameAnswer.value.question)!;
   assert.ok(f.store.get<DiscoveryDraft>(f.draft.id)!.value.questions.includes(original.id));
@@ -327,7 +369,7 @@ test('6.3 selected: missing cell, merely paid MR, common/foreign grounds, materi
 });
 
 test('6.3 selected: rejected/unassessed claims, addressed unknowns and both explicit contradiction/refutation sides survive', async t => {
-  const f = await setup(t), entries = await complete(f), target = addresses(entries.industry)[0]!;
+  const f = await completed(t), entries = f.entries, target = addresses(entries.industry)[0]!;
   const contrary = { ...(claim(f, 'q-market', 'market', 'Explicit contrary observation') as Record<string, Json>), contradicts: [target], refutedBy: [target] } as unknown as Json;
   const rejected = await deep(f, 'q-market', [contrary]); await assess(f, rejected, 'rejected');
   const unknown = { ...(claim(f, 'q-market', 'market', 'An addressed residual unknown') as Record<string, Json>), kind: 'unknown',
@@ -345,7 +387,7 @@ test('6.3 selected: rejected/unassessed claims, addressed unknowns and both expl
 });
 
 test('6.3 selected: closed input, structural complete and exact carrier grounds refuse missing/null/foreign/substituted data hot/cold', async t => {
-  const f = await setup(t); await complete(f);
+  const f = await completed(t);
   const first = produceSelectedDossier(f.store, 'p', f.input);
   const sites = referenceSites(SELECTED_DOSSIER_KIND, first.record.value);
   assert.equal(sites.length, 9 + Object.values(first.record.value.inventory).reduce((n, rows) => n + rows.length, 0));
@@ -376,7 +418,7 @@ test('6.3 selected: closed input, structural complete and exact carrier grounds 
 
 for (const race of ['mode', 'selection', 'plan', 'frame', 'P', 'material'] as const)
 test(`6.3 selected: second Store ${race} in the collection/publication window leaves neither half snapshot`, async t => {
-  const f = await setup(t); await complete(f);
+  const f = await completed(t);
   const other = new Store(f.store.path); t.after(() => other.close());
   let pendingMR: Awaited<ReturnType<typeof assess>> | null = null, pendingIntent: Ref | null = null;
   if (race === 'P') {
