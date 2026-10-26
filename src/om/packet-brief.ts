@@ -863,31 +863,41 @@ const SAMPLE_MEMO = Object.freeze({ entries: 256, keyChars: 65_536, totalChars: 
 const sampleMemo = new Map<string, { value: Json | undefined; chars: number }>();
 let sampleMemoChars = 0;
 function sampleKey(schema: unknown): string | null {
-  let nodes = SAMPLE_MEMO.nodes;
+  // The walk spends the exact JSON length of the key (escapes, quotes, separators) before any field is serialized, so an
+  // oversized annotation or string leaves for the uncached derivation without building its key.
+  let nodes = SAMPLE_MEMO.nodes, chars = SAMPLE_MEMO.keyChars;
   const path = new Set<object>();
+  const text = (value: string) => {
+    if (value.length + 2 > chars) return false;
+    chars -= JSON.stringify(value).length;
+    return chars >= 0;
+  };
   function plain(value: unknown, depth: number): boolean {
     if (--nodes < 0 || depth > SAMPLE_MEMO.depth) return false;
-    if (value === null || typeof value === 'boolean' || typeof value === 'string') return true;
-    if (typeof value === 'number') return Number.isFinite(value) && !Object.is(value, -0);
+    if (value === null || typeof value === 'boolean') return (chars -= String(value).length) >= 0;
+    if (typeof value === 'string') return text(value);
+    if (typeof value === 'number') return Number.isFinite(value) && !Object.is(value, -0) && (chars -= JSON.stringify(value).length) >= 0;
     if (typeof value !== 'object' || types.isProxy(value) || path.has(value)) return false;
     const array = Array.isArray(value);
     if (Object.getPrototypeOf(value) !== (array ? Array.prototype : Object.prototype)) return false;
-    const keys = Reflect.ownKeys(value), fields = Object.getOwnPropertyDescriptors(value), length = array ? (value as unknown[]).length : 0;
-    if (array && keys.length !== length + 1) return false;
+    const keys = Reflect.ownKeys(value), length = array ? (value as unknown[]).length : 0, entries = keys.length - (array ? 1 : 0);
+    if (array && entries !== length || entries > nodes || (chars -= 2 + Math.max(0, entries - 1)) < 0) return false;
     path.add(value);
     for (const key of keys) {
       if (typeof key !== 'string') return false;
       if (array && key === 'length') continue;
-      if (array && !(/^(?:0|[1-9][0-9]*)$/.test(key) && Number(key) < length)) return false;
-      const field = fields[key]!;
+      if (array ? !(/^(?:0|[1-9][0-9]*)$/.test(key) && Number(key) < length) : !text(key) || --chars < 0) return false;
+      const field = Object.getOwnPropertyDescriptor(value, key)!;
       if (!('value' in field) || field.enumerable !== true || !plain(field.value, depth + 1)) return false;
     }
     path.delete(value);
     return true;
   }
   if (!plain(schema, 0)) return null;
-  const key = JSON.stringify(schema);
-  return key.length <= SAMPLE_MEMO.keyChars ? key : null;
+  try {
+    const key = JSON.stringify(schema);
+    return key.length <= SAMPLE_MEMO.keyChars ? key : null;
+  } catch { return null; }
 }
 function sampleCopy(value: Json | undefined): Json | undefined {
   if (value === null || typeof value !== 'object') return value;

@@ -39,7 +39,7 @@ const transparent = <T extends object>(value: T): T => new Proxy(value, {});
 /** Counts strict-Ajv compilations of one schema content on the prototype, leaving instances untouched; restored by t.after. */
 function compilations(t: test.TestContext) {
   const previous = Ajv.prototype.compile, seen: { schema: unknown; text: string | null }[] = [];
-  const text = (schema: unknown) => { try { return JSON.stringify(schema); } catch { return null; } };
+  const stringify = JSON.stringify, text = (schema: unknown) => { try { return stringify(schema); } catch { return null; } };
   Ajv.prototype.compile = function (this: Ajv, schema: unknown, meta?: boolean) {
     seen.push({ schema, text: text(schema) });
     return previous.call(this, schema as never, meta);
@@ -174,4 +174,26 @@ test('SAMPLE-SPEED: a key over 64 KiB is never kept and the summed size of keys 
   f.brief(big[0]); f.brief(big[69]);
   assert.equal(counted.of(big[0]), 2, '70 × 60 000 characters exceed the summed bound: the oldest was evicted before 256 entries');
   assert.equal(counted.of(big[69]), 1);
+});
+
+test('SAMPLE-SPEED: an oversized annotation, an escape-heavy short string or too many keys leave before their key is built', async t => {
+  const f = world(t), counted = compilations(t), previous = JSON.stringify, whole = new Set<unknown>();
+  let serialized = 0;
+  JSON.stringify = function (value: unknown, ...rest: unknown[]) {
+    if (whole.has(value)) serialized++;
+    return (previous as (...args: unknown[]) => string).call(JSON, value, ...rest);
+  } as typeof JSON.stringify;
+  t.after(() => { JSON.stringify = previous; });
+  const annotation = { oneOf: [], description: `annotation ${process.pid} ${'x'.repeat(1_000_000)}` };
+  const escapes = { type: 'string', description: `escapes ${process.pid} ${'\u0001'.repeat(20_000)}` };
+  const wide = { type: 'object', description: `wide ${process.pid}`, properties: Object.fromEntries(Array.from({ length: 5000 }, (_, i) => [`k${i}`, { type: 'string' }])) };
+  const old = [annotation, escapes, wide].map(schema => bytes(f.brief(transparent(schema))));
+  for (const schema of [annotation, escapes, wide]) whole.add(schema);
+  for (let i = 0; i < 2; i++) [annotation, escapes, wide].forEach((schema, index) => assert.equal(bytes(f.brief(schema)), old[index]));
+  assert.equal(serialized, 0, 'no key of these schemas is ever serialized');
+  assert.equal(counted.of(escapes), 3, 'the escape-heavy schema is derived and compiled on every call');
+  const ordinary = described({ type: 'boolean' });
+  whole.add(ordinary); f.brief(ordinary); f.brief(ordinary);
+  assert.equal(serialized, 2, 'an ordinary schema within the budget is keyed on each call');
+  assert.equal(counted.of(ordinary), 1);
 });
