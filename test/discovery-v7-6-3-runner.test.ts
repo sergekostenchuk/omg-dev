@@ -501,7 +501,8 @@ test(`6.3-RUNNER-01: ${cold?'cold':'hot'} owner revise exits an unpublished reci
 });
 for(const lost of ['handoff','snapshot'] as const)
 test(`6.3-RUNNER-01: an explicit new choice does not bypass the pending ${lost} proof fault`,async t=>{
-  const f=await rejectedAtDossierCut(t,false), target=lost==='handoff'?reference(f.oldHandoff):f.oldHandoff.value.snapshot!;
+  // A proof fault needs only the pending cut world's exact bytes; its hot and cold doors are both fresh Stores over them.
+  const f=await rejectedAtDossierCut(t,false,false), target=lost==='handoff'?reference(f.oldHandoff):f.oldHandoff.value.snapshot!;
   assert.ok(target);
   for(const store of [f.store,f.open()]){
     const get=store.get.bind(store);
