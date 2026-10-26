@@ -1,5 +1,5 @@
 import { readPartialDossier } from "../discovery/dossier-manifest.js";
-import { readBudgetStopReentry, readSelectedResearchPause, SELECTED_DOSSIER_PENDING, SELECTED_DOSSIER_PAUSE } from "../discovery/research-runner.js";
+import { readBudgetReentryContinuation, readBudgetStopReentry, readSelectedResearchPause, SELECTED_DOSSIER_PENDING, SELECTED_DOSSIER_PAUSE } from "../discovery/research-runner.js";
 import { withResearchRunControl } from '../discovery/research-protocol.js';
 import { readVariantHandoff, discoveryInspection } from '../discovery/discovery-outcome.js';
 import { canonical, digest, type Json } from "../canonical.js";
@@ -467,41 +467,51 @@ export class EarlyStageDriver {
         // itself must never enable arbitrary v7 generation through this driver.
         const prior = readResearchRun(this.engine.store, request.project, draft.id);
         if (this.producerPolicy?.discovery === 7 && request.maxCalls > 0 && current.stage === 'discovery'
-          && isCurrentEra('discovery', draft.value.contractVersion, this.producerPolicy)
-          && prior?.value.pauseCode === 'research_dossier_assessment_unavailable') {
+          && isCurrentEra('discovery', draft.value.contractVersion, this.producerPolicy) && prior) {
           // Re-read and prove after acquiring the execution hold: entry's read
           // is not authority over a later head, handoff or budget chain.
-          await this.#stageOutcome(request.project, 'discovery', reference(draft), {
-            status: 'paused', stage: current.artifact ? reference(current.artifact) : null,
-            research: reference(prior), feedback: null, findings: [], turnsUsed: 0 });
-          const saved = JSON.parse(prior.value.error ?? 'null');
-          const eligible = isRef(saved?.stop)
-            && await readBudgetStopReentry(this.engine.store, request.project, draft.id, saved.stop);
+          let eligible: boolean;
+          if (prior.value.pauseCode === 'research_dossier_assessment_unavailable') {
+            await this.#stageOutcome(request.project, 'discovery', reference(draft), {
+              status: 'paused', stage: current.artifact ? reference(current.artifact) : null,
+              research: reference(prior), feedback: null, findings: [], turnsUsed: 0 });
+            const saved = JSON.parse(prior.value.error ?? 'null');
+            eligible = isRef(saved?.stop)
+              && await readBudgetStopReentry(this.engine.store, request.project, draft.id, saved.stop);
+          } else eligible = await readBudgetReentryContinuation(this.engine.store, request.project, draft.id, prior);
           admitRunControl(this.engine.store, request.project, execution.hold);
           if (eligible) {
             const policy = this.producerPolicy;
             requireCondition(executionAdmission(this.engine.store, draft, 'new-research', policy).admitted,
               'research_contract_upgrade_required', 'Budget re-entry requires the exact admitted current draft');
             let restored: Revision<ResearchRun>;
+            let unpaidPause: { code: string; target: string; message: string } | null = null;
             try {
               restored = await withResearchRunControl(this.engine.store, request.project, execution.hold,
                 () => this.engine.researcher.run(request.project, draft.id, request.maxTurns - turnsUsed,
-                  undefined, { producerPolicy: policy }));
+                  undefined, { producerPolicy: policy, preserveUnpaidBudgetPause: true }));
             } catch (error) {
               // The transport reports a typed refusal if control moved at its
               // reservation. Preserve the driver's original control outcome.
               admitRunControl(this.engine.store, request.project, execution.hold);
-              throw error;
+              if (!(error instanceof EngineError) || !['budget_estimate_missing', 'discovery_budget_reserve',
+                'discovery_budget_overrun', 'research_call_allowance'].includes(error.code)) throw error;
+              const paused = readResearchRun(this.engine.store, request.project, draft.id);
+              requireCondition(paused?.value.status === 'paused', 'research_consumer_intent_invalid',
+                'An unpaid budget or allowance refusal must preserve its research pause');
+              restored = paused;
+              unpaidPause = { code: error.code, target: draft.id, message: error.message };
             } finally {
               const latest = readResearchRun(this.engine.store, request.project, draft.id);
               turnsUsed += Math.max(0, (latest?.value.turns ?? prior.value.turns) - prior.value.turns);
             }
             admitRunControl(this.engine.store, request.project, execution.hold);
+            const pause = unpaidPause ?? (restored.value.pauseCode ? { code: restored.value.pauseCode, target: draft.id,
+              message: restored.value.error ?? 'Research is paused' } : null);
             const outcome = await this.#stageOutcome(request.project, 'discovery', reference(draft), {
               status: restored.value.status === 'needs_owner' ? 'needs_owner' : 'paused',
               stage: current.artifact ? reference(current.artifact) : null, research: reference(restored),
-              feedback: null, findings: restored.value.pauseCode ? [{ code: restored.value.pauseCode, target: draft.id,
-                message: restored.value.error ?? 'Research is paused' }] : [], turnsUsed });
+              feedback: null, findings: pause ? [pause] : [], reason: pause, turnsUsed });
             admitRunControl(this.engine.store, request.project, execution.hold);
             return { ...outcome, turnsUsed, handoff: false };
           }
@@ -724,7 +734,8 @@ export class EarlyStageDriver {
       if (partial || run?.value.pauseCode === 'research_partial_dossier_pending'
         || run?.value.pauseCode === 'research_variant_handoff_unavailable')
         requireCondition(isRef(address), 'discovery_variant_handoff_invalid', 'The saved handoff pause lost its exact address');
-      if (isRef(address)) {
+      if (isRef(address) && (partial || run?.value.pauseCode === 'research_partial_dossier_pending'
+        || run?.value.pauseCode === 'research_variant_handoff_unavailable')) {
         const handoff = (await readVariantHandoff(this.engine.store, project, address)).record;
         requireCondition(partial ? handoff.value.draft.id === draft.id : canonical(handoff.value.draft) === canonical(draft),
           'discovery_variant_handoff_invalid', 'The stage paused on another draft handoff');

@@ -166,6 +166,11 @@ export async function readSelectedResearchPause(store: Store, project: string, d
  * working group limit or spends the completion reserve. */
 export async function readBudgetStopReentry(store: Store, project: string, draftId: string, stop: Ref): Promise<boolean> {
   const old = await readDeepFrontierStop(store, project, stop);
+  return budgetStopReentryEligible(store, project, draftId, old);
+}
+
+function budgetStopReentryEligible(store: Store, project: string, draftId: string,
+  old: Awaited<ReturnType<typeof readDeepFrontierStop>>): boolean {
   requireCondition(old.record.value.draft.id === draftId, 'discovery_deep_stop_invalid',
     'Budget re-entry requires the stop of this exact draft');
   if (old.record.value.reason !== 'budget') return false;
@@ -179,11 +184,60 @@ export async function readBudgetStopReentry(store: Store, project: string, draft
       const act = store.get<{segment: Ref}>(ref.id, ref.revision)!;
       return act.value.segment.revision > previous.revision;
     })) return false;
+  // A later increase admits only the stopped plan and choice, not whatever
+  // other v7 route may have become current since that historical stop.
+  const plan = currentPlan(store, project);
+  if (plan.draft.id !== draftId || canonical(plan.planAnswer) !== canonical(old.record.value.plan)) return false;
+  const state = store.get<VariantState>(variantStateId(project, draftId));
+  if (!state || canonical(state.value.set) !== canonical(old.record.value.set)
+    || canonical(state.value.decision) !== canonical(old.record.value.decision)) return false;
+  const selected = readCurrentVariantScope(store, project, reference(plan.draft));
+  if (canonical(reference(selected.scope)) !== canonical(old.record.value.scope)) return false;
   const usage = budgetUsage(store, segment);
   if (usage.reserved || usage.measured >= effective.limit - effective.completionReserve) return false;
   const group = usage.groups[DISCOVERY_V7_STAGE_BUDGET_KEY];
   return (group?.measured ?? 0) + (group?.reserved ?? 0)
     < workingLimit(store, segment, DISCOVERY_V7_STAGE_BUDGET_KEY, 'tokens', segment.value.initialGroupLimit);
+}
+
+type BudgetReentryRun = ResearchRun & { budgetReentry?: { origin: Ref; stop: Ref } };
+
+/** A bounded invocation may leave a diagnostic or a pending deep position.
+ * Its continuation is still this exact stopped route, not a general v7 opt-in. */
+export async function readBudgetReentryContinuation(store: Store, project: string, draftId: string,
+  run: Revision<ResearchRun>): Promise<boolean> {
+  if (run.value.status !== 'paused' || !['research_deep_frontier_pending', 'budget_estimate_missing',
+    'research_call_allowance', 'research_interrupted'].includes(run.value.pauseCode ?? '')) return false;
+  const link = (run.value as BudgetReentryRun).budgetReentry;
+  if (link === undefined) return false;
+  const head = store.get<ResearchRun>(run.id);
+  requireCondition(run.kind === 'research-run' && run.value.projectId === project && run.value.draftId === draftId
+    && head && canonical(reference(head)) === canonical(reference(run)) && hashJson(run.value) === run.hash
+    && link && typeof link === 'object' && !Array.isArray(link)
+    && Object.keys(link).length === 2 && isRef(link.origin) && isRef(link.stop)
+    && link.origin.id === run.id && link.origin.revision < run.revision,
+    'discovery_deep_stop_invalid', 'The budget re-entry lost its exact original pause');
+  const origin = store.get<ResearchRun>(link.origin.id, link.origin.revision);
+  const started = store.get<BudgetReentryRun>(link.origin.id, link.origin.revision + 1);
+  requireCondition(origin?.kind === 'research-run' && canonical(reference(origin)) === canonical(link.origin)
+    && origin.value.projectId === project && origin.value.draftId === draftId
+    && origin.value.status === 'paused' && origin.value.pauseCode === 'research_dossier_assessment_unavailable'
+    && started?.kind === 'research-run'
+    && canonical(started.value) === canonical({ ...origin.value, budgetReentry: link }),
+    'discovery_deep_stop_invalid', 'The budget re-entry is not the exact successor of its saved pause');
+  let saved: any;
+  try { saved = JSON.parse(origin.value.error ?? 'null'); } catch { /* Refuse below. */ }
+  requireCondition(isRef(saved?.stop) && canonical(saved.stop) === canonical(link.stop)
+    && isRef(saved?.handoff) && isRef(saved?.dossier),
+    'discovery_deep_stop_invalid', 'The original budget pause lost its exact stop and dossier');
+  const stopped = await readDeepFrontierStop(store, project, link.stop);
+  const dossier = await readPartialDossier(store, project, saved.dossier);
+  requireCondition(stopped.record.value.reason === 'budget' && stopped.record.value.run.id === run.id
+    && canonical(stopped.record.value.handoff) === canonical(saved.handoff)
+    && dossier.stop && canonical(reference(dossier.stop)) === canonical(link.stop)
+    && canonical(reference(dossier.handoff)) === canonical(saved.handoff),
+    'discovery_deep_stop_invalid', 'The continued route does not belong to its proved budget stop');
+  return budgetStopReentryEligible(store, project, draftId, stopped);
 }
 
 /** dispatchMode with the X50 proviso: a failed planned child guards the
@@ -215,6 +269,8 @@ export class Researcher {
   constructor(private readonly store: Store, private readonly discovery: Discovery, private readonly environments: Environments) {}
   async run(project: string, draftId: string, limit: number, signal?: AbortSignal,
     options: { restoreOnly?: boolean; producerPolicy?: ProducerPolicy;
+      /** Keep the exact unpaid deep owner when a caller surfaces a forecast refusal. */
+      preserveUnpaidBudgetPause?: boolean;
       /** DRS1a2: trusted opt-in of the compact analyst storage on the v7 path. */
       contextContract?: typeof CONTEXT_PREPARATION_CONTRACT } = {}): Promise<Revision<ResearchRun>> {
     requireCondition(Number.isInteger(limit) && limit >= 1 && limit <= 100, "research_budget_invalid", "Research requires an explicit bounded turn allowance");
@@ -1800,7 +1856,8 @@ export class Researcher {
   /** The v7 open frontier uses the ordinary managed transport and K.
    * Paid work is resolved before today's plan, environment or allowance admits a new send. */
   private async runPlanAttempts(project: string, draftId: string, limit: number, signal: AbortSignal | undefined,
-    options: { restoreOnly?: boolean; producerPolicy?: ProducerPolicy; contextContract?: typeof CONTEXT_PREPARATION_CONTRACT }): Promise<Revision<ResearchRun>> {
+    options: { restoreOnly?: boolean; producerPolicy?: ProducerPolicy; preserveUnpaidBudgetPause?: boolean;
+      contextContract?: typeof CONTEXT_PREPARATION_CONTRACT }): Promise<Revision<ResearchRun>> {
     const id = `research-run:${hashJson([project, draftId])}`;
     const owner = { pid: process.pid, started: processStart(process.pid) };
     requireCondition(owner.started, "research_process_unknown", "Cannot identify the research process");
@@ -1866,6 +1923,14 @@ export class Researcher {
           requireCondition(dossier.stop && canonical(reference(dossier.stop)) === canonical(savedStop),
             'discovery_deep_stop_invalid', 'The snapshot belongs to another stop');
           if (!await mayResumeStopped(savedStop)) return run;
+          const stopped = await readDeepFrontierStop(this.store, project, savedStop);
+          if (stopped.record.value.reason === 'budget') {
+            // Preserve provenance before clearing the original pause. The first
+            // successor is a pure link; ordinary admission still decides every send.
+            const budgetReentry = { origin: reference(run), stop: savedStop };
+            run = this.save(run, { budgetReentry } as Partial<BudgetReentryRun>,
+              [budgetReentry.origin, savedStop, saved.dossier]);
+          }
         } else if (!newPartialRoute(proof.record.value)) return run;
         savedPartial = null; savedStop = null;
       } else pendingHandoff = proof.record.value;
@@ -1971,7 +2036,8 @@ export class Researcher {
       // Each unpaid admission owns a resumable exact pause, including the next
       // cell after this invocation's earlier paid work. Reservation alone
       // activates it; a preparation cut must not leave a live busy owner.
-      if (run!.value.status === 'running') run = this.save(run!, { status: 'paused',
+      if (run!.value.status === 'running' || ((run!.value as BudgetReentryRun).budgetReentry
+        && run!.value.pauseCode === 'research_dossier_assessment_unavailable')) run = this.save(run!, { status: 'paused',
         pauseCode: 'research_deep_frontier_pending',
         error: canonical({ code: 'research_deep_frontier_pending',
           message: 'The missing exact cell awaits its managed reservation', ...details }) }, frontier.guards);
@@ -2446,6 +2512,9 @@ export class Researcher {
       // Before reservation the saved pause is the prepared intent's exact
       // owner. A diagnostic revision would invalidate that unpaid admission.
       if (deepOperation && !(error instanceof EngineError) && current?.value.status === 'paused') return current;
+      if (options.preserveUnpaidBudgetPause && deepOperation && current?.value.status === 'paused'
+        && error instanceof EngineError && ['budget_estimate_missing', 'discovery_budget_reserve',
+          'discovery_budget_overrun', 'research_call_allowance'].includes(error.code)) throw error;
       // A CAS/proof refusal must not append a diagnostic over the competitor's
       // state. Once our reservation activated the run, a non-CAS application
       // failure must retain the ordinary paused recovery door, including typed cuts.
