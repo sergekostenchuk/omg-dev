@@ -2,6 +2,7 @@ import { canonical, hashJson, type Json } from '../canonical.js';
 import { EngineError } from '../errors.js';
 import { isRef, reference, type Ref } from '../pipeline/contracts.js';
 import type { Store, Revision } from '../storage/store.js';
+import { withHistoricalReads } from '../history/proofs.js';
 import { readSelectedDossier, SELECTED_DOSSIER_KIND } from './selected-dossier.js';
 import { readPartialDossier, DOSSIER_MANIFEST_KIND } from './dossier-manifest.js';
 import { resolveClaimAddress, type ClaimAddress } from './claim-address.js';
@@ -57,9 +58,17 @@ export async function prepareDossierAssessmentSubject(store: Store, project: str
   if (typeof project !== 'string' || !project) invalid('project', 'A project is required');
   exactRef(root, 'root');
   const row = exact(store, root);
-  const selected = row.kind === SELECTED_DOSSIER_KIND ? readSelectedDossier(store, project, root) : null;
-  if (!selected && row.kind !== DOSSIER_MANIFEST_KIND) invalid('root', 'A selected carrier or proven partial manifest is required');
-  const partial = selected ? null : await readPartialDossier(store, project, root);
+  // One synchronous area from the selected proof to the finished packet; the partial route awaits its handoff first, so only
+  // its synchronous assembly shares an area.
+  if (row.kind === SELECTED_DOSSIER_KIND)
+    return withHistoricalReads(() => assemblePacket(store, project, root, row, readSelectedDossier(store, project, root), null));
+  if (row.kind !== DOSSIER_MANIFEST_KIND) invalid('root', 'A selected carrier or proven partial manifest is required');
+  const partial = await readPartialDossier(store, project, root);
+  return withHistoricalReads(() => assemblePacket(store, project, root, row, null, partial));
+}
+function assemblePacket(store: Store, project: string, root: Ref, row: Revision<Json>,
+  selected: Awaited<ReturnType<typeof readSelectedDossier>> | null,
+  partial: Awaited<ReturnType<typeof readPartialDossier>> | null): DossierAssessmentPacket {
   const manifest = selected ? selected.manifest : partial!.record;
   const materialsProof = selected ? selected.materials : partial!.materials;
   const contradictionsProof = selected ? selected.contradictions : partial!.contradictions;

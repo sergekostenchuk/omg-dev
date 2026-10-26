@@ -3,7 +3,8 @@ import { canonical, hashJson, type Json } from "../canonical.js";
 import { isRef, reference, type Ref } from "../pipeline/contracts.js";
 import { EngineError } from "../errors.js";
 import type { Store, Revision, TransactionGuard } from "../storage/store.js";
-import { withHistoricalReads } from "../history/proofs.js";
+import { genuineStore } from "../storage/store-view.js";
+import { historicalProof, withHistoricalReads } from "../history/proofs.js";
 import type { DiscoveryDraft, Question } from "./discovery.js";
 import type { ResearchAnswer, ResearchRun, V7AttemptPacketEntry, V7ProgressState, V7ProgressApplication } from "./research-model.js";
 import { foldV7Progress, readV7ProgressStateAt } from "./v7-progress.js";
@@ -500,7 +501,16 @@ function projectRefOf(view: Store, project: string) {
  * changes nothing. What acceptance of an attempt MEANS is not decided yet;
  * this proof is the structural half the DR3b admission will build on. */
 export function proveAttempt(view: Store, ref: Ref): V7AttemptProof {
-  return proveAttemptWithPlan(view, ref);
+  // Every claim address, material and dossier read proves its attempt again. Read on the genuine Store, one exact attempt is
+  // a shared historical proof — derived once per operation, reused later only while its whole read footprint is current,
+  // handed out as an independent copy. Read through any other source (a traced view inside another proof, an evaluation's
+  // read view, an overlay) it is derived in place exactly as before, so the reads those sources record stay what they were.
+  // The key names the attempt by its id and its full Ref (project, kind and hash are proved inside, as before); what cannot key
+  // a proof is refused by the derivation itself, with the same typed refusal as ever.
+  if (!genuineStore(view) || !isRef(ref)) return proveAttemptWithPlan(view, ref);
+  return historicalProof(view, { reader: "discovery.v7-attempt/v1", project: ref.id, ref },
+    source => proveAttemptWithPlan(source, ref),
+    () => refuse("attempt_invalid", "attempt", "the attempt proof is cyclic"));
 }
 
 function proveAttemptWithPlan(view: Store, ref: Ref, plan?: CurrentPlan): V7AttemptProof {

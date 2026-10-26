@@ -13,6 +13,8 @@ import { BASIS_APPLICATION_CONTRACT_ERA, contractEraOf, readDraft, readRecord, r
 import { discoveryContext, requireDiscoveryProposal } from './discovery-outcome.js';
 import { Ajv } from "ajv";
 import { Store, type Revision, type TransactionGuard, type Write } from "../storage/store.js";
+import { genuineStore } from "../storage/store-view.js";
+import { historicalProof } from "../history/proofs.js";
 import { Evidence } from "../evidence/evidence.js";
 import { reference, isRef, stageId, uniqueRefs, type Ref, type Finding, type StageArtifact } from "../pipeline/contracts.js";
 import { uniqueTransactionGuards, type Environment } from "../runtime/environment.js";
@@ -629,8 +631,22 @@ function attemptsAssessmentValue(store: Store, proof: AssessmentProof): PaidDisc
 }
 
 /** Structural supported/version labels are insufficient: re-derive the entire saved
- * assessment from the producer's physical receipt, application and terminal. */
+ * assessment from the producer's physical receipt, application and terminal.
+ *
+ * A dossier read asks for the same exact assessment once per claim, per cell and per material. Read on the genuine Store
+ * it is one shared historical proof: derived once per operation, reused by a later one only while its whole read
+ * footprint is current, and handed out as an independent copy. Read through any other source — a traced view inside
+ * another proof, the assessment evaluation's own read view, an overlay — it is derived in place exactly as before, so the
+ * reads of the enclosing proof and the recorded read sequence of an evaluation stay what they were. Arguments that cannot
+ * key a proof refuse in the derivation itself, with the same typed refusal as ever. */
 export function readDiscoveryAssessment(store: Store, projectId: string, ref: Ref): Revision<PaidDiscoveryAttemptsAssessment> {
+  if (!genuineStore(store) || typeof projectId !== 'string' || projectId.trim().length === 0 || !isRef(ref))
+    return deriveDiscoveryAssessment(store, projectId, ref);
+  return historicalProof(store, { reader: 'discovery.assessment-read/v1', project: projectId, ref },
+    source => deriveDiscoveryAssessment(source, projectId, ref),
+    () => { throw new EngineError('discovery_assessment_invalid', 'The exact assessment proof is cyclic'); });
+}
+function deriveDiscoveryAssessment(store: Store, projectId: string, ref: Ref): Revision<PaidDiscoveryAttemptsAssessment> {
   const saved = isRef(ref) ? store.get<PaidDiscoveryAttemptsAssessment>(ref.id, ref.revision) : null;
   requireCondition(saved?.kind === DISCOVERY_ASSESSMENT_KIND && saved.revision === 1 && same(reference(saved), ref)
     && saved.hash === hashJson(saved.value) && saved.value !== null && typeof saved.value === 'object'

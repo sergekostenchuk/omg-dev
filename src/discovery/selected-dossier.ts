@@ -2,6 +2,7 @@ import { canonical, hashJson } from '../canonical.js';
 import { EngineError } from '../errors.js';
 import { isRef, reference, type Ref } from '../pipeline/contracts.js';
 import { Store, type Revision, type TransactionGuard, type Write } from '../storage/store.js';
+import { withHistoricalReads } from '../history/proofs.js';
 import { uniqueTransactionGuards, transactionGuardsCurrent } from '../runtime/environment.js';
 import { readProjectMode } from '../product/project-mode.js';
 import { computeMissingCoverageAt, type CoverageComputation } from './coverage.js';
@@ -121,7 +122,11 @@ function inventory(store: Store, project: string, plan: Ref, draft: Revision<Dis
   return { attempts: sorted(attempts.map(reference)), assessments: sorted(assessments.map(reference)),
     states: sorted(states), applications: sorted(applications), accounts: sorted(accounts) };
 }
+/** One synchronous area for the whole projection: the proofs its readers share are derived once inside it and kept at its end. */
 function projection(store: Store, project: string, scope: Ref, plan: Ref, boundary: SelectedDossier['boundary']) {
+  return withHistoricalReads(() => projectionAt(store, project, scope, plan, boundary));
+}
+function projectionAt(store: Store, project: string, scope: Ref, plan: Ref, boundary: SelectedDossier['boundary']) {
   if (!(store instanceof Store) || typeof project !== 'string' || !project) invalid('store', 'A Store and project are required');
   exactRef(scope, 'scope'); exactRef(plan, 'plan');
   if (!same(store.eventAt(boundary.sequence), boundary.record)) invalid('boundary', 'The saved journal cut is absent or changed');
@@ -155,6 +160,9 @@ function projection(store: Store, project: string, scope: Ref, plan: Ref, bounda
 /** Historical completeness uses only the saved exact inventory and original cut.
  * It never consults current selection, authority or current P for acceptance. */
 export function readSelectedDossier(store: Store, project: string, at: Ref): ProvenSelectedDossier {
+  return withHistoricalReads(() => readSelectedDossierAt(store, project, at));
+}
+function readSelectedDossierAt(store: Store, project: string, at: Ref): ProvenSelectedDossier {
   const raw = exact<unknown>(store, at, SELECTED_DOSSIER_KIND), value = decodeSelectedDossier(raw.value);
   if (raw.revision !== 1 || raw.id !== selectedDossierId(value) || value.projectId !== project) invalid('record', 'Noncanonical selected dossier');
   for (const key of links) exact(store, value[key]);
