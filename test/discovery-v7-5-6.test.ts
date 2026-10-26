@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { reference } from '../src/pipeline/contracts.js';
@@ -51,8 +52,16 @@ function interceptWrites(t:test.TestContext, target:Store,
   });
   return ()=>method.mock.restore();
 }
-async function setup(t: test.TestContext, questions: PlanQuestion[] = [planQuestion('q-one', 'industry', 'blocking'), planQuestion('q-two', 'market')], initialMode: 'questions'|'bypass'|null = 'questions') {
-  const f = discoveryFixture(t, 'omg-56-');
+// A world is built once by the real producers in a root of its own; every test opens its own Stores over it. A cached
+// ready world is restored from its byte snapshot before each test (tests of a file run one after another), so no test
+// sees another's writes. Saved records name the world's root (workspace, adapter), hence restore in place.
+const roots: string[] = [];
+process.once('exit', () => { for (const root of roots) rmSync(root, { recursive: true, force: true }); });
+type Base = { root: string; path: string; v: ReturnType<typeof acceptPlan>; environment: Revision<any>; command: { executable: string; args: string[] };
+  initial: Revision<unknown> | null; questions: PlanQuestion[] };
+async function build(questions: PlanQuestion[], initialMode: 'questions'|'bypass'|null): Promise<Base> {
+  const f = discoveryFixture({ after: () => {} }, 'omg-56-');
+  roots.push(f.root);
   f.engine.execute({ type: 'create-project', project: 'p', title: 'Runner generation' });
   const settings = join(f.root, 'settings.json'), wire = join(f.root, 'wire.ndjson'), adapter = join(f.root, 'adapter.mjs');
   const configure = (patch: Record<string, unknown> = {}) => {
@@ -114,6 +123,28 @@ console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,u
       { store: f.store, draftId: calibration.id, questionId: calibration.value.questions[0]!, purpose: `variant-${kind}` });
   }
   writeFileSync(wire, '');
+  f.store.close();
+  return { root: f.root, path: f.path, v, environment, command, initial, questions };
+}
+function bind(t: { after(fn: () => void): void }, base: Base) {
+  const { root, path, v, environment, command, initial, questions } = base, stores: Store[] = [];
+  const open = () => { const db = new Store(path); stores.push(db); return db; };
+  const store = open(), engine = new ProductEngine(store), discovery = new Discovery(store);
+  t.after(() => { for (const db of stores) db.close(); });
+  const f = { root, path, store, engine, discovery, open };
+  const settings = join(root, 'settings.json'), wire = join(root, 'wire.ndjson');
+  const configure = (patch: Record<string, unknown> = {}) => {
+    let prior = {}; try { prior = JSON.parse(readFileSync(settings, 'utf8')); } catch {}
+    writeFileSync(settings, JSON.stringify({ ...prior, ...patch }));
+  };
+  function mode(value: 'questions'|'bypass', store = f.store) {
+    const request = { project: 'p', mode: value, previous: store.get('project-mode:p') ? reference(store.get('project-mode:p')!) : null };
+    const sessions = new ProjectModeSessions(store), invitation = issueProjectModeInvitation(store, request);
+    assert.ok(invitation.ok); if (!invitation.ok) assert.fail();
+    const login = sessions.exchange({ project: 'p', invitation: invitation.value.invitation }); assert.ok(login.ok); if (!login.ok) assert.fail();
+    const record = setProjectMode(store, request, sessions.authority(login.value.bearer)).record;
+    assert.ok(sessions.revoke(login.value.bearer).ok); return record;
+  }
   const run = (limit = 8, store = f.store, restoreOnly = false) => new Researcher(store, new Discovery(store), new ProductEngine(store).environments)
     .run('p', v.draft.id, limit, undefined, { producerPolicy: { discovery: 7 }, restoreOnly });
   const wires = () => readFileSync(wire, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line));
@@ -128,6 +159,10 @@ console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,u
   };
   return { ...f, v, environment, command, run, wires, generationCalls, configure, mode, initial, nextEdition };
 }
+async function setup(t: test.TestContext, questions: PlanQuestion[] = [planQuestion('q-one', 'industry', 'blocking'), planQuestion('q-two', 'market')], initialMode: 'questions'|'bypass'|null = 'questions') {
+  return bind(t, await build(questions, initialMode));
+}
+const WORLD_FILES = ['state.sqlite', 'state.sqlite-wal', 'state.sqlite-shm', 'settings.json', 'wire.ndjson'];
 const money = (store: Store) => store.list().filter(row => ['model-call', 'research-budget-ledger'].includes(row.kind)).flatMap(row => store.history(row.id));
 function choiceScope(f: Awaited<ReturnType<typeof setup>>, kind: 'choose' | 'reject_all' = 'choose'): VariantChoiceScope {
   const state = f.store.get<VariantState>(variantStateId('p', f.v.draft.id))!;
@@ -154,8 +189,24 @@ async function inert(f: Awaited<ReturnType<typeof setup>>, store: Store, action:
   const result=await action();
   assert.equal(history(store),before);assert.deepEqual(money(store),paid);assert.deepEqual(f.wires(),wire);return result;
 }
+const readyWorlds = new Map<string, { base: Base; snapshot: string; data: { scope: any; pending: any } }>();
+/** The real generation, choice and pending deep frontier is produced once per (model, config); each later test starts
+ * from its exact bytes in its own Stores. */
 async function ready(t:test.TestContext,model=false,config:Record<string,unknown>={}) {
-  const f=await setup(t,undefined,model?'bypass':'questions');
+  const key=JSON.stringify([model,config]);let cached=readyWorlds.get(key);
+  if(!cached){
+    const closing:(()=>void)[]=[], base=await build([planQuestion('q-one', 'industry', 'blocking'), planQuestion('q-two', 'market')],model?'bypass':'questions');
+    const made=await readyIn(bind({after:fn=>closing.push(fn)},base),model,config);
+    for(const close of closing)close();
+    const snapshot=mkdtempSync(join(tmpdir(),'omg-56-snap-'));roots.push(snapshot);
+    for(const file of WORLD_FILES)if(existsSync(join(base.root,file)))copyFileSync(join(base.root,file),join(snapshot,file));
+    cached={base,snapshot,data:structuredClone({scope:made.scope,pending:made.pending})};readyWorlds.set(key,cached);
+  }
+  for(const file of WORLD_FILES){rmSync(join(cached.base.root,file),{force:true});
+    if(existsSync(join(cached.snapshot,file)))copyFileSync(join(cached.snapshot,file),join(cached.base.root,file));}
+  return {...bind(t,cached.base),...structuredClone(cached.data)};
+}
+async function readyIn(f:ReturnType<typeof bind>,model:boolean,config:Record<string,unknown>) {
   const generated=await f.run(3);
   assert.equal(generated.value.pauseCode,model?'research_turns_exhausted':'research_variant_owner_required',generated.value.error!);
   f.configure(config);
