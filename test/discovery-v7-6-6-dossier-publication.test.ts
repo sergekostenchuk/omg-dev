@@ -1,6 +1,9 @@
-import test from 'node:test';
+import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
-import { writeFileSync } from 'node:fs';
+import { cpSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { storeUnchanged, storeRefused } from './store-unchanged.js';
 import { DatabaseSync } from 'node:sqlite';
 import { canonical, hashJson, type Json } from '../src/canonical.js';
 import { reference, type Ref } from '../src/pipeline/contracts.js';
@@ -175,20 +178,48 @@ const all = (store: Store) => {
   finally { db.close(); }
 };
 async function unchanged<T>(f: Paid, store: Store, action: () => Promise<T>, refuses = false): Promise<T | undefined> {
-  const before = all(store), calls = money(store), wires = f.wires();
+  const calls = money(store), wires = f.wires();
   let result: T | undefined;
-  if (refuses) await assert.rejects(action, error => error instanceof EngineError);
-  else result = await action();
-  assert.equal(all(store), before); assert.deepEqual(money(store), calls); assert.deepEqual(f.wires(), wires);
+  if (refuses) await storeRefused(store, action);
+  else result = await storeUnchanged(store, action);
+  assert.deepEqual(money(store), calls); assert.deepEqual(f.wires(), wires);
   return result;
 }
-async function setup(t: test.TestContext, model = false) {
+/** Full product history is compared once around a fixed-point block; each
+ * individual public door inside it still has its own real Store stamp/money/wire. */
+async function fixedPoint<T>(store:Store,action:()=>Promise<T>):Promise<T> {
+  const before=all(store);try{return await action();}finally{assert.equal(all(store),before);}
+}
+interface World {root:string;path:string;store:Store;engine:ProductEngine;discovery:Discovery;open:()=>Store}
+const seeds=new Map<string,{value:World;snapshot:string;active:Store[]}>();
+const disposeSeeds:(()=>void)[]=[];
+after(()=>{for(const seed of seeds.values())for(const db of seed.active)db.close();for(const dispose of disposeSeeds)dispose();});
+/** Real producers run once per route. Restore their complete closed world at its
+ * original path before opening a test's Stores; historical paths/Refs/hashes are
+ * never rewritten. Only sequential tests use these roots. No proof is cached. */
+async function isolated<T extends World>(t:test.TestContext,key:string,make:(lifetime:test.TestContext)=>Promise<T>):Promise<T> {
+  let seed=seeds.get(key);
+  if(!seed){
+    const value=await make({after:(dispose:()=>void)=>disposeSeeds.push(dispose)} as unknown as test.TestContext);value.store.close();
+    const snapshot=mkdtempSync(join(tmpdir(),'omg-live-seed-'));cpSync(value.root,join(snapshot,'world'),{recursive:true});
+    disposeSeeds.push(()=>rmSync(snapshot,{recursive:true,force:true}));seed={value,snapshot,active:[]};seeds.set(key,seed);
+  }
+  for(const db of seed.active)db.close();
+  const base=seed.value as T;
+  for(const name of readdirSync(base.root))rmSync(join(base.root,name),{recursive:true,force:true});
+  cpSync(join(seed.snapshot,'world'),base.root,{recursive:true});
+  const stores:Store[]=[],open=()=>{const db=new Store(base.path);stores.push(db);return db;},store=open();
+  seed.active=stores;
+  t.after(()=>{for(const db of stores)db.close();});
+  return {...base,store,open,engine:new ProductEngine(store),discovery:new Discovery(store)};
+}
+async function setupRaw(t: test.TestContext, model = false) {
   const f = await paid(t);
   const decision = model ? await modelChoose(f) : selected(f).act.decision;
   const scope = publishVariantScope(f.store, 'p', reference(decision)).scope;
   return { ...f, scopeRecord: scope, input: { scope: reference(scope), plan: f.v.planAnswer } };
 }
-type Selected = Awaited<ReturnType<typeof setup>>;
+type Selected = Awaited<ReturnType<typeof setupRaw>>;
 function claim(f: Selected, question: string, axis: string, text: string, variants: 'common' | Ref[] = [f.scopeRecord.value.member]): Json {
   return { id: `h-${rand()}`, kind: 'hypothesis', text, axis,
     planQuestions: [{ planAnswer: f.v.planAnswer, planQuestionId: question }], scope: { variants },
@@ -321,13 +352,22 @@ function wideDelivery(f:Paid) {
     maxRequestChars:3000000,maxReadChars:128000,maxReplyChars:100000,maxCalls:100,maxReportedTokens:100000,
     physicalLimits:{maxRequestChars:3000000,maxReplyChars:100000,basis:'Full local dossier delivery'}},0);
 }
-async function partial(t:test.TestContext, material?:string) {
+async function partialRaw(t:test.TestContext, material?:string) {
   const f=await paid(t,(snapshot:Ref)=>({action:'no_variants',reasons:[{code:'bounded_search',message:'No bounded variant',grounds:[snapshot]}],
     searchLimits:['Saved sweep'],unknowns:['Demand unknown']}),material??true);
   const none=f.store.list<VariantNone>('discovery-variant-none')[0]!;
   const handoff=await publishVariantHandoff(f.store,'p',{draft:reference(f.store.get(f.draft.id)!),result:reference(none),decision:null,scope:null,earlyLimit:false});
   const root=reference((await producePartialDossier(f.store,'p',reference(handoff.record))).record);
   return {...f,packet:await prepareDossierAssessmentSubject(f.store,'p',root)};
+}
+
+async function completed(t:test.TestContext,model=false) {
+  return isolated(t,model?'model-complete':'owner-complete',async lifetime=>{
+    const f=await setupRaw(lifetime,model),entries=await complete(f);return {...f,entries};
+  });
+}
+async function partial(t:test.TestContext,material?:string) {
+  return isolated(t,material?'partial:'+hashJson(material):'partial',lifetime=>partialRaw(lifetime,material));
 }
 
 import { assessDossier, publishDossierAssessment, readDossierAssessmentAt } from '../src/discovery/research-assessment.js';
@@ -340,7 +380,9 @@ async function refusePublishedCorruptions(f:Paid,store:Store,published:Revision<
       await unchanged(f,store,()=>readDossierAssessmentAt(mask(store,missing),'p',reference(published)),true);
     const corrupt=[null,{...published.value,contract:'unknown'},{...published.value,projectId:'foreign'},
       {...published.value,subject:{...published.value.subject,manifest:{...published.value.manifest,hash:'0'.repeat(64)}}},
-      {...published.value,result:{...published.value.result,completeness:published.value.result.completeness==='complete'?'partial':'complete'}}];
+      {...published.value,result:{...published.value.result,completeness:published.value.result.completeness==='complete'?'partial':'complete'}},
+      {...published.value,result:{...published.value.result,result:{...published.value.result.result,verdict:'supported',return:null}}},
+      {...published.value,result:{...published.value.result,packet:{...published.value.result.packet,materials:published.value.result.packet.materials.slice(0,-1)}}}];
     for(const value of corrupt){
       const fake={...published,value,hash:hashJson(value as never)};
       await unchanged(f,store,()=>readDossierAssessmentAt(mask(store,reference(published),fake),'p',reference(fake)),true);
@@ -348,7 +390,7 @@ async function refusePublishedCorruptions(f:Paid,store:Store,published:Revision<
 }
 
 for(const model of [false,true])test('D6 publication: real '+(model?'model':'owner')+' selected terminal survives a cut and current-head movement',async t=>{
-  const f=await setup(t,model);await complete(f);
+  const f=await completed(t,model);
   const packet=await prepareDossierAssessmentSubject(f.store,'p',reference(produceSelectedDossier(f.store,'p',f.input).record));
   liveAdapter(f,packet,'supported',false);const pilot=wideDelivery(f);
   let cut=false;
@@ -377,12 +419,13 @@ for(const model of [false,true])test('D6 publication: real '+(model?'model':'own
     f.store.get<DiscoveryDraft>(before.value.binding.draft.id,before.value.binding.draft.revision)!,
     f.store.get<Question>(before.value.binding.question.id,before.value.binding.question.revision)!,before.value.role,before.value.profile);
   assert.equal(execution.kind,'response');assert.deepEqual(execution.response,published.value.response);
-  for(const store of [f.store,f.open()]){
-    assert.deepEqual(await unchanged(f,store,()=>readDossierAssessmentAt(store,'p',reference(published))),published);
-    assert.deepEqual(await unchanged(f,store,()=>assessDossier(store,'p',packet.subject,env,undefined,undefined,{allowance:0,restoreOnly:true})),published);
-    await unchanged(f,store,()=>readDossierAssessmentAt(mask(store,published.value.response),'p',reference(published)),true);
-    await unchanged(f,store,()=>readDossierAssessmentAt(store,'foreign',reference(published)),true);
-  }
+  // Each selected route keeps its paid historical read and free recovery after
+  // moving all current heads. Common negative tables run on the partial route.
+  const historical=model?f.open():f.store,replay=model?f.store:f.open();
+  await fixedPoint(historical,async()=>assert.deepEqual(await unchanged(f,historical,
+    ()=>readDossierAssessmentAt(historical,'p',reference(published))),published));
+  await fixedPoint(replay,async()=>assert.deepEqual(await unchanged(f,replay,
+    ()=>assessDossier(replay,'p',packet.subject,env,undefined,undefined,{allowance:0,restoreOnly:true})),published));
   const fields=referenceSites(published.kind,published.value).map(site=>site.field).sort();
   assert.deepEqual(fields,['application','call','manifest','request','response','session','subject.manifest','subject.root.ref']);
   assert.deepEqual(referenceSites(published.kind,{...published.value,result:{data:{id:'user-data',revision:1,hash:'a'.repeat(64)}}}).map(site=>site.field).sort(),fields);
@@ -400,15 +443,16 @@ test('D6 publication: nonempty partial, committed-publication cut and competing 
   assert.equal(published.value.result.completeness,'partial');assert.equal(published.value.result.result.verdict,'return');
   assert.ok(published.value.result.packet.materials.length);assert.deepEqual(published.value.result.packet.manifest.value.reasons,f.packet.manifest.value.reasons);
   const env=f.engine.environments.configure('p',{...f.environment.value,timeoutMs:f.environment.value.timeoutMs+1},f.environment.revision);
-  for(const store of [f.store,f.open()]){
+  for(const store of [f.store,f.open()])await fixedPoint(store,async()=>{
     await refusePublishedCorruptions(f,store,published);
+    await unchanged(f,store,()=>readDossierAssessmentAt(store,'foreign',reference(published)),true);
     assert.deepEqual(await unchanged(f,store,()=>assessDossier(store,'p',f.packet.subject,env,undefined,undefined,{restoreOnly:true,allowance:0})),published);
     assert.deepEqual(await unchanged(f,store,()=>publishDossierAssessment(store,'p',published.value.session)),published);
     for(const at of [null,undefined,{},reference(published)])
       await unchanged(f,store,()=>publishDossierAssessment(store,'p',at),true);
     for(const at of [null,undefined,{},published.value.session])
       await unchanged(f,store,()=>readDossierAssessmentAt(store,'p',at),true);
-  }
+  });
   const g=await partial(t);liveAdapter(g,g.packet,'return',false);
   const terminal=await runDossierAssessmentSession(g.store,'p',g.packet.subject,g.environment);
   const payments=money(g.store),wires=g.wires(),rival=g.open();let won=false;
@@ -417,13 +461,13 @@ test('D6 publication: nonempty partial, committed-publication cut and competing 
     return invoke();
   });
   const first=await publishDossierAssessment(race,'p',reference(terminal.session));assert.ok(won);
-  const second=await publishDossierAssessment(rival,'p',reference(terminal.session));assert.deepEqual(second,first);
+  const second=await fixedPoint(rival,()=>unchanged(g,rival,()=>publishDossierAssessment(rival,'p',reference(terminal.session))));assert.deepEqual(second,first);
   assert.equal(g.store.list(DOSSIER_ASSESSMENT_KIND).length,1);assert.equal(g.store.history(first.id).length,1);
   assert.deepEqual(money(g.store),payments);assert.deepEqual(g.wires(),wires);assert.equal(dossierCalls(g.store).length,1);
 });
 
 test('D6 publication: rich blocking return retains both sides; structural supported or a lost side cannot publish',async t=>{
-  const f=await setup(t);const entries=await complete(f),target=addresses(entries.industry)[0]!;
+  const f=await completed(t),target=addresses(f.entries.industry)[0]!;
   const rejected=await deep(f,'q-market',[{...(claim(f,'q-market','market','Rejected D6 counterargument') as Record<string,Json>),
     contradicts:[target],refutedBy:[target]} as unknown as Json]);await assess(f,rejected,'rejected');
   const unknown=await deep(f,'q-market',[{...(claim(f,'q-market','market','Unassessed D6 unknown') as Record<string,Json>),kind:'unknown',
@@ -435,23 +479,27 @@ test('D6 publication: rich blocking return retains both sides; structural suppor
   assert.deepEqual(published.value.result.packet,packet);assert.ok(packet.unknowns.length);assert.ok(packet.contradictions.length);
   assert.ok(packet.materials.some(row=>row.status==='rejected'));assert.ok(packet.materials.some(row=>row.status==='unassessed'));
   assert.ok(published.value.result.blockingContradictions.length);
-  for(const store of [f.store,f.open()]){
-    for(const ref of [packet.materials.find(row=>row.status==='rejected')!.address.container,reference(unknown.result.attempt!)]){
+  for(const store of [f.store,f.open()])await fixedPoint(store,async()=>{
+    // Generic result truncation and a caller-supported value are checked in the
+    // partial table. Here the rich-specific loss of a side remains hot and cold;
+    // the material-ground table has one cold representative, the unassessed one.
+    const rejected=packet.materials.find(row=>row.status==='rejected')!.address.container;
+    const unknownRef=reference(unknown.result.attempt!);
+    for(const ref of store===f.store?[rejected,unknownRef]:[unknownRef])
       await unchanged(f,store,()=>readDossierAssessmentAt(mask(store,ref),'p',reference(published)),true);
-    }
-    for(const change of [(value:any)=>value.result.packet.contradictions[0].sides.pop(),
-      (value:any)=>value.result.packet.materials.pop(),(value:any)=>{value.result.result.verdict='supported';value.result.result.return=null;}]){
-      const fake=structuredClone(published);change(fake.value);fake.hash=hashJson(fake.value as never);
-      await unchanged(f,store,()=>readDossierAssessmentAt(mask(store,reference(published),fake),'p',reference(fake)),true);
-    }
-  }
+    const fake=structuredClone(published);fake.value.result.packet.contradictions[0]!.sides.pop();fake.hash=hashJson(fake.value as never);
+    await unchanged(f,store,()=>readDossierAssessmentAt(mask(store,reference(published),fake),'p',reference(fake)),true);
+  });
   await assess(f,unknown,'material');
   const second=await prepareDossierAssessmentSubject(f.store,'p',reference(produceSelectedDossier(f.store,'p',f.input).record));
   liveAdapter(f,second,'supported',false);
   await assert.rejects(()=>assessDossier(f.store,'p',second.subject,f.environment,pilot),e=>e instanceof EngineError);
   assert.equal(f.store.list(DOSSIER_ASSESSMENT_KIND).length,1);
-  for(const store of [f.store,f.open()]){
-    await unchanged(f,store,()=>assessDossier(store,'p',second.subject),true);
-    assert.deepEqual(await unchanged(f,store,()=>readDossierAssessmentAt(store,'p',reference(published))),published);
-  }
+  // One cold fixed point after the later real MR/P proves both that the failed
+  // supported terminal cannot buy again and the former rich return stays exact.
+  const cold=f.open();
+  await fixedPoint(cold,async()=>{
+    await unchanged(f,cold,()=>assessDossier(cold,'p',second.subject),true);
+    assert.deepEqual(await unchanged(f,cold,()=>readDossierAssessmentAt(cold,'p',reference(published))),published);
+  });
 });
