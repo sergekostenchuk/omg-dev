@@ -14,6 +14,7 @@ import { discoveryContext, requireDiscoveryProposal } from './discovery-outcome.
 import { Ajv } from "ajv";
 import { Store, type Revision, type TransactionGuard, type Write } from "../storage/store.js";
 import { historicalProof, historicalSourceOverGenuine } from "../history/proofs.js";
+import { isProxy } from "node:util/types";
 import { Evidence } from "../evidence/evidence.js";
 import { reference, isRef, stageId, uniqueRefs, type Ref, type Finding, type StageArtifact } from "../pipeline/contracts.js";
 import { uniqueTransactionGuards, type Environment } from "../runtime/environment.js";
@@ -639,9 +640,12 @@ function attemptsAssessmentValue(store: Store, proof: AssessmentProof): PaidDisc
  * reads of the enclosing proof and the recorded read sequence of an evaluation stay what they were. Arguments that cannot
  * key a proof refuse in the derivation itself, with the same typed refusal as ever. */
 function plainExactRef(ref: unknown): Ref | null {
-  if (!ref || typeof ref !== 'object' || Array.isArray(ref) || Object.getPrototypeOf(ref) !== Object.prototype) return null;
-  const fields = Object.getOwnPropertyDescriptors(ref), names = Object.keys(fields);
-  if (names.length !== 3 || !['id', 'revision', 'hash'].every(name => names.includes(name) && 'value' in fields[name]!)) return null;
+  // Not a Proxy (its traps could answer get and the descriptor differently), exactly Object.prototype, exactly three own
+  // keys counting symbols, each an enumerable data field: any other form keeps the in-place derivation of the input.
+  if (!ref || typeof ref !== 'object' || isProxy(ref) || Array.isArray(ref) || Object.getPrototypeOf(ref) !== Object.prototype) return null;
+  const keys = Reflect.ownKeys(ref), fields = Object.getOwnPropertyDescriptors(ref);
+  if (keys.length !== 3 || !['id', 'revision', 'hash'].every(name => keys.includes(name)
+    && 'value' in fields[name]! && fields[name]!.enumerable === true)) return null;
   const exact = { id: fields['id']!.value, revision: fields['revision']!.value, hash: fields['hash']!.value };
   return isRef(exact) ? exact : null;
 }

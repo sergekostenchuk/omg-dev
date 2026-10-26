@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { writeFileSync } from 'node:fs';
 import { hashJson, canonical } from '../src/canonical.js';
-import { reference } from '../src/pipeline/contracts.js';
+import { reference, type Ref } from '../src/pipeline/contracts.js';
 import { EngineError } from '../src/errors.js';
 import { Store, type Revision } from '../src/storage/store.js';
 import { pendingOverlay } from '../src/storage/store-view.js';
@@ -221,5 +221,26 @@ test('nested assessment proof: a Ref whose hash accessor changes between reads n
     assert.deepEqual(reference(readDiscoveryAssessment(historicalTrace(store), 'p', { ...B })), B);
     assert.deepEqual(reference(readDiscoveryAssessment(store, 'p', { ...B })), B);
     assert.throws(() => readDiscoveryAssessment(historicalTrace(store), 'p', { ...A }), refusal);
+  }
+});
+
+test('nested assessment proof: a non-enumerable field and a Proxy Ref meet the new trace exactly as the old in-place path', async t => {
+  const f = await paid(t), [first] = paidAssessments(f.store), B = reference(first!);
+  const outcome = (action: () => unknown) => { try { return { ok: reference(action() as never) }; }
+    catch (error) { assert.ok(error instanceof EngineError); return { code: (error as EngineError).code }; } };
+  const hidden = () => Object.defineProperty({ id: B.id, revision: B.revision }, 'hash', { value: B.hash, enumerable: false }) as Ref;
+  const masked = () => new Proxy({ ...B }, { get(target, key) { return key === 'hash' ? '0'.repeat(64) : Reflect.get(target, key); } }) as Ref;
+  const fresh = new Store(f.store.path); t.after(() => fresh.close());
+  const warm = new Store(f.store.path); t.after(() => warm.close());
+  readDiscoveryAssessment(historicalTrace(warm), 'p', { ...B });
+  for (const store of [fresh, warm]) {
+    // The old path: a transparent but unregistered Proxy is no proved source and derives in place.
+    const old = new Proxy(store, { get(target, key) { const v = Reflect.get(target, key, target); return typeof v === 'function' ? v.bind(target) : v; } });
+    for (const form of [hidden, masked]) {
+      const before = outcome(() => readDiscoveryAssessment(old, 'p', form()));
+      assert.deepEqual(outcome(() => readDiscoveryAssessment(historicalTrace(store), 'p', form())), before);
+      assert.deepEqual(outcome(() => readDiscoveryAssessment(store, 'p', form())), before);
+    }
+    assert.deepEqual(reference(readDiscoveryAssessment(historicalTrace(store), 'p', { ...B })), B);
   }
 });
