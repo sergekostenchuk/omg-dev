@@ -4,7 +4,7 @@ import { writeFileSync } from 'node:fs';
 import { hashJson } from '../src/canonical.js';
 import { reference, type Ref } from '../src/pipeline/contracts.js';
 import { EngineError } from '../src/errors.js';
-import { Store } from '../src/storage/store.js';
+import { Store, type Revision, type Write, type TransactionGuard } from '../src/storage/store.js';
 import { uniqueTransactionGuards } from '../src/runtime/environment.js';
 import { processStart } from '../src/runtime/process-identity.js';
 import type { DiscoveryDraft, Question } from '../src/discovery/discovery.js';
@@ -35,6 +35,16 @@ import type { OmResult } from '../src/om/refusal.js';
 // scopes provable after later choices without reactivating them; reject_all, no_variants and a stale paid model result
 // select nothing; a requiring path without a published scope receives the typed refusal.
 const history = (store: Store) => store.list().flatMap(row => store.history(row.id));
+/** Intercepts this Store's writes on the prototype, leaving the instance itself untouched (an own property would make it
+ * an opaque source for the rest of the test); the returned restore is idempotent. */
+function onWrites(store: Store, wrap: (writes: Write[], guards: TransactionGuard[] | undefined, write: () => Revision<unknown>[]) => Revision<unknown>[]) {
+  const previous = Store.prototype.writeMany;
+  Store.prototype.writeMany = function (this: Store, writes: Write[], guards?: TransactionGuard[]) {
+    return this === store ? wrap(writes, guards, () => previous.call(this, writes, guards)) : previous.call(this, writes, guards);
+  } as typeof previous;
+  let done = false;
+  return () => { if (!done) { done = true; Store.prototype.writeMany = previous; } };
+}
 const refuses = (invoke: () => unknown, expected?: string) => assert.throws(invoke, (error: unknown) =>
   error instanceof EngineError && (!expected || error.code === expected));
 const money = (store: Store) => ({ calls: store.list('model-call').flatMap(row => store.history(row.id)),
@@ -299,9 +309,10 @@ test('4P.1: an absent mandatory basis — the paid set, a member, the decision o
   const get = f.store.get.bind(f.store);
   for (const hidden of [reference(f.set!), member!, reference(act.decision), reference(act.state)]) {
     f.store.get = ((id: string, revision?: number) => id === hidden.id && revision === hidden.revision ? null : get(id, revision)) as typeof f.store.get;
-    refuses(() => readVariantScope(f.store, 'p', scope));
-    refuses(() => readCurrentVariantScope(f.store, 'p', f.scope!.draft));
-    f.store.get = get;
+    try {
+      refuses(() => readVariantScope(f.store, 'p', scope));
+      refuses(() => readCurrentVariantScope(f.store, 'p', f.scope!.draft));
+    } finally { delete (f.store as { get?: unknown }).get; }
   }
   assert.deepEqual(readVariantScope(f.store, 'p', scope).verification, 'proven');
 });
@@ -310,9 +321,9 @@ for (const move of ['selection', 'mode'] as const) test(`4P.1: a second Store mo
   const f = await paid(t), m = mint(f.store, f.scope!);
   const act = answerVariantChoice(f.store, f.scope!, m.authority);
   const other = new Store(f.store.path); t.after(() => other.close());
-  const write = f.store.writeMany.bind(f.store); let intervened = false, afterMove: ReturnType<typeof history> = [];
-  f.store.writeMany = ((writes: unknown[], guards?: unknown) => {
-    if (!intervened && (writes as { kind?: string }[]).some(row => row.kind === VARIANT_SCOPE_KIND)) {
+  let intervened = false, afterMove: ReturnType<typeof history> = [];
+  const restore = onWrites(f.store, (writes, _guards, write) => {
+    if (!intervened && writes.some(row => row.kind === VARIANT_SCOPE_KIND)) {
       intervened = true;
       if (move === 'selection') {
         const rejection: VariantChoiceScope = { ...revised(f.scope!, act, 'reject_all') };
@@ -320,13 +331,15 @@ for (const move of ['selection', 'mode'] as const) test(`4P.1: a second Store mo
       } else modeOf(other, 'bypass');
       afterMove = history(other);
     }
-    return write(writes as never, guards as never);
-  }) as typeof f.store.writeMany;
+    return write();
+  });
+  t.after(restore);
   refuses(() => publishVariantScope(f.store, 'p', reference(act.decision)));
   assert.equal(intervened, true);
   assert.deepEqual(history(f.store), afterMove, 'nothing beyond the second Store\'s own move');
   assert.equal(f.store.list(VARIANT_SCOPE_KIND).length, 0, 'the aborted write left no scope');
-  f.store.writeMany = write;
+  restore();
+  assert.equal(Object.hasOwn(f.store, 'writeMany'), false);
   if (move === 'selection') {
     const winner = f.store.list<VariantOwnerDecision>('discovery-variant-owner-decision').find(row => row.value.outcome.kind === 'reject_all')!;
     refuses(() => publishVariantScope(f.store, 'p', reference(winner)), 'discovery_variant_scope_required');
