@@ -176,7 +176,9 @@ function onWrites(store: Store, wrap: (writes: Parameters<Store['writeMany']>[0]
   Store.prototype.writeMany = function (this: Store, writes: Parameters<Store['writeMany']>[0], guards?: Parameters<Store['writeMany']>[1]) {
     return this === store ? wrap(writes, guards, (w, g) => previous.call(this, w, g)) : previous.call(this, writes, guards);
   } as typeof previous;
-  return () => { Store.prototype.writeMany = previous; };
+  // Idempotent: a test may restore explicitly and also register the same restore with t.after as a safety net.
+  let done = false;
+  return () => { if (!done) { done = true; Store.prototype.writeMany = previous; } };
 }
 const money = (store: Store) => store.list().filter(row => ['model-call', 'research-budget-ledger'].includes(row.kind)).flatMap(row => store.history(row.id));
 function choiceScope(f: Awaited<ReturnType<typeof setup>>, kind: 'choose' | 'reject_all' = 'choose'): VariantChoiceScope {
@@ -320,6 +322,7 @@ async function withMaterials(t:test.TestContext, limit=false) {
     }
     return rows;
   });
+  t.after(restore);
   const claim=(id:string,text:string)=>({id,kind:'hypothesis',text,axis:'industry',planQuestions:[{planAnswer:f.v.planAnswer,planQuestionId:'q-one'}],scope:{variants:'common'},basis:{howToVerify:'Compare independent sources'}});
   const unknown={...claim('unknown','Demand is unknown'),kind:'unknown',basis:{origin:'Saved research',unknownId:'demand',question:'What is demand?',affects:['market'],consumer:'product-owner',blocksCurrentStage:true,moment:'om-pass',closeCriterion:'Obtain independent evidence'}};
   const action=(claims:unknown[])=>({action:'answer',question:'$selected',value:{type:'submitted',contract:'discovery-claims/v7',value:{claims}},citations:[]});
