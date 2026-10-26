@@ -1,15 +1,16 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { reference } from '../src/pipeline/contracts.js';
+import { reference, type Ref } from '../src/pipeline/contracts.js';
 import { Store, type Revision } from '../src/storage/store.js';
 import { Discovery, type DiscoveryDraft, type Question } from '../src/discovery/discovery.js';
 import { ProductEngine } from '../src/product/engine.js';
 import { Researcher } from '../src/discovery/research-runner.js';
 import { researchCall } from '../src/discovery/research-protocol.js';
-import { VARIANT_OWNER_ACTION, variantStateId, type VariantChoiceScope, type VariantState } from '../src/discovery/variant-decision.js';
+import { VARIANT_OWNER_ACTION, variantStateId, type VariantChoiceScope, type VariantState, type VariantHandoff } from '../src/discovery/variant-decision.js';
 import { VARIANT_SUBJECT_CONTRACT, type VariantSet } from '../src/discovery/discovery-variants.js';
 import { ProjectModeSessions, issueProjectModeInvitation, VariantChoiceSessions, issueVariantChoiceInvitation } from '../src/product/owner-authority.js';
 import { setProjectMode } from '../src/product/project-mode.js';
@@ -37,8 +38,16 @@ function history(store: Store): string {
       revisions: db.prepare('SELECT * FROM revisions ORDER BY entity_id, revision').all() });
   } finally { db.close(); }
 }
-async function setup(t: test.TestContext, questions: PlanQuestion[] = [planQuestion('q-one', 'industry')], initialMode: 'questions'|'bypass'|null = 'questions') {
-  const f = discoveryFixture(t, 'omg-63runner-');
+// A world is built once by the real producers in a root of its own; every test opens its own Stores over it. A cached
+// route world is restored from its byte snapshot before each test (tests of a file run one after another), so no test
+// sees another's writes. Saved records name the world's root (workspace, adapter), hence restore in place.
+const roots: string[] = [];
+process.once('exit', () => { for (const root of roots) rmSync(root, { recursive: true, force: true }); });
+type Base = { root: string; path: string; v: ReturnType<typeof acceptPlan>; environment: Revision<any>; command: { executable: string; args: string[] };
+  initial: Revision<unknown> | null; questions: PlanQuestion[] };
+async function build(questions: PlanQuestion[], initialMode: 'questions'|'bypass'|null): Promise<Base> {
+  const f = discoveryFixture({ after: () => {} }, 'omg-63runner-');
+  roots.push(f.root);
   f.engine.execute({ type: 'create-project', project: 'p', title: 'Runner generation' });
   const settings = join(f.root, 'settings.json'), wire = join(f.root, 'wire.ndjson'), adapter = join(f.root, 'adapter.mjs');
   const configure = (patch: Record<string, unknown> = {}) => {
@@ -94,6 +103,28 @@ console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,u
       { store: f.store, draftId: calibration.id, questionId: calibration.value.questions[0]!, purpose: `variant-${kind}` });
   }
   writeFileSync(wire, '');
+  f.store.close();
+  return { root: f.root, path: f.path, v, environment, command, initial, questions };
+}
+function bind(t: { after(fn: () => void): void }, base: Base) {
+  const { root, path, v, environment, command, initial, questions } = base, stores: Store[] = [];
+  const open = () => { const db = new Store(path); stores.push(db); return db; };
+  const store = open(), engine = new ProductEngine(store), discovery = new Discovery(store);
+  t.after(() => { for (const db of stores) db.close(); });
+  const f = { root, path, store, engine, discovery, open };
+  const settings = join(root, 'settings.json'), wire = join(root, 'wire.ndjson');
+  const configure = (patch: Record<string, unknown> = {}) => {
+    let prior = {}; try { prior = JSON.parse(readFileSync(settings, 'utf8')); } catch {}
+    writeFileSync(settings, JSON.stringify({ ...prior, ...patch }));
+  };
+  function mode(value: 'questions'|'bypass', store = f.store) {
+    const request = { project: 'p', mode: value, previous: store.get('project-mode:p') ? reference(store.get('project-mode:p')!) : null };
+    const sessions = new ProjectModeSessions(store), invitation = issueProjectModeInvitation(store, request);
+    assert.ok(invitation.ok); if (!invitation.ok) assert.fail();
+    const login = sessions.exchange({ project: 'p', invitation: invitation.value.invitation }); assert.ok(login.ok); if (!login.ok) assert.fail();
+    const record = setProjectMode(store, request, sessions.authority(login.value.bearer)).record;
+    assert.ok(sessions.revoke(login.value.bearer).ok); return record;
+  }
   const run = (limit = 8, store = f.store, restoreOnly = false) => new Researcher(store, new Discovery(store), new ProductEngine(store).environments)
     .run('p', v.draft.id, limit, undefined, { producerPolicy: { discovery: 7 }, restoreOnly });
   const wires = () => readFileSync(wire, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line));
@@ -108,6 +139,46 @@ console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,u
   };
   return { ...f, v, environment, command, run, wires, generationCalls, configure, mode, initial, nextEdition };
 }
+async function setup(t: test.TestContext, questions: PlanQuestion[] = [planQuestion('q-one', 'industry')], initialMode: 'questions'|'bypass'|null = 'questions') {
+  return bind(t, await build(questions, initialMode));
+}
+const WORLD_FILES = ['state.sqlite', 'state.sqlite-wal', 'state.sqlite-shm', 'settings.json', 'wire.ndjson'];
+function snapshot(root: string) {
+  const dir = mkdtempSync(join(tmpdir(), 'omg-63runner-snap-')); roots.push(dir);
+  for (const file of WORLD_FILES) if (existsSync(join(root, file))) copyFileSync(join(root, file), join(dir, file));
+  return dir;
+}
+function restore(root: string, dir: string) {
+  for (const file of WORLD_FILES) {
+    rmSync(join(root, file), { force: true });
+    if (existsSync(join(dir, file))) copyFileSync(join(dir, file), join(root, file));
+  }
+}
+type World = ReturnType<typeof bind>;
+const worlds = new Map<string, { base: Base; snapshot: string; data: unknown }>();
+/** A world produced once (or continued from another cached world's exact bytes in that world's root); each test then
+ * restores its bytes and opens its own Stores. `data` is the producers' own returned records, handed out as copies. */
+async function cachedWorld<D>(t: test.TestContext, key: string, make: (scratch: test.TestContext) => Promise<{ f: World; data: D }>) {
+  let cached = worlds.get(key);
+  if (!cached) {
+    const closing: (() => void)[] = [], scratch = { after: (fn: () => void) => closing.push(fn) } as unknown as test.TestContext;
+    const { f, data } = await make(scratch);
+    for (const close of closing) close();
+    cached = { base: { root: f.root, path: f.path, v: f.v, environment: f.environment, command: f.command, initial: f.initial,
+      questions: [planQuestion('q-one', 'industry')] }, snapshot: snapshot(f.root), data: structuredClone(data) };
+    worlds.set(key, cached);
+  }
+  restore(cached.base.root, cached.snapshot);
+  return { ...bind(t, cached.base), ...(structuredClone(cached.data) as D) };
+}
+/** setup → three paid turns → the real owner reject_all: the shared prefix of the owner route, the selection race and
+ * the pending-recipient cut. */
+const ownerRejected = (t: test.TestContext) => cachedWorld(t, 'owner-rejected', async scratch => {
+  const f = bind(scratch, await build([planQuestion('q-one', 'industry')], 'questions'));
+  await f.run(3);
+  const act = owner(f.store, choiceScope(f, 'reject_all'));
+  return { f, data: { rejected: { decision: act.decision, state: act.state } } };
+});
 const money = (store: Store) => store.list().filter(row => ['model-call', 'research-budget-ledger'].includes(row.kind)).flatMap(row => store.history(row.id));
 function choiceScope(f: Awaited<ReturnType<typeof setup>>, kind: 'choose' | 'reject_all' = 'choose'): VariantChoiceScope {
   const set = f.store.list<VariantSet>('discovery-variant-set')[0]!, state = f.store.get<VariantState>(variantStateId('p', f.v.draft.id))!;
@@ -131,14 +202,30 @@ async function saved(f: Awaited<ReturnType<typeof setup>>, run: Revision<import(
   assert.equal(proof.verification, 'proven'); assert.equal(proof.record.value.next, pause.next);
   assert.deepEqual(reference(proof.record), pause.handoff); return proof.record;
 }
-async function route(t: test.TestContext, kind: 'no_variants'|'model'|'owner'|'limit'|'limit-no-mode') {
-  const f = await setup(t, undefined, kind === 'limit-no-mode' ? null : kind === 'model' ? 'bypass' : 'questions');
-  if (kind === 'no_variants') f.configure({none:true});
-  if (kind === 'model') f.configure({reject:true});
-  if (kind.startsWith('limit')) f.configure({assessorTokens:V7_STAGE_TOKEN_CEILING-1000});
-  let run = await f.run(kind.startsWith('limit') ? 2 : 3);
-  if (kind === 'owner') { owner(f.store, choiceScope(f,'reject_all')); run = await f.run(1,f.open(),true); }
-  return {...f, handoff:await saved(f,run)};
+type RouteKind = 'no_variants'|'model'|'owner'|'limit'|'limit-no-mode';
+const routes = new Map<RouteKind, { base: Base; snapshot: string; handoff: Ref }>();
+/** The real route is produced once per kind; each later test starts from its exact bytes in its own Stores. */
+async function route(t: test.TestContext, kind: RouteKind) {
+  let cached = routes.get(kind);
+  if (!cached) {
+    const closing: (() => void)[] = [], scratch = { after: (fn: () => void) => closing.push(fn) } as unknown as test.TestContext;
+    // The owner route continues the shared owner-rejected prefix's exact bytes in its root.
+    const f = kind === 'owner' ? await ownerRejected(scratch)
+      : bind(scratch, await build([planQuestion('q-one', 'industry')], kind === 'limit-no-mode' ? null : kind === 'model' ? 'bypass' : 'questions'));
+    const base: Base = { root: f.root, path: f.path, v: f.v, environment: f.environment, command: f.command, initial: f.initial, questions: [planQuestion('q-one', 'industry')] };
+    if (kind === 'no_variants') f.configure({none:true});
+    if (kind === 'model') f.configure({reject:true});
+    if (kind.startsWith('limit')) f.configure({assessorTokens:V7_STAGE_TOKEN_CEILING-1000});
+    const run = kind === 'owner' ? await f.run(1,f.open(),true) : await f.run(kind.startsWith('limit') ? 2 : 3);
+    const handoff = reference(await saved(f,run));
+    for (const close of closing) close();
+    cached = { base, snapshot: snapshot(base.root), handoff };
+    routes.set(kind, cached);
+  }
+  restore(cached.base.root, cached.snapshot);
+  const f = bind(t, cached.base), handoff = f.store.get<VariantHandoff>(cached.handoff.id, cached.handoff.revision)!;
+  assert.deepEqual(reference(handoff), cached.handoff);
+  return {...f, handoff};
 }
 import { EarlyStageDriver } from '../src/product/early-stage-driver.js';
 import { discoveryInspection } from '../src/discovery/discovery-outcome.js';
@@ -296,8 +383,8 @@ test('6.3 runner: swapped genuine dossier from another handoff cannot masquerade
 });
 for(const shift of ['frame','plan','mode','selection'] as const)
 test(`6.3 runner: real second Store ${shift} race before dossier publication cannot escape the common guards`,async t=>{
-  const f=await setup(t),other=f.open();f.configure({none:shift!=='selection'});
-  if(shift==='selection'){await f.run(3);owner(f.store,choiceScope(f,'reject_all'));}
+  // The selection race starts from the shared real owner reject_all prefix.
+  const f=shift==='selection'?await ownerRejected(t):await setup(t),other=f.open();f.configure({none:shift!=='selection'});
   const write=f.store.writeMany.bind(f.store);let after='',paid:unknown,wire:unknown;
   f.store.writeMany=((writes,guards)=>{
     if(!after&&writes.some(w=>w.kind===DOSSIER_MANIFEST_KIND)){
@@ -319,8 +406,13 @@ test(`6.3 runner: real second Store ${shift} race before dossier publication can
 });
 
 async function rejectedAtDossierCut(t: test.TestContext, published: boolean) {
-  const f=await setup(t);await f.run(3);
-  const rejected=owner(f.store,choiceScope(f,'reject_all'));
+  return cachedWorld(t, `pending-${published}`, async scratch => {
+    const made = await cutAndRevise(await ownerRejected(scratch), published);
+    return { f: made, data: { pending: made.pending, oldHandoff: made.oldHandoff, chosen: { decision: made.chosen.decision, state: made.chosen.state } } };
+  });
+}
+async function cutAndRevise(f: World & { rejected: { decision: any; state: any } }, published: boolean) {
+  const rejected=f.rejected;
   const write=f.store.writeMany.bind(f.store);let cut=false;
   f.store.writeMany=((writes,guards)=>{
     const recipient=writes.some(w=>w.kind===DOSSIER_MANIFEST_KIND);
