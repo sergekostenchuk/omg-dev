@@ -1265,7 +1265,22 @@ interface PreparedBrief {
   head: string[];
   tail: string[];
 }
-function briefPrepare(payload: Record<string, any>, basis: BriefBasis): PreparedBrief {
+/** WB-SPEED: one caller's briefs of the same response schema compact it once. A memo lives only as long as its caller keeps
+ * it (one continuation derivation) and maps the JSON text of the schema in its own key order (the compact form numbers its
+ * shared definitions in that order) to the compact form, which is only ever serialized into the response-form line; a
+ * schema that is not canonical JSON keeps the direct compaction. */
+export class BriefMemo {
+  readonly #compact = new Map<string, unknown>();
+  compact(schema: unknown): unknown {
+    let key: string;
+    try { canonical(schema); key = JSON.stringify(schema); } catch { return compactSchema(schema); }
+    if (this.#compact.has(key)) return this.#compact.get(key);
+    const compact = compactSchema(schema);
+    if (this.#compact.size < 16) this.#compact.set(key, compact);
+    return compact;
+  }
+}
+function briefPrepare(payload: Record<string, any>, basis: BriefBasis, memo?: BriefMemo): PreparedBrief {
   if (Object.hasOwn(basis, 'briefContract') && !contentEra(basis.briefContract))
     invalid('briefContract', 'The selected brief content contract must be supported');
   if (Object.hasOwn(basis, 'selection') && basis.selection !== BRIEF_SELECTION_CONTRACT && basis.selection !== BASIS_BRIEF_SELECTION_CONTRACT)
@@ -1329,7 +1344,7 @@ function briefPrepare(payload: Record<string, any>, basis: BriefBasis): Prepared
     ...(payload.works ? [GRAPH_RULES.layer_join_design_required!] : []),
     canonical([...grouped.values()]),
     '# Response form — machine section is one JSON line immediately after this header',
-    canonical({ contract: 'om-brief-response/v1', responseForm: { ...responseForm, schema: compactSchema(schema) }, labels: display.meanings }),
+    canonical({ contract: 'om-brief-response/v1', responseForm: { ...responseForm, schema: memo ? memo.compact(schema) : compactSchema(schema) }, labels: display.meanings }),
     '# Examples of structure — replace example design, value, paths and commands with your substantiated answer',
     'Examples illustrate the declared forms; they are not an accepted design or proof of the claimed fact. The exact constraints and native checks above still apply.',
     ...(contentEra(basis.briefContract) ? ['The search examples use the single literal term "example", matched without case sensitivity. Use separate searches for different terms; | is not an alternative operator. A successful search may return []; an inaccessible scope instead refuses. Keep that delivery result outside the JSON request you return.'] : []),
@@ -1498,8 +1513,8 @@ export function withReadings(packet: Record<string, any>, carried: CarriedBasis,
 /** The same bounded construction applies to roots, parts and continuations. Optional material
  * cannot make a fitting mandatory assignment fail just because JSON escaping costs more. */
 export function boundedBrief(payload: Record<string, any>, basis: BriefBasis, limit: number,
-  fits?: (packet: Record<string, any>) => boolean): Record<string, any> {
-  const prepared = briefPrepare(payload, basis);
+  fits?: (packet: Record<string, any>) => boolean, memo?: BriefMemo): Record<string, any> {
+  const prepared = briefPrepare(payload, basis, memo);
   const derive = (materialBudget: number) => deriveBrief(payload, { ...basis, materialBudget }, prepared);
   // Each candidate packet is a distinct object; its prompt text is computed at most once.
   const prompts = new Map<Record<string, any>, string>();

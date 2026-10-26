@@ -1,4 +1,4 @@
-import { BRIEF_PACKET_CONTRACT, WORKS_BRIEF_PACKET_CONTRACT, BRIEF_VERSION, WORKS_BRIEF_VERSION, BRIEF_CONTENT_CONTRACT, BRIEF_REOPEN_CONTRACT, NEIGHBOR_CONTRACT, briefContract, briefMaterial, boundedBrief, briefRepairRule, packetPrompt, packetFingerprint, graphIndex, reopenedMaterial, resolveBriefAnswer, type BriefBasis, type BriefLabel,
+import { BRIEF_PACKET_CONTRACT, WORKS_BRIEF_PACKET_CONTRACT, BRIEF_VERSION, WORKS_BRIEF_VERSION, BRIEF_CONTENT_CONTRACT, BRIEF_REOPEN_CONTRACT, NEIGHBOR_CONTRACT, BriefMemo, briefContract, briefMaterial, boundedBrief, briefRepairRule, packetPrompt, packetFingerprint, graphIndex, reopenedMaterial, resolveBriefAnswer, type BriefBasis, type BriefLabel,
   briefReadings, withReadings, type BriefReadings, type CarriedBasis, type CarriedEntry, type ReadingEntry, type ReadingOrigin, type ReadingSnapshot,
   IMPACT_BRIEF_CONTRACT, briefImpactForm, type BriefImpact, BRIEF_SELECTION_CONTRACT, BASIS_BRIEF_SELECTION_CONTRACT, type BriefSelectionContract } from './packet-brief.js';
 import { SELECTED_SPECIFICATION_CODES, hasBasisApplications } from './selected-specification.js';
@@ -1016,6 +1016,8 @@ function deriveContinuation(store: Store, request: QuestionPacketRequest, curren
   const earlierAddress = { contract: 'om-source-delivery-history/v1', record: reference(prior),
     pointer: '/packet/sourceDeliveries', count: earlierDeliveries.length,
     read: { action: 'read_context', record: reference(prior), pointer: '/packet/sourceDeliveries' } };
+  // One continuation probes many deliveries of the same assignment: its response schema is compacted once.
+  const memo = new BriefMemo();
   const build = (rows: readonly Json[]) => {
     const whole = json({ ...payload, requestId,
       responseForm: { ...(payload.responseForm as Record<string, Json>), requestId },
@@ -1024,7 +1026,7 @@ function deriveContinuation(store: Store, request: QuestionPacketRequest, curren
         : Object.hasOwn(payload, 'sourceDeliveryHistory') ? { sourceDeliveryHistory: payload.sourceDeliveryHistory } : {}) });
     return briefContract(contract) ? json(boundedBrief({ ...whole as object, responseForm: { protocol, requestId,
       schema: packetAnswerSchema(kind, packetWorkContract(prior.value as QuestionPacketRecord), protocol, includePage) } }, basis!, capacity.maxRequestChars,
-      useCapacityDelivery ? wireFits : undefined)) : whole;
+      useCapacityDelivery ? wireFits : undefined, memo)) : whole;
   };
   const finalFits = (candidate: Json): boolean => {
     if (!bounded(candidate, capacity.maxRequestChars)) return false;
