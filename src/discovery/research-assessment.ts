@@ -13,8 +13,7 @@ import { BASIS_APPLICATION_CONTRACT_ERA, contractEraOf, readDraft, readRecord, r
 import { discoveryContext, requireDiscoveryProposal } from './discovery-outcome.js';
 import { Ajv } from "ajv";
 import { Store, type Revision, type TransactionGuard, type Write } from "../storage/store.js";
-import { genuineStore } from "../storage/store-view.js";
-import { historicalProof } from "../history/proofs.js";
+import { historicalProof, historicalSourceOverGenuine } from "../history/proofs.js";
 import { Evidence } from "../evidence/evidence.js";
 import { reference, isRef, stageId, uniqueRefs, type Ref, type Finding, type StageArtifact } from "../pipeline/contracts.js";
 import { uniqueTransactionGuards, type Environment } from "../runtime/environment.js";
@@ -640,11 +639,14 @@ function attemptsAssessmentValue(store: Store, proof: AssessmentProof): PaidDisc
  * reads of the enclosing proof and the recorded read sequence of an evaluation stay what they were. Arguments that cannot
  * key a proof refuse in the derivation itself, with the same typed refusal as ever. */
 export function readDiscoveryAssessment(store: Store, projectId: string, ref: Ref): Revision<PaidDiscoveryAttemptsAssessment> {
-  if (!genuineStore(store) || typeof projectId !== 'string' || projectId.trim().length === 0 || !isRef(ref))
+  // A nested derivation reads through the trace its parent proof made over the genuine Store: that source too may reuse
+  // the kept proof of this exact Ref. The original store goes to historicalProof, so the parent still observes every read.
+  if (!historicalSourceOverGenuine(store) || typeof projectId !== 'string' || projectId.trim().length === 0 || !isRef(ref))
     return deriveDiscoveryAssessment(store, projectId, ref);
-  return historicalProof(store, { reader: 'discovery.assessment-read/v1', project: projectId, ref },
+  // Every entry receives its own copy, also inside one withHistoricalReads region where the kept value is shared.
+  return structuredClone(historicalProof(store, { reader: 'discovery.assessment-read/v1', project: projectId, ref },
     source => deriveDiscoveryAssessment(source, projectId, ref),
-    () => { throw new EngineError('discovery_assessment_invalid', 'The exact assessment proof is cyclic'); });
+    () => { throw new EngineError('discovery_assessment_invalid', 'The exact assessment proof is cyclic'); }));
 }
 function deriveDiscoveryAssessment(store: Store, projectId: string, ref: Ref): Revision<PaidDiscoveryAttemptsAssessment> {
   const saved = isRef(ref) ? store.get<PaidDiscoveryAttemptsAssessment>(ref.id, ref.revision) : null;

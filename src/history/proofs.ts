@@ -103,6 +103,12 @@ function synchronous<T>(action: () => T): T {
 function sourceView(store: Store): Store {
   for (;;) { const trace = historicalTraces.get(store); if (!trace) return store; store = trace.source; }
 }
+/** A genuine Store, or a chain of transparent traces this module itself made (historicalTrace) that ends in one. Only a
+ * boolean: it never hands out the Store beneath, and it widens neither genuineStore nor provenStore. An opaque or Proxy
+ * view, a pending or evaluation overlay, a changed Store and a transparent trace made elsewhere all answer false. */
+export function historicalSourceOverGenuine(store: unknown): boolean {
+  return store instanceof Store && genuineStore(sourceView(store));
+}
 /** One identity of a source in proof keys, events and replay (№2194-3): the genuine Store beneath proven write-only
  * views, whose reads are exactly its reads; any other source keeps its own identity. */
 function sourceIdentity(store: Store): Store {
