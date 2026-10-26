@@ -20,6 +20,9 @@ import { discoveryFixture, acceptPlan, planQuestion, validPlan, type PlanQuestio
 import { answerDiscoveryFixture } from './product-fixture.js';
 import { discoveryInspection, readVariantHandoff, produceDeepFrontierStop, readDeepFrontierStop, DEEP_FRONTIER_STOP_KIND } from '../src/discovery/discovery-outcome.js';
 import { produceStoppedPartialDossier, readPartialDossier, projectDossierManifest } from '../src/discovery/dossier-manifest.js';
+import { V7_AXES } from '../src/discovery/v7-contracts.js';
+import { readSelectedDossier } from '../src/discovery/selected-dossier.js';
+import { resolveClaimAddress } from '../src/discovery/claim-address.js';
 import { EngineError } from '../src/errors.js';
 import { canonical, hashJson } from '../src/canonical.js';
 import { runDeepResearch } from '../src/discovery/deep-research-execution.js';
@@ -73,7 +76,7 @@ if(r.subject.subject?.contract==='v7-plan-subject/v1'&&!r.subject.deepPreparatio
 if(r.subject.deepPreparation){
  const cell=r.subject.deepCell, id=cell.subject.planQuestionId;
  const claim={id:'deep-'+prior.length,kind:'hypothesis',text:'Exact variant material '+prior.length,axis:id==='q-one'?'industry':'market',planQuestions:[{planAnswer:cell.subject.planAnswer,planQuestionId:id}],scope:{variants:s.deepMode==='common'?'common':[cell.variant.member]},basis:{howToVerify:'Measure the exact chosen variant'}};
- const claims=s.deepClaims??[claim];
+ const claims=s.deepClaims??(s.selectedAxes&&id==='q-two'&&s.deepMode!=='common'?${JSON.stringify(V7_AXES)}.map(axis=>({...claim,id:claim.id+'-'+axis,text:claim.text+' '+axis,axis,basis:{howToVerify:claim.basis.howToVerify+' '+axis}})):[claim]);
  research={action:'answer',question:id,value:s.deepMode==='impossible'?{type:'impossible',code:'source_unavailable',evidence:[],text:'No accessible source'}:{type:'submitted',contract:'discovery-claims/v7',value:{claims}},citations:[]};
 }
 if(r.subject.variantSubject?.kind==='decision')research=s.reject?{action:'reject_all',reason:'Model rejects this exact set'}:{action:'choose',key:'v1',reason:'Model chooses the bounded member'};
@@ -206,12 +209,27 @@ test('5.7: one stalled cell does not stop another; all applied N limits stop wit
   for (const store of [f.store, f.open()]) await inert(f, store, () => f.run(8, store));
 });
 test('5.7: complete coverage and an unpaid pending frontier are not partial', async t => {
-  const f = await ready(t);
+  const f = await ready(t);f.configure({selectedAxes:true});
   await inert(f, f.store, () => assert.rejects(() => produceDeepFrontierStop(f.store, 'p', JSON.parse(f.pending.value.error!).handoff), { code: 'discovery_deep_stop_invalid' }));
   const result = await f.run(2);
-  assert.equal(result.value.pauseCode, 'research_deep_frontier_complete', result.value.error!);
+  assert.equal(result.value.pauseCode, 'research_selected_dossier_assessment_unavailable', result.value.error!);
+  const details=JSON.parse(result.value.error!), selected=readSelectedDossier(f.store,'p',details.selected);
+  for(const axis of V7_AXES){
+    assert.ok(selected.manifest.value.axes[axis].claims.length,axis);
+    for(const address of selected.manifest.value.axes[axis].claims){
+      const claim=resolveClaimAddress(f.store,address).claim;
+      assert.ok(claim&&typeof claim==='object'&&!Array.isArray(claim));
+      assert.equal(claim.axis,axis);
+    }
+  }
+  assert.deepEqual(reference(selected.manifest),details.dossier);assert.equal(selected.manifest.value.completeness,'complete');
+  assert.equal(selected.coverage.missing.length,0);assert.deepEqual(selected.record.value.scope,f.scope);
+  assert.equal(f.store.list('discovery-dossier-manifest').length,1);
   assert.equal(f.store.list(DEEP_FRONTIER_STOP_KIND).length, 0);
   await inert(f, f.store, () => assert.rejects(() => produceDeepFrontierStop(f.store, 'p', JSON.parse(f.pending.value.error!).handoff), { code: 'discovery_deep_stop_invalid' }));
+  for(const store of [f.store,f.open()])await inert(f,store,async()=>{
+    assert.deepEqual(await f.run(3,store),result);assert.deepEqual(await f.run(1,store,true),result);
+  });
 });
 
 test('5.7: a real prepared intent before reservation is not terminal even when its run is paused', async t => {

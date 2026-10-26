@@ -20,6 +20,9 @@ import { discoveryFixture, acceptPlan, planQuestion, validPlan, type PlanQuestio
 import { answerDiscoveryFixture } from './product-fixture.js';
 import { discoveryInspection, readVariantHandoff, readDeepFrontierStop } from '../src/discovery/discovery-outcome.js';
 import { readPartialDossier } from '../src/discovery/dossier-manifest.js';
+import { V7_AXES } from '../src/discovery/v7-contracts.js';
+import { readSelectedDossier } from '../src/discovery/selected-dossier.js';
+import { resolveClaimAddress } from '../src/discovery/claim-address.js';
 import { EngineError } from '../src/errors.js';
 import { canonical } from '../src/canonical.js';
 import { deepPlanSelection } from '../src/discovery/v7-plan-questions.js';
@@ -82,7 +85,8 @@ if(r.subject.subject?.contract==='v7-plan-subject/v1'&&!r.subject.deepPreparatio
 if(r.subject.deepPreparation){
  const cell=r.subject.deepCell, id=cell.subject.planQuestionId;
  const claim={id:'deep-'+prior.length,kind:'hypothesis',text:'Exact variant material '+prior.length,axis:id==='q-one'?'industry':'market',planQuestions:[{planAnswer:cell.subject.planAnswer,planQuestionId:id}],scope:{variants:s.deepMode==='common'?'common':[cell.variant.member]},basis:{howToVerify:'Measure the exact chosen variant'}};
- research={action:'answer',question:id,value:s.deepMode==='impossible'?{type:'impossible',code:'source_unavailable',evidence:[],text:'No accessible source'}:{type:'submitted',contract:'discovery-claims/v7',value:{claims:[claim]}},citations:[]};
+ const claims=s.deepClaims??(s.selectedAxes&&id==='q-two'&&s.deepMode!=='common'?${JSON.stringify(V7_AXES)}.map(axis=>({...claim,id:claim.id+'-'+axis,text:claim.text+' '+axis,axis,basis:{howToVerify:claim.basis.howToVerify+' '+axis}})):[claim]);
+ research={action:'answer',question:id,value:s.deepMode==='impossible'?{type:'impossible',code:'source_unavailable',evidence:[],text:'No accessible source'}:{type:'submitted',contract:'discovery-claims/v7',value:{claims}},citations:[]};
 }
 if(r.subject.variantSubject?.kind==='decision')research=s.reject?{action:'reject_all',reason:'Model rejects this exact set'}:{action:'choose',key:'v1',reason:'Model chooses the bounded member'};
 else if(r.subject.variantSubject){
@@ -219,7 +223,7 @@ async function readyIn(f:ReturnType<typeof bind>,model:boolean,config:Record<str
   return {...f,scope:details.scope,pending};
 }
 for(const model of [false,true])test(`5.6: real ${model?'model':'owner'} choose buys only the other cell after applied coverage, then cold fixed point`,async t=>{
-  const f=await ready(t,model), first=await f.run(1), details=JSON.parse(first.value.error!);
+  const f=await ready(t,model,{selectedAxes:true}), first=await f.run(1), details=JSON.parse(first.value.error!);
   assert.equal(first.value.pauseCode,'research_deep_frontier_pending',first.value.error!);
   const coverage=deepPlanSelection(f.store,'p',f.scope);
   assert.deepEqual(coverage.coverage.cells.map(row=>row.covered),[true,false]);
@@ -227,13 +231,26 @@ for(const model of [false,true])test(`5.6: real ${model?'model':'owner'} choose 
   assert.deepEqual(details.progress.map((row:any)=>row.summary.count),[2,1]);
   assert.deepEqual(deepCalls(f).map(row=>row.subject.deepCell.subject.planQuestionId),['q-one']);
   const final=await f.run(1,f.open());
-  assert.equal(final.value.pauseCode,'research_deep_frontier_complete',final.value.error!);
+  assert.equal(final.value.pauseCode,'research_selected_dossier_assessment_unavailable',final.value.error!);
+  const selected=readSelectedDossier(f.store,'p',JSON.parse(final.value.error!).selected);
+  for(const axis of V7_AXES){
+    assert.ok(selected.manifest.value.axes[axis].claims.length,axis);
+    for(const address of selected.manifest.value.axes[axis].claims){
+      const claim=resolveClaimAddress(f.store,address).claim;
+      assert.ok(claim&&typeof claim==='object'&&!Array.isArray(claim));
+      assert.equal(claim.axis,axis);
+    }
+  }
+  assert.deepEqual(reference(selected.manifest),JSON.parse(final.value.error!).dossier);
+  assert.equal(selected.coverage.missing.length,0);assert.deepEqual(selected.record.value.scope,f.scope);
   assert.deepEqual(deepCalls(f).map(row=>row.subject.deepCell.subject.planQuestionId),['q-one','q-two']);
   assert.deepEqual(deepPlanSelection(f.store,'p',f.scope).coverage.cells.map(row=>row.covered),[true,true]);
   for(const row of deepIntents(f.store))assert.equal(readDeepResearchResult(f.store,'p',reference(row)).verification,'proven');
-  assert.equal(f.store.list('discovery-dossier-manifest').length,0);
+  assert.equal(f.store.list('discovery-dossier-manifest').length,1);assert.equal(selected.manifest.value.completeness,'complete');
   assert.equal(discoveryInspection(f.store,f.store.get<DiscoveryDraft>(f.v.draft.id)!).outcome.state,'researching');
-  for(const store of [f.store,f.open()])await inert(f,store,async()=>assert.deepEqual(await f.run(3,store,true),final));
+  for(const store of [f.store,f.open()])await inert(f,store,async()=>{
+    assert.deepEqual(await f.run(3,store,true),final);assert.deepEqual(await f.run(3,store),final);
+  });
 });
 
 for(const mode of ['common','insufficient'] as const)test(`5.6: applied ${mode} material stays in the exact missing frontier`,async t=>{
@@ -335,6 +352,7 @@ test('5.6: a real new scope with the same cell has its own preparation and paid 
 for(const cold of [false,true])for(const position of [1,2])
 test(`5.6-01: ${cold?'cold':'hot'} prepared cut at deep position ${position} resumes the original owner without revise`,async t=>{
   const f=await ready(t);let prepared=0, cut=false, savedHistory='', savedMoney=money(f.store), savedWire=f.wires();
+  if(position===2)f.configure({selectedAxes:true});
   const restore=interceptWrites(t,f.store,(writes,commit)=>{
     const preparing=writes.some(row=>row.kind==='research-consumer-intent'&&row.expected===0
       &&Object.hasOwn((row.value as ResearchConsumerIntent).cursor,'deepPreparation'));
@@ -356,7 +374,7 @@ test(`5.6-01: ${cold?'cold':'hot'} prepared cut at deep position ${position} res
   const store=cold?f.open():f.store;
   await inert(f,store,async()=>assert.deepEqual(await f.run(1,store,true),admitted));
   const result=await f.run(1,store);
-  assert.equal(result.value.pauseCode,position===1?'research_deep_frontier_pending':'research_deep_frontier_complete',result.value.error!);
+  assert.equal(result.value.pauseCode,position===1?'research_deep_frontier_pending':'research_selected_dossier_assessment_unavailable',result.value.error!);
   const applied=store.get<ResearchConsumerIntent>(intent.id)!;
   assert.equal(applied.value.state,'applied');assert.equal(deepIntents(store).length,position);
   assert.deepEqual(applied.value.owner,intent.value.owner);assert.equal(applied.value.rootKey,intent.value.rootKey);
@@ -371,7 +389,23 @@ test(`5.6-01: ${cold?'cold':'hot'} prepared cut at deep position ${position} res
   assert.equal(added.length,2);assert.ok(added.some(row=>row.id===proof.call.id));
   assert.deepEqual(added.map(row=>row.value.requestId).sort(),f.wires().slice(savedWire.length).map(row=>row.requestId).sort());
   assert.equal(deepPlanSelection(store,'p',f.scope).coverage.cells[position-1]!.covered,true);
-  for(const again of [store,f.open()])await inert(f,again,async()=>assert.deepEqual(await f.run(2,again,true),result));
+  if(position===2){
+    const selected=readSelectedDossier(store,'p',JSON.parse(result.value.error!).selected);
+    for(const axis of V7_AXES){
+      assert.ok(selected.manifest.value.axes[axis].claims.length,axis);
+      for(const address of selected.manifest.value.axes[axis].claims){
+        const claim=resolveClaimAddress(store,address).claim;
+      assert.ok(claim&&typeof claim==='object'&&!Array.isArray(claim));
+      assert.equal(claim.axis,axis);
+    }
+    }
+    assert.deepEqual(reference(selected.manifest),JSON.parse(result.value.error!).dossier);
+    assert.deepEqual(selected.record.value.scope,f.scope);assert.equal(selected.coverage.missing.length,0);
+  }
+  for(const again of [store,f.open()])await inert(f,again,async()=>{
+    assert.deepEqual(await f.run(2,again,true),result);
+    if(position===2)assert.deepEqual(await f.run(2,again),result);
+  });
 });
 
 async function unpaidDeep(t:test.TestContext, dedicatedEnvironment=false) {
@@ -542,10 +576,24 @@ test('5.6: paid replacement recovers before a reopened plan and never rechecks t
 });
 
 test('5.6: a new accepted plan with the same question ids buys no replay of the former edition',async t=>{
-  const f=await ready(t);await f.run(2);const before=deepCalls(f);
-  assert.equal(before.length,2);const next=f.nextEdition();
+  const f=await ready(t);await f.run(1);
+  f.configure({close:false,outcome:'open'});await f.run(1);f.configure({close:true});
+  const before=deepCalls(f),frontier=deepPlanSelection(f.store,'p',f.scope);
+  assert.equal(before.length,2);
+  assert.deepEqual(before.map(row=>row.subject.deepCell.subject.planQuestionId),['q-one','q-two']);
+  for(const [id,covered,outcome] of [['q-one',true,'closed'],['q-two',false,'open']] as const){
+    const cell=frontier.coverage.cells.find(row=>row.cell.subject.planQuestionId===id)!;
+    assert.deepEqual(cell.cell.subject.planAnswer,f.v.planAnswer);assert.equal(cell.covered,covered);
+    assert.equal(frontier.progress.find(row=>row.question===id)!.summary!.outcome,outcome);
+  }
+  assert.equal(f.store.list('discovery-selected-dossier').length,0);
+  assert.equal(f.store.list('discovery-dossier-manifest').length,0);
+  const next=f.nextEdition();
   await f.run(3);owner(f.store,choiceScope(f));await f.run(1);
   const sent=deepCalls(f);assert.equal(sent.length,3);
+  assert.deepEqual(sent.slice(0,2),before);
+  assert.equal(f.generationCalls().filter(row=>row.subject.variantSubject.kind==='proposal').length,2);
+  assert.equal(f.generationCalls().filter(row=>row.subject.variantSubject.kind==='decision').length,0);
   assert.equal(sent[2].subject.deepCell.subject.planQuestionId,before[0].subject.deepCell.subject.planQuestionId);
   assert.deepEqual(sent[2].subject.deepCell.subject.planAnswer,next);
   assert.notDeepEqual(sent[2].subject.deepPreparation,before[0].subject.deepPreparation);

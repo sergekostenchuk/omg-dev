@@ -1,4 +1,5 @@
 import { readPartialDossier } from "../discovery/dossier-manifest.js";
+import { readSelectedResearchPause, SELECTED_DOSSIER_PENDING, SELECTED_DOSSIER_PAUSE } from "../discovery/research-runner.js";
 import { readVariantHandoff, discoveryInspection } from '../discovery/discovery-outcome.js';
 import { canonical, digest, type Json } from "../canonical.js";
 import { Discovery } from "../discovery/discovery.js";
@@ -26,7 +27,7 @@ export type EarlyStageEnd = "stage_paused" | "needs_owner" | "conditional" | "no
   | "om_waiting" | "om_stopped" | "om_busy" | "om_refused";
 
 /** DRY6-01: a stage paused on a refused original assessment carries its exact machine door (reopen of the assessed question). */
-export interface EarlyStageReason { code: string; target: string; message: string; field?: string; door?: AssessmentRefusalDoor; handoff?: Ref; dossier?: Ref; completeness?: 'partial'; next?: 'deep' | 'dossier' | 'dossier-assessment' }
+export interface EarlyStageReason { code: string; target: string; message: string; field?: string; door?: AssessmentRefusalDoor; handoff?: Ref; selected?: Ref; dossier?: Ref; completeness?: 'partial' | 'complete'; next?: 'deep' | 'dossier' | 'dossier-assessment' }
 export interface EarlyStageBudget {
   maxTurns: number; turnsUsed: number; turnsRemaining: number;
   maxCalls: number; callsMade: number; callsRemaining: number;
@@ -117,7 +118,7 @@ export class EarlyStageDriver {
     try {
       inspected = this.#inspectInput(request);
       if (inspected && !("binding" in inspected)) this.#ensureProject(project, inspected);
-      // An addressed completed partial result is a read, not a new execution lease.
+      // An addressed dossier result is a read, not a new execution lease.
       // Prove its saved outputs before acquiring control so malformed addresses and
       // hot/cold fixed points leave even control history unchanged.
       const current = !inspected || 'binding' in inspected ? this.#currentStage(project) : null;
@@ -126,11 +127,12 @@ export class EarlyStageDriver {
           inspected && 'binding' in inspected ? inspected.refs : []).draft : null;
       const run = draft ? readResearchRun(this.engine.store, project, draft.id) : null;
       if (draft?.value.projectId === project && draft.value.stage === 'discovery' && isCurrentEra('discovery', draft.value.contractVersion, { discovery: 7 })
-        && (run?.value.pauseCode === 'research_dossier_assessment_unavailable' || run?.value.pauseCode === 'research_partial_dossier_pending')) {
+        && (run?.value.pauseCode === 'research_dossier_assessment_unavailable' || run?.value.pauseCode === 'research_partial_dossier_pending'
+          || run?.value.pauseCode === SELECTED_DOSSIER_PAUSE || run?.value.pauseCode === SELECTED_DOSSIER_PENDING)) {
         const control = readRunControl(this.engine.store, { project });
         const artifact = current!.artifact;
         if (control.ok && !control.value.stopped && artifact?.value.status !== 'accepted') {
-          const restored = run.value.pauseCode === 'research_partial_dossier_pending'
+          const restored = run.value.pauseCode === 'research_partial_dossier_pending' || run.value.pauseCode === SELECTED_DOSSIER_PENDING
             ? await this.engine.researcher.run(project, draft.id, 1, undefined, { restoreOnly: true }) : run;
           const early = await this.#stageOutcome(project, 'discovery', reference(draft), {
             status: 'paused', stage: artifact ? reference(artifact) : null, research: reference(restored),
@@ -648,6 +650,17 @@ export class EarlyStageDriver {
     const finding = result.reason;
     if (stage === 'discovery' && result.status === 'paused' && result.research) {
       const run = this.engine.store.get<import('../discovery/research-model.js').ResearchRun>(result.research.id, result.research.revision);
+      if (run && [SELECTED_DOSSIER_PENDING,SELECTED_DOSSIER_PAUSE].includes(run.value.pauseCode ?? '')) {
+        const proof = await readSelectedResearchPause(this.engine.store,project,draft.id,run);
+        requireCondition(run.value.pauseCode === SELECTED_DOSSIER_PAUSE && proof.selected,
+          'discovery_selected_pause_invalid', 'The selected dossier publication is not complete');
+        const { guards: _guards, findings: _findings, ...discovery } = discoveryInspection(this.engine.store,
+          this.engine.store.get<DiscoveryDraft>(proof.handoff.value.draft.id,proof.handoff.value.draft.revision)!).outcome;
+        return { ...this.#base(project,'stage_paused',stage,proof.handoff.value.draft,[],{...result,discovery},
+          { code: SELECTED_DOSSIER_PAUSE, target: 'dossier-assessment', message: 'The complete selected dossier awaits assessment',
+            handoff: reference(proof.handoff), selected: reference(proof.selected.record), dossier: reference(proof.selected.manifest),
+            completeness: 'complete', next: 'dossier-assessment' }), turnsUsed: result.turnsUsed ?? 0, handoff: false };
+      }
       let saved: any;
       try { saved = JSON.parse(run?.value.error ?? 'null'); } catch { /* A diagnostic pause carries no authority. */ }
       const address: unknown = saved?.handoff;
@@ -661,6 +674,7 @@ export class EarlyStageDriver {
           'discovery_variant_handoff_invalid', 'The stage paused on another draft handoff');
         let partialReason: EarlyStageReason | null = null;
         if (partial) {
+          requireCondition(!Object.hasOwn(saved,'selected'), 'discovery_selected_pause_invalid', 'A partial pause cannot carry a selected carrier');
           requireCondition(isRef(saved?.dossier), 'discovery_dossier_invalid', 'The saved partial result lost its exact dossier');
           const dossier = await readPartialDossier(this.engine.store, project, saved.dossier);
           requireCondition(canonical(reference(dossier.handoff)) === canonical(address)

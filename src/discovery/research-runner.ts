@@ -6,6 +6,7 @@ import { variantStateId, readVariantStateStructural, type VariantHandoff, type V
 import { readVariantOwnerDecision } from "./discovery-decision.js";
 import { publishVariantScope, readCurrentVariantScope } from "./variant-scope.js";
 import { producePartialDossier, produceStoppedPartialDossier, readPartialDossier } from "./dossier-manifest.js";
+import { produceSelectedDossier, readSelectedDossier, SELECTED_DOSSIER_KIND, type SelectedDossier, type ProvenSelectedDossier } from "./selected-dossier.js";
 import { DISCOVERY_DEEP_PREPARATION_CONTRACT, produceDeepPreparation, readDeepPreparation } from "./deep-research.js";
 import { prepareDeepResearch, resumeDeepResearch } from "./deep-research-execution.js";
 import { withHistoricalReads } from "../history/proofs.js";
@@ -28,7 +29,7 @@ import { planningForQuestion, planningForPlanSubject } from "./research-routing.
 import { Store, type Revision, type Write, type TransactionGuard } from "../storage/store.js";
 import { Environments, uniqueTransactionGuards, transactionGuardsCurrent, type Environment } from "../runtime/environment.js";
 import { isRef, reference, uniqueRefs, type Ref } from "../pipeline/contracts.js";
-import { canonical, hashJson } from "../canonical.js";
+import { canonical, hashJson, type Json } from "../canonical.js";
 import { EngineError, requireCondition } from "../errors.js";
 import { Discovery, type Decision, type DiscoveryDraft, type Question } from "./discovery.js";
 import type { PaidDiscoveryAttemptsAssessment, V7AttemptPacket, EarlyUnknown, ResearchAction, ResearchAssessment, ResearchRun, ResearchTurn } from "./research-model.js";
@@ -96,6 +97,63 @@ const INSTRUCTION = `Resolve the internal research questions yourself using exis
 Use read/search tools before concluding information is unavailable. A failed provider or exhausted turn budget is a technical pause, never a reason to ask the owner a subject-matter question. Do not mutate files or invoke external paid actions. Citations must point to source refs from inventory, not stage or graph refs; use json-pointer selectors for JSON when appropriate. File inventory entries contain metadata only: use read_source or search to obtain their exact contents. A history answer with valuePointer references the identical value already present in the current context fields; the original action remains stored unchanged.`;
 
 const paidTurnId = (run: string, number: number) => `research-turn:v1:${hashJson([run, number])}`;
+
+export const SELECTED_DOSSIER_PENDING = 'research_selected_dossier_pending';
+export const SELECTED_DOSSIER_PAUSE = 'research_selected_dossier_assessment_unavailable';
+const SELECTED_PAUSE_CONTRACT = 'research-selected-dossier-pause/v1';
+function selectedRoute(handoff: Revision<VariantHandoff>, dossier: ProvenSelectedDossier): void {
+  const route = handoff.value, saved = dossier.record.value;
+  requireCondition(route.reason === 'choose' && route.next === 'deep'
+    && ['draft','frame','plan','scope','set','decision'].every(key =>
+      canonical(saved[key as keyof SelectedDossier]) === canonical(route[key as keyof VariantHandoff]))
+    && canonical(saved.member) === canonical(route.choice),
+    'discovery_selected_pause_invalid', 'The selected carrier belongs to another exact chosen handoff');
+}
+/** Both public doors read the same explicit pause contract. Completeness is
+ * proved by the selected reader; a manifest or diagnostic flag cannot select it. */
+export async function readSelectedResearchPause(store: Store, project: string, draftId: string, run: Revision<ResearchRun>) {
+  let saved: any;
+  try { saved = JSON.parse(run.value.error ?? 'null'); } catch { /* Refuse below. */ }
+  const actual = store.get<ResearchRun>(run.id,run.revision);
+  const keys = ['contract','code','message','handoff','selected','dossier','completeness','next'];
+  requireCondition(actual && actual.kind === run.kind && canonical(reference(actual)) === canonical(reference(run))
+    && canonical(actual.value) === canonical(run.value)
+    && run.kind === 'research-run' && run.id === `research-run:${hashJson([project,draftId])}`
+    && run.value.projectId === project && run.value.draftId === draftId && run.value.status === 'paused'
+    && run.hash === hashJson(run.value as unknown as Json) && saved && typeof saved === 'object'
+    && !Array.isArray(saved) && canonical(Object.keys(saved).sort()) === canonical(keys.sort())
+    && saved.contract === SELECTED_PAUSE_CONTRACT && saved.code === run.value.pauseCode
+    && [SELECTED_DOSSIER_PENDING,SELECTED_DOSSIER_PAUSE].includes(saved.code)
+    && typeof saved.message === 'string' && saved.completeness === 'complete' && saved.next === 'dossier-assessment'
+    && isRef(saved.handoff), 'discovery_selected_pause_invalid', 'The selected result lost its explicit saved address contract');
+  const handoff = (await readVariantHandoff(store, project, saved.handoff)).record;
+  requireCondition(handoff.value.draft.id === draftId && handoff.value.reason === 'choose' && handoff.value.next === 'deep',
+    'discovery_selected_pause_invalid', 'The selected result needs its original chosen deep route');
+  let selected: ProvenSelectedDossier | null = null;
+  if (isRef(saved.selected) && isRef(saved.dossier)) {
+    selected = withHistoricalReads(() => readSelectedDossier(store,project,saved.selected));
+    requireCondition(canonical(reference(selected.manifest)) === canonical(saved.dossier),
+      'discovery_selected_pause_invalid', 'The saved manifest differs from the selected carrier');
+  } else {
+    requireCondition(saved.code === SELECTED_DOSSIER_PENDING && saved.selected === null && saved.dossier === null,
+      'discovery_selected_pause_invalid', 'A selected result requires both exact carrier and manifest');
+    // The pending run's exact body at the producer boundary anchors the pair,
+    // including after an unchanged concurrent run revision. Unrelated events
+    // and later choice/plan/P changes cannot redirect it to another snapshot.
+    const candidates = store.list<SelectedDossier>(SELECTED_DOSSIER_KIND)
+      .filter(row => {
+        const sequence = row.value?.boundary?.sequence;
+        if (!Number.isSafeInteger(sequence)) return false;
+        const at = store.getAtEvent(sequence,run.id);
+        return at && at.kind === 'research-run' && at.hash === hashJson(at.value)
+          && canonical(at.value) === canonical(run.value);
+      });
+    requireCondition(candidates.length <= 1, 'discovery_selected_pause_invalid', 'Several selected publications claim this pending boundary');
+    if (candidates[0]) selected = withHistoricalReads(() => readSelectedDossier(store,project,reference(candidates[0]!)));
+  }
+  if (selected) selectedRoute(handoff,selected);
+  return { handoff, selected };
+}
 
 /** dispatchMode with the X50 proviso: a failed planned child guards the
  * planning phase only. When a synthesis-phase turn of this same question is
@@ -1722,6 +1780,9 @@ export class Researcher {
       "research_busy", "This draft already has an active researcher");
     // The pause carries exact durable addresses. Its historical replay precedes today's
     // selection and cannot activate a new paid step after a mode or plan revision.
+    const savedSelected = run && [SELECTED_DOSSIER_PENDING,SELECTED_DOSSIER_PAUSE].includes(run.value.pauseCode ?? '')
+      ? await readSelectedResearchPause(this.store,project,draftId,run) : null;
+    if (savedSelected && run!.value.pauseCode === SELECTED_DOSSIER_PAUSE) return run!;
     let savedPartial: { handoff: Ref; [field: string]: unknown } | null = null;
     let pendingHandoff: VariantHandoff | null = null;
     let savedStop: Ref | null = null;
@@ -1752,6 +1813,8 @@ export class Researcher {
       try { saved = JSON.parse(run.value.error ?? "null"); } catch { /* Refuse below. */ }
       requireCondition(isRef(saved?.handoff), "discovery_variant_handoff_invalid", "The partial result lost its exact handoff");
       const proof = await readVariantHandoff(this.store, project, saved.handoff);
+      requireCondition(!Object.hasOwn(saved, 'selected') && saved.contract !== SELECTED_PAUSE_CONTRACT,
+        'discovery_selected_pause_invalid', 'A partial pause cannot masquerade as a selected result');
       requireCondition(proof.record.value.draft.id === draftId, "discovery_variant_handoff_invalid", "The partial result names another draft");
       savedPartial = saved;
       if (proof.record.value.next === 'deep') {
@@ -1778,6 +1841,7 @@ export class Researcher {
       } else pendingHandoff = proof.record.value;
     }
     let partialPending = false;
+    let selectedPending = false;
     let deepOperation = false;
     const receivePartial = async (handoff: Ref, display: object = {}): Promise<never> => {
       const proof = await readVariantHandoff(this.store, project, handoff);
@@ -1816,6 +1880,29 @@ export class Researcher {
       partialPending = false; deepOperation = false;
       throw new EngineError('research_dossier_assessment_unavailable', message);
     };
+    const receiveSelected = async (handoff: Ref, guards: TransactionGuard[] = []): Promise<never> => {
+      selectedPending = true;
+      requireCondition(run, 'discovery_selected_pause_invalid', 'The selected recipient needs its original run');
+      if (run.value.pauseCode !== SELECTED_DOSSIER_PENDING) {
+        run = this.save(run, { status: 'paused', owner, pauseCode: SELECTED_DOSSIER_PENDING,
+          error: canonical({ contract: SELECTED_PAUSE_CONTRACT, code: SELECTED_DOSSIER_PENDING,
+            message: 'The complete frontier awaits its selected snapshot', handoff,
+            selected: null, dossier: null, completeness: 'complete', next: 'dossier-assessment' }) }, guards);
+      }
+      const pending = await readSelectedResearchPause(this.store,project,draftId,run);
+      requireCondition(canonical(reference(pending.handoff)) === canonical(handoff),
+        'discovery_selected_pause_invalid', 'The selected pending route changed');
+      const selected = pending.selected ?? withHistoricalReads(() => produceSelectedDossier(this.store,project,
+        { scope: pending.handoff.value.scope, plan: pending.handoff.value.plan }));
+      selectedRoute(pending.handoff,selected);
+      const message = canonical({ contract: SELECTED_PAUSE_CONTRACT, code: SELECTED_DOSSIER_PAUSE,
+        message: 'The complete selected dossier awaits assessment', handoff,
+        selected: reference(selected.record), dossier: reference(selected.manifest), completeness: 'complete', next: 'dossier-assessment' });
+      run = this.save(run, { status: 'paused', owner, pauseCode: SELECTED_DOSSIER_PAUSE, error: message },
+        [handoff,reference(selected.record),reference(selected.manifest)]);
+      selectedPending = false; deepOperation = false;
+      throw new EngineError(SELECTED_DOSSIER_PAUSE,message);
+    };
     const receiveDeep = async (handoff: Ref, display: object): Promise<void> => {
       deepOperation = true;
       const proof = await readVariantHandoff(this.store, project, handoff), value = proof.record.value;
@@ -1835,8 +1922,7 @@ export class Researcher {
         deepOperation = false;
         throw new EngineError(code, canonical({ code, message, ...details }));
       };
-      if (!frontier.coverage.missing.length) pause('research_deep_frontier_complete',
-        'The selected variant has proven coverage; its next recipient is not connected');
+      if (!frontier.coverage.missing.length) await receiveSelected(handoff,frontier.guards);
       if (!frontier.next || traversal.budget.exhausted) {
         // Publication may be interrupted before its durable stop address reaches
         // the pause. Keep this position resumable even at that first write cut.
@@ -1873,6 +1959,7 @@ export class Researcher {
       deepOperation = false;
     };
     try {
+      if (savedSelected) await receiveSelected(reference(savedSelected.handoff));
       if (savedPartial) {
         try {
           if (savedStop) await receiveStopped(savedStop, savedPartial);
@@ -2323,7 +2410,7 @@ export class Researcher {
           options.contextContract && mode !== "planning" ? { contextContract: options.contextContract } : {});
       }
     } catch (error) {
-      if (partialPending) throw error;
+      if (partialPending || selectedPending) throw error;
       if (error instanceof EngineError && error.code === 'discovery_deep_environment_invalid') throw error;
       const current = this.store.get<ResearchRun>(id) ?? run;
       // Before reservation the saved pause is the prepared intent's exact
