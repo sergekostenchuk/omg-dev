@@ -7,11 +7,13 @@ import { canonical, type Json } from "../src/canonical.js";
 import { reference, type Ref } from "../src/pipeline/contracts.js";
 import type { Selector } from "../src/evidence/evidence.js";
 import type { Revision, Store } from "../src/storage/store.js";
+import type { Environment, RoleBinding } from "../src/runtime/environment.js";
 import { Discovery, type DiscoveryDraft, type Question } from "../src/discovery/discovery.js";
 import { createPartialV7Draft, V7_FRAME_INTERPRETATIONS_CONTRACT,
   V7_FRAME_INTERPRETATIONS_KIND } from "../src/discovery/v7-contracts.js";
 import { projectFrameInterpretations } from "../src/discovery/frame-interpretations.js";
 import type { FrameSubjectRequest } from "../src/discovery/frame-interpretation-subject.js";
+import { prepareFrameInterpretationRequest } from "../src/discovery/frame-interpretation-request.js";
 import { readArchiveBody } from "../src/discovery/request-parts.js";
 import { requirePacketMaterialDelivery } from "../src/discovery/research-delivery.js";
 import { contextValue, prepareFrameInterpretationContextPacker
@@ -100,8 +102,17 @@ function base(f: DiscoveryFixture, project: string, sourceKey = "brief-src"): Ba
 const requestOf = (project: string, b: Base, previousSet?: Ref | null): FrameSubjectRequest =>
   ({ project, frame: b.frameRef, mandate: b.mandate as FrameSubjectRequest["mandate"],
     ...(previousSet !== undefined ? { previousSet } : {}) });
-const envelopeInput = { prompt: "Build the interpretations set for this frame.",
-  packetChars: 150000, limitChars: 200000 };
+// The existing role/environment the shared omg-agent/v1 envelope is declared
+// over — explicit parameters of the packing API; their presence admits
+// nothing (no dispatch and no payment inside preparation).
+const ROLE: RoleBinding = { actor: "frame-interpreter", model: "managed-model",
+  effort: "high", command: { executable: "managed", args: [] } };
+const environmentOf = (project: string): Environment => ({
+  projectId: project, workspace: "/tmp/omg-2bp", implementer: ROLE, reviewer: ROLE,
+  fullCheck: { executable: "true", args: [] }, timeoutMs: 60000 });
+const envelopeInput = (project: string) => ({
+  prompt: "Build the interpretations set for this frame.",
+  packetChars: 150000, limitChars: 200000, role: ROLE, environment: environmentOf(project) });
 
 function writeStructuralSet(store: Store, value: Record<string, unknown>): Ref {
   const projected = projectFrameInterpretations(value);
@@ -123,8 +134,9 @@ test("2b-P a small request packs whole into the exact archive: proven metadata, 
   const prev = writeStructuralSet(f.store, plainSet(project, first.mandate, first.frameRef));
   const b = base(f, project, "brief-src-2");
   const req = requestOf(project, b, prev);
+  const input = envelopeInput(project);
   const before = state(f.store, wireFile);
-  const env = prepareFrameInterpretationEnvelope(f.store, req, envelopeInput);
+  const env = prepareFrameInterpretationEnvelope(f.store, req, input);
   // Packing writes only research-context archives — no calls, ledger, wire,
   // set publication or choice.
   const after = state(f.store, wireFile);
@@ -149,15 +161,27 @@ test("2b-P a small request packs whole into the exact archive: proven metadata, 
   // The bounded packet names its archive and keeps the request inline.
   assert.equal(canonical(env.packet.working.archive), canonical(env.archive));
   assert.ok(env.packet.frameRequest !== undefined, "small material crosses inline");
+  // The actual complete omg-agent/v1 input — model, effort, requestId, the
+  // packed context as subject, the admission and the response bound — is
+  // returned and measured, not the admission alone.
+  const wire = JSON.parse(env.input) as Record<string, any>;
+  assert.equal(wire.protocol, "omg-agent/v1");
+  assert.equal(wire.model, ROLE.model); assert.equal(wire.effort, ROLE.effort);
+  assert.ok(typeof wire.requestId === "string" && wire.requestId.length > 0);
+  assert.equal(canonical(wire.subject.resultCapacity), canonical(env.capacity));
+  assert.equal(wire.subject.responseOutputLimit.contract, "research-output-limit/v1");
+  assert.equal(wire.subject.working.archive.id, env.archive.id);
+  assert.ok(!Object.hasOwn(wire.subject, "question"), "no D1 question schema in the wire subject");
+  assert.equal(env.measuredChars, env.input.length);
   assert.ok(env.capacity.forms[0]!.minimumChars > 0 && env.measuredChars > 0
-    && env.measuredChars <= envelopeInput.limitChars);
+    && env.measuredChars <= input.limitChars);
   assert.equal(env.capacity.bindings.request, env.request.request);
   // A cold store restores the same bytes; check verifies a presented copy.
   const cold = f.open();
   assert.equal(canonical(readArchiveBody(cold, cold.get(env.archive.id, env.archive.revision)!).body['frameRequest']),
     canonical(env.request));
   noWrite(cold, wireFile,
-    () => assert.deepEqual(checkFrameInterpretationEnvelope(cold, req, envelopeInput,
+    () => assert.deepEqual(checkFrameInterpretationEnvelope(cold, req, input,
       structuredClone(env)), env));
 });
 
@@ -166,7 +190,8 @@ test("2b-P a large request names its exact address and a nonempty bounded page �
   const wireFile = join(f.root, "wire.ndjson");
   const b = base(f, project);
   const req = requestOf(project, b);
-  const tight = { prompt: "Build the interpretations set.", packetChars: 6000, limitChars: 20000 };
+  const tight = { prompt: "Build the interpretations set.", packetChars: 6000, limitChars: 20000,
+    role: ROLE, environment: environmentOf(project) };
   const env = prepareFrameInterpretationEnvelope(f.store, req, tight);
   const addresses = env.packet.working.materialAddresses as { field: string; pointer: string }[] | undefined;
   assert.ok(Array.isArray(addresses) && addresses.some(a => a.field === "frameRequest"),
@@ -206,13 +231,22 @@ test("2b-P the physical limit refuses with zero staged writes — heads, calls, 
     // A bound that cannot admit the mandatory grounds: the staged archive is
     // prepared, capacity refuses, and commit never runs.
     const refused = code(() => prepareFrameInterpretationEnvelope(f.store, req,
-      { prompt: "Build the interpretations set.", packetChars: 1999, limitChars: 2000 }));
+      { prompt: "Build the interpretations set.", packetChars: 1999, limitChars: 2000,
+        role: ROLE, environment: environmentOf(project) }));
     assert.ok(["pilot_core_limit", "research_capacity_configuration"].includes(refused), refused);
     assert.equal(f.store.list().filter(row => row.kind === "research-context").length, 0,
       "a refused envelope left no staged archive");
+    // The shared envelope builder's own physical check: the complete input
+    // exceeding the declared bound refuses before any archive write.
+    assert.equal(code(() => prepareFrameInterpretationEnvelope(f.store, req,
+      { prompt: "Build the interpretations set.", packetChars: 4500, limitChars: 5000,
+        role: ROLE, environment: environmentOf(project) })),
+      "pilot_request_limit");
+    assert.equal(f.store.list().filter(row => row.kind === "research-context").length, 0);
     // A bound the packet itself cannot keep refuses the same way.
     assert.equal(code(() => prepareFrameInterpretationEnvelope(f.store, req,
-      { prompt: "Build the interpretations set.", packetChars: 200, limitChars: 300 })),
+      { prompt: "Build the interpretations set.", packetChars: 200, limitChars: 300,
+        role: ROLE, environment: environmentOf(project) })),
       "pilot_core_limit");
   });
 });
@@ -222,35 +256,41 @@ test("2b-P missing, null, truncated and tampered envelopes refuse at their field
   const wireFile = join(f.root, "wire.ndjson");
   const b = base(f, project);
   const req = requestOf(project, b);
-  const env = prepareFrameInterpretationEnvelope(f.store, req, envelopeInput);
+  const env = prepareFrameInterpretationEnvelope(f.store, req, envelopeInput(project));
   // An envelope of another real draft — its own exact archive.
   const alien = base(f, "other-yard", "alien-src");
-  const alienEnv = prepareFrameInterpretationEnvelope(f.store, requestOf("other-yard", alien), envelopeInput);
+  const alienEnv = prepareFrameInterpretationEnvelope(f.store, requestOf("other-yard", alien), envelopeInput("other-yard"));
   noWrite(f.store, wireFile, () => {
     for (const presented of [null, 42, "envelope", []])
-      assert.equal(code(() => checkFrameInterpretationEnvelope(f.store, req, envelopeInput, presented)),
+      assert.equal(code(() => checkFrameInterpretationEnvelope(f.store, req, envelopeInput(project), presented)),
         "frame_pack_invalid");
     const at = (mutate: (v: Record<string, unknown>) => void): [string, string] => {
       const bad = structuredClone(env) as unknown as Record<string, unknown>;
       mutate(bad);
-      return [code(() => checkFrameInterpretationEnvelope(f.store, req, envelopeInput, bad)),
-        field(() => checkFrameInterpretationEnvelope(f.store, req, envelopeInput, bad))];
+      return [code(() => checkFrameInterpretationEnvelope(f.store, req, envelopeInput(project), bad)),
+        field(() => checkFrameInterpretationEnvelope(f.store, req, envelopeInput(project), bad))];
     };
     assert.deepEqual(at(v => { delete v.packet; }), ["frame_pack_invalid", "envelope.packet"]);
+    assert.deepEqual(at(v => { delete v.input; }), ["frame_pack_invalid", "envelope.input"]);
     assert.deepEqual(at(v => { v.paid = true; }), ["frame_pack_invalid", "envelope.paid"]);
     // A truncated request inside the envelope fails the closed request form.
     const cut = structuredClone(env) as unknown as Record<string, unknown>;
     delete (cut.request as Record<string, unknown>).instruction;
-    assert.equal(code(() => checkFrameInterpretationEnvelope(f.store, req, envelopeInput, cut)),
+    assert.equal(code(() => checkFrameInterpretationEnvelope(f.store, req, envelopeInput(project), cut)),
       "frame_request_invalid");
     // A changed instruction reaches the request decoder, never the compare.
     const instr = structuredClone(env) as unknown as Record<string, unknown>;
     (instr.request as Record<string, unknown>).instruction = "Pick the winner";
-    assert.equal(code(() => checkFrameInterpretationEnvelope(f.store, req, envelopeInput, instr)),
+    assert.equal(code(() => checkFrameInterpretationEnvelope(f.store, req, envelopeInput(project), instr)),
       "frame_request_invalid");
     // A swapped archive address is a binding mismatch.
     assert.deepEqual(at(v => { v.archive = alienEnv.archive; }),
       ["frame_pack_mismatch", "archive"]);
+    // A foreign request and a changed complete input reach the field compare.
+    assert.deepEqual(at(v => { v.request = alienEnv.request; }),
+      ["frame_pack_mismatch", "request"]);
+    assert.deepEqual(at(v => { v.input = `${v.input} `; }),
+      ["frame_pack_mismatch", "input"]);
   });
 });
 
@@ -276,8 +316,7 @@ test("2b-P heads moved before preparation and by a second store between staging 
   // head between staging and commit — no head guard exists to refuse it, and
   // the archive keeps the proven revision.
   const packer = prepareFrameInterpretationContextPacker(f.store, project, req);
-  const packet = packer.pack(packer.context, 200000,
-    { purpose: "frame-interpretation-request", common: true });
+  const packet = packer.pack(200000);
   const moving = f.open();
   const movingDiscovery = new Discovery(moving);
   movingDiscovery.reopen(b.frameQ.id, moving.get<Question>(b.frameQ.id)!.revision);
@@ -288,7 +327,7 @@ test("2b-P heads moved before preparation and by a second store between staging 
   assert.ok(f.store.get<{ content: string }>(b.src.id)!.revision > b.src.revision,
     "the mandate's source head moved mid-staging");
   packer.commit();
-  const env = prepareFrameInterpretationEnvelope(f.store, req, envelopeInput);
+  const env = prepareFrameInterpretationEnvelope(f.store, req, envelopeInput(project));
   const row = f.store.get(env.archive.id, env.archive.revision)!;
   const rowValue = row.value as Record<string, any>;
   assert.equal(canonical(rowValue.draft), canonical(reference(provenDraft)),
@@ -305,6 +344,47 @@ test("2b-P heads moved before preparation and by a second store between staging 
   assert.equal(canonical(readArchiveBody(cold, cold.get(env.archive.id, env.archive.revision)!).body['frameRequest']),
     canonical(env.request));
   assert.equal(state(f.store, wireFile).wire, null, "no wire record appeared");
+  // 2B-PACK-03: an already-saved exact archive resolves identically on a
+  // re-pack — reopening the metadata question head must not push the
+  // addressed material through the current-basis reader (context_reference_stale).
+  f.discovery.reopen(b.frameQ.id, f.store.get<Question>(b.frameQ.id)!.revision);
+  const again = prepareFrameInterpretationEnvelope(f.store, req,
+    { prompt: "Build the interpretations set.", packetChars: 6000, limitChars: 20000,
+      role: ROLE, environment: environmentOf(project) });
+  assert.equal(canonical(again.archive), canonical(env.archive),
+    "the re-pack names the same content-addressed archive");
+  const addresses = again.packet.working.materialAddresses as { field: string }[] | undefined;
+  assert.ok(addresses?.some(a => a.field === "frameRequest"), "the oversized request stays addressed");
+  assert.ok(Array.isArray(again.packet.materialDelivery), "a nonempty page rides again");
+  noWrite(f.open(), wireFile, () => checkFrameInterpretationEnvelope(f.open(), req,
+    { prompt: "Build the interpretations set.", packetChars: 6000, limitChars: 20000,
+      role: ROLE, environment: environmentOf(project) }, structuredClone(again)));
+});
+
+test("2b-P the checking door never commits: a presented envelope with null capacity refuses leaving zero archives on a fresh set", (t) => {
+  const f = discoveryFixture(t, "omg-2bp-check-"), project = "vault";
+  const wireFile = join(f.root, "wire.ndjson");
+  const b = base(f, project);
+  const req = requestOf(project, b);
+  // A plausibly closed envelope over the real proven request — but never
+  // prepared here, so the archive set is still empty.
+  const presented = {
+    contract: FRAME_INTERPRETATION_ENVELOPE_CONTRACT,
+    request: prepareFrameInterpretationRequest(f.store, req),
+    archive: { id: `research-context:${"1".repeat(64)}`, revision: 1, hash: "1".repeat(64) },
+    packet: { working: {} },
+    capacity: null,
+    input: "{}",
+    measuredChars: 2,
+  };
+  noWrite(f.store, wireFile, () => {
+    assert.equal(code(() => checkFrameInterpretationEnvelope(f.store, req,
+      envelopeInput(project), presented)), "research_capacity_invalid");
+    assert.equal(f.store.list().filter(row => row.kind === "research-context").length, 0,
+      "the checking door left zero staged archives");
+    assert.equal(f.store.list("model-call").length, 0);
+    assert.equal(f.store.list("research-budget-ledger").length, 0);
+  });
 });
 
 test("2b-P foreign and substituted grounds refuse before any archive write", (t) => {
@@ -312,19 +392,19 @@ test("2b-P foreign and substituted grounds refuse before any archive write", (t)
   const wireFile = join(f.root, "wire.ndjson");
   const b = base(f, project);
   const req = requestOf(project, b);
-  const env = prepareFrameInterpretationEnvelope(f.store, req, envelopeInput);
+  const env = prepareFrameInterpretationEnvelope(f.store, req, envelopeInput(project));
   const other = base(f, "cellar", "cellar-src");
-  const cellarEnv = prepareFrameInterpretationEnvelope(f.store, requestOf("cellar", other), envelopeInput);
+  const cellarEnv = prepareFrameInterpretationEnvelope(f.store, requestOf("cellar", other), envelopeInput("cellar"));
   const sibling = f.discovery.evidence.document(project, "sibling", "Другой документ", "text/plain", 0);
   const archivesBefore = f.store.list().filter(row => row.kind === "research-context").length;
   noWrite(f.store, wireFile, () => {
     // A presented request of another project under this request.
-    assert.equal(code(() => prepareFrameInterpretationEnvelope(f.store, req, envelopeInput,
+    assert.equal(code(() => prepareFrameInterpretationEnvelope(f.store, req, envelopeInput(project),
       cellarEnv.request)), "frame_request_mismatch");
     // A forged request linkage — substituted source inside the package.
     const forged = structuredClone(env.request) as unknown as Record<string, unknown>;
     (forged.brief as { source: Ref }).source = reference(sibling);
-    assert.equal(code(() => prepareFrameInterpretationEnvelope(f.store, req, envelopeInput, forged)),
+    assert.equal(code(() => prepareFrameInterpretationEnvelope(f.store, req, envelopeInput(project), forged)),
       "frame_request_mismatch");
     // No archive record appeared for the refused inputs.
     assert.equal(f.store.list().filter(row => row.kind === "research-context").length,

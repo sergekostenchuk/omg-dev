@@ -198,16 +198,31 @@ export function prepareFrameInterpretationContextPacker(store: Store, projectId:
       requireCondition(existing.kind === 'research-context' && existing.revision === 1
         && existing.hash === hash && canonical(existing.value) === canonical(value),
         'frame_pack_mismatch', 'The exact request archive was substituted');
+      // The verified exact record resolves like a staged one: a re-pack or a
+      // cold store must never fall back to the current-basis archive reader,
+      // which checks today's question head against a historical revision.
+      records.set(id, existing);
       return existing;
     }
     const row = { id, kind: 'research-context', revision: 1, hash, value };
     records.set(id, row); writes.set(id, { id, kind: row.kind, expected: 0, value });
     return row;
   };
-  return { request: prepared, context: structuredClone(context), provenBasis,
-    pack: (body: unknown, limit: number, options: WorkingOptions) =>
-      packWorkingContext(store, projectId, provenBasis.draft.id, provenBasis.question.id,
-        body, limit, options, null, stage, records, provenBasis),
+  // The proven basis stays private: the packet is packed only from this exact
+  // verified request on the fixed request branch — no caller-supplied body,
+  // options or another transport's subject fields can reach the shared packer.
+  return { request: structuredClone(prepared), context: structuredClone(context),
+    pack: (limit: number) => {
+      requireCondition(Number.isSafeInteger(limit) && limit > 0, 'frame_pack_invalid',
+        'The request packet needs a positive bound');
+      const body = structuredClone(context) as Record<string, unknown>;
+      requireCondition(Object.keys(body).length === 2 && body['role'] === 'frame-interpretation-request'
+        && canonical(body['frameRequest']) === canonical(prepared), 'frame_pack_invalid',
+        'The request packet carries exactly the proven request');
+      return packWorkingContext(store, projectId, provenBasis.draft.id, provenBasis.question.id,
+        body, limit, { purpose: 'frame-interpretation-request', common: true },
+        null, stage, records, provenBasis);
+    },
     staged: () => ({ writes: [...writes.values()], guards, records }),
     commit: () => { if (writes.size) store.writeMany([...writes.values()], guards); } };
 }
