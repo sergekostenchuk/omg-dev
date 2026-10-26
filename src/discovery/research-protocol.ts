@@ -50,6 +50,7 @@ import { phasePolicy } from "./phase-policy.js";
 import { budgetUsage, reserveResearchCall, type BudgetSegment, type CallEstimate } from "../runtime/research-budget.js";
 import type { DiscoveryDraft, Question } from "./discovery.js";
 import { randomUUID } from "node:crypto";
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { runProcess } from "../runtime/process.js";
 import { processStart, evaluateProcessStopWitnesses, isProcessStopRefusal, writeProcessStopWitness } from "../runtime/process-identity.js";
 import type { Environment, RoleBinding } from "../runtime/environment.js";
@@ -72,13 +73,54 @@ import { ARCHIVE_PARTS_CONTRACT } from './request-parts.js';
 import type { RecoverableContextSession } from './context-recovery.js';
 import { projectResearchPhysicalReply, SYNTHESIS_SESSION_V3_PREFIX } from './research-consumer-transition.js';
 import { earlyResearchStage, researchCapacityProjection, researchResponseOutputLimit, DEFAULT_RESEARCH_REQUEST_CHARS, RESULT_CAPACITY } from './early-research-outcome.js';
-import { RunControlGate, RunControlLost, RUN_CONTROL_MOVED, callStopCancelWrite } from '../om/run-control.js';
+import { RunControlGate, RunControlLost, RUN_CONTROL_MOVED, callStopCancelWrite, type RunControlHold } from '../om/run-control.js';
 import { REQUEST_MANIFEST_CONTRACT, prepareRequestPartsAndManifest, partitionResearchWire } from './request-parts.js';
 
 import { isDiscoveryV7Draft } from './v7-contracts.js';
 import { stageBudgetPlan, DISCOVERY_V7_STAGE_BUDGET_KEY } from './stage-token-budget.js';
 
 export { researchAction } from './research-consumer-transition.js';
+
+interface ResearchControlScope {
+  readonly store: Store;
+  readonly project: string;
+  readonly hold: RunControlHold;
+  active: boolean;
+}
+const researchControl = new AsyncLocalStorage<ResearchControlScope>();
+
+/** An invocation's original control follows its new sends, never its paid
+ * returns or receipts. The snapshot cannot be replaced by a nested caller. */
+export async function withResearchRunControl<T>(store: Store, project: string, hold: RunControlHold,
+  work: () => Promise<T>): Promise<T> {
+  requireCondition(recordValue(hold) && Object.keys(hold).length === 2 && hold.project === project
+    && (hold.control === null || isRef(hold.control)),
+    'run_control_request_invalid', 'Research control requires the original project hold');
+  const snapshot: RunControlHold = Object.freeze({ project, control: hold.control === null ? null : Object.freeze({ ...hold.control }) });
+  const outer = researchControl.getStore();
+  if (outer) {
+    requireCondition(outer.active && outer.store === store && outer.project === project && canonical(outer.hold) === canonical(snapshot),
+      'run_control_changed', 'A nested research invocation cannot replace its original control');
+    return work();
+  }
+  const scope: ResearchControlScope = { store, project, hold: snapshot, active: true };
+  try { return await researchControl.run(scope, work); }
+  finally { scope.active = false; }
+}
+
+function researchControlScope(store: Store | undefined, project: string): ResearchControlScope | undefined {
+  const scope = researchControl.getStore();
+  if (scope) {
+    requireCondition(scope.active && scope.store === store && scope.project === project,
+      'run_control_changed', 'A research send must retain its invocation Store, project and live control scope');
+  }
+  return scope;
+}
+function researchDispatchControl(store: Store | undefined, project: string, early: boolean): RunControlGate | null {
+  const scope = researchControlScope(store, project);
+  if (scope) return new RunControlGate(scope.store, project, scope.hold);
+  return store && early ? new RunControlGate(store, project) : null;
+}
 
 export interface ResearchCallAudit {
   store: Store; draftId: string; purpose: string; questionId?: string; pilot?: Revision<ReaderPilot>;
@@ -689,8 +731,7 @@ async function dispatchResearchCall(role: RoleBinding, environment: Environment,
       throw error;
     }
   }
-  const control = audit && draft && earlyResearchStage(draft.value.stage)
-    ? new RunControlGate(audit.store, environment.projectId) : null;
+  const control = researchDispatchControl(audit?.store, environment.projectId, !!draft && earlyResearchStage(draft.value.stage));
   try { control?.admit(); }
   catch (error) {
     if (error instanceof RunControlLost) throw new EngineError(error.refusal.code, error.refusal.message, error.refusal.at);
@@ -833,10 +874,12 @@ async function executeResearchPhysicalCall(role:RoleBinding, environment:Environ
   const stopWatching = controlAbort ? control!.watch(controlAbort) : null;
   const dispatchSignal = controlAbort?.signal ?? signal;
   try {
+    researchControlScope(audit?.store, environment.projectId);
     control?.assertCurrent();
     const result = await runProcess(role.command, environment.workspace, input, environment.timeoutMs, dispatchSignal, true, pid=>{
       spawnedPid = pid;
       try {
+        researchControlScope(audit?.store, environment.projectId);
         if(call&&audit) call = authorizeModelDispatch(control?.view() ?? audit.store, reference(call), pid);
         consumeInvocationAllowance();
       } catch (error) {
@@ -1003,7 +1046,7 @@ export async function resumeDossierResearchCall(store:Store,applicationRef:Ref,s
   });
   requireContextDelivery(admitted.context.contextWorkspace,wire.subject);
   requireInvocationAllowance();
-  const control=earlyResearchStage(admitted.draft.value.stage)?new RunControlGate(store,claim.value.projectId):null;
+  const control=researchDispatchControl(store,claim.value.projectId,earlyResearchStage(admitted.draft.value.stage));
   try{control?.admit();}catch(error){if(error instanceof RunControlLost)throw new EngineError(error.refusal.code,error.refusal.message,error.refusal.at);throw error;}
   const segmentRef=claim.value.budget?.segment;
   const segment=isRef(segmentRef)?store.get<BudgetSegment>(segmentRef.id,segmentRef.revision):null;

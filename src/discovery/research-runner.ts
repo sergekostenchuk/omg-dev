@@ -17,6 +17,8 @@ import { applyDiscoveryAssessment, v7ProgressBaseline } from "./v7-progress.js";
 import { projectAttemptPacket, proveAttemptPacket, attemptAccountKey } from "./v7-attempt-assessment.js";
 import { recordV7Attempt } from "./v7-attempts.js";
 import { planSubjectOf, sameSubject, attemptEndOfAction, addressedQuestionId, V7_PLAN_SUBJECT_CONTRACT, type V7PlanSubject } from "./v7-managed-attempt.js";
+import { readEffectiveStageBudget, DISCOVERY_V7_STAGE_BUDGET_KEY } from "./stage-token-budget.js";
+import { budgetUsage, workingLimit } from "../runtime/research-budget.js";
 import { isResearchPreview } from './research-preview.js';
 import { stageNeighbors, usesStageNeighbors, STAGE_NEIGHBOR_CONTEXT, STAGE_NEIGHBOR_INSTRUCTION } from './stage-neighbors.js';
 import { earlyResearchStage, earlyResearchFailure, earlyResearchCorrection, deliveredConceptSections, RESULT_CAPACITY_REFUSAL,
@@ -156,6 +158,32 @@ export async function readSelectedResearchPause(store: Store, project: string, d
   }
   if (selected) selectedRoute(handoff,selected);
   return { handoff, selected };
+}
+
+/** Read-only eligibility to leave a proved budget stop. This is not dispatch
+ * authorization: the ordinary transport still estimates and reserves the exact
+ * next request under its current guards. A stage increase never raises the
+ * working group limit or spends the completion reserve. */
+export async function readBudgetStopReentry(store: Store, project: string, draftId: string, stop: Ref): Promise<boolean> {
+  const old = await readDeepFrontierStop(store, project, stop);
+  requireCondition(old.record.value.draft.id === draftId, 'discovery_deep_stop_invalid',
+    'Budget re-entry requires the stop of this exact draft');
+  if (old.record.value.reason !== 'budget') return false;
+  const effective = readEffectiveStageBudget(store, project), segment = effective.segment;
+  const previous = store.get<import('../runtime/research-budget.js').BudgetSegment>(
+    old.record.value.budget.segment.id, old.record.value.budget.segment.revision)!;
+  // The common reader proves every owner act. Comparing with the stop's exact
+  // saved segment excludes increases that were already exhausted at that stop.
+  if (!segment || segment.id !== previous.id || segment.revision <= previous.revision
+    || effective.limit <= previous.value.limit || !effective.increases.some(ref => {
+      const act = store.get<{segment: Ref}>(ref.id, ref.revision)!;
+      return act.value.segment.revision > previous.revision;
+    })) return false;
+  const usage = budgetUsage(store, segment);
+  if (usage.reserved || usage.measured >= effective.limit - effective.completionReserve) return false;
+  const group = usage.groups[DISCOVERY_V7_STAGE_BUDGET_KEY];
+  return (group?.measured ?? 0) + (group?.reserved ?? 0)
+    < workingLimit(store, segment, DISCOVERY_V7_STAGE_BUDGET_KEY, 'tokens', segment.value.initialGroupLimit);
 }
 
 /** dispatchMode with the X50 proviso: a failed planned child guards the
@@ -1791,11 +1819,10 @@ export class Researcher {
     let savedStop: Ref | null = null;
     const mayResumeStopped = async (at: Ref): Promise<boolean> => {
       const old = await readDeepFrontierStop(this.store, project, at);
-      if (options.restoreOnly || producerContractEra('discovery', options.producerPolicy) !== 7 || old.record.value.reason === 'budget') return false;
+      if (options.restoreOnly || producerContractEra('discovery', options.producerPolicy) !== 7) return false;
+      if (old.record.value.reason === 'budget') return readBudgetStopReentry(this.store, project, draftId, at);
       const current = currentPlan(this.store, project), budget = discoveryTraversal(this.store, current.draft)?.budget;
       if (!budget || budget.exhausted || budget.reserved) return false;
-      // Owner stage-budget increases have no accepted producer yet. A saved
-      // budget stop above stays terminal even after new P, choice or allowance.
       if (newPartialRoute(old.handoff.value)) return false;
       const frontier = deepPlanSelection(this.store, project, old.record.value.scope);
       const states = frontier.progress.flatMap(row => row.state ? [row.state] : []).sort((a,b) => canonical(a).localeCompare(canonical(b)));
