@@ -8,6 +8,14 @@ import { EngineError, requireCondition } from "../errors.js";
 import { isRef, reference, type Ref } from "../pipeline/contracts.js";
 import { Store, type Revision } from "../storage/store.js";
 import { readRecord, writeGuarded } from "../om/refs.js";
+import { STAGE_BUDGET_ACTION, STAGE_BUDGET_PAIRING_METHOD, STAGE_BUDGET_GRANT_CONTRACT, STAGE_BUDGET_SESSION_CONTRACT,
+  STAGE_BUDGET_GRANT_PREFIX, STAGE_BUDGET_GRANT_KIND, STAGE_BUDGET_SESSION_KIND, STAGE_BUDGET_GRANT_LIFETIME_MS,
+  STAGE_BUDGET_SESSION_LIFETIME_MS, STAGE_BUDGET_INCREASE_KIND, STAGE_BUDGET_INCREASE_CONTRACT, readEffectiveStageBudget,
+  readStageBudgetGrant, readStageBudgetSession, requireStageBudgetScope, stageBudgetIncreaseId, stageBudgetSegmentId,
+  stageBudgetSessionId, type StageBudgetIncrease, type StageBudgetScope, type StageBudgetSession,
+  type StageBudgetSessionGrant } from "../discovery/stage-token-budget.js";
+import type { BudgetSegment } from "../runtime/research-budget.js";
+import { uniqueTransactionGuards } from "../runtime/environment.js";
 import { delivered, isPlainObject, isText, refused, type OmResult, type Refusal, type Sealed } from "../om/refusal.js";
 
 /**
@@ -986,3 +994,240 @@ export class VariantChoiceSessions {
   }
 }
 const VARIANT_CHOICE_SESSION_OF = VariantChoiceSessions.prototype.sessionOf;
+
+
+// ---- 5.7/Р3 (codex-omg №14393): the owner increase of the Discovery v7 stage budget — a separate versioned branch ------
+// One exact capability for one approved raise: database (the grant's), project, the discovery stage, the exact previous
+// segment revision and the new finite limit. Its saved forms and historical proofs live in stage-token-budget.ts; the
+// unforgeable authority, the session registry and the single producer live here. No other owner action, actor string,
+// owner flag or bypass mode authorizes it.
+type StageBudgetRefusalCode = OwnerAuthorityRefusalCode | 'discovery_budget_increase_invalid' | 'discovery_budget_increase_stale';
+function denyBudget(code: StageBudgetRefusalCode, target: string, field: string, message: string): never {
+  deny(code as DiscoveryChoiceAuthorityRefusalCode, target, field, message, 'DR5.7');
+}
+function budgetScope(value: unknown, code: StageBudgetRefusalCode, target = 'owner-stage-budget'): StageBudgetScope {
+  try { return requireStageBudgetScope(value); }
+  catch (error) {
+    if (error instanceof EngineError) denyBudget(code, target, 'scope', error.message);
+    throw error;
+  }
+}
+function provenBudgetRecord<T>(read: () => T, code: StageBudgetRefusalCode, target: string): T {
+  try { return read(); }
+  catch (error) {
+    if (error instanceof EngineError) denyBudget(code, target, 'record', error.message);
+    throw error;
+  }
+}
+
+/** The trusted CLI's one-use invitation for one exact raise of the current proven stage budget. */
+export function issueStageBudgetInvitation(store: Store, request: unknown):
+  OmResult<Sealed<{ invitation: string; grant: Ref; expiresAt: number }>> {
+  return run(() => {
+    requireCondition(store instanceof Store, 'owner_invitation_invalid', 'A stage-budget invitation needs a Store');
+    const scope = budgetScope(request, 'owner_invitation_invalid');
+    const project = store.get(`project:${scope.project}`);
+    if (!project) denyBudget('owner_project_missing', scope.project, 'project', 'A stage-budget invitation is issued for an existing project only');
+    const effective = provenBudgetRecord(() => readEffectiveStageBudget(store, scope.project), 'owner_invitation_invalid', scope.project);
+    if (!effective.segment || !sameScope(reference(effective.segment), scope.previous))
+      denyBudget('discovery_budget_increase_stale', scope.project, 'previous', 'The named previous segment revision is not the proven current stage budget');
+    if (scope.limit <= effective.limit)
+      denyBudget('discovery_budget_increase_invalid', scope.project, 'limit', 'An increase names a finite limit above the current stage limit');
+    const secret = randomBytes(32).toString('hex'), id = randomBytes(16).toString('hex'), issuedAt = Date.now();
+    const grant: StageBudgetSessionGrant = { contract: STAGE_BUDGET_GRANT_CONTRACT, id, database: store.databaseId,
+      action: STAGE_BUDGET_ACTION, method: STAGE_BUDGET_PAIRING_METHOD, scope, issuedAt,
+      expiresAt: issuedAt + STAGE_BUDGET_GRANT_LIFETIME_MS, proof: digest(secret) };
+    const written = take(writeGuarded<StageBudgetSessionGrant>(store, { unit: 'DR5.7', target: `${STAGE_BUDGET_GRANT_PREFIX}${id}`,
+      writes: [{ id: `${STAGE_BUDGET_GRANT_PREFIX}${id}`, kind: STAGE_BUDGET_GRANT_KIND, expected: 0, value: grant }],
+      guards: [exactRef(reference(project)), exactRef(reference(effective.segment!))] }));
+    return { invitation: `${id}.${secret}`, grant: exactRef(reference(written[0]!)), expiresAt: grant.expiresAt };
+  });
+}
+
+const STAGE_BUDGET_MINT = Symbol('stage-budget-authority-mint');
+const STAGE_BUDGET_AUTHORITIES = new WeakSet<StageBudgetAuthority>();
+
+export class StageBudgetAuthority {
+  readonly #sessions: StageBudgetSessions; readonly #store: Store; readonly #digest: string;
+  readonly #sessionId: string; readonly #scope: StageBudgetScope;
+  constructor(token: symbol, sessions: StageBudgetSessions, store: Store, bearerDigest: string,
+    sessionId: string, scope: StageBudgetScope) {
+    requireCondition(token === STAGE_BUDGET_MINT, 'owner_authority_invalid',
+      'Stage-budget authority is minted by its scoped session exchange only');
+    this.#sessions = sessions; this.#store = store; this.#digest = bearerDigest;
+    this.#sessionId = sessionId; this.#scope = scope; STAGE_BUDGET_AUTHORITIES.add(this);
+  }
+  exercise(request: { store: Store; action: string; scope: StageBudgetScope }):
+    OmResult<Sealed<{ session: Ref; at: number }>> {
+    return run(() => {
+      if (!STAGE_BUDGET_AUTHORITIES.has(this)) denyBudget('owner_authority_invalid', 'authority', 'authority',
+        'Stage-budget authority is an object of the closed scoped registry');
+      if (request.store !== this.#store || request.action !== STAGE_BUDGET_ACTION || !sameScope(request.scope, this.#scope))
+        denyBudget('owner_authority_foreign', this.#sessionId, 'scope',
+          'Stage-budget authority is bound to one Store and one exact raise');
+      const found = this.#store.get<StageBudgetSession>(this.#sessionId);
+      if (!found) denyBudget('owner_session_missing', this.#sessionId, 'session', 'The stage-budget owner session record is absent');
+      const session = provenBudgetRecord(() => readStageBudgetSession(this.#store, reference(found!)), 'owner_session_state_invalid', this.#sessionId);
+      if (session.value.state !== 'open') denyBudget('owner_session_revoked', this.#sessionId, 'session',
+        'The stage-budget owner session is revoked');
+      if (this.#sessions.sessionOf(this.#digest) !== this.#sessionId)
+        denyBudget('owner_session_missing', this.#sessionId, 'session', 'The stage-budget owner session is not live in this process');
+      const now = Date.now();
+      if (now < session.value.openedAt) denyBudget('owner_session_expired', this.#sessionId, 'session',
+        'The stage-budget owner session is not yet open at this time');
+      if (session.value.expiresAt <= now) denyBudget('owner_session_expired', this.#sessionId, 'session',
+        'The stage-budget owner session has expired');
+      if (session.value.database !== this.#store.databaseId || !sameScope(session.value.scope, this.#scope))
+        denyBudget('owner_authority_foreign', this.#sessionId, 'scope',
+          'The stage-budget owner session is bound to another database or raise');
+      return { session: exactRef(reference(session)), at: now };
+    });
+  }
+}
+const STAGE_BUDGET_AUTHORITY_EXERCISE = StageBudgetAuthority.prototype.exercise;
+
+export function requireStageBudgetAuthority(candidate: unknown,
+  request: { store: Store; action: string; scope: StageBudgetScope }): OmResult<Sealed<{ session: Ref; at: number }>> {
+  if (candidate instanceof OwnerAuthority || candidate instanceof DiscoveryChoiceAuthority
+    || candidate instanceof ProjectModeAuthority || candidate instanceof VariantChoiceAuthority)
+    return refused('owner_authority_foreign', 'Another owner authority cannot authorize a stage-budget increase',
+      { unit: 'DR5.7', target: 'authority', field: 'action' }, 'owner');
+  if (!(candidate instanceof StageBudgetAuthority) || !STAGE_BUDGET_AUTHORITIES.has(candidate))
+    return refused('owner_authority_invalid', 'Use the trusted owner stage-budget door for this exact raise',
+      { unit: 'DR5.7', target: 'authority', field: 'authority' }, 'owner');
+  return STAGE_BUDGET_AUTHORITY_EXERCISE.call(candidate, request);
+}
+
+export class StageBudgetSessions {
+  readonly #store: Store;
+  readonly #live = new Map<string, { session: string; authority: StageBudgetAuthority }>();
+  constructor(store: Store) {
+    requireCondition(store instanceof Store, 'owner_invitation_invalid', 'The stage-budget session registry needs a Store');
+    this.#store = store;
+  }
+  sessionOf(bearerDigest: string): string | null { return this.#live.get(bearerDigest)?.session ?? null; }
+  exchange(request: unknown): OmResult<Sealed<{ bearer: string; session: Ref; expiresAt: number }>> {
+    return run(() => {
+      if (!shape(request) || !isText(request.project) || !isText(request.invitation)
+        || Object.keys(request).some(key => !['project', 'invitation'].includes(key)))
+        denyBudget('owner_invitation_invalid', 'stage-budget-session', 'request', 'A stage-budget session exchange needs a project and invitation');
+      const project = request.project as string, parts = (request.invitation as string).split('.');
+      if (parts.length !== 2 || !/^[a-f0-9]{32}$/.test(parts[0]!) || !/^[a-f0-9]{64}$/.test(parts[1]!))
+        denyBudget('owner_invitation_invalid', project, 'invitation', 'An invitation is <grant-id>.<secret>');
+      const found = this.#store.get<StageBudgetSessionGrant>(`${STAGE_BUDGET_GRANT_PREFIX}${parts[0]}`);
+      if (!found) denyBudget('owner_invitation_invalid', project, 'invitation', 'Unknown stage-budget invitation');
+      const grant = provenBudgetRecord(() => readStageBudgetGrant(this.#store, reference(found!)), 'owner_invitation_invalid', project);
+      if (!timingSafeEqual(Buffer.from(digest(parts[1]!), 'hex'), Buffer.from(grant.value.proof, 'hex')))
+        denyBudget('owner_invitation_invalid', project, 'invitation', 'The invitation secret does not verify');
+      if (grant.value.database !== this.#store.databaseId || grant.value.scope.project !== project
+        || grant.value.action !== STAGE_BUDGET_ACTION)
+        denyBudget('owner_invitation_foreign', project, 'invitation', 'The invitation belongs to another database, project or action');
+      const now = Date.now();
+      if (now < grant.value.issuedAt) denyBudget('owner_invitation_invalid', project, 'invitation',
+        'The stage-budget invitation is not yet issued at this time');
+      if (grant.value.expiresAt <= now) denyBudget('owner_invitation_expired', project, 'invitation',
+        'The stage-budget invitation has expired');
+      const grantRef = exactRef(reference(grant)), sessionId = stageBudgetSessionId(grantRef);
+      if (this.#store.get(sessionId)) denyBudget('owner_invitation_spent', project, 'invitation',
+        'The stage-budget invitation is already exchanged');
+      const session: StageBudgetSession = { contract: STAGE_BUDGET_SESSION_CONTRACT, grant: grantRef,
+        database: grant.value.database, action: STAGE_BUDGET_ACTION, method: STAGE_BUDGET_PAIRING_METHOD,
+        scope: grant.value.scope, session: randomBytes(16).toString('hex'), openedAt: now,
+        expiresAt: now + STAGE_BUDGET_SESSION_LIFETIME_MS, state: 'open' };
+      const written = take(writeGuarded<StageBudgetSession>(this.#store, { unit: 'DR5.7', target: sessionId,
+        writes: [{ id: sessionId, kind: STAGE_BUDGET_SESSION_KIND, expected: 0, value: session }], guards: [grantRef] }));
+      const bearer = randomBytes(32).toString('hex'), key = digest(bearer);
+      this.#live.set(key, { session: sessionId,
+        authority: new StageBudgetAuthority(STAGE_BUDGET_MINT, this, this.#store, key, sessionId, grant.value.scope) });
+      return { bearer, session: exactRef(reference(written[0]!)), expiresAt: session.expiresAt };
+    });
+  }
+  authority(bearer: unknown): StageBudgetAuthority | null {
+    return typeof bearer === 'string' && /^[a-f0-9]{64}$/.test(bearer) ? this.#live.get(digest(bearer))?.authority ?? null : null;
+  }
+  revoke(bearer: unknown): OmResult<Sealed<{ session: Ref }>> {
+    return run(() => {
+      const key = typeof bearer === 'string' ? digest(bearer) : null;
+      const live = key ? this.#live.get(key) : undefined;
+      if (!live) denyBudget('owner_session_missing', 'stage-budget-session', 'bearer', 'No live stage-budget session carries this bearer');
+      this.#live.delete(key!);
+      const head = this.#store.get<StageBudgetSession>(live!.session);
+      if (!head) denyBudget('owner_session_missing', live!.session, 'session', 'The stage-budget session record is absent');
+      if (head!.value.state === 'closed') return { session: exactRef(reference(head!)) };
+      const closed: StageBudgetSession = { ...head!.value, state: 'closed', closedAt: Date.now() };
+      const written = take(writeGuarded<StageBudgetSession>(this.#store, { unit: 'DR5.7', target: head!.id,
+        writes: [{ id: head!.id, kind: STAGE_BUDGET_SESSION_KIND, expected: head!.revision, value: closed }],
+        guards: [exactRef(reference(head!))] }));
+      return { session: exactRef(reference(written[0]!)) };
+    });
+  }
+}
+
+export interface StageBudgetIncreaseOutcome {
+  segment: Revision<BudgetSegment>; increase: Revision<StageBudgetIncrease>; repeated: boolean;
+}
+function increaseFailure(result: OmResult<unknown>): never {
+  if (result.ok) throw new EngineError('owner_authority_internal', 'Authority refusal unexpectedly delivered a value');
+  throw new EngineError(result.refusal.code, result.refusal.message, { ...result.refusal.at, door: 'owner-stage-budget' });
+}
+/**
+ * 5.7/Р3: the single protected producer of a stage-budget increase. Only a minted stage-budget authority bound to this
+ * exact raise may write: the next segment revision — the previous body with only the higher limit — and the act that
+ * names it, atomically, under the CAS of the previous revision and the guard of the exact open session. Ledger, working
+ * limits, reserve and past spend are untouched; no model is sent. The same act again returns the saved one.
+ */
+export function increaseStageBudget(store: Store, request: unknown, authority: unknown): StageBudgetIncreaseOutcome {
+  if (!(authority instanceof StageBudgetAuthority))
+    return increaseFailure(requireStageBudgetAuthority(authority, { store, action: STAGE_BUDGET_ACTION,
+      scope: { project: '', stage: 'discovery', previous: { id: '', revision: 1, hash: '' }, limit: 1 } }));
+  const scope = (() => { const parsed = run(() => budgetScope(request, 'discovery_budget_increase_invalid')); return parsed.ok ? parsed.value : increaseFailure(parsed); })();
+  const admitted = requireStageBudgetAuthority(authority, { store, action: STAGE_BUDGET_ACTION, scope });
+  if (!admitted.ok) return increaseFailure(admitted);
+  const project = store.get(`project:${scope.project}`);
+  if (!project) throw new EngineError('owner_project_missing', 'A stage-budget increase addresses an existing project only',
+    { project: scope.project, door: 'owner-stage-budget' });
+  const segId = stageBudgetSegmentId(scope.project);
+  const repeatOf = (head: Revision<BudgetSegment>): StageBudgetIncreaseOutcome | null => {
+    const act = store.get<StageBudgetIncrease>(stageBudgetIncreaseId(scope.project, head.revision), 1);
+    return act && sameScope(act.value.authority.scope, scope) ? { segment: head, increase: act, repeated: true } : null;
+  };
+  const effective = readEffectiveStageBudget(store, scope.project);
+  if (!effective.segment) throw new EngineError('discovery_budget_increase_invalid', 'The stage has no budget to raise',
+    { project: scope.project, door: 'owner-stage-budget' });
+  const head = effective.segment;
+  const repeated = repeatOf(head);
+  if (repeated) return repeated;
+  if (!sameScope(reference(head), scope.previous))
+    throw new EngineError('discovery_budget_increase_stale', 'The stage budget moved since this raise was scoped',
+      { project: scope.project, expected: scope.previous, actual: reference(head), door: 'owner-stage-budget' });
+  if (scope.limit <= head.value.limit)
+    throw new EngineError('discovery_budget_increase_invalid', 'An increase names a finite limit above the current stage limit',
+      { project: scope.project, limit: scope.limit, current: head.value.limit, door: 'owner-stage-budget' });
+  // The second exercise closes the check-to-write window; the pinned session revision is a transaction guard.
+  const applied = requireStageBudgetAuthority(authority, { store, action: STAGE_BUDGET_ACTION, scope });
+  if (!applied.ok) return increaseFailure(applied);
+  const prior = effective.increases.at(-1);
+  if (prior && store.get<StageBudgetIncrease>(prior.id, prior.revision)!.value.at > applied.value.at)
+    throw new EngineError('discovery_budget_increase_stale', 'The increase is not younger than the increase before it',
+      { project: scope.project, door: 'owner-stage-budget' });
+  const raised: BudgetSegment = { ...head.value, limit: scope.limit };
+  const act: StageBudgetIncrease = { contract: STAGE_BUDGET_INCREASE_CONTRACT, database: store.databaseId, project: scope.project,
+    stage: 'discovery', segment: { id: segId, revision: head.revision + 1, hash: hashJson(raised as never) },
+    previous: exactRef(reference(head)), limit: scope.limit, authority: { session: applied.value.session, scope }, at: applied.value.at };
+  try {
+    const written = store.writeMany<unknown>([
+      { id: segId, kind: 'research-budget', expected: head.revision, value: raised },
+      { id: stageBudgetIncreaseId(scope.project, head.revision + 1), kind: STAGE_BUDGET_INCREASE_KIND, expected: 0, value: act }],
+      uniqueTransactionGuards([reference(project), reference(head), applied.value.session]));
+    return { segment: written[0] as Revision<BudgetSegment>, increase: written[1] as Revision<StageBudgetIncrease>, repeated: false };
+  } catch (error) {
+    if (error instanceof EngineError && ['revision_conflict', 'input_stale'].includes(error.code)) {
+      const latest = readEffectiveStageBudget(store, scope.project).segment;
+      const again = latest ? repeatOf(latest) : null;
+      if (again) return again;
+      throw new EngineError('discovery_budget_increase_stale', 'A competing stage-budget change reached the store first',
+        { project: scope.project, expected: scope.previous, actual: latest ? reference(latest) : null, door: 'owner-stage-budget' });
+    }
+    throw error;
+  }
+}
