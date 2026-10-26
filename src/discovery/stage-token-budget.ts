@@ -279,8 +279,9 @@ function exactRecord<T>(store: Store, ref: unknown, kind: string, prefix: string
 export function readStageBudgetGrant(store: Store, ref: unknown): Revision<StageBudgetSessionGrant> {
   const row = exactRecord<StageBudgetSessionGrant>(store, ref, STAGE_BUDGET_GRANT_KIND, STAGE_BUDGET_GRANT_PREFIX, "grant");
   const value = row.value as unknown as Record<string, unknown>;
-  if (!exactKeys(value, ["contract", "id", "database", "action", "method", "scope", "issuedAt", "expiresAt", "proof"])
-    || value.contract !== STAGE_BUDGET_GRANT_CONTRACT || !text(value.id) || row.id !== `${STAGE_BUDGET_GRANT_PREFIX}${value.id}`
+  // The invitation is written once: only its immutable first revision is the grant; a later revision is a substitution.
+  if (row.revision !== 1 || !exactKeys(value, ["contract", "id", "database", "action", "method", "scope", "issuedAt", "expiresAt", "proof"])
+    || value.database !== store.databaseId || value.contract !== STAGE_BUDGET_GRANT_CONTRACT || !text(value.id) || row.id !== `${STAGE_BUDGET_GRANT_PREFIX}${value.id}`
     || !text(value.database) || value.action !== STAGE_BUDGET_ACTION || value.method !== STAGE_BUDGET_PAIRING_METHOD
     || !Number.isSafeInteger(value.issuedAt) || !Number.isSafeInteger(value.expiresAt)
     || (value.expiresAt as number) - (value.issuedAt as number) !== STAGE_BUDGET_GRANT_LIFETIME_MS
@@ -300,9 +301,24 @@ export function readStageBudgetSession(store: Store, ref: unknown): Revision<Sta
     || (value.expiresAt as number) - (value.openedAt as number) !== STAGE_BUDGET_SESSION_LIFETIME_MS
     || (value.state !== "open" && value.state !== "closed")
     || (value.state === "closed") !== Object.hasOwn(value, "closedAt")
-    || (value.state === "closed" && !Number.isSafeInteger(value.closedAt)))
+    || (value.state === "closed" && !Number.isSafeInteger(value.closedAt))
+    // Opened once at revision 1 and closed once at revision 2: no other revision is this session.
+    || (value.state === "open" && row.revision !== 1) || (value.state === "closed" && row.revision !== 2)
+    || value.database !== store.databaseId)
     increaseInvalid("session", "A stage-budget owner session keeps its complete v5 provenance", { ref: reference(row) });
-  requireStageBudgetScope(value.scope);
+  const scope = requireStageBudgetScope(value.scope);
+  const grant = readStageBudgetGrant(store, value.grant);
+  if (!same(grant.value.scope, scope) || (value.openedAt as number) < grant.value.issuedAt
+    || (value.openedAt as number) >= grant.value.expiresAt)
+    increaseInvalid("session", "A stage-budget session descends from its exact scoped grant inside its saved window", { ref: reference(row) });
+  if (value.state === "closed") {
+    const first = store.get<StageBudgetSession>(row.id, 1);
+    if (!first) increaseInvalid("session", "The exact open revision of a revoked session is absent", { ref: reference(row) });
+    const opened = readStageBudgetSession(store, reference(first!));
+    const { closedAt, ...rest } = value;
+    if (opened.revision !== 1 || !same({ ...rest, state: "open" }, opened.value) || (closedAt as number) < (value.openedAt as number))
+      increaseInvalid("session", "Revocation changes only the state and closedAt of the exact open session", { ref: reference(row) });
+  }
   return row;
 }
 /** The saved act that raised `segment` from `prior`, proved from its own grounds — never from a live bearer or today. */

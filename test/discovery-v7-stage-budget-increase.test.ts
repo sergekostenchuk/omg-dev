@@ -11,7 +11,7 @@ import { Researcher } from '../src/discovery/research-runner.js';
 import { researchCall } from '../src/discovery/research-protocol.js';
 import { V7_STAGE_TOKEN_CEILING, V7_COMPLETION_RESERVE, createPartialV7Draft } from '../src/discovery/v7-contracts.js';
 import { STAGE_BUDGET_ACTION, STAGE_BUDGET_INCREASE_KIND, STAGE_BUDGET_INCREASE_CONTRACT, ensureStageBudget,
-  readEffectiveStageBudget, readStageBudgetIncrease, stageBudgetIncreaseId, stageBudgetPlan, stageBudgetSegmentId,
+  readEffectiveStageBudget, readStageBudgetIncrease, stageBudgetIncreaseId, stageBudgetPlan, stageBudgetSegmentId, stageBudgetSessionId,
   type StageBudgetIncrease, type StageBudgetScope } from '../src/discovery/stage-token-budget.js';
 import { budgetUsage, reserveResearchCall, type BudgetSegment } from '../src/runtime/research-budget.js';
 import type { ModelCall } from '../src/runtime/model-usage.js';
@@ -140,7 +140,7 @@ test('SBI: actor strings, owner flags, forged instances and every other owner au
   }
   for (const other of [OwnerAuthority, DiscoveryChoiceAuthority, ProjectModeAuthority, VariantChoiceAuthority])
     assert.throws(() => increaseStageBudget(f.store, scope, Object.create(other.prototype)), { code: 'owner_authority_foreign' });
-  assert.throws(() => new StageBudgetAuthority(Symbol(), new StageBudgetSessions(f.store), f.store, 'x', 'y', scope),
+  assert.throws(() => new StageBudgetAuthority(Symbol(), new StageBudgetSessions(f.store), f.store, 'x', reference(f.segment), scope),
     { code: 'owner_authority_invalid' });
   // A real authority of another owner action — the project mode — is refused by its class, not by its session.
   const modeRequest = { project: 'p', mode: 'questions' as const, previous: null };
@@ -271,6 +271,63 @@ test('SBI: a second Store wins the race — the same raise is returned, a differ
     assert.equal(f.store.get(stageBudgetIncreaseId('p', 3)), null);
     assert.equal(readEffectiveStageBudget(f.open(), 'p').limit, competing);
   }
+});
+
+/** A whole raise chain assembled by hand on a substituted session: the public historical readers must refuse it. */
+function forgedChain(store: Store, segment: Revision<BudgetSegment>, session: Revision<unknown>, limit: number, at: number) {
+  const scope = scopeOf(segment, limit), raised = store.write<BudgetSegment>({ id: segment.id, kind: 'research-budget',
+    expected: segment.revision, value: { ...segment.value, limit } });
+  const act = store.write<StageBudgetIncrease>({ id: stageBudgetIncreaseId('p', raised.revision), kind: STAGE_BUDGET_INCREASE_KIND,
+    expected: 0, value: { contract: STAGE_BUDGET_INCREASE_CONTRACT, database: store.databaseId, project: 'p', stage: 'discovery',
+      segment: reference(raised), previous: reference(segment), limit, authority: { session: reference(session), scope }, at } });
+  for (const read of [store, new Store(store.path)]) {
+    assert.throws(() => readEffectiveStageBudget(read, 'p'), { code: 'discovery_budget_policy_invalid' });
+    assert.throws(() => readStageBudgetIncrease(read, 'p', reference(act)), { code: 'discovery_budget_policy_invalid' });
+    if (read !== store) read.close();
+  }
+}
+
+test('SBI: a rewritten grant@2 with a larger limit opens no session, raises nothing and proves no chain', async t => {
+  const f = await unit(t);
+  exhaust(f);
+  const scope = scopeOf(f.segment), issued = ok(issueStageBudgetInvitation(f.store, scope));
+  const grant = f.store.get<{ scope: StageBudgetScope }>(issued.grant.id)!;
+  const rewritten = f.store.write({ id: grant.id, kind: grant.kind, expected: 1,
+    value: { ...grant.value, scope: { ...grant.value.scope, limit: 30_000_000 } } });
+  const before = history(f.store), paid = money(f.store);
+  for (const store of [f.store, f.open()]) {
+    const sessions = new StageBudgetSessions(store);
+    no(sessions.exchange({ project: 'p', invitation: issued.invitation }), 'owner_invitation_invalid');
+    assert.equal(store.get(stageBudgetIncreaseId('p', 2)), null);
+  }
+  assert.deepEqual(history(f.store), before); assert.deepEqual(money(f.store), paid);
+  assert.equal(readEffectiveStageBudget(f.store, 'p').limit, V7_STAGE_TOKEN_CEILING);
+  // A session written beside the substituted grant, and the raise it would name, prove nothing either.
+  const now = Date.now(), session = f.store.write({ id: stageBudgetSessionId(reference(rewritten)), kind: 'owner-session',
+    expected: 0, value: { contract: 'owner-session/v5', grant: reference(rewritten), database: f.store.databaseId,
+      action: STAGE_BUDGET_ACTION, method: 'local-pairing/v1', scope: { ...scope, limit: 30_000_000 }, session: 'a'.repeat(32),
+      openedAt: now, expiresAt: now + 30 * 60_000, state: 'open' } });
+  forgedChain(f.store, f.segment, session, 30_000_000, now + 1);
+});
+
+test('SBI: an expired session prolonged as open session@2 is not the original session hot, cold or historically', async t => {
+  const f = await unit(t);
+  exhaust(f);
+  const scope = scopeOf(f.segment), owner = login(f.store, scope), now = Date.now();
+  const grant = f.store.get<{ issuedAt: number }>(owner.issued.grant.id)!;
+  t.mock.method(Date, 'now', () => now + 31 * 60_000);
+  assert.throws(() => increaseStageBudget(f.store, scope, owner.authority), { code: 'owner_session_expired' });
+  const head = f.store.get<{ openedAt: number; expiresAt: number }>(owner.opened.session.id)!;
+  const openedAt = grant.value.issuedAt + 9 * 60_000;
+  const prolonged = f.store.write({ id: head.id, kind: head.kind, expected: 1,
+    value: { ...head.value, openedAt, expiresAt: openedAt + 30 * 60_000 } });
+  const before = history(f.store), paid = money(f.store);
+  assert.throws(() => increaseStageBudget(f.store, scope, owner.authority), { code: 'owner_session_state_invalid' });
+  no(requireStageBudgetAuthority(owner.authority, { store: f.store, action: STAGE_BUDGET_ACTION, scope }), 'owner_session_state_invalid');
+  assert.deepEqual(history(f.store), before); assert.deepEqual(money(f.store), paid);
+  assert.equal(f.store.get(stageBudgetIncreaseId('p', 2)), null);
+  t.mock.restoreAll();
+  forgedChain(f.store, f.segment, prolonged, RAISED, openedAt + 1);
 });
 
 test('SBI: saved records are closed and om-fsck enumerates exactly their Refs', async t => {

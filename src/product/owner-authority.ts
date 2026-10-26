@@ -1049,13 +1049,14 @@ const STAGE_BUDGET_AUTHORITIES = new WeakSet<StageBudgetAuthority>();
 
 export class StageBudgetAuthority {
   readonly #sessions: StageBudgetSessions; readonly #store: Store; readonly #digest: string;
-  readonly #sessionId: string; readonly #scope: StageBudgetScope;
+  readonly #sessionId: string; readonly #session: Ref; readonly #scope: StageBudgetScope;
   constructor(token: symbol, sessions: StageBudgetSessions, store: Store, bearerDigest: string,
-    sessionId: string, scope: StageBudgetScope) {
+    session: Ref, scope: StageBudgetScope) {
     requireCondition(token === STAGE_BUDGET_MINT, 'owner_authority_invalid',
       'Stage-budget authority is minted by its scoped session exchange only');
     this.#sessions = sessions; this.#store = store; this.#digest = bearerDigest;
-    this.#sessionId = sessionId; this.#scope = scope; STAGE_BUDGET_AUTHORITIES.add(this);
+    this.#session = exactRef(session); this.#sessionId = this.#session.id; this.#scope = structuredClone(scope);
+    STAGE_BUDGET_AUTHORITIES.add(this);
   }
   exercise(request: { store: Store; action: string; scope: StageBudgetScope }):
     OmResult<Sealed<{ session: Ref; at: number }>> {
@@ -1070,6 +1071,8 @@ export class StageBudgetAuthority {
       const session = provenBudgetRecord(() => readStageBudgetSession(this.#store, reference(found!)), 'owner_session_state_invalid', this.#sessionId);
       if (session.value.state !== 'open') denyBudget('owner_session_revoked', this.#sessionId, 'session',
         'The stage-budget owner session is revoked');
+      if (!sameScope(reference(session), this.#session))
+        denyBudget('owner_authority_foreign', this.#sessionId, 'session', 'The original stage-budget session cannot be substituted');
       if (this.#sessions.sessionOf(this.#digest) !== this.#sessionId)
         denyBudget('owner_session_missing', this.#sessionId, 'session', 'The stage-budget owner session is not live in this process');
       const now = Date.now();
@@ -1136,10 +1139,10 @@ export class StageBudgetSessions {
         expiresAt: now + STAGE_BUDGET_SESSION_LIFETIME_MS, state: 'open' };
       const written = take(writeGuarded<StageBudgetSession>(this.#store, { unit: 'DR5.7', target: sessionId,
         writes: [{ id: sessionId, kind: STAGE_BUDGET_SESSION_KIND, expected: 0, value: session }], guards: [grantRef] }));
-      const bearer = randomBytes(32).toString('hex'), key = digest(bearer);
+      const bearer = randomBytes(32).toString('hex'), key = digest(bearer), opened = exactRef(reference(written[0]!));
       this.#live.set(key, { session: sessionId,
-        authority: new StageBudgetAuthority(STAGE_BUDGET_MINT, this, this.#store, key, sessionId, grant.value.scope) });
-      return { bearer, session: exactRef(reference(written[0]!)), expiresAt: session.expiresAt };
+        authority: new StageBudgetAuthority(STAGE_BUDGET_MINT, this, this.#store, key, opened, grant.value.scope) });
+      return { bearer, session: opened, expiresAt: session.expiresAt };
     });
   }
   authority(bearer: unknown): StageBudgetAuthority | null {
