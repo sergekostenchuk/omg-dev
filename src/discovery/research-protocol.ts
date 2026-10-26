@@ -647,9 +647,16 @@ async function dispatchResearchCall(role: RoleBinding, environment: Environment,
   let stageSegment: Revision<BudgetSegment> | null = null;
   let stageEstimate: CallEstimate | null = null;
   let stageRemaining = 0;
-  const stageFailure = (code: string, message: string): never => {
+  // DR6: only the proven managed dossier admission (its exact session, application and subject, proved above by
+  // proveDossierDispatchAdmission) spends the completion reserve. No caller field — purpose, role, actor,
+  // finalization mode, context marker or answer form — selects the class; every other send stays research.
+  const stageClass: 'research' | 'completion' = assessment?.kind === 'dossier' ? 'completion' : 'research';
+  const stageAvailable = (segment: Revision<BudgetSegment>, usage: { measured: number; reserved: number }) =>
+    segment.value.limit - (stageClass === 'completion' ? 0 : segment.value.completionReserve!) - usage.measured - usage.reserved;
+  // `cause` keeps the shared reservation's own reason visible: a working group limit is not an exhausted stage.
+  const stageFailure = (code: string, message: string, cause?: string): never => {
     throw new EngineError(code, message, { segment: stageSegment ? reference(stageSegment) : null,
-      class: 'research', remaining: stageRemaining, estimate: stageEstimate });
+      class: stageClass, remaining: stageRemaining, estimate: stageEstimate, ...(cause ? { cause } : {}) });
   };
   if (stagePlan && audit && draft) {
     requireCondition(isDiscoveryV7Draft(draft.value), 'discovery_draft_invalid', 'A v7 draft cannot lose its era');
@@ -659,7 +666,7 @@ async function dispatchResearchCall(role: RoleBinding, environment: Environment,
       id: stagePlan.writes[0]!.id, kind: 'research-budget', revision: 1,
       value: stagePlan.target.creating, hash: hashJson(stagePlan.target.creating) };
     const usage = stagePlan.isNew ? { measured: 0, reserved: 0 } : budgetUsage(audit.store, stageSegment);
-    stageRemaining = stageSegment.value.limit - stageSegment.value.completionReserve! - usage.measured - usage.reserved;
+    stageRemaining = stageAvailable(stageSegment, usage);
     if (usage.measured > stageSegment.value.limit)
       stageFailure('discovery_budget_overrun', 'Actual stage usage forbids another paid send');
     try {
@@ -694,18 +701,17 @@ async function dispatchResearchCall(role: RoleBinding, environment: Environment,
     reservation.guards.push(...dossierEnvelope.archives.guards);
   }
   if (stagePlan && stageEstimate && audit && draft) {
-    // The closing-kind whitelist is empty until DR6/DR7. No caller/model field
-    // (role, purpose, finalization mode or attempt end) grants completion funds.
+    // The one closing kind is the proven dossier admission (stageClass above); the shared reservation applies it.
     try {
       const reserved = reserveResearchCall(audit.store, stagePlan.target, callId,
-        [DISCOVERY_V7_STAGE_BUDGET_KEY], stageEstimate, 'research');
+        [DISCOVERY_V7_STAGE_BUDGET_KEY], stageEstimate, stageClass);
       reservation.writes.push(...reserved.writes);
       reservation.guards.push(...reserved.guards, reference(draft), ...draft.value.inputs);
     } catch (error) {
       if (error instanceof EngineError && ['budget_segment_exhausted', 'budget_question_limit', 'budget_owner_group_limit'].includes(error.code)) {
         const latest = stagePlan.isNew ? { measured: 0, reserved: 0 } : budgetUsage(audit.store, stageSegment!);
-        stageRemaining = stageSegment!.value.limit - stageSegment!.value.completionReserve! - latest.measured - latest.reserved;
-        stageFailure(latest.measured > stageSegment!.value.limit ? 'discovery_budget_overrun' : 'discovery_budget_reserve', error.message);
+        stageRemaining = stageAvailable(stageSegment!, latest);
+        stageFailure(latest.measured > stageSegment!.value.limit ? 'discovery_budget_overrun' : 'discovery_budget_reserve', error.message, error.code);
       }
       throw error;
     }
