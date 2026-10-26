@@ -24,6 +24,9 @@ import { priorEvidenceSources, packPriorEvidence } from './prior-evidence-summar
 import { addressArchivedMaterials, serveArchivedMaterial, packAddressedValue,
   requirePacketMaterialDelivery, planResearchDelivery, type AddressedOriginal } from './research-delivery.js';
 import { ARCHIVE_PARTS_CONTRACT, prepareArchiveParts, readArchiveBody } from './request-parts.js';
+import { prepareFrameInterpretationRequest, checkFrameInterpretationRequest
+  } from './frame-interpretation-request.js';
+import type { FrameSubjectRequest } from './frame-interpretation-subject.js';
 
 interface Archive { projectId: string; draft: Ref; question: Ref; subject?: V7PlanSubject; variantSubject?: VariantSubject; purpose?: string; actor?: string; body: Record<string, Json> }
 export interface ContextPage { offset: number; limit: number; encoding?: 'canonical-json' }
@@ -162,10 +165,74 @@ export async function prepareDossierContextPacker(store: Store, projectId: strin
     commit: () => { if (writes.size) store.writeMany([...writes.values()], guards); } };
 }
 
+/** DR2b 2b-PACK (codex-omg №15201/№15208): the request branch of the shared
+ * packer. The request arrives only through the accepted preparation/check;
+ * the exact proven draft/question records of its subject feed the archive
+ * metadata — never today's heads — and no head guard is taken: Store guards
+ * pin current heads, while these exact revisions are proven by the shared
+ * reader. Archives are staged in one atomic batch; a reused content-addressed
+ * record is verified by kind, exact revision/hash and full bytes, never by
+ * id alone. The caller commits only after the whole envelope measured — a
+ * refusal leaves zero staged writes. No plan/variant/deep/dossier path is
+ * entered and no D1 question schema is substituted: the closed answer schema
+ * travels inside the request itself. */
+export function prepareFrameInterpretationContextPacker(store: Store, projectId: string,
+  subjectRequest: FrameSubjectRequest, presented?: unknown) {
+  const prepared = presented === undefined
+    ? prepareFrameInterpretationRequest(store, subjectRequest)
+    : checkFrameInterpretationRequest(store, subjectRequest, presented);
+  requireCondition(prepared.project === projectId, 'frame_pack_mismatch',
+    'The request is of another project');
+  const provenBasis = { draft: prepared.subject.frame.draft, question: prepared.subject.frame.question };
+  const context = { frameRequest: prepared, role: 'frame-interpretation-request' };
+  const writes = new Map<string, Write>(), records = new Map<string, Revision<any>>();
+  const guards: TransactionGuard[] = [];
+  const stage: ArchiveWriter = (_store, compact, metadata, body, required) => {
+    requireCondition(!compact, 'frame_pack_invalid',
+      'The request packer uses the full exact context archive');
+    requireCondition(required.length === 0, 'frame_pack_invalid',
+      'The historical request archive takes no head guards');
+    const value = { ...metadata, body }, hash = hashJson(value), id = `research-context:${hash}`;
+    const existing = store.get(id);
+    if (existing) {
+      requireCondition(existing.kind === 'research-context' && existing.revision === 1
+        && existing.hash === hash && canonical(existing.value) === canonical(value),
+        'frame_pack_mismatch', 'The exact request archive was substituted');
+      return existing;
+    }
+    const row = { id, kind: 'research-context', revision: 1, hash, value };
+    records.set(id, row); writes.set(id, { id, kind: row.kind, expected: 0, value });
+    return row;
+  };
+  return { request: prepared, context: structuredClone(context), provenBasis,
+    pack: (body: unknown, limit: number, options: WorkingOptions) =>
+      packWorkingContext(store, projectId, provenBasis.draft.id, provenBasis.question.id,
+        body, limit, options, null, stage, records, provenBasis),
+    staged: () => ({ writes: [...writes.values()], guards, records }),
+    commit: () => { if (writes.size) store.writeMany([...writes.values()], guards); } };
+}
+
 function packWorkingContext(store: Store, projectId: string, draftId: string, questionId: string,
   context: unknown, maxChars: number, options: WorkingOptions = {}, dossier: DossierAssessmentPacket | null = null,
-  archiveWriter: ArchiveWriter = saveArchive, staged = new Map<string, Revision<any>>()): Record<string, any> {
-  const draft = store.get<DiscoveryDraft>(draftId), question = store.get<Question>(questionId);
+  archiveWriter: ArchiveWriter = saveArchive, staged = new Map<string, Revision<any>>(),
+  provenBasis: { draft: Revision<DiscoveryDraft>; question: Revision<Question> } | null = null): Record<string, any> {
+  let draft = store.get<DiscoveryDraft>(draftId), question = store.get<Question>(questionId);
+  if (provenBasis) {
+    // DR2b 2b-PACK (№15208): the request branch binds the exact proven
+    // draft/question revisions — never today's heads. Archive metadata uses
+    // only these records and no head guard is taken; the shared reader proves
+    // their exact revisions, the saved archive is no payment admission.
+    const savedDraft = store.get<DiscoveryDraft>(provenBasis.draft.id, provenBasis.draft.revision);
+    const savedQuestion = store.get<Question>(provenBasis.question.id, provenBasis.question.revision);
+    requireCondition(savedDraft?.kind === "discovery-draft" && savedQuestion?.kind === "question"
+      && savedDraft.value.projectId === projectId && savedQuestion.value.draftId === savedDraft.id
+      && savedDraft.value.questions.includes(savedQuestion.id)
+      && savedDraft.id === draftId && savedQuestion.id === questionId
+      && canonical(reference(savedDraft)) === canonical(reference(provenBasis.draft))
+      && canonical(reference(savedQuestion)) === canonical(reference(provenBasis.question)),
+      "context_basis_missing", "A request archive needs its exact proven draft and question");
+    draft = savedDraft; question = savedQuestion;
+  }
   requireCondition(draft?.kind === "discovery-draft" && question?.kind === "question" && draft.value.projectId === projectId
     && question.value.draftId === draftId && draft.value.questions.includes(questionId), "context_basis_missing", "A working set needs its exact question and draft");
   let body = JSON.parse(JSON.stringify(context)) as Record<string, any>;
@@ -204,8 +271,9 @@ function packWorkingContext(store: Store, projectId: string, draftId: string, qu
     body = {...body,...variantFields};
     if (options.previous) requireVariantArchive(store,options.previous,projectId,reference(draft),reference(question),options.purpose!,options.actor!,variantSubject!);
   }
-  const archiveGuards: TransactionGuard[] = [reference(draft),reference(question),...draft.value.inputs,
-    ...(variantSubject?variantTransportGuards(projectId,draftId,variantSubject):[])];
+  const archiveGuards: TransactionGuard[] = provenBasis ? []
+    : [reference(draft),reference(question),...draft.value.inputs,
+      ...(variantSubject?variantTransportGuards(projectId,draftId,variantSubject):[])];
   const assessmentSubject = proveAssessmentTransportSubject(store, body, projectId, reference(question));
   // 5.3: the deep step proves its saved preparation through the shared 5.2 current admission — the wire
   // content (the full cell and the proven scope) comes from that record, never from the caller, and the
@@ -337,7 +405,7 @@ function packWorkingContext(store: Store, projectId: string, draftId: string, qu
       ...(sourceNavigation ? { sourceCatalogue: sourceNavigation } : {}),
       ...(plannerCorrections?.length ? { corrections: plannerCorrections } : {}) };
     archive = archiveWriter(store, compact, metadata, archivedBody,
-      [reference(draft), reference(question), ...draft.value.inputs, first]);
+      provenBasis ? [] : [reference(draft), reference(question), ...draft.value.inputs, first]);
     body = archivedBody;
   }
   const relatedResearch = body['discoveryContext'];
@@ -346,7 +414,7 @@ function packWorkingContext(store: Store, projectId: string, draftId: string, qu
     ? { assessmentContextContract: STAGE_NEIGHBOR_CONTEXT, stageNeighbors: body['stageNeighbors'] } : null;
   if (neighborMaterial) requireCondition(neighborMaterial.stageNeighbors?.contract === 'stage-neighbors/v1',
     'context_stage_neighbors_incomplete', `[${question.id}] The assessor needs its declared stage material`);
-  const hasQuestion = !dossier && (Object.hasOwn(body, 'question') || Object.hasOwn(body, 'questions') || (options.purpose ?? body['role']) !== 'reader');
+  const hasQuestion = !dossier && !provenBasis && (Object.hasOwn(body, 'question') || Object.hasOwn(body, 'questions') || (options.purpose ?? body['role']) !== 'reader');
   const responseContract = assessmentContract ?? planContract;
   const selected = responseContract ? {question:responseContract,schemaPointer:'/body/question/schema'} : hasQuestion ? selectedQuestion(question, archivedBody) : null;
   const contract = responseContract ?? (selected ? { id: question.id, ...question.value.spec } : null);
@@ -511,7 +579,7 @@ function packWorkingContext(store: Store, projectId: string, draftId: string, qu
     if (fullHistory !== undefined) delete initial.history;
     const addressed = addressArchivedMaterials(initial, reference(archive),
       exactArchivedFields(initial, ['dossierPacket', 'dossierReplyContract', 'dossierNotes', 'fields', 'discoveryContext', 'discoveryBasisCatalogue',
-        'prerequisites', 'operationMap', 'inventory', 'consumerFeedback', 'request', 'sourceCatalogue']),
+        'prerequisites', 'operationMap', 'inventory', 'consumerFeedback', 'request', 'frameRequest', 'sourceCatalogue']),
       maxChars, materialRecord);
     packContextWorkspace(initial,maxChars,options.contextChars,undefined,
       addressed.length || fullHistory !== undefined ? 4096 : 1024);
