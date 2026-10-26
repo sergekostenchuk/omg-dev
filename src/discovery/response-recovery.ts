@@ -1,4 +1,5 @@
-import { withHistoricalReads } from '../history/proofs.js';
+import { historicalProof, withHistoricalReads } from '../history/proofs.js';
+import { genuineStore } from '../storage/store-view.js';
 import { readDeepPreparation as proveDeepPreparation, requireCurrentDeepPreparation, type ProvenDeepPreparation } from './deep-research.js';
 import { deepPreparationRef, projectPaidDeepResearch } from './research-consumer-transition.js';
 import { decodeVariantExecutionSession, decodeVariantSubject, readVariantNoneStructural, readVariantSetStructural,
@@ -4318,8 +4319,18 @@ export interface ProvenVariantGeneration {
   verification:'proven'; session:Revision<VariantExecutionSession>; publication:VariantPublication; state:Ref|null;
 }
 /** 4B.1: the proven reader of a published generation result — a set or no_variants. A structural record alone, or a 4T.4
- * execution-only receipt, proves no product set. */
+ * execution-only receipt, proves no product set. The genuine Store proves one exact (project, Ref) once and keeps it while
+ * everything the proof read is current; a trace, overlay or evaluation view, a padded Ref and a non-string project read
+ * through themselves, as before. Each caller receives a copy of its own. */
 export function readVariantGeneration(store:Store,project:string,ref:Ref):ProvenVariantGeneration {
+  if(!genuineStore(store) || typeof project!=='string' || project.trim().length===0 || !isRef(ref) || Object.keys(ref).length!==3)
+    return deriveVariantGeneration(store,project,ref);
+  const exact={id:ref.id,revision:ref.revision,hash:ref.hash};
+  return structuredClone(historicalProof(store,{reader:'variant.generation-read/v1',project,ref:exact},
+    source=>deriveVariantGeneration(source,project,exact),
+    ()=>variantSessionInvalid('The generation proof is cyclic')));
+}
+function deriveVariantGeneration(store:Store,project:string,ref:Ref):ProvenVariantGeneration {
   const row=isRef(ref)?store.get(ref.id,ref.revision):null;
   const structural=row?.kind==='discovery-variant-set'?readVariantSetStructural(store,project,ref).record
     :row?.kind==='discovery-variant-none'?readVariantNoneStructural(store,project,ref).record:variantSessionInvalid('Expected an exact published set or no_variants');
