@@ -20,11 +20,14 @@ import { designOf } from '../src/graph/builder.js';
 import { enrichedGraph } from './enriched-graph-fixture.js';
 import { exampleGraph } from './graph-fixture.js';
 
+// An oversize child writes its bytes and then stays alive: only the executor's stop at the physical limit may end it, so a natural exit can never
+// race that stop. The never-firing timer holds the event loop and costs nothing; the Environment timeout still bounds a stop that never comes.
+const holdUntilStopped = 'setInterval(()=>{},2147483647)';
 const adapter = String.raw`import {readFileSync,appendFileSync} from 'node:fs';
 import {boundDiscoveryValue} from ${JSON.stringify(new URL('./preparation-fixture.js',import.meta.url).href)};
 const r=JSON.parse(readFileSync(0,'utf8')),c=r.subject,settings=JSON.parse(readFileSync(process.argv[2],'utf8'));
 appendFileSync(process.argv[3],JSON.stringify({role:c.role,request:r.requestId})+'\n');
-if(c.role===settings.oversize){process.stdout.write('x'.repeat(4100000));}
+if(c.role===settings.oversize){process.stdout.write('x'.repeat(4100000));${holdUntilStopped};}
 else {let research;
 if(c.role==='assess-answer')research={verdict:'supported',reasons:[]};
 else if(c.role==='assess-escalation')research={necessary:true,reason:'The owner must choose'};
@@ -565,7 +568,7 @@ async function readerRetryFixture(t: import('node:test').TestContext, split: boo
     return { path, media: 'text/plain' as const };
   });
   writeFileSync(script, `import{readFileSync}from'node:fs';const r=JSON.parse(readFileSync(0,'utf8')),settings=JSON.parse(readFileSync(${JSON.stringify(settings)},'utf8'));
-    if(settings.physical)process.stdout.write('x'.repeat(4100000));
+    if(settings.physical){process.stdout.write('x'.repeat(4100000));${holdUntilStopped};}
     else console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research:{
       selections:r.subject.sources.map((s,sourceIndex)=>({sourceIndex,firstLine:s.lines[0][0],lastLine:s.lines.at(-1)[0]})),
       unresolved:settings.large?['x'.repeat(400000)]:[]},usage:{inputTokens:10,outputTokens:2,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
