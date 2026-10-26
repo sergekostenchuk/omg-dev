@@ -1245,8 +1245,8 @@ function unknownResult(f: { project: string }): Ref {
   return { id: `unknown-producer:${f.project}:result`, revision: 1, hash: '0'.repeat(64) };
 }
 const traceUsage = { inputTokens: 120, outputTokens: 30, cachedInputTokens: 20, reasoningOutputTokens: 10 };
-/** The MC1 batch of the fixture question with its series, environment, adapter and ready packet. */
-function mc1Exchange(f: ReturnType<typeof fixture>, slice: string, reviewer = 'answers-independent', completion = false, active = false) {
+/** The MC1 batch of the fixture question with its managed series, environment, adapter and ready packet. */
+function mc1Exchange(f: ReturnType<typeof fixture>, slice: string, reviewer = 'answers-independent', active = false) {
   const batch = f.route.value.batches.find(item => item.model === 'MC1'
     && item.items.some(question => question.target === f.target))!;
   assert.ok(batch);
@@ -1255,12 +1255,13 @@ function mc1Exchange(f: ReturnType<typeof fixture>, slice: string, reviewer = 'a
     result: gapLineExpectedResult(f.project, batch.items[0]!.target, batch.items[0]!.field) };
   ok(openSeries(f.store, { project: f.project, block: f.block, line: 1, slice: `answers:${slice}`, predecessor: null, basis: null }));
   if (active) activateLines(f, f.horizon);
-  const series = ok(completion ? managedOpenAttempt(f.store, { project: f.project, block: f.block, line: 1, attempt: 1, goal,
-    completion: { routes: reference(f.route), batches: [batch.id] } })
-    : beginAttempt(f.store, { project: f.project, block: f.block, line: 1, attempt: 1, goal }));
-  const scenario = join(f.root, `${slice}-scenario.json`);
-  const command = { executable: process.execPath, args: [adapterFixture, '--scenario', scenario,
-    '--trace', join(f.root, `${slice}-trace.jsonl`)] };
+  const plan = { routes: reference(f.route), batches: [batch.id] };
+  const series = ok(managedOpenAttempt(f.store, { project: f.project, block: f.block, line: 1, attempt: 1, goal, completion: plan }));
+  const binding = ok(readCompletionBinding(f.store, f.project, reference(series), 1));
+  assert.ok(binding, 'The managed opening writes its binding');
+  assert.deepEqual(binding.value.plan, plan);
+  const scenario = join(f.root, `${slice}-scenario.json`), trace = join(f.root, `${slice}-trace.jsonl`);
+  const command = { executable: process.execPath, args: [adapterFixture, '--scenario', scenario, '--trace', trace] };
   const configure = (actor: string, expected: number) => f.engine.environments.configure(f.project, { workspace: f.root,
     implementer: { actor: 'answers-original', model: 'fixture', effort: 'high', command },
     reviewer: { actor, model: 'fixture', effort: 'medium', command },
@@ -1271,17 +1272,20 @@ function mc1Exchange(f: ReturnType<typeof fixture>, slice: string, reviewer = 'a
   const packetRequest = { project: f.project, routes: reference(f.route), batch: batch.id,
     environment: reference(config), attempt: { series: reference(series), ordinal: 1 }, previous: [] };
   const packet = ok(writeQuestionPacket(f.store, packetRequest)).record;
+  assert.equal(packet.value.state, 'ready');
+  assert.deepEqual(packet.value.request.attempt, { series: reference(series), ordinal: 1 });
   const source = f.store.get<{ content: string }>(`source:${f.project}:brief`)!;
   const answer = { research: { protocol: '$answerProtocol', requestId: '$requestId', action: 'answer',
     results: batch.items.map(item => ({ questionId: item.gap, value: source.value.content.slice(0, 8),
       citations: [{ source: reference(source), selector: { kind: 'text-range', start: 0, end: source.value.content.length } }] })) },
   usage: traceUsage };
+  assert.ok(!existsSync(trace), 'The target MC1 has sent nothing yet');
   return { batch, series, scenario, config, configure, packet, answer,
     dispatch: { adapter: reference(adapter), config: reference(config) } };
 }
 /** Row 9: the process stops right after the durable MC1 receipt of a managed attempt, so the call stays unfinished. */
 async function receivedMc1(f: ReturnType<typeof fixture>) {
-  const exchange = mc1Exchange(f, 'received', 'answers-independent', true);
+  const exchange = mc1Exchange(f, 'received', 'answers-independent');
   const binding = ok(readCompletionBinding(f.store, f.project, reference(exchange.series), 1));
   assert.ok(binding, 'The managed opening writes its binding');
   assert.deepEqual(binding.value.plan, { routes: reference(f.route), batches: [exchange.batch.id] });
@@ -1314,7 +1318,7 @@ async function receivedMc1(f: ReturnType<typeof fixture>) {
  * assessor transport and its application, so H1.0b terminates the application with its checked cause.
  */
 async function e5Terminal(f: ReturnType<typeof fixture>, assessor: Json, ended = false) {
-  const exchange = mc1Exchange(f, ended ? 'e5-ended' : 'e5-terminal', 'answers-independent', true);
+  const exchange = mc1Exchange(f, ended ? 'e5-ended' : 'e5-terminal', 'answers-independent');
   const binding = ok(readCompletionBinding(f.store, f.project, reference(exchange.series), 1));
   assert.ok(binding, 'The managed opening writes its binding');
   assert.deepEqual(binding.value.plan, { routes: reference(f.route), batches: [exchange.batch.id] });
@@ -1347,7 +1351,7 @@ async function e5Terminal(f: ReturnType<typeof fixture>, assessor: Json, ended =
  * preparation; the paid model calls of the preparation stay exactly as they were saved.
  */
 async function stopAnalysisTransport(f: ReturnType<typeof fixture>) {
-  const exchange = mc1Exchange(f, 'stop-paid', 'answers-independent', true);
+  const exchange = mc1Exchange(f, 'stop-paid', 'answers-independent');
   const address = { project: f.project, block: f.block, line: 1 }, plan = { routes: reference(f.route), batches: [exchange.batch.id] };
   const goal = f.store.get<RepairSeries>(exchange.series.id)!.value.attempts[0]!.goal;
   const steps: unknown[] = [], payments: Ref[] = [];
@@ -1875,7 +1879,7 @@ test('1 H1.0c readAnswersGateTrace checks the shape of every argument before sto
 // ---- H1.0c S2: registration of the managed check (№1616 п.1, №1628 Q2) ----
 /** A managed block attempt of the fixture fact, opened by the real G7 opening with its materialized MC1 packet. */
 function managedAttempt(f: ReturnType<typeof fixture>, slice: string, active = false) {
-  const exchange = mc1Exchange(f, slice, 'answers-independent', true, active);
+  const exchange = mc1Exchange(f, slice, 'answers-independent', active);
   const binding = ok(readCompletionBinding(f.store, f.project, reference(exchange.series), 1));
   if (!binding) assert.fail('The managed opening writes its binding');
   const head = () => f.store.get<CompletionWork>(completionWorkId(f.project, binding.id))!;
