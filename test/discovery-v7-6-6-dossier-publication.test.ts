@@ -495,11 +495,10 @@ test('D6 publication: rich blocking return retains both sides; structural suppor
   liveAdapter(f,second,'supported',false);
   await assert.rejects(()=>assessDossier(f.store,'p',second.subject,f.environment,pilot),e=>e instanceof EngineError);
   assert.equal(f.store.list(DOSSIER_ASSESSMENT_KIND).length,1);
-  // One cold fixed point after the later real MR/P proves both that the failed
-  // supported terminal cannot buy again and the former rich return stays exact.
-  const cold=f.open();
-  await fixedPoint(cold,async()=>{
-    await unchanged(f,cold,()=>assessDossier(cold,'p',second.subject),true);
-    assert.deepEqual(await unchanged(f,cold,()=>readDossierAssessmentAt(cold,'p',reference(published))),published);
+  // The Store that received the paid terminal refusal must itself recover for
+  // free; a new Store additionally proves the same fixed point without its cache.
+  for(const store of [f.store,f.open()])await fixedPoint(store,async()=>{
+    await unchanged(f,store,()=>assessDossier(store,'p',second.subject),true);
+    assert.deepEqual(await unchanged(f,store,()=>readDossierAssessmentAt(store,'p',reference(published))),published);
   });
 });
