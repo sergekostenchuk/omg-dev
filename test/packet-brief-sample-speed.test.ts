@@ -176,7 +176,7 @@ test('SAMPLE-SPEED: a key over 64 KiB is never kept and the summed size of keys 
   assert.equal(counted.of(big[69]), 1);
 });
 
-test('SAMPLE-SPEED: an oversized annotation, an escape-heavy short string or too many keys leave before their key is built', async t => {
+test('SAMPLE-SPEED: an oversized annotation, const or key name, an escape-heavy short string or too many keys leave before their key is built', async t => {
   const f = world(t), counted = compilations(t), previous = JSON.stringify, whole = new Set<unknown>();
   let serialized = 0;
   JSON.stringify = function (value: unknown, ...rest: unknown[]) {
@@ -187,9 +187,13 @@ test('SAMPLE-SPEED: an oversized annotation, an escape-heavy short string or too
   const annotation = { oneOf: [], description: `annotation ${process.pid} ${'x'.repeat(1_000_000)}` };
   const escapes = { type: 'string', description: `escapes ${process.pid} ${'\u0001'.repeat(20_000)}` };
   const wide = { type: 'object', description: `wide ${process.pid}`, properties: Object.fromEntries(Array.from({ length: 5000 }, (_, i) => [`k${i}`, { type: 'string' }])) };
-  const old = [annotation, escapes, wide].map(schema => bytes(f.brief(transparent(schema))));
-  for (const schema of [annotation, escapes, wide]) whole.add(schema);
-  for (let i = 0; i < 2; i++) [annotation, escapes, wide].forEach((schema, index) => assert.equal(bytes(f.brief(schema)), old[index]));
+  const constant = { const: `const ${process.pid} ${'x'.repeat(1_000_000)}` };
+  const name = { type: 'object', properties: { [`name ${process.pid} ${'n'.repeat(100_000)}`]: { type: 'string' } } };
+  const large = [annotation, escapes, wide, constant, name];
+  const old = large.map(schema => bytes(f.brief(transparent(schema))));
+  for (const schema of large) whole.add(schema);
+  for (let i = 0; i < 2; i++) large.forEach((schema, index) => assert.equal(bytes(f.brief(schema)), old[index]));
+  assert.equal(example(f.brief(constant)), undefined, 'the old bounded sample still refuses a const over SAMPLE_LIMIT.chars');
   assert.equal(serialized, 0, 'no key of these schemas is ever serialized');
   assert.equal(counted.of(escapes), 3, 'the escape-heavy schema is derived and compiled on every call');
   const ordinary = described({ type: 'boolean' });
