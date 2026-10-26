@@ -27,7 +27,8 @@ import { writeHorizon } from '../src/om/horizon.js';
 import { writeGaps, type GapRequest } from '../src/om/gaps.js';
 import { gapLineKey, gapLineExpectedResult } from '../src/om/gap-lines.js';
 import { writeRoutes } from '../src/om/routes.js';
-import { openSeries, beginAttempt } from '../src/om/series.js';
+import { openSeries, readCompletionBinding } from '../src/om/series.js';
+import { openAttempt } from '../src/om/repeat-gate.js';
 import { resolveExternalSource } from '../src/compiler/inputs.js';
 import { resolveResearchBasis } from '../src/graph/research-basis.js';
 import { configureResearchScope, scopedQuestions } from '../src/graph/research-scope.js';
@@ -278,9 +279,15 @@ function packetFixture(f: ReturnType<typeof fixture>, source: Revision<Source>) 
   const block = 'garden-consume-block', goal = { key: 'web-source', questions: batch.items.map(item => gapLineKey(project, item.target, item.field)),
     result: gapLineExpectedResult(project, batch.items[0]!.target, batch.items[0]!.field) };
   ok(openSeries(store, { project, block, line: 1, slice: 'web-source', predecessor: null, basis: null }));
-  const series = ok(beginAttempt(store, { project, block, line: 1, attempt: 1, goal }));
+  const plan = { routes: reference(routes), batches: [batch.id] };
+  const series = ok(openAttempt(store, { project, block, line: 1, attempt: 1, goal, completion: plan }));
+  const binding = ok(readCompletionBinding(store, project, reference(series), 1));
+  assert.ok(binding, 'The managed opening writes its binding');
+  assert.deepEqual(binding.value.plan, plan);
   const packet = ok(writeQuestionPacket(store, { project, routes: reference(routes), batch: batch.id,
     environment: reference(environment), attempt: { series: reference(series), ordinal: 1 }, previous: [] })).record;
+  assert.equal(packet.value.state, 'ready');
+  assert.deepEqual(packet.value.request.attempt, { series: reference(series), ordinal: 1 });
   const request: ModelCallRequest = { project, packet: reference(packet), dispatch: { adapter: reference(adapter), config: reference(environment) }, role: 'implementer' };
   const need = (selected: Revision<Source>) => ({ protocol: '$answerProtocol', requestId: '$requestId', action: 'need_source',
     questionIds: batch.items.map(item => item.gap), missing: 'Read the saved page',
