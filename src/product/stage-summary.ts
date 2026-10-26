@@ -1,6 +1,12 @@
 import type { V7PlanSubject } from "../discovery/v7-managed-attempt.js";
 import { canonical, digest, hashJson, type Json } from "../canonical.js";
-import { discoveryConstraintBindings, discoveryDecisionId } from "../discovery/discovery-outcome.js";
+import { DEEP_FRONTIER_STOP_KIND, discoveryConstraintBindings, discoveryDecisionId, readDeepFrontierStop } from "../discovery/discovery-outcome.js";
+import type { ClaimAddress } from "../discovery/claim-address.js";
+import { prepareDossierAssessmentSubject } from "../discovery/dossier-assessment.js";
+import type { DossierPartialReason } from "../discovery/dossier-manifest.js";
+import type { DossierAssessmentMaterial, V7ProgressSummary } from "../discovery/research-model.js";
+import { readV7ProgressStateAt } from "../discovery/v7-progress.js";
+import { V7_AXES, type V7Axis } from "../discovery/v7-contracts.js";
 import {
   acceptedIssuance, contractEraOf, discoveryContext, discoveryOutcome, hasPlanQuestions, planStopSubject,
   isAdmissionEra, isSupportedEra, issuedEntry, issuedForm,
@@ -106,6 +112,64 @@ export interface VariantGenerationStageSummary {
 export interface VariantChoiceSummaryRequest { section: "variant-choice"; decision: Ref }
 export interface VariantChoiceStageSummary {
   contract: "stage-summary/variant-choice/v1"; project: string; stage: "discovery"; choice: VariantChoiceSummary;
+}
+
+/** An exact proven snapshot of the Discovery dossier (D6): a selected carrier or a partial manifest, named by its Ref. The summary
+ * stands on that saved root alone; no current draft, mode, choice, plan or progress state replaces it. */
+export interface DossierSnapshotSummaryRequest { section: "dossier-snapshot"; root: Ref }
+export type SummaryDossierStatus = "accepted" | "rejected" | "unassessed";
+export interface SummaryDossierAxis { axis: V7Axis; depth: string; reason: string | null; claims: number }
+/** A claim is named by its exact typed address: an attempt keeps its claims behind its own proof, so /claims/<i> is not a JSON pointer into the record. */
+export interface SummaryDossierUnknown {
+  claim: ClaimAddress; unknownId: string; consumer: string; moment: string;
+  blocksCurrentStage: boolean; status: SummaryDossierStatus; text: string | null;
+}
+export interface SummaryDossierSide { claim: ClaimAddress; status: SummaryDossierStatus; text: string | null; application: Ref | null }
+export interface SummaryDossierContradiction {
+  id: string; address: SummaryAddress; relation: string; blocking: boolean; reason: string;
+  resolution: "open" | "side" | "scoped"; grounds: Ref[]; sides: [SummaryDossierSide, SummaryDossierSide];
+}
+export interface SummaryDossierReason { index: number; address: SummaryAddress; code: DossierPartialReason; message: string; grounds: number }
+export interface SummaryDossierMissingCell {
+  key: string; planQuestionId: string; requiredDepth: string; criterion: string; code: string; message: string; address: SummaryAddress;
+}
+export interface SummaryDossierProgress {
+  state: Ref; planQuestionId: string; count: number; streak: number; outcome: V7ProgressSummary["outcome"];
+  reason: string | null; nextAction: string | null; address: SummaryAddress;
+}
+export interface SummaryDossierBudget {
+  segment: Ref; ledger: Ref; calls: Ref[]; measured: number; reserved: number; remaining: number; overrun: boolean; exhausted: boolean;
+}
+/** The saved post-choice stop with what it fixed at its own boundary: the missing cells, the progress (P) counters and the stage accounting. */
+export interface SummaryDossierStop {
+  record: Ref; reason: "budget" | "stall"; run: Ref; boundary: { sequence: number; record: Ref };
+  missing: SummaryDossierMissingCell[]; progress: SummaryDossierProgress[]; budget: SummaryDossierBudget;
+}
+/** Where a next step returns to: a JSON pointer into one exact saved record, or the typed address of one claim. */
+export type SummaryDossierAddress = { kind: "record"; record: Ref; pointer: string } | { kind: "claim"; claim: ClaimAddress };
+export interface SummaryDossierNext {
+  action: "return-partial-reason" | "complete-missing-cell" | "follow-progress-action" | "close-unknown" | "resolve-contradiction" | "assess-dossier";
+  address: SummaryDossierAddress; text: string;
+}
+export interface DossierSnapshotSummary {
+  root: { kind: "selected" | "partial"; ref: Ref }; subject: string; manifest: Ref;
+  /** complete is a full proven snapshot, never an assessment or an acceptance. */
+  completeness: "complete" | "partial";
+  basis: { draft: Ref; frame: Ref; plan: Ref };
+  route: { handoff: Ref | null; snapshot: Ref | null; result: Ref | null; scope: Ref | null; set: Ref | null; member: Ref | null; decision: Ref | null };
+  coverage: { cells: number; missing: number } | null;
+  axes: SummaryDossierAxis[];
+  materials: Record<SummaryDossierStatus, number>;
+  unknowns: SummaryDossierUnknown[];
+  contradictions: SummaryDossierContradiction[];
+  partial: { reasons: SummaryDossierReason[] } | null;
+  stop: SummaryDossierStop | null;
+  /** No proven assessment of this subject is read here: the summary only waits for it and states no verdict, acceptance or concept admission. */
+  assessment: { state: "awaiting"; supported: false; accepted: false; conceptAdmission: false };
+  next: SummaryDossierNext[];
+}
+export interface DossierSnapshotStageSummary {
+  contract: "stage-summary/dossier-snapshot/v1"; project: string; stage: "discovery"; snapshot: DossierSnapshotSummary;
 }
 
 export type SummaryStructuredStage = Exclude<UpstreamStage, "discovery">;
@@ -898,11 +962,13 @@ function selectStructuredCandidate(store: Store, project: string, stage: Summary
 export function stageSummary(store: Store, project: string, stage: "discovery", request: VariantChoiceSummaryRequest): VariantChoiceStageSummary;
 export function stageSummary(store: Store, project: string, stage: "discovery", request: VariantGenerationSummaryRequest): VariantGenerationStageSummary;
 export function stageSummary(store: Store, project: string, stage: "discovery", request: DiscoveryIndexSummaryRequest): DiscoveryIndexStageSummary;
+export function stageSummary(store: Store, project: string, stage: "discovery", request: DossierSnapshotSummaryRequest): Promise<DossierSnapshotStageSummary>;
 export function stageSummary(store: Store, project: string, stage: "discovery", draftId?: string): DiscoveryStageSummary;
 export function stageSummary(store: Store, project: string, stage: SummaryStructuredStage, draftId?: string): StructuredStageSummary;
 export function stageSummary(store: Store, project: string, stage: Stage, draftId?: string): StageSummary;
 export function stageSummary(store: Store, project: string, stage: Stage,
-  draftId?: string | DiscoveryIndexSummaryRequest | VariantGenerationSummaryRequest | VariantChoiceSummaryRequest): StageSummary | DiscoveryIndexStageSummary | VariantGenerationStageSummary | VariantChoiceStageSummary {
+  draftId?: string | DiscoveryIndexSummaryRequest | VariantGenerationSummaryRequest | VariantChoiceSummaryRequest | DossierSnapshotSummaryRequest):
+  StageSummary | DiscoveryIndexStageSummary | VariantGenerationStageSummary | VariantChoiceStageSummary | Promise<DossierSnapshotStageSummary> {
   if (draftId !== undefined && typeof draftId !== "string") {
     if (object(draftId) && draftId.section === "variant-choice") {
       requireCondition(stage === "discovery" && Object.keys(draftId).length === 2
@@ -918,6 +984,7 @@ export function stageSummary(store: Store, project: string, stage: Stage,
       return { contract: "stage-summary/variant-generation/v1", project, stage: "discovery",
         generation: variantGenerationSummary(store, project, draftId.result) };
     }
+    if (object(draftId) && draftId.section === "dossier-snapshot") return dossierSnapshotStageSummary(store, project, stage, draftId);
     requireCondition(stage === "discovery" && object(draftId) && draftId.section === "v7-index",
       "stage_summary_index_request_invalid", "Expected an explicit Discovery v7 index section request");
     // This section has its own historical boundary. It does not read the current outcome,
@@ -956,6 +1023,87 @@ export function stageSummary(store: Store, project: string, stage: Stage,
   requireCondition(store.changeStamp() === stamp, "input_stale",
     `[${id}] Stage summary inputs changed during the read; refresh the summary`);
   return result;
+}
+
+const dossierAddress = (record: Ref, pointer: string): SummaryAddress => ({ record, pointer });
+const dossierText = (value: Json): string | null => object(value) && typeof value.text === "string" ? value.text : null;
+const dossierRecord = (address: SummaryAddress): SummaryDossierAddress => ({ kind: "record", ...address });
+function dossierSide(material: DossierAssessmentMaterial, application: Ref | null): SummaryDossierSide {
+  return { claim: material.address, status: material.status, text: dossierText(material.value), application };
+}
+/** The saved post-choice stop with its own boundary facts, through the exact P-state reader; the stop itself is proven by the shared stop reader. */
+function dossierStopSummary(store: Store, at: Ref, proof: Awaited<ReturnType<typeof readDeepFrontierStop>>): SummaryDossierStop {
+  const value = proof.record.value;
+  const missing = value.missing.map((key, index): SummaryDossierMissingCell => {
+    const cell = proof.coverage.missing.find(row => row.key === key);
+    requireCondition(cell, "stage_summary_dossier_invalid", "The stop names a missing cell that its proof does not hold");
+    return { key, planQuestionId: cell.cell.subject.planQuestionId, requiredDepth: cell.cell.requiredDepth, criterion: cell.cell.criterion,
+      code: cell.missing?.code ?? "covered", message: cell.missing?.message ?? "", address: dossierAddress(at, `/missing/${index}`) };
+  });
+  const progress = value.states.map((state): SummaryDossierProgress => {
+    const saved = readV7ProgressStateAt(store, state), summary = saved.value.summary;
+    return { state, planQuestionId: saved.value.subject.planQuestionId, count: summary.count, streak: summary.streak, outcome: summary.outcome,
+      reason: summary.reason, nextAction: summary.nextAction, address: dossierAddress(state, "/summary") };
+  });
+  const budget = value.budget;
+  return { record: at, reason: value.reason, run: value.run, boundary: value.boundary, missing, progress,
+    budget: { segment: budget.segment, ledger: budget.ledger, calls: budget.calls, measured: budget.measured, reserved: budget.reserved,
+      remaining: budget.remaining, overrun: budget.overrun, exhausted: budget.exhausted } };
+}
+async function dossierSnapshotSummary(store: Store, project: string, root: Ref): Promise<DossierSnapshotSummary> {
+  // The one door of the dossier subject proves the selected carrier or the partial manifest and everything it stands on.
+  const packet = await prepareDossierAssessmentSubject(store, project, root);
+  const manifest = packet.manifest.value, manifestRef = packet.manifest.ref, partial = manifest.completeness === "partial";
+  const route = packet.route, refOf = (record: { ref: Ref } | null): Ref | null => record ? record.ref : null;
+  const unknowns = packet.unknowns.map(({ unknown, material }): SummaryDossierUnknown => ({
+    claim: unknown.claim, unknownId: unknown.unknownId, consumer: unknown.consumer, moment: unknown.moment,
+    blocksCurrentStage: unknown.blocksCurrentStage, status: material.status, text: dossierText(material.value) }));
+  const contradictions = packet.contradictions.map((item): SummaryDossierContradiction => {
+    const { contradiction } = item, index = manifest.contradictions.findIndex(row => row.id === contradiction.id);
+    return { id: contradiction.id, address: dossierAddress(manifestRef, `/contradictions/${index}`), relation: contradiction.relation,
+      blocking: contradiction.blocking, reason: contradiction.reason, resolution: contradiction.resolution.state,
+      grounds: item.grounds.map(record => record.ref),
+      sides: [dossierSide(item.sides[0], item.sides[0].application), dossierSide(item.sides[1], item.sides[1].application)] };
+  });
+  const reasons = manifest.reasons.map((reason, index): SummaryDossierReason => ({ index, address: dossierAddress(manifestRef, `/reasons/${index}`),
+    code: reason.code, message: reason.message, grounds: reason.grounds.length }));
+  const first = manifest.reasons[0]?.grounds[0];
+  const proof = partial && first && store.get(first.id, first.revision)?.kind === DEEP_FRONTIER_STOP_KIND
+    ? await readDeepFrontierStop(store, project, first) : null;
+  const stop = proof && first ? dossierStopSummary(store, first, proof) : null;
+  const computation = packet.coverage ?? proof?.coverage ?? null;
+  const next: SummaryDossierNext[] = [];
+  for (const reason of reasons) next.push({ action: "return-partial-reason", address: dossierRecord(reason.address), text: `${reason.code}: ${reason.message}` });
+  if (stop) {
+    for (const cell of stop.missing) next.push({ action: "complete-missing-cell", address: dossierRecord(cell.address), text: `${cell.planQuestionId}: ${cell.message}` });
+    for (const row of stop.progress) if (row.nextAction)
+      next.push({ action: "follow-progress-action", address: dossierRecord(dossierAddress(row.state, "/summary/nextAction")), text: `${row.planQuestionId}: ${row.nextAction}` });
+  }
+  for (const unknown of unknowns) next.push({ action: "close-unknown", address: { kind: "claim", claim: unknown.claim }, text: `${unknown.unknownId} → ${unknown.consumer}` });
+  for (const row of contradictions) if (row.resolution === "open")
+    next.push({ action: "resolve-contradiction", address: dossierRecord(row.address), text: `${row.id}${row.blocking ? " (блокирует)" : ""}: ${row.reason}` });
+  next.push({ action: "assess-dossier", address: dossierRecord(dossierAddress(packet.subject.root.ref, "")), text: "Оценить доказанный снимок" });
+  const count = (status: SummaryDossierStatus) => packet.materials.filter(item => item.status === status).length;
+  return { root: { kind: packet.subject.root.kind, ref: packet.subject.root.ref }, subject: packet.subject.identity, manifest: manifestRef,
+    completeness: manifest.completeness,
+    basis: { draft: packet.basis.draft.ref, frame: packet.basis.frame.ref, plan: packet.basis.plan.ref },
+    route: { handoff: refOf(route.handoff), snapshot: refOf(route.snapshot), result: refOf(route.result), scope: refOf(route.scope),
+      set: refOf(route.set), member: refOf(route.member), decision: refOf(route.decision) },
+    coverage: computation ? { cells: computation.cells.length, missing: computation.missing.length } : null,
+    axes: V7_AXES.map((axis): SummaryDossierAxis => ({ axis, depth: manifest.axes[axis].depth, reason: manifest.axes[axis].reason,
+      claims: manifest.axes[axis].claims.length })),
+    materials: { accepted: count("accepted"), rejected: count("rejected"), unassessed: count("unassessed") },
+    unknowns, contradictions, partial: partial ? { reasons } : null, stop,
+    assessment: { state: "awaiting", supported: false, accepted: false, conceptAdmission: false }, next };
+}
+
+/** The asynchronous section of stageSummary: it rests on async proof readers, so only this branch returns a Promise (and rejects, never throws
+ * synchronously); every other request keeps its synchronous result. */
+async function dossierSnapshotStageSummary(store: Store, project: string, stage: Stage, request: DossierSnapshotSummaryRequest): Promise<DossierSnapshotStageSummary> {
+  requireCondition(stage === "discovery" && object(request) && Object.keys(request).length === 2 && Object.hasOwn(request, "section")
+    && request.section === "dossier-snapshot" && Object.hasOwn(request, "root") && isRef(request.root),
+    "stage_summary_dossier_request_invalid", "Expected only an exact selected carrier or partial manifest Ref");
+  return { contract: "stage-summary/dossier-snapshot/v1", project, stage: "discovery", snapshot: await dossierSnapshotSummary(store, project, request.root) };
 }
 
 const valueText = (value: Json): string => typeof value === "string" ? value : `\n\n\`\`\`json\n${JSON.stringify(value, null, 2)}\n\`\`\``;
@@ -1147,7 +1295,61 @@ function renderVariantChoiceSummary(summary: VariantChoiceStageSummary): string 
   return `${lines.join("\n").trimEnd()}\n`;
 }
 
-export function renderStageSummary(summary: StageSummary | DiscoveryIndexStageSummary | VariantGenerationStageSummary | VariantChoiceStageSummary): string {
+const exactRefText = (ref: Ref): string => `${ref.id}@${ref.revision}#${ref.hash}`;
+const claimText = (claim: ClaimAddress): string => `${claim.container.id}@${claim.container.revision}${claim.pointer} (${claim.claimId})`;
+const dossierAddressText = (address: SummaryDossierAddress): string => address.kind === "claim" ? claimText(address.claim) : addressText(address);
+function renderDossierSnapshotSummary(summary: DossierSnapshotStageSummary): string {
+  const s = summary.snapshot, nullable = (ref: Ref | null): string => ref ? exactRefText(ref) : "нет";
+  const lines = ["# Досье Discovery: доказанный снимок", "",
+    `Носитель: ${s.root.kind === "selected" ? "выбранный (selected)" : "частичный (partial)"} ${exactRefText(s.root.ref)}`,
+    `Предмет оценки: ${s.subject}`, `Манифест: ${exactRefText(s.manifest)}`,
+    `Полнота: ${s.completeness === "complete" ? "полный снимок (complete) — это не оценка и не принятие" : "частичный снимок (partial)"}`,
+    "Оценка: ожидание оценки; supported и accepted не заявлены, допуска к concept нет", "",
+    "## Основание", "", `Черновик: ${exactRefText(s.basis.draft)}`, `Рамка: ${exactRefText(s.basis.frame)}`, `План: ${exactRefText(s.basis.plan)}`, "",
+    "## Выбор", "", `Область (scope): ${nullable(s.route.scope)}`, `Набор (set): ${nullable(s.route.set)}`, `Вариант (member): ${nullable(s.route.member)}`,
+    `Решение (decision): ${nullable(s.route.decision)}`, `Передача (handoff): ${nullable(s.route.handoff)}`, `Снимок вариантов: ${nullable(s.route.snapshot)}`,
+    `Результат генерации: ${nullable(s.route.result)}`, ""];
+  lines.push("## Покрытие", "", s.coverage ? `Ячеек: ${s.coverage.cells}; не покрыто: ${s.coverage.missing}` : "Покрытие выбранного варианта не вычислялось: выбор не состоялся", "",
+    `Материалы: принято ${s.materials.accepted}; отклонено ${s.materials.rejected}; без оценки ${s.materials.unassessed}`, "");
+  for (const axis of s.axes) lines.push(`- ось ${axis.axis}: глубина ${axis.depth}; утверждений ${axis.claims}${axis.reason ? `; не применима: ${axis.reason}` : ""}`);
+  lines.push("", "## Неизвестные", "");
+  if (!s.unknowns.length) lines.push("Нет.");
+  for (const unknown of s.unknowns) lines.push(`- ${unknown.unknownId} [${claimText(unknown.claim)}]: потребитель ${unknown.consumer}; момент ${unknown.moment}; `
+    + `${unknown.blocksCurrentStage ? "блокирует стадию" : "не блокирует стадию"}; статус ${unknown.status}${unknown.text ? `; ${unknown.text}` : ""}`);
+  lines.push("", "## Противоречия", "");
+  if (!s.contradictions.length) lines.push("Нет.");
+  for (const row of s.contradictions) {
+    lines.push(`- ${row.id} [${addressText(row.address)}]: ${row.relation}; ${row.blocking ? "блокирует" : "не блокирует"}; разрешение ${row.resolution}; ${row.reason}`);
+    for (const side of row.sides) lines.push(`  - сторона [${claimText(side.claim)}]: ${side.status}${side.text ? `; ${side.text}` : ""}`);
+    for (const ground of row.grounds) lines.push(`  - основание разрешения ${exactRefText(ground)}`);
+  }
+  lines.push("");
+  if (s.partial) {
+    lines.push("## Причина partial", "");
+    for (const reason of s.partial.reasons) lines.push(`- ${reason.code} [${addressText(reason.address)}]: ${reason.message}; оснований ${reason.grounds}`);
+    lines.push("");
+  }
+  if (s.stop) {
+    const stop = s.stop;
+    lines.push("## Остановка после выбора", "", `Остановка: ${exactRefText(stop.record)}; причина ${stop.reason}`, `Запуск: ${exactRefText(stop.run)}`,
+      `Граница: событие ${stop.boundary.sequence}; ${exactRefText(stop.boundary.record)}`, "", "### Недостающие ячейки", "");
+    if (!stop.missing.length) lines.push("Нет.");
+    for (const cell of stop.missing) lines.push(`- ${cell.planQuestionId} [${addressText(cell.address)}]: глубина ${cell.requiredDepth}; критерий ${cell.criterion}; ${cell.code}: ${cell.message}`);
+    lines.push("", "### Счётчики P/N на границе", "");
+    for (const row of stop.progress) lines.push(`- ${row.planQuestionId} [${addressText(row.address)}]: учтено попыток ${row.count}; подряд без нового N=${row.streak}; исход ${row.outcome}`
+      + `${row.reason ? `; ${row.reason}` : ""}${row.nextAction ? `; следующее действие: ${row.nextAction}` : ""}`);
+    const budget = stop.budget;
+    lines.push("", "### Учёт бюджета на границе", "", `Измерено ${budget.measured}; зарезервировано ${budget.reserved}; осталось ${budget.remaining}; `
+      + `превышение ${budget.overrun ? "да" : "нет"}; исчерпан ${budget.exhausted ? "да" : "нет"}`, `Сегмент: ${exactRefText(budget.segment)}`,
+      `Журнал: ${exactRefText(budget.ledger)}`, ...budget.calls.map(call => `- вызов ${exactRefText(call)}`), "");
+  }
+  lines.push("## Следующее действие", "");
+  for (const step of s.next) lines.push(`- ${step.action} [${dossierAddressText(step.address)}]: ${step.text}`);
+  return `${lines.join("\n").trimEnd()}\n`;
+}
+
+export function renderStageSummary(summary: StageSummary | DiscoveryIndexStageSummary | VariantGenerationStageSummary | VariantChoiceStageSummary | DossierSnapshotStageSummary): string {
+  if (summary.contract === "stage-summary/dossier-snapshot/v1") return renderDossierSnapshotSummary(summary);
   if (summary.contract === "stage-summary/variant-choice/v1") return renderVariantChoiceSummary(summary);
   if (summary.contract === "stage-summary/variant-generation/v1") return renderVariantGenerationSummary(summary);
   if (summary.contract === "stage-summary/discovery-index/v1") return renderDiscoveryIndexSummary(summary);
