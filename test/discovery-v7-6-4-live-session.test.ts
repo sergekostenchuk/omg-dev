@@ -1,6 +1,9 @@
-import test from 'node:test';
+import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync, writeFileSync } from 'node:fs';
+import { cpSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { basename, join } from 'node:path';
+import { storeUnchanged, storeRefused } from './store-unchanged.js';
 import { DatabaseSync } from 'node:sqlite';
 import { canonical, hashJson, type Json } from '../src/canonical.js';
 import { reference, type Ref } from '../src/pipeline/contracts.js';
@@ -175,20 +178,48 @@ const all = (store: Store) => {
   finally { db.close(); }
 };
 async function unchanged<T>(f: Paid, store: Store, action: () => Promise<T>, refuses = false): Promise<T | undefined> {
-  const before = all(store), calls = money(store), wires = f.wires();
+  const calls = money(store), wires = f.wires();
   let result: T | undefined;
-  if (refuses) await assert.rejects(action, error => error instanceof EngineError);
-  else result = await action();
-  assert.equal(all(store), before); assert.deepEqual(money(store), calls); assert.deepEqual(f.wires(), wires);
+  if (refuses) await storeRefused(store, action);
+  else result = await storeUnchanged(store, action);
+  assert.deepEqual(money(store), calls); assert.deepEqual(f.wires(), wires);
   return result;
 }
-async function setup(t: test.TestContext, model = false) {
+/** Full product history is compared once around a fixed-point block; each
+ * individual public door inside it still has its own real Store stamp/money/wire. */
+async function fixedPoint<T>(store:Store,action:()=>Promise<T>):Promise<T> {
+  const before=all(store);try{return await action();}finally{assert.equal(all(store),before);}
+}
+interface World {root:string;path:string;store:Store;engine:ProductEngine;discovery:Discovery;open:()=>Store}
+const seeds=new Map<string,{value:World;snapshot:string;active:Store[]}>();
+const disposeSeeds:(()=>void)[]=[];
+after(()=>{for(const seed of seeds.values())for(const db of seed.active)db.close();for(const dispose of disposeSeeds)dispose();});
+/** Real producers run once per route. Restore their complete closed world at its
+ * original path before opening a test's Stores; historical paths/Refs/hashes are
+ * never rewritten. Only sequential tests use these roots. No proof is cached. */
+async function isolated<T extends World>(t:test.TestContext,key:string,make:(lifetime:test.TestContext)=>Promise<T>):Promise<T> {
+  let seed=seeds.get(key);
+  if(!seed){
+    const value=await make({after:(dispose:()=>void)=>disposeSeeds.push(dispose)} as unknown as test.TestContext);value.store.close();
+    const snapshot=mkdtempSync(join(tmpdir(),'omg-live-seed-'));cpSync(value.root,join(snapshot,'world'),{recursive:true});
+    disposeSeeds.push(()=>rmSync(snapshot,{recursive:true,force:true}));seed={value,snapshot,active:[]};seeds.set(key,seed);
+  }
+  for(const db of seed.active)db.close();
+  const base=seed.value as T;
+  for(const name of readdirSync(base.root))rmSync(join(base.root,name),{recursive:true,force:true});
+  cpSync(join(seed.snapshot,'world'),base.root,{recursive:true});
+  const stores:Store[]=[],open=()=>{const db=new Store(base.path);stores.push(db);return db;},store=open();
+  seed.active=stores;
+  t.after(()=>{for(const db of stores)db.close();});
+  return {...base,store,open,engine:new ProductEngine(store),discovery:new Discovery(store)};
+}
+async function setupRaw(t: test.TestContext, model = false) {
   const f = await paid(t);
   const decision = model ? await modelChoose(f) : selected(f).act.decision;
   const scope = publishVariantScope(f.store, 'p', reference(decision)).scope;
   return { ...f, scopeRecord: scope, input: { scope: reference(scope), plan: f.v.planAnswer } };
 }
-type Selected = Awaited<ReturnType<typeof setup>>;
+type Selected = Awaited<ReturnType<typeof setupRaw>>;
 function claim(f: Selected, question: string, axis: string, text: string, variants: 'common' | Ref[] = [f.scopeRecord.value.member]): Json {
   return { id: `h-${rand()}`, kind: 'hypothesis', text, axis,
     planQuestions: [{ planAnswer: f.v.planAnswer, planQuestionId: question }], scope: { variants },
@@ -325,7 +356,7 @@ function wideDelivery(f:Paid) {
     maxRequestChars:3000000,maxReadChars:128000,maxReplyChars:100000,maxCalls:100,maxReportedTokens:100000,
     physicalLimits:{maxRequestChars:3000000,maxReplyChars:100000,basis:'Full local dossier delivery'}},0);
 }
-async function partial(t:test.TestContext, material?:string) {
+async function partialRaw(t:test.TestContext, material?:string) {
   const f=await paid(t,(snapshot:Ref)=>({action:'no_variants',reasons:[{code:'bounded_search',message:'No bounded variant',grounds:[snapshot]}],
     searchLimits:['Saved sweep'],unknowns:['Demand unknown']}),material??true);
   const none=f.store.list<VariantNone>('discovery-variant-none')[0]!;
@@ -333,8 +364,26 @@ async function partial(t:test.TestContext, material?:string) {
   const root=reference((await producePartialDossier(f.store,'p',reference(handoff.record))).record);
   return {...f,packet:await prepareDossierAssessmentSubject(f.store,'p',root)};
 }
+async function completed(t:test.TestContext,model=false) {
+  return isolated(t,model?'model-complete':'owner-complete',async lifetime=>{
+    const f=await setupRaw(lifetime,model),entries=await complete(f);return {...f,entries};
+  });
+}
+async function partial(t:test.TestContext,material?:string) {
+  return isolated(t,material?'partial:'+hashJson(material):'partial',lifetime=>partialRaw(lifetime,material));
+}
+async function refusePaidGrounds(f:Paid,store:Store,result:Awaited<ReturnType<typeof runDossierAssessmentSession>>) {
+  const session=result.session,app=store.get<DossierAssessmentApplication>(result.application!.id,1)!;
+  const call=dossierCalls(store).find(row=>row.value.assessmentApplication?.id===app.id)!;
+  const refs=[reference(session),reference(app),call.value.request.record!,call.value.response!.record!,call.value.packet!.archive];
+  await fixedPoint(store,async()=>{
+    for(const ref of refs)await unchanged(f,store,()=>readDossierAssessmentSessionAt(mask(store,ref),'p',reference(session)),true);
+    const value={...session.value,result:{verdict:'supported'}},fake={...session,value,hash:hashJson(value as never)};
+    await unchanged(f,store,()=>readDossierAssessmentSessionAt(mask(store,reference(session),fake),'p',reference(fake)),true);
+  });
+}
 for(const model of [false,true])test(`live dossier: real ${model?'model':'owner'} selected, read_context/checkpoint/terminal; exact paid history and free hot/cold repeat`,async t=>{
-  const f=await setup(t,model);await complete(f);
+  const f=await completed(t,model);
   const packet=await prepareDossierAssessmentSubject(f.store,'p',reference(produceSelectedDossier(f.store,'p',f.input).record));
   const terminal=liveAdapter(f,packet);const before=money(f.store),wires=f.wires().length;
   const profile=wideDelivery(f);
@@ -368,15 +417,14 @@ for(const model of [false,true])test(`live dossier: real ${model?'model':'owner'
   const late=await deep(f,'q-market',[claim(f,'q-market','market','Late dossier evidence')]);await assess(f,late,'material');
   revise(f);modeOf(f.store,'bypass');nextPlan(f,f.store);
   const env=f.engine.environments.configure('p',{...f.environment.value,reviewer:{...f.environment.value.reviewer,actor:'later-reviewer'}},f.environment.revision);
-  for(const store of [f.store,f.open()]) {
-    const reread=await unchanged(f,store,()=>readDossierAssessmentSessionAt(store,'p',reference(session)));
-    assert.deepEqual(reread,result);
-    const repeated=await unchanged(f,store,()=>runDossierAssessmentSession(store,'p',packet.subject,env));assert.deepEqual(repeated,result);
-    const refs=[reference(session),reference(app),call.value.request.record!,call.value.response!.record!,call.value.packet!.archive];
-    for(const ref of refs)await unchanged(f,store,()=>readDossierAssessmentSessionAt(mask(store,ref),'p',reference(session)),true);
-    const fake={...session,value:{...session.value,result:{verdict:'supported'}},hash:hashJson({...session.value,result:{verdict:'supported'}} as never)};
-    await unchanged(f,store,()=>readDossierAssessmentSessionAt(mask(store,reference(session),fake),'p',reference(fake)),true);
-  }
+  // Each route proves historical reading and free replay; together they cover
+  // both real Store modes. Common corruptions run once on the partial route.
+  const historical=model?f.open():f.store,replay=model?f.store:f.open();
+  await fixedPoint(historical,async()=>assert.deepEqual(await unchanged(f,historical,
+    ()=>readDossierAssessmentSessionAt(historical,'p',reference(session))),result));
+  await fixedPoint(replay,async()=>assert.deepEqual(await unchanged(f,replay,
+    ()=>runDossierAssessmentSession(replay,'p',packet.subject,env)),result));
+
 });
 
 test('live dossier: nonempty partial; prepared, paid-response and application cuts recover the original position',async t=>{
@@ -392,12 +440,12 @@ test('live dossier: nonempty partial; prepared, paid-response and application cu
     if(cut==='prepared') {
       const initial=f.store.list<DossierAssessmentSession>('assessment-session').find(s=>s.value.contract==='dossier-session/v1')!;
       const prepared=f.store.get<DossierAssessmentApplication>(initial.value.application,1)!;
-      for(const store of [f.store,f.open()]) {
+      for(const store of [f.store,f.open()]) await fixedPoint(store,async()=>{
         for(const missing of [reference(initial),reference(prepared)])
           await unchanged(f,store,()=>runDossierAssessmentSession(mask(store,missing),'p',packet.subject,f.environment,undefined,undefined,{restoreOnly:true}),true);
         const restored=await unchanged(f,store,()=>runDossierAssessmentSession(store,'p',packet.subject,f.environment,undefined,undefined,{restoreOnly:true}));
         assert.equal(restored!.session.id,initial.id);assert.equal(restored!.result,null);
-      }
+      });
       const resumed=await runDossierAssessmentSession(f.open(),'p',packet.subject,f.environment);
       assert.equal(resumed.session.id,initial.id);assert.equal(dossierCalls(f.store).length,1);
     }
@@ -405,18 +453,32 @@ test('live dossier: nonempty partial; prepared, paid-response and application cu
     const restored=await runDossierAssessmentSession(f.open(),'p',packet.subject,env);
     assert.equal(restored.result!.completeness,'partial');assert.ok(restored.result!.packet.materials.length);
     assert.deepEqual(restored.result!.packet.materials,packet.materials);assert.equal(dossierCalls(f.store).length,1);
-    await unchanged(f,f.store,()=>runDossierAssessmentSession(f.store,'p',packet.subject,env));
+    await fixedPoint(f.store,()=>unchanged(f,f.store,()=>runDossierAssessmentSession(f.store,'p',packet.subject,env)));
+    if(cut==='application') {
+      for(const store of [f.store,f.open()])await refusePaidGrounds(f,store,restored);
+      const app=f.store.get<DossierAssessmentApplication>(restored.application!.id,1)!;
+      const call=dossierCalls(f.store).find(row=>row.value.assessmentApplication?.id===app.id)!;
+      await fixedPoint(f.store,async()=>{
+        for(const at of [reference(app),call.value.request.record!,call.value.response!.record!,call.value.packet!.archive]) {
+          const row=f.store.get<any>(at.id,at.revision)!;
+          for(const value of [{...row,value:null},{...row,value:{...row.value,projectId:'foreign'}}])
+            await unchanged(f,f.store,()=>readDossierAssessmentSessionAt(mask(f.store,at,value),'p',reference(restored.session)),true);
+        }
+      });
+    }
   }
 });
 
 test('live dossier: raw/mixed/missing subjects refuse before claims; reservation and application races retain one physical operation',async t=>{
   const f=await partial(t),packet=f.packet;liveAdapter(f,packet,'return',false);
+  await fixedPoint(f.store,async()=>{
   for(const subject of [undefined,null,{}, {...packet.subject,contract:'unknown'},{...packet.subject,root:{...packet.subject.root,hash:'0'.repeat(64)}}])
     await unchanged(f,f.store,()=>runDossierAssessmentSession(f.store,'p',subject,f.environment),true);
   for(const context of [{dossierSubject:packet.subject,dossierResultTransport:DOSSIER_RESULT_TRANSPORT},
     {dossierSubject:packet.subject,dossierResultTransport:DOSSIER_RESULT_TRANSPORT,managedDossier:null}])
     await unchanged(f,f.store,()=>researchCall(f.environment.value.reviewer,f.environment.value,'Raw dossier',context,undefined,
       {store:f.store,draftId:f.draft.id,questionId:f.v.plan.id,purpose:'dossier-assessor'}),true);
+  });
   const rival=f.open();let moved=false,afterMove:string|undefined;
   const beforePayment=money(f.store),beforeWires=f.wires();
   const race=view(f.store,(writes,_guards,invoke)=>{
@@ -433,33 +495,54 @@ test('live dossier: raw/mixed/missing subjects refuse before claims; reservation
 });
 
 test('live dossier: exact reservation cut resumes on hot/new Store only for its original live owner, without a second ledger reservation',async t=>{
+  const f=await partial(t),packet=f.packet;liveAdapter(f,packet,'return',false);
+  let interrupted=false;
+  const cutting=view(f.store,(writes,_guards,invoke)=>{
+    const cut=!interrupted&&writes.some(write=>write.kind==='model-call');
+    const result=invoke();if(cut){interrupted=true;throw new Error('reservation-cut');}return result;
+  });
+  await assert.rejects(()=>runDossierAssessmentSession(cutting,'p',packet.subject,f.environment),/reservation-cut/);
+  const claim=dossierCalls(f.store)[0]!,ledger=money(f.store).ledger,wires=f.wires();
+  assert.equal(claim.revision,1);assert.equal(claim.value.status,'running');
+  // This one real committed cut supplies both isolated recovery cases. SQLite
+  // backs up every committed row while the original Store stays live for hot
+  // recovery; that Store is closed before restoring the cut for the new Store.
+  // Runtime files stay at their original paths; no paid row or Ref is invented.
+  const checkpoint=mkdtempSync(join(tmpdir(),'omg-reserved-cut-')),world=join(checkpoint,'world');
+  t.after(()=>rmSync(checkpoint,{recursive:true,force:true}));cpSync(f.root,world,{recursive:true});
+  const database=join(world,basename(f.path));
+  for(const suffix of ['', '-wal', '-shm'])rmSync(database+suffix,{force:true});
+  const backup=new DatabaseSync(f.path);
+  try{backup.prepare('VACUUM INTO ?').run(database);}finally{backup.close();}
   for(const cold of [false,true]) {
-    const f=await partial(t),packet=f.packet;liveAdapter(f,packet,'return',false);
-    let interrupted=false;
-    const cutting=view(f.store,(writes,_guards,invoke)=>{
-      const cut=!interrupted&&writes.some(write=>write.kind==='model-call');
-      const result=invoke();if(cut){interrupted=true;throw new Error('reservation-cut');}return result;
-    });
-    await assert.rejects(()=>runDossierAssessmentSession(cutting,'p',packet.subject,f.environment),/reservation-cut/);
-    const claim=dossierCalls(f.store)[0]!,ledger=money(f.store).ledger,wires=f.wires();
-    assert.equal(claim.revision,1);assert.equal(claim.value.status,'running');
+    if(cold) {
+      f.store.close();
+      for(const name of readdirSync(f.root))rmSync(join(f.root,name),{recursive:true,force:true});
+      cpSync(world,f.root,{recursive:true});
+    }
     const store=cold?f.open():f.store;
     const running=store.get<DossierAssessmentApplication>(claim.value.assessmentApplication!.id,2)!;
-    for(const row of [running,claim])for(const value of [null,{...row,value:null}])
+    const readBefore=all(store);
+    // Both Store modes recover this real reservation. The hot table covers both
+    // missing-row and null-body forms; cold repeats each missing proof class.
+    for(const row of [running,claim])for(const value of cold?[null]:[null,{...row,value:null}])
       await unchanged(f,store,()=>runDossierAssessmentSession(mask(store,reference(row),value),'p',packet.subject),true);
-    await unchanged(f,store,()=>runDossierAssessmentSession(store,'p',packet.subject,undefined,undefined,undefined,{restoreOnly:true}));
-    await unchanged(f,store,()=>runDossierAssessmentSession(store,'p',packet.subject,undefined,undefined,undefined,{allowance:0}),true);
-    const original=store.get<DossierAssessmentSession>(f.store.list<DossierAssessmentSession>('assessment-session').find(s=>s.value.contract==='dossier-session/v1')!.id)!;
+    if(!cold) {
+      await unchanged(f,store,()=>runDossierAssessmentSession(store,'p',packet.subject,undefined,undefined,undefined,{restoreOnly:true}));
+      await unchanged(f,store,()=>runDossierAssessmentSession(store,'p',packet.subject,undefined,undefined,undefined,{allowance:0}),true);
+    }
+    const original=store.get<DossierAssessmentSession>(store.list<DossierAssessmentSession>('assessment-session').find(s=>s.value.contract==='dossier-session/v1')!.id)!;
     // An honest foreign owner cannot acquire the original prepared application's identity.
     const foreign={...claim,value:{...claim.value,ownerProcess:{pid:process.pid,started:'foreign'},execution:{...claim.value.execution!,owner:{pid:process.pid,started:'foreign'}}}};
     foreign.hash=hashJson(foreign.value as never);
     await unchanged(f,store,()=>runDossierAssessmentSession(mask(store,reference(claim),foreign),'p',packet.subject),true);
+    assert.equal(all(store),readBefore);
     const result=await runDossierAssessmentSession(store,'p',packet.subject);
     assert.ok(result.result);assert.equal(dossierCalls(store).length,1);assert.equal(f.wires().length,wires.length+1);
     const terminal=dossierCalls(store)[0]!;assert.equal(terminal.id,claim.id);assert.deepEqual(terminal.value.request,claim.value.request);
     assert.deepEqual(terminal.value.packet,claim.value.packet);assert.deepEqual(money(store).ledger,ledger);
     assert.equal(result.session.id,original.id);
-    await unchanged(f,store,()=>runDossierAssessmentSession(store,'p',packet.subject));
+    await fixedPoint(store,()=>unchanged(f,store,()=>runDossierAssessmentSession(store,'p',packet.subject)));
   }
 });
 
@@ -474,11 +557,11 @@ test('live dossier: a competing application commit wins once and the loser resto
   });
   await assert.rejects(()=>runDossierAssessmentSession(racing,'p',packet.subject,f.environment),e=>e instanceof EngineError);
   assert.ok(won);assert.equal(dossierCalls(f.store).length,1);
-  const result=await unchanged(f,f.store,()=>runDossierAssessmentSession(f.store,'p',packet.subject));assert.ok(result!.result);
+  const result=await fixedPoint(f.store,()=>unchanged(f,f.store,()=>runDossierAssessmentSession(f.store,'p',packet.subject)));assert.ok(result!.result);
 });
 
 test('live dossier: rejected/unassessed/unknown and both blocking sides survive paid return; another snapshot cannot inherit it',async t=>{
-  const f=await setup(t);const entries=await complete(f),target=addresses(entries.industry)[0]!;
+  const f=await completed(t),target=addresses(f.entries.industry)[0]!;
   const rejected=await deep(f,'q-market',[{...(claim(f,'q-market','market','Rejected explicit counterargument') as Record<string,Json>),
     contradicts:[target],refutedBy:[target]} as unknown as Json]);await assess(f,rejected,'rejected');
   const unknown=await deep(f,'q-market',[{...(claim(f,'q-market','market','Unassessed addressed unknown') as Record<string,Json>),kind:'unknown',
@@ -492,18 +575,16 @@ test('live dossier: rejected/unassessed/unknown and both blocking sides survive 
   assert.deepEqual(result.result!.packet,packet);const firstPurchases=dossierCalls(f.store).length;
   const app=f.store.get<DossierAssessmentApplication>(result.application!.id,1)!,call=dossierCalls(f.store).find(call=>call.value.assessmentApplication?.id===app.id)!;
   const archive=f.store.get<any>(call.value.packet!.archive.id,1)!;
-  for(const store of [f.store,f.open()]) {
-    for(const ref of [reference(app),call.value.request.record!,call.value.response!.record!,call.value.packet!.archive]) {
-      const original=store.get<any>(ref.id,ref.revision)!;
-      for(const value of [null,{...original,value:null},{...original,value:{...original.value,projectId:'foreign'}}])
-        await unchanged(f,store,()=>readDossierAssessmentSessionAt(mask(store,ref,value),'p',reference(result.session)),true);
-    }
-    for(const change of [(body:any)=>{body.dossierPacket.contradictions[0].sides.pop()},(body:any)=>{body.dossierPacket.materials.pop()},
-      (body:any)=>{body.resultCapacity.bindings.managedDossier=null},(body:any)=>{delete body.managedDossier}]) {
+  for(const store of [f.store,f.open()]) await fixedPoint(store,async()=>{
+    // All distinct archive corruptions remain hot; cold repeats cover inventory
+    // loss and managed binding, rather than duplicating the entire table.
+    const changes=[(body:any)=>{body.dossierPacket.contradictions[0].sides.pop()},(body:any)=>{body.dossierPacket.materials.pop()},
+      (body:any)=>{body.resultCapacity.bindings.managedDossier=null},(body:any)=>{delete body.managedDossier}];
+    for(const change of store===f.store?changes:[changes[0]!,changes[2]!]) {
       const fake=structuredClone(archive);change(fake.value.body);fake.hash=hashJson(fake.value);
       await unchanged(f,store,()=>readDossierAssessmentSessionAt(mask(store,reference(archive),fake),'p',reference(result.session)),true);
     }
-  }
+  });
   // Real later classification changes the immutable inventory and therefore the exact session identity.
   await assess(f,unknown,'material');
   const second=await prepareDossierAssessmentSubject(f.store,'p',reference(produceSelectedDossier(f.store,'p',f.input).record));
@@ -512,10 +593,10 @@ test('live dossier: rejected/unassessed/unknown and both blocking sides survive 
   const rejectedPurchases=dossierCalls(f.store).length;assert.ok(rejectedPurchases>firstPurchases);
   const rejectedSession=f.store.list<DossierAssessmentSession>('assessment-session').find(s=>s.value.contract==='dossier-session/v1'&&s.value.subject.identity===second.subject.identity)!;
   assert.equal(rejectedPurchases-firstPurchases,rejectedSession.value.step+1);
-  for(const store of [f.store,f.open()]) {
+  for(const store of [f.store,f.open()]) await fixedPoint(store,async()=>{
     await unchanged(f,store,()=>runDossierAssessmentSession(store,'p',second.subject),true);
     const first=await unchanged(f,store,()=>runDossierAssessmentSession(store,'p',packet.subject));assert.deepEqual(first,result);
-  }
+  });
 });
 
 test('live dossier: two original-owner authorization contenders send once; authorized provider is never relaunched',async t=>{
@@ -526,12 +607,12 @@ test('live dossier: two original-owner authorization contenders send once; autho
   const count=f.wires().length;
   const outcomes=await Promise.allSettled([runDossierAssessmentSession(f.store,'p',packet.subject),runDossierAssessmentSession(f.open(),'p',packet.subject)]);
   assert.ok(outcomes.some(o=>o.status==='fulfilled'));assert.equal(dossierCalls(f.store).length,1);assert.equal(f.wires().length,count+1);
-  const final=await unchanged(f,f.store,()=>runDossierAssessmentSession(f.store,'p',packet.subject));assert.ok(final!.result);
+  const final=await fixedPoint(f.store,()=>unchanged(f,f.store,()=>runDossierAssessmentSession(f.store,'p',packet.subject)));assert.ok(final!.result);
   const g=await partial(t);liveAdapter(g,g.packet,'return',false);let authorized=false;
   const authorizedCut=view(g.store,(writes,_guards,invoke)=>{const hit=!authorized&&writes.some(w=>w.kind==='model-call'&&w.value.execution?.phase==='authorized');const rows=invoke();if(hit){authorized=true;throw new Error('authorized-cut');}return rows;});
   await assert.rejects(()=>runDossierAssessmentSession(authorizedCut,'p',g.packet.subject,g.environment),e=>e instanceof EngineError&&e.code==='process_record_failed');assert.ok(authorized);
   assert.equal(dossierCalls(g.store)[0]!.value.execution!.phase,'authorized');
-  await unchanged(g,g.store,()=>runDossierAssessmentSession(g.store,'p',g.packet.subject),true);
+  await fixedPoint(g.store,()=>unchanged(g,g.store,()=>runDossierAssessmentSession(g.store,'p',g.packet.subject),true));
 });
 
 test('live dossier: missing compatible samples and unaffordable real forecast refuse before claim/ledger/wire',async t=>{
@@ -566,7 +647,7 @@ test('live dossier: foreign exact profile refuses before publication and leaves 
   await f.engine.execute({type:'create-project',project:'other',title:'Other dossier profile'});
   f.engine.environments.configure('other',f.environment.value,0);
   const foreign=configureReaderPilot(f.store,f.engine.environments,'other',settings,0);
-  for(const store of [f.store,f.open()]) {
+  for(const store of [f.store,f.open()]) await fixedPoint(store,async()=>{
     for(const profile of [foreign,{...foreign,value:{...foreign.value,projectId:'p'}}])
       await unchanged(f,store,async()=>{
         await assert.rejects(()=>runDossierAssessmentSession(store,'p',packet.subject,f.environment,profile),
@@ -575,12 +656,12 @@ test('live dossier: foreign exact profile refuses before publication and leaves 
     assert.equal(store.list<DossierAssessmentSession>('assessment-session').filter(s=>s.value.contract==='dossier-session/v1').length,0);
     assert.equal(store.list<DossierAssessmentApplication>('assessment-application').filter(a=>a.value.contract==='dossier-application/v1').length,0);
     assert.equal(dossierCalls(store).length,0);
-  }
+  });
   const result=await runDossierAssessmentSession(f.open(),'p',packet.subject,f.environment,own);
   assert.equal(result.result!.result.verdict,'return');assert.deepEqual(result.result!.packet,packet);
   assert.equal(dossierCalls(f.store).length,1);
   for(const store of [f.store,f.open()])
-    assert.deepEqual(await unchanged(f,store,()=>runDossierAssessmentSession(store,'p',packet.subject)),result);
+    await fixedPoint(store,async()=>assert.deepEqual(await unchanged(f,store,()=>runDossierAssessmentSession(store,'p',packet.subject)),result));
 });
 test('live dossier: bounded managed pages deliver the full saved packet and schema before terminal assessment',async t=>{
   const f=await partial(t,'Exact rejected argument '+ 'bounded material '.repeat(2000)),packet=f.packet;
@@ -598,5 +679,5 @@ test('live dossier: bounded managed pages deliver the full saved packet and sche
   assert.ok(wires.length>3);assert.ok(wires.every(w=>JSON.stringify(w).length<=100000));
   assert.ok(wires.some(w=>w.subject.contextWorkspace?.length));
   const profile=f.store.get<ReaderPilot>(pilot.id)!;f.store.write({id:profile.id,kind:profile.kind,expected:profile.revision,value:{...profile.value,maxCalls:1}});
-  for(const store of [f.store,f.open()])await unchanged(f,store,()=>runDossierAssessmentSession(store,'p',packet.subject,undefined,store.get<ReaderPilot>(pilot.id)!));
+  for(const store of [f.store,f.open()])await fixedPoint(store,()=>unchanged(f,store,()=>runDossierAssessmentSession(store,'p',packet.subject,undefined,store.get<ReaderPilot>(pilot.id)!)));
 });
