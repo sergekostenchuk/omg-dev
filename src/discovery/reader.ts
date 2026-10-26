@@ -1,5 +1,6 @@
 import { researchReadLimit } from "./research-limits.js";
 import { realpathSync } from 'node:fs';
+import { isProxy } from 'node:util/types';
 import type { Store, Revision, Write, TransactionGuard } from "../storage/store.js";
 import { Environments, uniqueTransactionGuards, workspacePath, type Environment } from "../runtime/environment.js";
 import { pilotEnvironment, type ReaderPilot } from "./reader-pilot.js";
@@ -13,6 +14,8 @@ import { prepareResearchConsumerIntent, prepareResearchConsumerApplication,
   type ResearchConsumerIntent, type ResearchConsumerIntentInput, type ResearchConsumerExecution } from "./response-recovery.js";
 import { canonical, digest, hashJson } from "../canonical.js";
 import { requireCondition, EngineError } from "../errors.js";
+import { historicalProof } from "../history/proofs.js";
+import { genuineStore } from "../storage/store-view.js";
 import { reusableReaderRanges } from './reader-reuse.js';
 import { continuationPrompt } from './continuation-packet.js';
 import { questionDispatchId } from './v7-managed-attempt.js';
@@ -331,7 +334,32 @@ function combinedReaderOutcome(parts: readonly Revision<ReaderResult>[], prior: 
   };
 }
 
+/** Only a plain exact Ref keys a kept proof: not a Proxy, exactly Object.prototype, exactly three own keys (symbols counted),
+ * each of id/revision/hash an enumerable data field; its values are taken once and that very snapshot is what is proved. */
+function plainExactRef(ref: unknown): Ref | null {
+  if (!ref || typeof ref !== 'object' || isProxy(ref) || Array.isArray(ref) || Object.getPrototypeOf(ref) !== Object.prototype) return null;
+  const keys = Reflect.ownKeys(ref), fields = Object.getOwnPropertyDescriptors(ref);
+  if (keys.length !== 3 || !['id', 'revision', 'hash'].every(name => keys.includes(name)
+    && 'value' in fields[name]! && fields[name]!.enumerable === true)) return null;
+  const exact = { id: fields['id']!.value, revision: fields['revision']!.value, hash: fields['hash']!.value };
+  return isRef(exact) ? exact : null;
+}
+
+/** The exact (project, Ref) reader result is one historical proof on the genuine Store: derived once from its producer's exact
+ * saved inputs, kept while everything it read is current — the head of its intent included, which the derivation reads through
+ * the source it is handed — and given to every caller as a copy of its own. Any other Store (a trace, an overlay, an opaque
+ * view), any other Ref form and any project that cannot key a proof derive in place, with the refusals they always had. A
+ * refusal is never kept; whether the bytes on disk are still current is the callers' separate admission, not this proof. */
 export function readReaderResultAt(store: Store, project: string, ref: Ref): Revision<ReaderResult> {
+  const exact = plainExactRef(ref);
+  if (!exact || !genuineStore(store) || typeof project !== 'string' || project.trim().length === 0)
+    return deriveReaderResultAt(store, project, ref);
+  return structuredClone(historicalProof(store, { reader: 'reader.result-read/v1', project, ref: exact },
+    source => deriveReaderResultAt(source, project, exact),
+    () => invalidReaderResult(exact, 'The reader origin is missing or cyclic')));
+}
+
+function deriveReaderResultAt(store: Store, project: string, ref: Ref): Revision<ReaderResult> {
   const ancestors = new Set<string>();
   function invalid(message: string): never { return invalidReaderResult(ref, message); }
   const read = (selected: Ref): Revision<ReaderResult> => {
