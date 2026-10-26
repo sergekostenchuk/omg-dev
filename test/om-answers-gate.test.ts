@@ -3,7 +3,7 @@ const { fixtureAnswer } = await import(new URL('../../test/om-adapter-fixture.mj
 
 import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -1338,35 +1338,61 @@ async function e5Terminal(f: ReturnType<typeof fixture>, assessor: Json, ended =
     assessor: reference(physical.record) }));
   return { terminal, replacement };
 }
-/** A real E4 stop-analysis transport of this project: a transport of another purpose than fact assessment. */
+/**
+ * A real E4 stop-analysis transport of this project: a transport of another purpose than fact assessment. Its basis is a real stop of
+ * the block: three managed attempts, each owning the complete MC1 batch of the fixture question, paid through a real E2/E4 off its
+ * form and closed at G7 with the claim the registry derives itself. A6 has its own scenario and trace and is admitted only after that
+ * preparation; the paid model calls of the preparation stay exactly as they were saved.
+ */
 async function stopAnalysisTransport(f: ReturnType<typeof fixture>) {
-  const address = { project: f.project, block: f.block, line: 1 };
-  const goal: AttemptGoal = { key: 'answers:stopped-goal', questions: ['Address one contract'], result: 'A supported contract' };
-  ok(openSeries(f.store, { ...address, slice: 'answers:stop-analysis', predecessor: null, basis: null }));
-  let series: Revision<unknown> | null = null;
+  const exchange = mc1Exchange(f, 'stop-paid', 'answers-independent', true);
+  const address = { project: f.project, block: f.block, line: 1 }, plan = { routes: reference(f.route), batches: [exchange.batch.id] };
+  const goal = f.store.get<RepairSeries>(exchange.series.id)!.value.attempts[0]!.goal;
+  const steps: unknown[] = [], payments: Ref[] = [];
   for (const attempt of [1, 2, 3]) {
-    ok(beginAttempt(f.store, { ...address, attempt, goal }));
-    series = ok(completeAttempt(f.store, { ...address, attempt,
-      outcome: { reason: 'result', achieved: [], cancelled: [], refusals: [] } })) as Revision<unknown>;
+    const opened = attempt === 1 ? exchange.series : ok(managedOpenAttempt(f.store, { ...address, attempt, goal, completion: plan }));
+    const packet = attempt === 1 ? exchange.packet : ok(writeQuestionPacket(f.store, { project: f.project, routes: reference(f.route),
+      batch: exchange.batch.id, environment: reference(exchange.config), attempt: { series: reference(opened), ordinal: attempt }, previous: [] })).record;
+    steps.push({ research: { invalid: true }, usage: traceUsage });
+    writeFileSync(exchange.scenario, JSON.stringify({ database: f.path, steps }));
+    const physical = ok(await runModelCall(f.store, { project: f.project, packet: reference(packet), dispatch: exchange.dispatch, role: 'implementer' }));
+    assert.ok(physical.diagnostic, `attempt ${attempt} ended its own work off its form`);
+    payments.push(reference(physical.record));
+    const binding = ok(readCompletionBinding(f.store, f.project, reference(f.store.get(exchange.series.id)!), attempt));
+    if (!binding) assert.fail(`attempt ${attempt} has its completion binding`);
+    assert.deepEqual(binding.value.plan, plan);
+    const work = ok(readCompletionWorkAt(f.store, f.project, reference(f.store.get(completionWorkId(f.project, binding.id))!)));
+    assert.equal(work.complete, true, `attempt ${attempt} completed its own work`);
+    const claim = ok(prepareManagedClaim(f.store, { ...address, attempt,
+      outcome: { reason: 'off-form', accepting: [], cancelling: [], refusals: [] } })).outcome;
+    ok(closeAttempt(f.store, { ...address, attempt, outcome: claim }));
   }
-  const basis = { kind: 'series-stop' as const, series: reference(series!), attempt: 3 };
-  const scenario = join(f.root, 'stop-analysis-scenario.json');
-  const command = { executable: process.execPath, args: [adapterFixture, '--scenario', scenario,
-    '--trace', join(f.root, 'stop-analysis-trace.jsonl')] };
+  const series = f.store.get<RepairSeries>(exchange.series.id)!;
+  assert.deepEqual(series.value.stop?.attempts, [1, 2, 3]);
+  assert.deepEqual(series.value.attempts.map(item => item.outcome?.reason), ['off-form', 'off-form', 'off-form']);
+  const paid = f.store.list('model-call').map(row => f.store.get(row.id)!);
+  assert.ok(payments.length > 0 && payments.every(ref => paid.some(row => row.id === ref.id)), 'The preparation left its own saved model calls');
+  assert.ok(f.store.list<{ purpose?: string }>('call-record').every(row => row.value.purpose !== 'stop-analysis'), 'The target A6 is not admitted yet');
+  const basis = { kind: 'series-stop' as const, series: reference(series), attempt: 3 };
+  const scenario = join(f.root, 'stop-analysis-scenario.json'), trace = join(f.root, 'stop-analysis-trace.jsonl');
+  assert.ok(!existsSync(trace), 'Nothing of the analysis itself was sent yet');
+  const command = { executable: process.execPath, args: [adapterFixture, '--scenario', scenario, '--trace', trace] };
   const environment = f.engine.environments.configure(f.project, { workspace: f.root,
     implementer: { actor: 'analysis-executor', model: 'fixture', effort: 'high', command },
-    reviewer: { actor: 'analysis-reviewer', model: 'fixture', effort: 'high', command }, fullCheck: command, timeoutMs: 5000 }, 0);
+    reviewer: { actor: 'analysis-reviewer', model: 'fixture', effort: 'high', command }, fullCheck: command, timeoutMs: 5000 }, f.store.get(`environment:${f.project}`)!.revision);
   const adapter = f.store.write({ id: `adapter:${f.project}:answers:stop-analysis`, kind: 'dispatch-adapter', expected: 0,
     value: { projectId: f.project, protocol: 'codex-stdio' } });
   const packet = { task: 'Diagnose the named ground', basis } as unknown as Json;
   const admitted = ok(recordCall(f.store, f.project, { call: 'answers:stop-analysis', purpose: 'stop-analysis', basis,
     block: f.block, gaps: [{ id: 'stop-analysis', goal: 'stop-analysis', field: 'cause-and-change', consumer: 'A6:stop-analysis' }],
-    series: reference(series!), attempt: 3,
+    series: reference(series), attempt: 3,
     goal: { key: 'stop-analysis', questions: ['What caused this ground?'], result: 'A cause with an addressed change' },
     dispatch: { adapter: reference(adapter), config: reference(environment) }, packet }));
   writeFileSync(scenario, JSON.stringify({ steps: [{ research: { cause: 'fixture observation', hypothesis: true },
     usage: traceUsage }] }));
-  return ok(await runModelTransport(f.store, { project: f.project, call: reference(admitted.call), packet, role: 'reviewer' }));
+  const transport = ok(await runModelTransport(f.store, { project: f.project, call: reference(admitted.call), packet, role: 'reviewer' }));
+  assert.deepEqual(paid.map(row => f.store.get(row.id)), paid, 'The paid preparation is unchanged by the stop-analysis transport');
+  return transport;
 }
 
 test('26 H1.0c duplicate submissions of one gap keep one finding with every occurrence and no winner', t => {
