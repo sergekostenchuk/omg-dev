@@ -1,5 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import { EngineError } from "../src/errors.js";
 import { canonical, hashJson, type Json } from "../src/canonical.js";
 import { reference, type Ref } from "../src/pipeline/contracts.js";
@@ -12,6 +14,7 @@ import { createPartialV7Draft, discoveryAcceptanceActId, isDiscoveryV7Draft,
   type DiscoveryAcceptanceAct } from "../src/discovery/v7-contracts.js";
 import { discoveryPrefixClosureId } from "../src/discovery/discovery.js";
 import { reuseResearch } from "../src/discovery/research-reuse.js";
+import { managedAnswerId } from "../src/discovery/research-consumer-transition.js";
 import { savedAcceptanceAct } from "../src/discovery/projection-reader.js";
 import { projectFrameInterpretations } from "../src/discovery/frame-interpretations.js";
 import { collectFrameInterpretationSubject, checkFrameInterpretationSubject,
@@ -32,30 +35,34 @@ const RANGE = { kind: "text-range", start: 3, end: 62 } as const;
 const JSON_DOC = JSON.stringify({ meta: { author: "owner" },
   brief: "Учёт материалов: склад и списание на объектах", extra: { notes: ["a", "b"] } });
 
-/** A read-only block boundary: every head and every revision history, the
- * model calls and the ledger stay byte-identical across the action. */
-const noWrite = async <T>(store: Store, action: () => T | Promise<T>): Promise<T> => {
-  const snap = () => canonical(store.list().map(row => reference(row)));
-  const hist = () => canonical(store.list().map(row => [row.id, store.history(row.id).map(r => r.revision)]));
-  const before = snap(), beforeHist = hist(), calls = canonical(store.list("model-call")),
-    ledger = canonical(store.list("ledger"));
-  const result = await action();
-  assert.equal(snap(), before); assert.equal(hist(), beforeHist);
-  assert.equal(canonical(store.list("model-call")), calls);
-  assert.equal(canonical(store.list("ledger")), ledger);
-  return result;
-};
-const noWriteSync = <T>(store: Store, action: () => T): T => {
-  const snap = () => canonical(store.list().map(row => reference(row)));
-  const hist = () => canonical(store.list().map(row => [row.id, store.history(row.id).map(r => r.revision)]));
-  const before = snap(), beforeHist = hist(), calls = canonical(store.list("model-call")),
-    ledger = canonical(store.list("ledger"));
-  const result = action();
-  assert.equal(snap(), before); assert.equal(hist(), beforeHist);
-  assert.equal(canonical(store.list("model-call")), calls);
-  assert.equal(canonical(store.list("ledger")), ledger);
-  return result;
-};
+/** A read-only block boundary: the FULL head rows and the FULL revision rows of
+ * every entity, the model calls, the research-budget-ledger and the wire state
+ * (for this fixture the provable state is the wire file's absence) stay
+ * byte-identical across the action — the comparison also runs when the action
+ * refuses. One algorithm serves sync and async actions. */
+const state = (store: Store, wireFile: string) => ({
+  heads: canonical(store.list()),
+  revisions: canonical(store.list().map(row => [row.id, store.history(row.id)])),
+  calls: canonical(store.list("model-call")),
+  ledger: canonical(store.list("research-budget-ledger")),
+  wire: existsSync(wireFile) ? readFileSync(wireFile, "utf8") : null,
+});
+function noWrite<T>(store: Store, wireFile: string, action: () => Promise<T>): Promise<T>;
+function noWrite<T>(store: Store, wireFile: string, action: () => T): T;
+function noWrite(store: Store, wireFile: string, action: () => unknown): unknown {
+  const before = state(store, wireFile);
+  const verify = () => assert.deepEqual(state(store, wireFile), before,
+    "a read-only block changed the saved state");
+  try {
+    const result = action();
+    if (result instanceof Promise) return result.finally(verify);
+    verify();
+    return result;
+  } catch (error) {
+    verify();
+    throw error;
+  }
+}
 
 const code = (fn: () => unknown): string => {
   try { fn(); } catch (error) {
@@ -416,7 +423,7 @@ test("2b.1-S the local refusal catalogue is exactly the three subject codes; for
 });
 
 test("2b.1-S a rebound frame accepted through real reuse still resolves its own accepted brief; hot and cold reads agree", async (t) => {
-  const f = discoveryFixture(t, "omg-2bs-reuse-"), project = "reuse";
+  const f = discoveryFixture(t, "omg-2bs-reuse-"), project = "reuse", wire = join(f.root, "wire.ndjson");
   const first = base(f, project);
   // The second v7 draft of the same project, stage, specs, consumer and
   // inputs — the exact reuse candidate of the first one's answered frame.
@@ -452,20 +459,19 @@ test("2b.1-S a rebound frame accepted through real reuse still resolves its own 
   const briefHead = f.store.get<Question>(briefQ2.id)!;
   f.discovery.reopen(briefHead.id, briefHead.revision);
   f.engine.discovery.fact(briefQ2.id, f.store.get<Question>(briefQ2.id)!.revision, reference(late), { ...RANGE });
-  assert.deepEqual(await noWrite(f.store, () => collectFrameInterpretationSubject(f.store, req)), pkg,
+  assert.deepEqual(await noWrite(f.store, wire, () => collectFrameInterpretationSubject(f.store, req)), pkg,
     "the historical package is unchanged by the late acceptance");
   assert.deepEqual(collectFrameInterpretationSubject(f.open(), req), pkg, "a cold store agrees");
   const cold = f.open();
-  assert.deepEqual(await noWrite(cold, () => checkFrameInterpretationSubject(cold, req, structuredClone(pkg))), pkg);
-  assert.equal(code(() => collectFrameInterpretationSubject(f.store,
-    { project, frame: frameRef2, mandate: { source: reference(late), selector: { ...RANGE } } })),
+  assert.deepEqual(await noWrite(cold, wire, () => checkFrameInterpretationSubject(cold, req, structuredClone(pkg))), pkg);
+  const lateReq = { project, frame: frameRef2, mandate: { source: reference(late), selector: { ...RANGE } } };
+  assert.equal(await noWrite(f.store, wire, () => code(() => collectFrameInterpretationSubject(f.store, lateReq))),
     "frame_subject_mismatch", "the late source is not the historical mandate");
-  assert.equal(field(() => collectFrameInterpretationSubject(f.store,
-    { project, frame: frameRef2, mandate: { source: reference(late), selector: { ...RANGE } } })), "mandate");
+  assert.equal(await noWrite(f.store, wire, () => field(() => collectFrameInterpretationSubject(f.store, lateReq))), "mandate");
 });
 
-test("2b.1-S a hidden before-revision of the saved brief act refuses; the acceptance is proven through the shared reader, not borrowed fields", (t) => {
-  const f = discoveryFixture(t, "omg-2bs-brief-"), project = "brick";
+test("2b.1-S a hidden before-revision of the saved brief act refuses; the acceptance is proven through the shared reader, not borrowed fields", async (t) => {
+  const f = discoveryFixture(t, "omg-2bs-brief-"), project = "brick", wire = join(f.root, "wire.ndjson");
   const b = base(f, project);
   const req = requestOf(project, b);
   const pkg = collectFrameInterpretationSubject(f.store, req);
@@ -482,20 +488,20 @@ test("2b.1-S a hidden before-revision of the saved brief act refuses; the accept
   try {
     for (const fn of [() => collectFrameInterpretationSubject(f.store, req),
       () => checkFrameInterpretationSubject(f.store, req, structuredClone(pkg))]) {
-      assert.equal(code(fn), "frame_subject_missing");
-      assert.equal(field(fn), "mandate");
+      assert.equal(await noWrite(f.store, wire, () => code(fn)), "frame_subject_missing");
+      assert.equal(await noWrite(f.store, wire, () => field(fn)), "mandate");
     }
   } finally { delete (f.store as { get?: unknown }).get; }
 });
 
-test("2b.1-S the shared reader still refuses a malformed managed research-answer address; only proven non-managed answers carry no turn", (t) => {
-  const f = discoveryFixture(t, "omg-2bs-managed-"), project = "managed-x";
+test("2b.1-S the shared reader still refuses a malformed managed research-answer address and a fact masked by a managed address; only proven non-managed answers at their own address carry no turn", async (t) => {
+  const f = discoveryFixture(t, "omg-2bs-managed-"), project = "managed-x", wire = join(f.root, "wire.ndjson");
   const b = base(f, project);
   const head = f.store.get<DiscoveryDraft>(b.draft.id)!;
   // Positive right beside it: the real fact acceptance of this draft proves
   // through the same shared door — absence of a managed turn is its lawful form.
   const briefQ = f.store.get<Question>(b.briefQ.id)!;
-  assert.equal(noWriteSync(f.store,
+  assert.equal(await noWrite(f.store, wire,
     () => savedAcceptanceAct(f.store, head, briefQ, "brief", briefQ.value.answer!, head.value.fields.brief!)), true);
   // A consistent crafted act — real transitions, real assessment — but its
   // answer carries a malformed managed research-answer address: the shared
@@ -519,9 +525,29 @@ test("2b.1-S the shared reader still refuses a malformed managed research-answer
     expected: 0, value: { ...realAct.value, field: "plan", draftBefore: reference(head), draftAfter: reference(dAfter),
       questionBefore: reference(planQ), questionAfter: reference(qAfter), answer: badRef,
       assessment: reference(fakeAssessment), binding: null } });
-  assert.equal(noWriteSync(f.store,
+  assert.equal(await noWrite(f.store, wire,
     () => savedAcceptanceAct(f.store, dAfter, f.store.get<Question>(planQ.id)!, "plan", badRef, planted)), false,
     "a malformed managed research-answer address is refused, not read as a binding-less acceptance");
+  // The namespace masquerade beside it: a real fact record at a VALID managed
+  // research-answer address, a consistent act with binding:null — the proven
+  // kind is fact but the address is not the fact address of its project.
+  const masked = { masked: true } as unknown as Json;
+  const maskedFact = f.store.write({ id: managedAnswerId(project, "research-turn:v1:fact-mask"), kind: "fact",
+    expected: 0, value: { projectId: project, question: b.briefQ.id,
+      observation: { projectId: project, source: reference(b.src), selector: { ...RANGE }, value: masked } } as never });
+  const maskedRef = reference(maskedFact);
+  const reopened = f.discovery.reopen(b.briefQ.id, f.store.get<Question>(b.briefQ.id)!.revision);
+  const qAfter2 = f.store.write<Question>({ id: b.briefQ.id, kind: "question", expected: reopened.revision,
+    value: { ...reopened.value, status: "answered", answer: maskedRef } });
+  const dAfter2 = f.store.write<DiscoveryDraft>({ id: b.draft.id, kind: "discovery-draft", expected: dAfter.revision,
+    value: { ...dAfter.value, fields: { ...dAfter.value.fields, brief: masked } } });
+  f.store.write({ id: discoveryAcceptanceActId(project, b.draft.id, "brief", maskedRef), kind: "discovery-acceptance-act",
+    expected: 0, value: { ...realAct.value, field: "brief", draftBefore: reference(dAfter), draftAfter: reference(dAfter2),
+      questionBefore: reference(reopened), questionAfter: reference(qAfter2), answer: maskedRef,
+      assessment: null, binding: null } });
+  assert.equal(await noWrite(f.store, wire,
+    () => savedAcceptanceAct(f.store, dAfter2, f.store.get<Question>(b.briefQ.id)!, "brief", maskedRef, masked)), false,
+    "a fact masked by a valid managed research-answer address is refused — the address must be of its own kind");
 });
 
 test("2b.1-S an accepted frame of another stage is not a D1 subject: the saved draft and question must stand at the Discovery v7 boundary", (t) => {

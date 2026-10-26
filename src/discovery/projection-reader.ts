@@ -788,6 +788,13 @@ export function savedAcceptanceAct(view: RecordView, draft: Revision<DiscoveryDr
       if (!ansRec || ansRec.kind === "research-answer") {
         return false;
       }
+      // Вид И адрес: fact/decision/design пишутся только как
+      // `${kind}:${projectId}:…`. Любой другой адрес — включая валидный
+      // managed-адрес research-answer — на такой записи маскарад, а не
+      // законное отсутствие связки.
+      if (!ref.id.startsWith(`${ansRec.kind}:${draft.value.projectId}:`)) {
+        return false;
+      }
       if (ansRec.kind === "fact") {
         if (!same((ansRec.value as Fact).observation.value, value)) return false;
       } else if (ansRec.kind === "decision" || ansRec.kind === "design") {
