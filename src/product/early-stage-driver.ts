@@ -489,7 +489,7 @@ export class EarlyStageDriver {
             try {
               restored = await withResearchRunControl(this.engine.store, request.project, execution.hold,
                 () => this.engine.researcher.run(request.project, draft.id, request.maxTurns - turnsUsed,
-                  undefined, { producerPolicy: policy, preserveUnpaidBudgetPause: true }));
+                  undefined, { producerPolicy: policy }));
             } catch (error) {
               // The transport reports a typed refusal if control moved at its
               // reservation. Preserve the driver's original control outcome.

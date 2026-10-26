@@ -202,14 +202,15 @@ function budgetStopReentryEligible(store: Store, project: string, draftId: strin
 
 type BudgetReentryRun = ResearchRun & { budgetReentry?: { origin: Ref; stop: Ref } };
 
-/** A bounded invocation may leave a diagnostic or a pending deep position.
- * Its continuation is still this exact stopped route, not a general v7 opt-in. */
-export async function readBudgetReentryContinuation(store: Store, project: string, draftId: string,
-  run: Revision<ResearchRun>): Promise<boolean> {
+/** Prove the saved route independently of today's admission or budget. A
+ * refusal must not invalidate an already-prepared owner's exact revision. */
+async function readBudgetReentryOrigin(store: Store, project: string, draftId: string,
+  run: Revision<ResearchRun>): Promise<Awaited<ReturnType<typeof readDeepFrontierStop>> | null> {
   if (run.value.status !== 'paused' || !['research_deep_frontier_pending', 'budget_estimate_missing',
-    'research_call_allowance', 'research_interrupted'].includes(run.value.pauseCode ?? '')) return false;
+    'discovery_budget_reserve', 'discovery_budget_overrun', 'research_assessment_pending',
+    'research_call_allowance', 'research_interrupted'].includes(run.value.pauseCode ?? '')) return null;
   const link = (run.value as BudgetReentryRun).budgetReentry;
-  if (link === undefined) return false;
+  if (link === undefined) return null;
   const head = store.get<ResearchRun>(run.id);
   requireCondition(run.kind === 'research-run' && run.value.projectId === project && run.value.draftId === draftId
     && head && canonical(reference(head)) === canonical(reference(run)) && hashJson(run.value) === run.hash
@@ -237,7 +238,15 @@ export async function readBudgetReentryContinuation(store: Store, project: strin
     && dossier.stop && canonical(reference(dossier.stop)) === canonical(link.stop)
     && canonical(reference(dossier.handoff)) === canonical(saved.handoff),
     'discovery_deep_stop_invalid', 'The continued route does not belong to its proved budget stop');
-  return budgetStopReentryEligible(store, project, draftId, stopped);
+  return stopped;
+}
+
+/** A bounded invocation may leave a diagnostic or a pending deep position.
+ * Its continuation is still this exact stopped route, not a general v7 opt-in. */
+export async function readBudgetReentryContinuation(store: Store, project: string, draftId: string,
+  run: Revision<ResearchRun>): Promise<boolean> {
+  const stopped = await readBudgetReentryOrigin(store, project, draftId, run);
+  return stopped !== null && budgetStopReentryEligible(store, project, draftId, stopped);
 }
 
 /** dispatchMode with the X50 proviso: a failed planned child guards the
@@ -269,8 +278,6 @@ export class Researcher {
   constructor(private readonly store: Store, private readonly discovery: Discovery, private readonly environments: Environments) {}
   async run(project: string, draftId: string, limit: number, signal?: AbortSignal,
     options: { restoreOnly?: boolean; producerPolicy?: ProducerPolicy;
-      /** Keep the exact unpaid deep owner when a caller surfaces a forecast refusal. */
-      preserveUnpaidBudgetPause?: boolean;
       /** DRS1a2: trusted opt-in of the compact analyst storage on the v7 path. */
       contextContract?: typeof CONTEXT_PREPARATION_CONTRACT } = {}): Promise<Revision<ResearchRun>> {
     requireCondition(Number.isInteger(limit) && limit >= 1 && limit <= 100, "research_budget_invalid", "Research requires an explicit bounded turn allowance");
@@ -1856,7 +1863,7 @@ export class Researcher {
   /** The v7 open frontier uses the ordinary managed transport and K.
    * Paid work is resolved before today's plan, environment or allowance admits a new send. */
   private async runPlanAttempts(project: string, draftId: string, limit: number, signal: AbortSignal | undefined,
-    options: { restoreOnly?: boolean; producerPolicy?: ProducerPolicy; preserveUnpaidBudgetPause?: boolean;
+    options: { restoreOnly?: boolean; producerPolicy?: ProducerPolicy;
       contextContract?: typeof CONTEXT_PREPARATION_CONTRACT }): Promise<Revision<ResearchRun>> {
     const id = `research-run:${hashJson([project, draftId])}`;
     const owner = { pid: process.pid, started: processStart(process.pid) };
@@ -2512,9 +2519,15 @@ export class Researcher {
       // Before reservation the saved pause is the prepared intent's exact
       // owner. A diagnostic revision would invalidate that unpaid admission.
       if (deepOperation && !(error instanceof EngineError) && current?.value.status === 'paused') return current;
-      if (options.preserveUnpaidBudgetPause && deepOperation && current?.value.status === 'paused'
-        && error instanceof EngineError && ['budget_estimate_missing', 'discovery_budget_reserve',
-          'discovery_budget_overrun', 'research_call_allowance'].includes(error.code)) throw error;
+      if (deepOperation && current?.value.status === 'paused' && error instanceof EngineError
+        && ['budget_estimate_missing', 'discovery_budget_reserve', 'discovery_budget_overrun',
+          'research_call_allowance'].includes(error.code)
+        && listResearchConsumerIntents(this.store, project, draftId).some(intent =>
+          intent.value.kind === 'analyst' && intent.value.state === 'prepared'
+          && intent.value.call === null && intent.value.request === null
+          && Object.hasOwn(intent.value.cursor, 'deepPreparation')
+          && canonical(intent.value.owner) === canonical(reference(current)))
+        && await readBudgetReentryOrigin(this.store, project, draftId, current)) throw error;
       // A CAS/proof refusal must not append a diagnostic over the competitor's
       // state. Once our reservation activated the run, a non-CAS application
       // failure must retain the ordinary paused recovery door, including typed cuts.

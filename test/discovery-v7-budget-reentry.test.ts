@@ -10,6 +10,7 @@ import { Discovery, type DiscoveryDraft, type Question } from '../src/discovery/
 import { EarlyStageDriver } from '../src/product/early-stage-driver.js';
 import { stopRun, acquireRunExecution, releaseRunExecution, readRunControl } from '../src/om/run-control.js';
 import { ProductEngine } from '../src/product/engine.js';
+import { EngineError } from '../src/errors.js';
 import { Researcher, readBudgetStopReentry } from '../src/discovery/research-runner.js';
 import { prepareResearchEnvelope, researchCall, resumeDossierResearchCall, withResearchRunControl } from '../src/discovery/research-protocol.js';
 import { prepareDossierAssessmentSubject } from '../src/discovery/dossier-assessment.js';
@@ -279,6 +280,56 @@ function increase(f: Stopped, limit = 24_000_000, store = f.store) {
 function driver(f: Stopped, store = f.store, maxTurns = 1, maxCalls = 2) {
   return new EarlyStageDriver(new ProductEngine(store), { discovery: 7 }).run({ project: 'p', draftId: f.v.draft.id, maxTurns, maxCalls });
 }
+async function forecastRefusal(f: Stopped, door: 'driver' | 'researcher', code: string, store = f.store) {
+  if (door === 'driver') {
+    const result = await driver(f, store);
+    assert.equal(result.reason?.code, code, JSON.stringify(result.reason));
+    assert.equal(result.reason?.target, f.v.draft.id); assert.equal(result.budget.callsMade, 0);
+    return result.reason!.message;
+  }
+  let message: string | undefined;
+  await assert.rejects(f.run(1, store), (error: unknown) => {
+    assert.ok(error instanceof EngineError); assert.equal(error.code, code);
+    message = error.message; return true;
+  });
+  assert.ok(message); return message;
+}
+async function refusedByBothDoors(f: Stopped, code: string) {
+  const paid = money(f.store), wire = f.wires();
+  const message = await forecastRefusal(f, 'researcher', code);
+  const paused = f.store.get<ResearchRun>(f.original.id)!;
+  const intent = deepIntents(f.store).find(row => row.value.kind === 'analyst'
+    && row.value.cursor.subject?.planQuestionId === 'q-two')!;
+  assert.ok(intent); assert.equal(intent.value.state, 'prepared');
+  assert.equal(intent.value.call, null); assert.equal(intent.value.request, null);
+  assert.deepEqual(intent.value.owner, reference(paused));
+  assert.equal(await forecastRefusal(f, 'driver', code, f.open()), message);
+  assert.equal(await inert(f, f.store, () => forecastRefusal(f, 'researcher', code, f.open())), message);
+  assert.equal(await forecastRefusal(f, 'driver', code, f.open()), message);
+  assert.deepEqual(reference(f.store.get<ResearchRun>(paused.id)!), reference(paused));
+  assert.deepEqual(reference(f.store.get<ResearchConsumerIntent>(intent.id)!), reference(intent));
+  assert.deepEqual(money(f.store), paid); assert.deepEqual(f.wires(), wire);
+  return { paused, intent, message };
+}
+async function continueBothDoors(t: test.TestContext, f: Stopped, intent: Revision<ResearchConsumerIntent>,
+  increases: ReturnType<typeof readEffectiveStageBudget>['increases']) {
+  // Each door starts from the same genuine, calibrated unpaid checkpoint, in
+  // its own SQLite and runtime copy. The hot run uses the original open Store.
+  const seed = await saveWorld(f);
+  const check = async (world: Stopped) => {
+    assertAdvanced(world, 1);
+    assert.equal(world.store.list<ModelCall>('model-call').filter(row => row.value.consumerIntent?.id === intent.id).length, 1);
+    assert.deepEqual(readEffectiveStageBudget(world.store, 'p').increases, increases);
+    await oldSnapshot(world);
+  };
+  await f.run(1); await check(f);
+  const cold = { ...copyWorld(t, seed), original: f.original, details: f.details };
+  await cold.run(1, cold.open()); await check(cold);
+  const driven = { ...copyWorld(t, seed), original: f.original, details: f.details };
+  const outcome = await driver(driven, driven.open());
+  assert.equal(outcome.budget.callsMade, 2, JSON.stringify(outcome.reason));
+  await check(driven);
+}
 async function oldSnapshot(f: Stopped, store = f.store) {
   const before = history(store), wire = f.wires();
   const proof = await readPartialDossier(store, 'p', f.details.dossier);
@@ -367,8 +418,7 @@ test('budget re-entry: working group stays blocked after owner increase and resu
 
 test('budget re-entry: a forecast over the working group preserves the unpaid owner until its own increase', async t => {
   const f = await stopped(t), raised = increase(f);
-  // A real measured v6 call makes the next analyst's forecast larger than
-  // the remaining working group, without changing its role or environment.
+  // One real measured v6 call establishes the forecast for both public doors.
   const environment = f.engine.environments.effective('p').environment;
   const calibration = f.discovery.create('p', 'discovery', 'R0', 'concept',
     [{ field: 'probe', kind: 'fact', prompt: 'Measure analyst', risk: 'unknown', schema: { type: 'object' } }], [], 6);
@@ -376,27 +426,69 @@ test('budget re-entry: a forecast over the working group preserves the unpaid ow
   await researchCall(environment.value.implementer, environment.value, 'Measure analyst ' + 'x'.repeat(80_000), {}, undefined,
     { store: f.store, draftId: calibration.id, questionId: calibration.value.questions[0]!, purpose: 'analyst' });
   f.configure({ analystTokens: 10 });
-  const paid = money(f.store), wire = f.wires();
-  const first = await driver(f);
-  assert.equal(first.reason?.code, 'discovery_budget_reserve', JSON.stringify(first.reason));
-  assert.equal(first.budget.callsMade, 0);
-  const pending = deepIntents(f.store).find(row => row.value.kind === 'analyst'
-    && row.value.cursor.subject?.planQuestionId === 'q-two')!;
-  assert.ok(pending); assert.equal(pending.value.state, 'prepared');
-  assert.deepEqual(pending.value.owner, reference(f.store.get<ResearchRun>(f.original.id)!));
-  const repeated = await driver(f, f.open());
-  assert.deepEqual(repeated.reason, first.reason); assert.equal(repeated.budget.callsMade, 0);
-  assert.deepEqual(money(f.store), paid); assert.deepEqual(f.wires(), wire);
+  const { intent } = await refusedByBothDoors(f, 'discovery_budget_reserve');
   const usage = budgetUsage(f.store, raised.segment);
+  const beforeIncreases = readEffectiveStageBudget(f.store, 'p').increases;
   raiseWorkingLimit(f.store, raised.segment, DISCOVERY_V7_STAGE_BUDGET_KEY, 'tokens', raised.segment.value.initialGroupLimit,
     { reason: 'The measured next analyst exceeds the old group', progress: 'The exact first cell is paid',
       required: usage.measured + 3_000_000,
       options: [{ method: 'Reuse the paid first cell', saved: 0, decision: 'accept', quality: 'No evidence removed', preserved: ['q-two'] }],
       obligations: ['q-two'], forecast: 'The measured analyst and its calibrated MR', basis: [f.details.stop] }, 24_000_000);
-  const resumed = await driver(f, f.open());
-  assert.equal(resumed.budget.callsMade, 2, JSON.stringify(resumed.reason)); assertAdvanced(f, 1);
-  assert.equal(f.store.list<ModelCall>('model-call').filter(row => row.value.consumerIntent?.id === pending.id).length, 1);
-  await oldSnapshot(f);
+  await continueBothDoors(t, f, intent, beforeIncreases);
+});
+
+test('budget re-entry: a paid analyst survives an MR working-limit pause until the remaining MR is admitted', async t => {
+  const f = await stopped(t), raised = increase(f);
+  const environment = f.engine.environments.effective('p').environment;
+  const calibration = f.discovery.create('p', 'discovery', 'R0', 'concept',
+    [{ field: 'probe', kind: 'fact', prompt: 'Measure pending reviewer', risk: 'unknown', schema: { type: 'object' } }], [], 6);
+  // Real reviewer calibration makes its reserve exceed the group while the
+  // analyst still fits. The old analyst stays paid throughout recovery.
+  f.configure({ analystTokens: 2_000_000 });
+  await researchCall(environment.value.reviewer, environment.value,
+    'Measure pending reviewer ' + 'x'.repeat(200_000), {}, undefined,
+    { store: f.store, draftId: calibration.id, questionId: calibration.value.questions[0]!, purpose: 'assessor' });
+  f.configure({ analystTokens: 10, assessorTokens: 10 });
+  const before = deepCalls(f).length;
+  const assessments = () => f.wires().filter(row => row.subject.assessmentSubject);
+  const beforeAssessments = assessments().length;
+  const first = await driver(f);
+  const paused = f.store.get<ResearchRun>(f.original.id)!;
+  const usage = budgetUsage(f.store, raised.segment);
+  assert.equal(first.budget.callsMade, 1);
+  assert.equal(deepCalls(f).length, before + 1);
+  assert.equal(assessments().length, beforeAssessments);
+  assert.equal(paused.value.pauseCode, 'discovery_budget_reserve');
+  assert.equal(JSON.parse(paused.value.error!).details.cause, 'budget_question_limit');
+  const paidDeep = deepCalls(f).at(-1), paid = money(f.store), wire = f.wires();
+  const analyst = deepIntents(f.store).find(row => row.value.kind === 'analyst'
+    && row.value.cursor.subject?.planQuestionId === 'q-two')!;
+  assert.ok(analyst); assert.equal(analyst.value.state, 'applied');
+  const analystCalls = f.store.list<ModelCall>('model-call').filter(row => row.value.consumerIntent?.id === analyst.id);
+  assert.equal(analystCalls.length, 1);
+  const increaseRefs = readEffectiveStageBudget(f.store, 'p').increases;
+  // Neither the default driver nor a second invocation while the working
+  // limit remains blocked may acquire a fresh analyst or reviewer call.
+  const disabled = await new ProductEngine(f.open()).earlyStages.run({ project: 'p', draftId: f.v.draft.id, maxTurns: 1, maxCalls: 2 });
+  assert.equal(disabled.budget.callsMade, 0);
+  const blocked = await driver(f, f.open());
+  assert.equal(blocked.budget.callsMade, 0);
+  assert.deepEqual(money(f.store), paid); assert.deepEqual(f.wires(), wire);
+  raiseWorkingLimit(f.store, raised.segment, DISCOVERY_V7_STAGE_BUDGET_KEY, 'tokens', raised.segment.value.initialGroupLimit,
+    { reason: 'The already paid analyst needs its measured MR', progress: 'q-two analyst is paid; no MR was sent',
+      required: usage.measured + 3_000_000,
+      options: [{ method: 'Reuse the exact paid analyst', saved: 0, decision: 'accept', quality: 'Keep the full paid answer', preserved: ['q-two'] }],
+      obligations: ['q-two'], forecast: 'The measured reviewer requires 2.2M reserve', basis: [f.details.stop] }, 24_000_000);
+  const resumed = await driver(f, f.open(), 1, 1);
+  assert.equal(resumed.budget.callsMade, 1, JSON.stringify(resumed.reason));
+  assert.equal(assessments().length, beforeAssessments + 1);
+  assert.equal(deepCalls(f).length, before + 1);
+  assert.deepEqual(deepCalls(f).at(-1), paidDeep);
+  assert.deepEqual(f.store.get<ResearchConsumerIntent>(analyst.id), analyst);
+  assert.deepEqual(f.store.list<ModelCall>('model-call').filter(row => row.value.consumerIntent?.id === analyst.id), analystCalls);
+  assert.deepEqual(f.wires().slice(0, wire.length), wire);
+  assert.deepEqual(readEffectiveStageBudget(f.store, 'p').increases, increaseRefs);
+  assertAdvanced(f, before); await oldSnapshot(f, f.open());
 });
 
 test('budget re-entry: no owner increase, new plan/allowance, restoreOnly and zero driver allowances cannot buy research', async t => {
@@ -499,36 +591,31 @@ test('budget re-entry: owner permission cannot replace the real dispatch forecas
   const current = f.engine.environments.effective('p').environment;
   const uncalibrated = f.engine.environments.configure('p', { ...current.value,
     implementer: { ...current.value.implementer, model: 'uncalibrated-owner-reentry' } }, current.revision);
-  const paid = money(f.store), wire = f.wires();
   assert.equal(await readBudgetStopReentry(f.store, 'p', f.v.draft.id, f.details.stop), true);
-  const result = await driver(f);
-  const paused = f.store.get<ResearchRun>(f.original.id)!;
+  const { paused, intent, message } = await refusedByBothDoors(f, 'budget_estimate_missing');
+  assert.match(message, /No comparable measured calls/);
   assert.equal(paused.value.pauseCode, 'research_deep_frontier_pending', paused.value.error!);
-  assert.equal(result.reason?.code, 'budget_estimate_missing');
-  assert.equal(result.reason?.target, f.v.draft.id);
-  assert.match(result.reason?.message ?? '', /No comparable measured calls/);
-  const unpaid = deepIntents(f.store).find(row => row.value.kind === 'analyst'
-    && row.value.cursor.subject?.planQuestionId === 'q-two')!;
-  assert.ok(unpaid); assert.equal(unpaid.value.state, 'prepared');
-  assert.deepEqual(unpaid.value.owner, reference(paused));
-  assert.equal(result.budget.callsMade, 0);
-  const repeated = await driver(f, f.open());
-  assert.deepEqual(repeated.reason, result.reason); assert.equal(repeated.budget.callsMade, 0);
-  assert.deepEqual(reference(f.store.get<ResearchRun>(paused.id)!), reference(paused));
-  assert.deepEqual(reference(f.store.get<ResearchConsumerIntent>(unpaid.id)!), reference(unpaid));
-  assert.deepEqual(money(f.store), paid); assert.deepEqual(f.wires(), wire);
   assert.equal(deepCalls(f).length, 1);
-  // Calibrate the same actor/model through the ordinary paid transport. The
-  // already proven stage increase is enough; no second owner increase occurs.
+  // Calibrate the same actor/model once through ordinary paid transport. The
+  // saved checkpoint and exact owner then feed both independent public doors.
   const beforeIncreases = readEffectiveStageBudget(f.store, 'p').increases;
   const calibration = f.discovery.create('p', 'discovery', 'R0', 'concept',
     [{ field: 'probe', kind: 'fact', prompt: 'Calibrate next analyst', risk: 'unknown', schema: { type: 'object' } }], [], 6);
   await researchCall(uncalibrated.value.implementer, uncalibrated.value, 'Calibrate', {}, undefined,
     { store: f.store, draftId: calibration.id, questionId: calibration.value.questions[0]!, purpose: 'analyst' });
-  const resumed = await driver(f, f.open());
-  assert.equal(resumed.budget.callsMade, 2, JSON.stringify(resumed)); assertAdvanced(f, 1);
-  assert.deepEqual(readEffectiveStageBudget(f.store, 'p').increases, beforeIncreases);
-  await oldSnapshot(f);
+  await continueBothDoors(t, f, intent, beforeIncreases);
+});
+
+test('budget re-entry: an ordinary v7 forecast refusal does not use the stopped-route exception', async t => {
+  const f = await ready(t);
+  const current = f.engine.environments.effective('p').environment;
+  f.engine.environments.configure('p', { ...current.value,
+    implementer: { ...current.value.implementer, model: 'uncalibrated-ordinary-v7' } }, current.revision);
+  const paid = money(f.store), wire = f.wires();
+  const result = await f.run(1);
+  assert.equal(result.value.pauseCode, 'budget_estimate_missing');
+  assert.equal(Object.hasOwn(result.value, 'budgetReentry'), false);
+  assert.deepEqual(money(f.store), paid); assert.deepEqual(f.wires(), wire);
 });
 
 test('budget re-entry: one-call invocations recover the same paid deep step without paying for it again', async t => {
