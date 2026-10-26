@@ -870,6 +870,22 @@ function withoutManagedFields(value: RepairSeries): RepairSeries {
   const body = clone(value) as unknown as Record<string, unknown>; delete body['contract']; delete body['activation'];
   return body as unknown as RepairSeries;
 }
+// The later managed revision of the activated series: a real managed open on the product's own routes and MC1 batch,
+// workGoal pinned to the whole selected batch, its plan and goal proved by the real completion binding.
+function laterManaged(f: Fixture, p: ReturnType<typeof product>, first: Revision<RepairSeries>) {
+  assert.deepEqual(workGoal.questions, p.batch.items.map(item => gapLineKey(project, item.target, item.field)).sort(),
+    'workGoal asks the whole selected batch');
+  assert.equal(workGoal.result, gapLineExpectedResult(project, p.batch.items[0]!.target, p.batch.items[0]!.field));
+  const before = era(f, reference(first));
+  const plan = { routes: reference(p.routes), batches: [p.batch.id] };
+  const later = ok(managedOpenAttempt(p.store, { project, block, line: 1, attempt: 1, goal: workGoal, completion: plan }));
+  assert.ok(later.revision > first.revision, 'The managed opening raises the series revision');
+  assert.deepEqual(era(f, reference(later)), before, 'The managed opening leaves the era witness unchanged');
+  assert.deepEqual(before.value.firstManaged, reference(first), 'The era witness pins the original first managed revision');
+  const binding = ok(readCompletionBinding(p.store, project, reference(later), 1));
+  assert.ok(binding); assert.deepEqual(binding.value.plan, plan); assert.deepEqual(binding.value.goal, workGoal);
+  return { later, binding };
+}
 
 test('B3.0b era witness rejects paired field loss at first later and unactivated series revisions', { todo: "NR1 №3646: согласованная перезапись цепочки до новейшей записи — om-fsck её не видит; решение позже" }, t => {
   // Same split as above: the first managed revision and the unactivated registration are pinned by the era witness, so
@@ -877,11 +893,12 @@ test('B3.0b era witness rejects paired field loss at first later and unactivated
   // no witness pins, meets the check of the activation form (series_invalid on activation).
   for (const [stage, code, at] of [['first', 'record_forged', 'hash'], ['later', 'series_invalid', 'activation'],
     ['unactivated', 'record_forged', 'hash']] as const) {
-    const f = fixture(t), legacy = f.series(); activate(f);
+    const f = fixture(t), legacy = f.series();
+    const p = stage === 'later' ? product(f, true, false) : (activate(f), undefined);
     const first = head(f), witness = era(f, reference(first));
     assert.equal(witness.revision, 1); assert.deepEqual(witness.value.firstManaged, reference(first));
     assert.equal(witness.value.origin.kind, 'activation');
-    const row = stage === 'later' ? ok(beginAttempt(f.store, { project, block, line: 1, attempt: 1, goal: workGoal }))
+    const row = stage === 'later' ? laterManaged(f, p!, first).later
       : stage === 'unactivated' ? f.series(independent) : first;
     if (stage === 'unactivated') {
       const registration = era(f, reference(row)); assert.equal(row.revision, 1);
@@ -896,8 +913,9 @@ test('B3.0b era witness rejects paired field loss at first later and unactivated
 
 test('B3.0b era proof rejects absent foreign or incomplete threshold and producer sources', { todo: "NR1 №3591/№3646: записанное читается доверенно; эту порчу базы ловит om-fsck на старте (test/om-fsck.test.ts)" }, t => {
   for (const variant of ['missing-witness', 'foreign-first', 'missing-first', 'missing-origin', 'foreign-origin', 'missing-field'] as const) {
-    const f = fixture(t); f.series(); activate(f);
-    const first = head(f), later = ok(beginAttempt(f.store, { project, block, line: 1, attempt: 1, goal: workGoal }));
+    const f = fixture(t); f.series();
+    const p = product(f, true, false);
+    const first = head(f), { later } = laterManaged(f, p, first);
     const witness = era(f, reference(first));
     if (variant === 'missing-witness') erase(f.store, witness.id);
     else if (variant === 'missing-first') {
@@ -916,6 +934,22 @@ test('B3.0b era proof rejects absent foreign or incomplete threshold and produce
     }
     refusedWith(readSeriesAt(f.store, project, reference(later)), 'series_invalid');
   }
+});
+
+test('B3.0b a later managed revision keeps legacy, first, its witness and the completion binding exact after restart', t => {
+  const f = fixture(t), legacy = f.series();
+  const p = product(f, true, false);
+  const first = head(f), witness = era(f, reference(first));
+  const { later, binding } = laterManaged(f, p, first);
+  assert.deepEqual(era(f, reference(later)), witness, 'The opening leaves the era witness unchanged');
+  assert.equal(f.store.list('model-call').length, 0, 'The opening pays nothing');
+  assert.equal(p.sent().length, 0, 'The opening sends nothing');
+  f.restart();
+  assert.deepEqual(ok(readSeriesAt(f.store, project, reference(legacy))), legacy);
+  assert.deepEqual(ok(readSeriesAt(f.store, project, reference(first))), first);
+  assert.deepEqual(ok(readSeriesAt(f.store, project, reference(later))), later);
+  assert.deepEqual(era(f, reference(later)), witness);
+  assert.deepEqual(ok(readCompletionBinding(f.store, project, reference(later), 1)), binding);
 });
 
 test('B3.0b earlier legacy revisions read only their era threshold and predecessor uses its own exact Ref', t => {
