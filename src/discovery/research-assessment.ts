@@ -638,14 +638,24 @@ function attemptsAssessmentValue(store: Store, proof: AssessmentProof): PaidDisc
  * another proof, the assessment evaluation's own read view, an overlay — it is derived in place exactly as before, so the
  * reads of the enclosing proof and the recorded read sequence of an evaluation stay what they were. Arguments that cannot
  * key a proof refuse in the derivation itself, with the same typed refusal as ever. */
+function plainExactRef(ref: unknown): Ref | null {
+  if (!ref || typeof ref !== 'object' || Array.isArray(ref) || Object.getPrototypeOf(ref) !== Object.prototype) return null;
+  const fields = Object.getOwnPropertyDescriptors(ref), names = Object.keys(fields);
+  if (names.length !== 3 || !['id', 'revision', 'hash'].every(name => names.includes(name) && 'value' in fields[name]!)) return null;
+  const exact = { id: fields['id']!.value, revision: fields['revision']!.value, hash: fields['hash']!.value };
+  return isRef(exact) ? exact : null;
+}
 export function readDiscoveryAssessment(store: Store, projectId: string, ref: Ref): Revision<PaidDiscoveryAttemptsAssessment> {
   // A nested derivation reads through the trace its parent proof made over the genuine Store: that source too may reuse
   // the kept proof of this exact Ref. The original store goes to historicalProof, so the parent still observes every read.
-  if (!historicalSourceOverGenuine(store) || typeof projectId !== 'string' || projectId.trim().length === 0 || !isRef(ref))
+  // Only a plain exact Ref of three data fields keys the kept proof: its values are taken once and that very snapshot is
+  // what the derivation proves. Accessors, a Proxy, an array or an inheriting object derive in place from the input as before.
+  const exact = plainExactRef(ref);
+  if (!historicalSourceOverGenuine(store) || typeof projectId !== 'string' || projectId.trim().length === 0 || !exact)
     return deriveDiscoveryAssessment(store, projectId, ref);
   // Every entry receives its own copy, also inside one withHistoricalReads region where the kept value is shared.
-  return structuredClone(historicalProof(store, { reader: 'discovery.assessment-read/v1', project: projectId, ref },
-    source => deriveDiscoveryAssessment(source, projectId, ref),
+  return structuredClone(historicalProof(store, { reader: 'discovery.assessment-read/v1', project: projectId, ref: exact },
+    source => deriveDiscoveryAssessment(source, projectId, exact),
     () => { throw new EngineError('discovery_assessment_invalid', 'The exact assessment proof is cyclic'); }));
 }
 function deriveDiscoveryAssessment(store: Store, projectId: string, ref: Ref): Revision<PaidDiscoveryAttemptsAssessment> {

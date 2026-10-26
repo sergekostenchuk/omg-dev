@@ -205,3 +205,21 @@ test('nested assessment proof: opaque, overlay, changed Store and a lost or fore
   assert.deepEqual(readDiscoveryAssessment(historicalTrace(f.store), 'p', ref), proof);
   assert.deepEqual(money(f.store), paidBefore); assert.equal(f.wires().length, wires);
 });
+
+test('nested assessment proof: a Ref whose hash accessor changes between reads never keeps a proof of B under A', async t => {
+  const f = await paid(t), [first] = paidAssessments(f.store), B = reference(first!);
+  const A = { ...B, hash: B.hash === '0'.repeat(64) ? '1'.repeat(64) : '0'.repeat(64) };
+  const refusal = (error: unknown) => error instanceof EngineError && error.code === 'discovery_assessment_invalid';
+  // The review's probe: the hash answers A while it is checked and keyed (five reads) and B afterwards.
+  const changing = () => { let reads = 0; return { id: B.id, revision: B.revision, get hash() { return ++reads <= 5 ? A.hash : B.hash; } }; };
+  for (const store of [new Store(f.store.path), new Store(f.store.path)]) {
+    t.after(() => store.close());
+    assert.throws(() => readDiscoveryAssessment(store, 'p', A), refusal);
+    try { readDiscoveryAssessment(historicalTrace(store), 'p', changing()); } catch (error) { assert.ok(error instanceof EngineError); }
+    assert.throws(() => readDiscoveryAssessment(store, 'p', { ...A }), refusal);
+    assert.throws(() => readDiscoveryAssessment(historicalTrace(store), 'p', { ...A }), refusal);
+    assert.deepEqual(reference(readDiscoveryAssessment(historicalTrace(store), 'p', { ...B })), B);
+    assert.deepEqual(reference(readDiscoveryAssessment(store, 'p', { ...B })), B);
+    assert.throws(() => readDiscoveryAssessment(historicalTrace(store), 'p', { ...A }), refusal);
+  }
+});
