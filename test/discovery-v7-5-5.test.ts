@@ -709,18 +709,16 @@ test('5.345-01 a proven reject_all supersedes unpaid deep without inventing a sc
   }
 });
 
-// Every masked door re-derives the old admission through the opaque view (no kept proof), so hot and cold are two tests.
-for (const cold of [false, true])
-test(`5.345-01 current-choice proof refuses missing state, decision, grant, session, set and member ${cold ? 'cold' : 'hot'}`, async t => {
+test('5.345-01 current-choice proof refuses missing state, decision, grant, session, set and member', async t => {
   const f = await ready(t), old = prepareDeepResearch(f.store, linkedInput(f)), act = revisedChoice(f);
   const before = all(f.store), account = money(f.store), sent = f.wires().length;
-  const store = cold ? new Store(f.store.path) : f.store; if (cold) t.after(() => store.close());
+  const cold = new Store(f.store.path); t.after(() => cold.close());
   const missing = [
     { id: variantStateId('p', f.draft.id), headOnly: true },
     { id: act.decision.id }, { id: act.decision.value.authority.grant.id },
     { id: act.decision.value.authority.session.id }, { id: f.scopeRecord.value.set.id }, { id: f.scopeRecord.value.member.id },
   ];
-  for (const absent of missing) {
+  for (const store of [f.store, cold]) for (const absent of missing) {
     const view = storeView(store, { get: (id, revision) => id === absent.id && (!absent.headOnly || revision === undefined) ? null : undefined,
       write: () => { throw new Error('A read-only proof attempted a write'); } });
     assert.throws(() => staleUnpaidDeepAdmission(view, old), EngineError, absent.id);
