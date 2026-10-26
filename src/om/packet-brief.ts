@@ -1,4 +1,5 @@
 import { posix } from 'node:path';
+import { types } from 'node:util';
 import { Ajv } from 'ajv';
 import { canonical, digest, type Json } from '../canonical.js';
 import { EngineError } from '../errors.js';
@@ -854,8 +855,66 @@ function boundedSample(value: unknown, budget = { nodes: SAMPLE_LIMIT.nodes, cha
   }
   return result;
 }
+/** SAMPLE-SPEED: a bounded memo of the example over an ordinary stable JSON schema. The key is the full content in its own
+ * key order (the example copies a const/enum object in that order), taken only from a non-Proxy tree of Object.prototype
+ * records and dense arrays whose fields are enumerable own data and whose numbers are finite and not -0; any other form, a
+ * cycle or an excess keeps the uncached derivation. A thrown compilation is never kept, and every answer is a fresh copy. */
+const SAMPLE_MEMO = Object.freeze({ entries: 256, keyChars: 65_536, totalChars: 4_194_304, nodes: 4096, depth: 64 });
+const sampleMemo = new Map<string, { value: Json | undefined; chars: number }>();
+let sampleMemoChars = 0;
+function sampleKey(schema: unknown): string | null {
+  let nodes = SAMPLE_MEMO.nodes;
+  const path = new Set<object>();
+  function plain(value: unknown, depth: number): boolean {
+    if (--nodes < 0 || depth > SAMPLE_MEMO.depth) return false;
+    if (value === null || typeof value === 'boolean' || typeof value === 'string') return true;
+    if (typeof value === 'number') return Number.isFinite(value) && !Object.is(value, -0);
+    if (typeof value !== 'object' || types.isProxy(value) || path.has(value)) return false;
+    const array = Array.isArray(value);
+    if (Object.getPrototypeOf(value) !== (array ? Array.prototype : Object.prototype)) return false;
+    const keys = Reflect.ownKeys(value), fields = Object.getOwnPropertyDescriptors(value), length = array ? (value as unknown[]).length : 0;
+    if (array && keys.length !== length + 1) return false;
+    path.add(value);
+    for (const key of keys) {
+      if (typeof key !== 'string') return false;
+      if (array && key === 'length') continue;
+      if (array && !(/^(?:0|[1-9][0-9]*)$/.test(key) && Number(key) < length)) return false;
+      const field = fields[key]!;
+      if (!('value' in field) || field.enumerable !== true || !plain(field.value, depth + 1)) return false;
+    }
+    path.delete(value);
+    return true;
+  }
+  if (!plain(schema, 0)) return null;
+  const key = JSON.stringify(schema);
+  return key.length <= SAMPLE_MEMO.keyChars ? key : null;
+}
+function sampleCopy(value: Json | undefined): Json | undefined {
+  if (value === null || typeof value !== 'object') return value;
+  if (Array.isArray(value)) return value.map(item => sampleCopy(item)!);
+  const copy: Record<string, Json> = Object.create(null);
+  for (const key of Object.keys(value)) copy[key] = sampleCopy(value[key])!;
+  return copy;
+}
 /** A bounded candidate builder, not a JSON Schema solver. The complete E3 schema remains authoritative. */
 function sampleValue(schema: unknown): Json | undefined {
+  const key = sampleKey(schema);
+  if (key === null) return deriveSample(schema).value;
+  const kept = sampleMemo.get(key);
+  if (kept) { sampleMemo.delete(key); sampleMemo.set(key, kept); return sampleCopy(kept.value); }
+  const derived = deriveSample(schema);
+  if (derived.thrown) return derived.value;
+  const chars = key.length + (derived.value === undefined ? 0 : JSON.stringify(derived.value).length);
+  if (chars <= SAMPLE_MEMO.totalChars) {
+    for (const [oldest, entry] of sampleMemo) {
+      if (sampleMemo.size < SAMPLE_MEMO.entries && sampleMemoChars + chars <= SAMPLE_MEMO.totalChars) break;
+      sampleMemo.delete(oldest); sampleMemoChars -= entry.chars;
+    }
+    sampleMemo.set(key, { value: sampleCopy(derived.value), chars }); sampleMemoChars += chars;
+  }
+  return derived.value;
+}
+function deriveSample(schema: unknown): { value: Json | undefined; thrown: boolean } {
   let nodes = SAMPLE_LIMIT.nodes;
   function candidate(shape: unknown, depth = 0): unknown {
     if (depth > SAMPLE_LIMIT.depth || --nodes < 0) return undefined;
@@ -901,11 +960,11 @@ function sampleValue(schema: unknown): Json | undefined {
     return undefined;
   }
   const value = boundedSample(candidate(schema));
-  if (value === undefined) return undefined;
+  if (value === undefined) return { value: undefined, thrown: false };
   // Match checkFactValueForm: strict Ajv, union types enabled, no coercion/defaults, no shared schema cache.
   // Unsupported synthesis or schema compilation never prevents issuance of the assignment itself.
-  try { return new Ajv({ strict: true, allowUnionTypes: true }).compile(schema as object)(value) ? value : undefined; }
-  catch { return undefined; }
+  try { return { value: new Ajv({ strict: true, allowUnionTypes: true }).compile(schema as object)(value) ? value : undefined, thrown: false }; }
+  catch { return { value: undefined, thrown: true }; }
 }
 function briefExamples(payload: Record<string, any>, labels: LabelIndex, basis: BriefBasis): Json[] {
   const label = (domain: BriefLabel['domain'], value: unknown) => labels.byDomain(domain, value)!.label;
