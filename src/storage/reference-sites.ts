@@ -342,6 +342,13 @@ const RECORD_REFERENCE_SEMANTICS: readonly RecordReferenceSemantics[] = [
   // frame proposal revision and the previous set; meanings, consequences and support selectors are data.
   { kind: "frame-interpretations", contract: "frame-interpretations/v1", data: [], refs: [
     ["brief", "source"], ["frame"], ["previousSet"]] },
+  // DR2b 2b-GEN: the prepared generation session names exactly its bound grounds — the mandate Source,
+  // the frame revision, the previous set, the request archive and the exact environment revision. The
+  // request, the preparation parameters, the saved envelope and the initial cursor are verified data —
+  // the session proves no paid call, choice or result.
+  { kind: "frame-interpretation-session", contract: "frame-interpretation-session/v1", data: [
+    ["request"], ["input"], ["envelope"], ["cursor"], ["brief", "selector"]], refs: [
+    ["brief", "source"], ["frame"], ["previousSet"], ["archive"], ["environment"]] },
   // DR5 5.1-F: the coverage cell names exactly its plan answer and its exact variant set and member — the
   // plan-question id, depth and criterion are data; the cell confirms no coverage.
   { kind: "discovery-coverage-cell", contract: "discovery-coverage-cell/v1", data: [], refs: [
