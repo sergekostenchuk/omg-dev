@@ -261,17 +261,30 @@ async function gardenRecipe(m: RecipeModules, root: string, plan: 'facts' | 'fie
       m.assert.deepEqual(produceRelativePacket.value.request.attempt, { series: m.reference(produceSeries), ordinal: 1 });
       m.assert.equal(omCalls().length, 0, 'Two unpaid packets of one producer');
       data.packets.produceRelative = m.reference(produceRelativePacket);
+      m.assert.ok(field.model === 'MC2' && field.task === 'input-field' && field.items.length > 0
+        && field.items.every(item => item.target === 'discovery:encoding'),
+        'The M5 batch is the own whole MC2 input-field batch of the discovery:encoding question');
       const owner = { project, owner: { kind: 'mechanism', mechanism: 'M5:addressing' }, line: 1 };
       m.openSeries(store, { ...owner, scope: gapRequest, predecessor: null, basis: null } as never);
-      const mechanism = ok(m.beginAttempt(store, { ...owner, attempt: 1, goal: goalOf(field),
-        admission: { gaps: gapRequest, routes: m.reference(routes), batch: field.id } } as never));
+      const plan = { routes: m.reference(routes), batches: [field.id] };
+      const mechanism = ok(m.openAttempt(store, { ...owner, attempt: 1, goal: goalOf(field),
+        admission: { gaps: gapRequest, routes: m.reference(routes), batch: field.id }, completion: plan } as never));
+      const binding = ok(m.readCompletionBinding(store, project, m.reference(mechanism), 1));
+      m.assert.ok(binding?.value, 'The managed M5 attempt holds its completion binding');
+      m.assert.deepEqual(binding!.value!.plan, plan, 'The binding holds the exact completion plan');
       // The field call runs under that later environment: the engine starts the relative adapter in its workspace.
       const fieldPacket = packetOf(field, m.reference(mechanism), 1, relative);
+      m.assert.equal(fieldPacket.value.state, 'ready');
+      m.assert.deepEqual(fieldPacket.value.request.attempt, { series: m.reference(mechanism), ordinal: 1 });
       const fieldAnswer = { protocol: '$answerProtocol', requestId: '$requestId', action: 'answer', results: field.items.map(item => ({ target: item.target, field: item.field,
         basis: item.record, value: { consumer: 'garden-consume-block', kind: 'repository-fact' } })) };
       steps([{ research: fieldAnswer, usage }]);
+      m.assert.equal(omCalls().length, 0, 'No payments before the real M5 field call');
       ok(await m.runModelCycle(store, callOf(m.reference(fieldPacket), relative)));
       data.packets.field = m.reference(fieldPacket); data.calls.field = omCalls();
+      m.assert.ok(data.calls.field.length > 0, 'The M5 cycle saved its call');
+      data.calls.field.forEach(id => m.assert.deepEqual(store.get<{ om: { request: { packet: Ref } } }>(id)!.value.om.request.packet,
+        m.reference(fieldPacket), 'The saved field call belongs to the issued packet'));
       // The same consumer routed again under a later horizon: its packet names other D1 sources, so it stands in another frame.
       const now = m.reference(store.get(input.id)!);
       const later = ok(m.writeHorizon(store, { project, input: now, graph: m.reference(graph), refinement: null, available: {},
