@@ -24,7 +24,7 @@ import { inputDecisionWrite, writeAddressing } from '../src/om/addressing.js';
 import { writeHorizon } from '../src/om/horizon.js';
 import { writeGaps, type GapRequest } from '../src/om/gaps.js';
 import { gapLineKey, gapLineExpectedResult } from '../src/om/gap-lines.js';
-import { openSeries, beginAttempt, type AttemptGoal } from '../src/om/series.js';
+import { openSeries, beginAttempt, readCompletionBinding, type AttemptGoal } from '../src/om/series.js';
 import { openAttempt as managedOpenAttempt } from '../src/om/repeat-gate.js';
 import { recordCall } from '../src/om/call-record.js';
 import { writeGuarded } from '../src/om/refs.js';
@@ -719,7 +719,7 @@ test('X44 environment change: the discarded historical capture leaks nothing int
   // prepares through the Environment projection over the pending facade: the stale ref is remapped to the
   // current head, no write runs, and the saved packet decides the result.
   {
-    const f = e4q(t, true);
+    const f = e4q(t);
     const payload = f.packet.value.packet as Record<string, Json> & { requestId: string; purpose: 'model-research' };
     const e1 = { call: payload.requestId, purpose: payload.purpose, basis: null, block: 'garden-consume-block',
       series: reference(f.series), attempt: 1, goal: f.series.value.attempts[0]!.goal,
@@ -783,11 +783,11 @@ test('X14 every guard the native producer attaches during the capture rides to t
   assert.equal(store.list('question').length, nativeBefore, 'no native question became durable');
 });
 
-/** The E4 dispatch fixture reduced to one MC1 fact batch with a scenario-driven adapter. */
+/** The E4 dispatch fixture reduced to one MC1 fact batch, opened as a managed attempt, with a scenario-driven adapter. */
 const q1Adapter = fileURLToPath(new URL('../../test/om-adapter-fixture.mjs', import.meta.url));
 const q1Usage = { inputTokens: 120, outputTokens: 30, cachedInputTokens: 20, reasoningOutputTokens: 10 };
 const q1Confirmed = { model: 'fixture-confirmed', effort: 'high', speed: 'fast' };
-function e4q(t: TestContext, managed = false) {
+function e4q(t: TestContext) {
   const root = mkdtempSync(join(tmpdir(), 'omg-q1-e4-')), database = join(root, 'state.sqlite');
   const store = new Store(database), engine = new ProductEngine(store);
   t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
@@ -839,13 +839,18 @@ function e4q(t: TestContext, managed = false) {
     result: gapLineExpectedResult(project, batch.items[0]!.target, batch.items[0]!.field) };
   const address = { project, block: 'garden-consume-block', line: 1 };
   ok(openSeries(store, { ...address, slice: 'e4-fixture', predecessor: null, basis: null } as never));
-  const series = managed
-    ? ok(managedOpenAttempt(store, { ...address, attempt: 1, goal, completion: { routes: reference(routes), batches: [batch.id] } } as never))
-    : ok(beginAttempt(store, { ...address, attempt: 1, goal } as never));
+  const plan = { routes: reference(routes), batches: [batch.id] };
+  const series = ok(managedOpenAttempt(store, { ...address, attempt: 1, goal, completion: plan } as never));
+  const binding = ok(readCompletionBinding(store, project, reference(series), 1));
+  assert.ok(binding, 'The managed opening writes its binding');
+  assert.deepEqual(binding.value.plan, plan);
   const packetRequest: QuestionPacketRequest = { project, routes: reference(routes), batch: batch.id, environment: reference(configured),
     attempt: { series: reference(series), ordinal: 1 }, previous: [] };
   const packet = ok(writeQuestionPacket(store, packetRequest)).record;
+  assert.equal(packet.value.state, 'ready');
+  assert.deepEqual(packet.value.request.attempt, { series: reference(series), ordinal: 1 });
   const request: ModelCallRequest = { project, packet: reference(packet), dispatch: { adapter: reference(adapter), config: reference(configured) }, role: 'implementer' };
+  assert.ok(!existsSync(trace), 'The target E4 has sent nothing yet');
   return { root, database, project, source, batch, packet, request, scenario, trace, store, engine,
     adapter, configured, series, packetRequest, reconfigure,
     steps(steps: Record<string, unknown>[]) { writeFileSync(scenario, JSON.stringify({ database: store.path, steps })); },
