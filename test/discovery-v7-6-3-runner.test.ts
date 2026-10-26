@@ -405,7 +405,14 @@ test(`6.3 runner: real second Store ${shift} race before dossier publication can
   }
 });
 
-async function rejectedAtDossierCut(t: test.TestContext, published: boolean) {
+async function rejectedAtDossierCut(t: test.TestContext, published: boolean, hot = true) {
+  // Hot: the same open Store that survives the recipient cut and the owner revise continues the test — no close or
+  // rebind in between. Cold: the cut world's exact bytes in fresh Stores.
+  if (hot) {
+    const f = await ownerRejected(t), survivor = f.store, made = await cutAndRevise(f, published);
+    assert.equal(made.store, survivor);
+    return made;
+  }
   return cachedWorld(t, `pending-${published}`, async scratch => {
     const made = await cutAndRevise(await ownerRejected(scratch), published);
     return { f: made, data: { pending: made.pending, oldHandoff: made.oldHandoff, chosen: { decision: made.chosen.decision, state: made.chosen.state } } };
@@ -432,7 +439,7 @@ async function cutAndRevise(f: World & { rejected: { decision: any; state: any }
 }
 for(const cold of [false,true])for(const published of [false,true])
 test(`6.3-RUNNER-01: ${cold?'cold':'hot'} owner revise exits an unpublished recipient; ${published?'written dossier restores first':'unwritten dossier stays absent'}`,async t=>{
-  const f=await rejectedAtDossierCut(t,published),store=cold?f.open():f.store;
+  const f=await rejectedAtDossierCut(t,published,!cold),store=cold?f.open():f.store;
   const oldHistory=f.store.history(f.oldHandoff.id), paid=money(f.store), wire=f.wires();
   const existing=f.store.list(DOSSIER_MANIFEST_KIND)[0];
   if(published){
