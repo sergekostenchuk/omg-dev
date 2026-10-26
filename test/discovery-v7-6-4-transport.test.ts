@@ -1,6 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { storeRefused } from './store-unchanged.js';
 import { DatabaseSync } from 'node:sqlite';
 import { canonical, hashJson, type Json } from '../src/canonical.js';
 import { reference, type Ref } from '../src/pipeline/contracts.js';
@@ -62,10 +65,9 @@ const generation = () => ({ action: 'variants', variants: [1, 2].map(i => ({ key
 
 /** The real paid line of 4B.1/4O.2: two assessed plan questions, the variant snapshot, real project modes and the real
  * paid generation of a two-member set with its first state. */
-async function paid(t: test.TestContext, answer: unknown = generation(), withMaterial = false) {
-  const f = await researchSetup(t, { adapter: 'reply', prefix: 'omg-64-transport-' }), project = 'p', runs = new Map<string, string>();
-  await f.engine.execute({ type: 'create-project', project, title: 'Selected variant scope' });
-  const prepare = (selected = f.subject()) => {
+type Turnable = Awaited<ReturnType<typeof researchSetup>> & { runs: Map<string, string> };
+function prepareTurn(f: Turnable, selected = f.subject()) {
+    const project = 'p', runs = f.runs;
     const context = { history: [], readings: [] };
     const draft = f.store.get<DiscoveryDraft>(f.v.draft.id)!, question = f.store.get<Question>(f.v.plan.id)!;
     const old = runs.get(selected.planAnswer.hash), run = old ? f.store.get<ResearchRun>(old)! : f.store.write<ResearchRun>({
@@ -78,8 +80,12 @@ async function paid(t: test.TestContext, answer: unknown = generation(), withMat
     const intent = prepareResearchConsumerIntent(f.store, input), invoke = () => researchCall(f.environment.value.implementer, f.environment.value, f.prompt, context, undefined,
       { store: f.store, draftId: draft.id, questionId: question.id, purpose: 'analyst', consumerIntent: reference(intent), requestContract: REQUEST_MANIFEST_CONTRACT });
     return { run, number, intent, input, invoke, question, draft, selected, context };
-  };
-  const g = { ...f, prepare };
+}
+async function paid(t: { after(fn: () => void): void }, answer: unknown = generation(), withMaterial = false) {
+  const base = await researchSetup(t as test.TestContext, { adapter: 'reply', prefix: 'omg-64-transport-' }), project = 'p';
+  await base.engine.execute({ type: 'create-project', project, title: 'Selected variant scope' });
+  const f = { ...base, runs: new Map<string, string>() } as Turnable;
+  const g = { ...f, prepare: (selected = f.subject()) => prepareTurn(g, selected) };
   for (const question of ['q-industry', 'q-market']) {
     const end = withMaterial && question === 'q-industry' ? { type: 'submitted', contract: DISCOVERY_CLAIMS_CONTRACT,
       value: { claims: [{ id: 'broad-rejected', kind: 'hypothesis', text: 'Real pre-choice rejected material', axis: 'industry',
@@ -177,6 +183,12 @@ const all = (store: Store) => {
     revisions: db.prepare('SELECT * FROM revisions ORDER BY entity_id,revision').all() } as never); }
   finally { db.close(); }
 };
+/** A refusal inside a write-free block: the change stamp, money and wire stay; full dumps bound the block. */
+async function refused(f: Paid, store: Store, action: () => Promise<unknown>) {
+  const calls = money(store), wires = f.wires();
+  await storeRefused(store, action);
+  assert.deepEqual(money(store), calls); assert.deepEqual(f.wires(), wires);
+}
 async function unchanged<T>(f: Paid, store: Store, action: () => Promise<T>, refuses = false): Promise<T | undefined> {
   const before = all(store), calls = money(store), wires = f.wires();
   let result: T | undefined;
@@ -185,13 +197,49 @@ async function unchanged<T>(f: Paid, store: Store, action: () => Promise<T>, ref
   assert.equal(all(store), before); assert.deepEqual(money(store), calls); assert.deepEqual(f.wires(), wires);
   return result;
 }
-async function setup(t: test.TestContext, model = false) {
+async function built(t: { after(fn: () => void): void }, model = false) {
   const f = await paid(t);
   const decision = model ? await modelChoose(f) : selected(f).act.decision;
   const scope = publishVariantScope(f.store, 'p', reference(decision)).scope;
   return { ...f, scopeRecord: scope, input: { scope: reference(scope), plan: f.v.planAnswer } };
 }
-type Selected = Awaited<ReturnType<typeof setup>>;
+type Selected = Awaited<ReturnType<typeof built>>;
+// A world is built once by the real producers; every test then restores its exact bytes in place (its records name the
+// world's root) and opens Stores of its own. Tests of one file run one after another, so no test sees another's writes.
+const worldRoots: string[] = [];
+process.once('exit', () => { for (const root of worldRoots) rmSync(root, { recursive: true, force: true }); });
+const WORLD_FILES = ['state.sqlite', 'state.sqlite-wal', 'state.sqlite-shm', 'reply.json', 'wire.ndjson'];
+const worlds = new Map<string, { world: Selected; snapshot: string; entries: unknown }>();
+function rebind<T extends Selected>(t: test.TestContext, world: T): T {
+  const stores: Store[] = [], open = () => { const db = new Store(world.path); stores.push(db); return db; };
+  const store = open();
+  t.after(() => { for (const db of stores) db.close(); });
+  const g = { ...world, store, engine: new ProductEngine(store), discovery: new Discovery(store), open, runs: new Map(world.runs) } as T;
+  (g as any).prepare = (selected = g.subject()) => prepareTurn(g as unknown as Turnable, selected);
+  return g;
+}
+async function world<E>(t: test.TestContext, key: string, model: boolean, extend: (f: Selected) => Promise<E>,
+  from?: string): Promise<Selected & { entries: E }> {
+  let cached = worlds.get(key);
+  if (!cached) {
+    // A derived world continues the exact restored bytes of its base world in that world's own root.
+    const closing: (() => void)[] = [], scratch = { after: (fn: () => void) => closing.push(fn) } as unknown as test.TestContext;
+    const f = from ? await world(scratch, from, model, async () => null) : await built({ after: () => {} }, model), entries = await extend(f);
+    if (!from) worldRoots.push(f.root);
+    f.store.close(); for (const close of closing) close();
+    const snapshot = mkdtempSync(join(tmpdir(), 'omg-64transport-snap-')); worldRoots.push(snapshot);
+    for (const file of WORLD_FILES) if (existsSync(join(f.root, file))) copyFileSync(join(f.root, file), join(snapshot, file));
+    cached = { world: f, snapshot, entries: structuredClone(entries) };
+    worlds.set(key, cached);
+  }
+  for (const file of WORLD_FILES) {
+    rmSync(join(cached.world.root, file), { force: true });
+    if (existsSync(join(cached.snapshot, file))) copyFileSync(join(cached.snapshot, file), join(cached.world.root, file));
+  }
+  return { ...rebind(t, cached.world), entries: structuredClone(cached.entries) as E };
+}
+/** The selected owner/model world with both managed deep cells completed by the real producers. */
+const completed = (t: test.TestContext, model = false) => world(t, model ? 'model-complete' : 'owner-complete', model, complete, model ? 'model' : 'owner');
 function claim(f: Selected, question: string, axis: string, text: string, variants: 'common' | Ref[] = [f.scopeRecord.value.member]): Json {
   return { id: `h-${rand()}`, kind: 'hypothesis', text, axis,
     planQuestions: [{ planAnswer: f.v.planAnswer, planQuestionId: question }], scope: { variants },
@@ -290,7 +338,7 @@ function verifyBytes(f: Paid, built: Awaited<ReturnType<typeof envelope>>, packe
 
 for (const model of [false,true])
 test(`6.4 transport: real ${model ? 'model' : 'owner'} selected -> common capacity/archive/envelope; bounded full bytes and historical cold identity`,async t=>{
-  const f = await setup(t,model); await complete(f);
+  const f = await completed(t,model);
   const saved = produceSelectedDossier(f.store,'p',f.input);
   const packet = await prepareDossierAssessmentSubject(f.store,'p',reference(saved.record));
   const before = money(f.store), wires=f.wires();
@@ -316,7 +364,7 @@ test(`6.4 transport: real ${model ? 'model' : 'owner'} selected -> common capaci
 });
 
 test('6.4 transport: rejected, unassessed, unknown and both relation sides are exact; missing/mixed/substituted and raw dispatch refuse without effects',async t=>{
-  const f=await setup(t); const entries=await complete(f), target=addresses(entries.industry)[0]!;
+  const f=await completed(t); const entries=f.entries, target=addresses(entries.industry)[0]!;
   const contrary={...(claim(f,'q-market','market','Retained rejected counterargument') as Record<string,Json>),
     contradicts:[target],refutedBy:[target]} as unknown as Json;
   const rejected=await deep(f,'q-market',[contrary]);await assess(f,rejected,'rejected');
@@ -344,32 +392,39 @@ test('6.4 transport: rejected, unassessed, unknown and both relation sides are e
   const truncated=structuredClone(packet);truncated.contradictions[0]!.sides.pop();
   for(const candidate of [ {...packet,materials:packet.materials.slice(1)}, {...packet,unknowns:[]},
     {...packet,contradictions:[]},truncated ])malformed.push({dossierSubject:packet.subject,dossierPacket:candidate});
+  // Every malformed variant passes the main door hot; the cold Store keeps one representative of each distinct class
+  // (context shape, packet substitution) beside every other distinct door. Full dumps bound the write-free blocks.
+  const representatives=[malformed[0],malformed.at(-1)];
   for(const store of [f.store,new Store(f.store.path)]) {
-    if(store!==f.store)t.after(()=>store.close());
-    for(const context of malformed)await unchanged(f,store,()=>envelope(f,packet,24000,store,context),true);
-    await unchanged(f,store,()=>envelope(f,packet,600,store),true);
-    await unchanged(f,store,()=>envelope(f,packet,6000,store),true);
+    const hot=store===f.store;if(!hot)t.after(()=>store.close());
+    const refuse=(action:()=>Promise<unknown>)=>refused(f,store,action), dumped=all(store);
+    for(const context of hot?malformed:representatives)await refuse(()=>envelope(f,packet,24000,store,context));
+    if(hot)assert.equal(all(store),dumped);
+    await refuse(()=>envelope(f,packet,600,store));
+    await refuse(()=>envelope(f,packet,6000,store));
     const bad=structuredClone(wire.subject.resultCapacity);bad.bindings.dossierSubject={...packet.subject,identity:'foreign'};
-    await unchanged(f,store,()=>envelope(f,packet,24000,store,{dossierSubject:packet.subject,resultCapacity:bad}),true);
-    await unchanged(f,store,()=>envelope(f,packet,24000,store,undefined,bad),true);
-    await unchanged(f,store,async()=>prepareResearchEnvelope(f.environment.value.reviewer,f.environment.value,instruction,
-      {dossierSubject:packet.subject},audit(f,store)),true);
-    await unchanged(f,store,async()=>workingContext(store,'p',f.draft.id,f.v.plan.id,{dossierSubject:packet.subject},24000),true);
+    await refuse(()=>envelope(f,packet,24000,store,{dossierSubject:packet.subject,resultCapacity:bad}));
+    await refuse(()=>envelope(f,packet,24000,store,undefined,bad));
+    await refuse(async()=>prepareResearchEnvelope(f.environment.value.reviewer,f.environment.value,instruction,
+      {dossierSubject:packet.subject},audit(f,store)));
+    await refuse(async()=>workingContext(store,'p',f.draft.id,f.v.plan.id,{dossierSubject:packet.subject},24000));
     for(const context of [{dossierSubject:packet.subject},{dossierSubject:null},{resultCapacity:wire.subject.resultCapacity}])
-      await unchanged(f,store,()=>researchCall(f.environment.value.reviewer,f.environment.value,instruction,context,undefined,audit(f,store)),true);
-    await unchanged(f,store,()=>researchCall(f.environment.value.reviewer,f.environment.value,instruction,{dossierSubject:packet.subject},undefined),true);
-    await unchanged(f,store,()=>researchCall(f.environment.value.reviewer,f.environment.value,instruction,{dossierSubject:packet.subject},undefined,{...audit(f,store),purpose:'assessor'}),true);
+      await refuse(()=>researchCall(f.environment.value.reviewer,f.environment.value,instruction,context,undefined,audit(f,store)));
+    await refuse(()=>researchCall(f.environment.value.reviewer,f.environment.value,instruction,{dossierSubject:packet.subject},undefined));
+    await refuse(()=>researchCall(f.environment.value.reviewer,f.environment.value,instruction,{dossierSubject:packet.subject},undefined,{...audit(f,store),purpose:'assessor'}));
     // An honestly saved content-addressed archive still cannot substitute material.
     const original=store.get<any>(wire.subject.working.archive.id,1)!;
     const value=structuredClone(original.value);value.body.dossierPacket.contradictions[0].sides.pop();
     const id=`research-context:${hashJson(value)}`;
     const counterfeit=store.get(id) ?? store.write({id,kind:'research-context',expected:0,value});
-    await unchanged(f,store,()=>requireDossierTransportArchive(store,'p',reference(counterfeit),packet.subject),true);
+    await refuse(()=>requireDossierTransportArchive(store,'p',reference(counterfeit),packet.subject));
     const bindingValue=structuredClone(original.value);bindingValue.body.resultCapacity.bindings.dossierSubject.identity='foreign';
     const bindingId=`research-context:${hashJson(bindingValue)}`;
     const wrongBinding=store.get(bindingId) ?? store.write({id:bindingId,kind:'research-context',expected:0,value:bindingValue});
-    await unchanged(f,store,()=>requireDossierTransportArchive(store,'p',reference(wrongBinding),packet.subject),true);
-    await unchanged(f,store,()=>requireDossierTransportArchive(store,'p',{...wire.subject.working.archive,hash:'0'.repeat(64)},packet.subject),true);
+    await refuse(()=>requireDossierTransportArchive(store,'p',reference(wrongBinding),packet.subject));
+    await refuse(()=>requireDossierTransportArchive(store,'p',{...wire.subject.working.archive,hash:'0'.repeat(64)},packet.subject));
+    // The cold pass finds both honestly saved counterfeits already present: its whole block writes nothing.
+    if(!hot)assert.equal(all(store),dumped);
   }
 });
 
