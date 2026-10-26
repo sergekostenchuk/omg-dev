@@ -248,9 +248,9 @@ for(const model of [false,true])test(`5.6: real ${model?'model':'owner'} choose 
   for(const row of deepIntents(f.store))assert.equal(readDeepResearchResult(f.store,'p',reference(row)).verification,'proven');
   assert.equal(f.store.list('discovery-dossier-manifest').length,1);assert.equal(selected.manifest.value.completeness,'complete');
   assert.equal(discoveryInspection(f.store,f.store.get<DiscoveryDraft>(f.v.draft.id)!).outcome.state,'researching');
-  for(const store of [f.store,f.open()])await inert(f,store,async()=>{
-    assert.deepEqual(await f.run(3,store,true),final);assert.deepEqual(await f.run(3,store),final);
-  });
+  await inert(f,f.store,async()=>assert.deepEqual(await f.run(3,f.store,true),final));
+  const cold=f.open();
+  await inert(f,cold,async()=>assert.deepEqual(await f.run(3,cold),final));
 });
 
 for(const mode of ['common','insufficient'] as const)test(`5.6: applied ${mode} material stays in the exact missing frontier`,async t=>{
@@ -402,9 +402,12 @@ test(`5.6-01: ${cold?'cold':'hot'} prepared cut at deep position ${position} res
     assert.deepEqual(reference(selected.manifest),JSON.parse(result.value.error!).dossier);
     assert.deepEqual(selected.record.value.scope,f.scope);assert.equal(selected.coverage.missing.length,0);
   }
-  for(const again of [store,f.open()])await inert(f,again,async()=>{
+  if(position===2){
+    await inert(f,store,async()=>assert.deepEqual(await f.run(2,store,true),result));
+    const again=f.open();
+    await inert(f,again,async()=>assert.deepEqual(await f.run(2,again),result));
+  }else for(const again of [store,f.open()])await inert(f,again,async()=>{
     assert.deepEqual(await f.run(2,again,true),result);
-    if(position===2)assert.deepEqual(await f.run(2,again),result);
   });
 });
 

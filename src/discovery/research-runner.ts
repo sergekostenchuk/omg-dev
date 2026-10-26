@@ -101,12 +101,14 @@ const paidTurnId = (run: string, number: number) => `research-turn:v1:${hashJson
 export const SELECTED_DOSSIER_PENDING = 'research_selected_dossier_pending';
 export const SELECTED_DOSSIER_PAUSE = 'research_selected_dossier_assessment_unavailable';
 const SELECTED_PAUSE_CONTRACT = 'research-selected-dossier-pause/v1';
-function selectedRoute(handoff: Revision<VariantHandoff>, dossier: ProvenSelectedDossier): void {
-  const route = handoff.value, saved = dossier.record.value;
-  requireCondition(route.reason === 'choose' && route.next === 'deep'
+function matchesSelectedRoute(route: VariantHandoff, saved: SelectedDossier | null | undefined): boolean {
+  return route.reason === 'choose' && route.next === 'deep' && saved?.projectId === route.projectId
     && ['draft','frame','plan','scope','set','decision'].every(key =>
       canonical(saved[key as keyof SelectedDossier]) === canonical(route[key as keyof VariantHandoff]))
-    && canonical(saved.member) === canonical(route.choice),
+    && canonical(saved.member) === canonical(route.choice);
+}
+function selectedRoute(handoff: Revision<VariantHandoff>, dossier: ProvenSelectedDossier): void {
+  requireCondition(matchesSelectedRoute(handoff.value,dossier.record.value),
     'discovery_selected_pause_invalid', 'The selected carrier belongs to another exact chosen handoff');
 }
 /** Both public doors read the same explicit pause contract. Completeness is
@@ -137,11 +139,12 @@ export async function readSelectedResearchPause(store: Store, project: string, d
   } else {
     requireCondition(saved.code === SELECTED_DOSSIER_PENDING && saved.selected === null && saved.dossier === null,
       'discovery_selected_pause_invalid', 'A selected result requires both exact carrier and manifest');
-    // The pending run's exact body at the producer boundary anchors the pair,
-    // including after an unchanged concurrent run revision. Unrelated events
-    // and later choice/plan/P changes cannot redirect it to another snapshot.
+    // A run body persists across later events, including another project's
+    // publication. First restrict candidates to this exact chosen route, then
+    // anchor its pair to the pending body and prove it through the common reader.
     const candidates = store.list<SelectedDossier>(SELECTED_DOSSIER_KIND)
       .filter(row => {
+        if (!matchesSelectedRoute(handoff.value,row.value)) return false;
         const sequence = row.value?.boundary?.sequence;
         if (!Number.isSafeInteger(sequence)) return false;
         const at = store.getAtEvent(sequence,run.id);

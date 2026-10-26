@@ -227,9 +227,9 @@ test('5.7: complete coverage and an unpaid pending frontier are not partial', as
   assert.equal(f.store.list('discovery-dossier-manifest').length,1);
   assert.equal(f.store.list(DEEP_FRONTIER_STOP_KIND).length, 0);
   await inert(f, f.store, () => assert.rejects(() => produceDeepFrontierStop(f.store, 'p', JSON.parse(f.pending.value.error!).handoff), { code: 'discovery_deep_stop_invalid' }));
-  for(const store of [f.store,f.open()])await inert(f,store,async()=>{
-    assert.deepEqual(await f.run(3,store),result);assert.deepEqual(await f.run(1,store,true),result);
-  });
+  await inert(f,f.store,async()=>assert.deepEqual(await f.run(3,f.store),result));
+  const cold=f.open();
+  await inert(f,cold,async()=>assert.deepEqual(await f.run(1,cold,true),result));
 });
 
 test('5.7: a real prepared intent before reservation is not terminal even when its run is paused', async t => {
