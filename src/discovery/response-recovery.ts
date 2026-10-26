@@ -26,6 +26,7 @@ import { Ajv } from 'ajv';
 import { readFileSync, realpathSync } from 'node:fs';
 import { isAbsolute, normalize } from 'node:path';
 import { constants as systemConstants } from 'node:os';
+import { types } from 'node:util';
 import type { Store, Revision, Write, TransactionGuard } from '../storage/store.js';
 import type { ModelCall } from '../runtime/model-usage.js';
 import type { Environment, RoleBinding } from '../runtime/environment.js';
@@ -4318,14 +4319,23 @@ function variantApplicationOf(store:Store,project:string,ref:Ref,origin:{intent:
 export interface ProvenVariantGeneration {
   verification:'proven'; session:Revision<VariantExecutionSession>; publication:VariantPublication; state:Ref|null;
 }
+/** The one form that keys a kept generation proof: a plain object (no Proxy, array or inheritor) of exactly the three enumerable
+ * data fields id, revision and hash. Its values are read once; that snapshot is what is keyed and what is proved. */
+function plainExactRef(ref:unknown):Ref|null {
+  if(!ref || typeof ref!=='object' || types.isProxy(ref) || Object.getPrototypeOf(ref)!==Object.prototype) return null;
+  const fields=Object.getOwnPropertyDescriptors(ref);
+  if(Reflect.ownKeys(fields).length!==3 || !['id','revision','hash'].every(name=>fields[name]?.enumerable===true && 'value' in fields[name]!)) return null;
+  const exact={id:fields['id']!.value,revision:fields['revision']!.value,hash:fields['hash']!.value};
+  return isRef(exact)?exact:null;
+}
 /** 4B.1: the proven reader of a published generation result — a set or no_variants. A structural record alone, or a 4T.4
  * execution-only receipt, proves no product set. The genuine Store proves one exact (project, Ref) once and keeps it while
- * everything the proof read is current; a trace, overlay or evaluation view, a padded Ref and a non-string project read
- * through themselves, as before. Each caller receives a copy of its own. */
+ * everything the proof read is current; a trace, overlay or evaluation view, any Ref that is not the plain closed form and a
+ * non-string or blank project read through themselves, as before. Each caller receives a copy of its own. */
 export function readVariantGeneration(store:Store,project:string,ref:Ref):ProvenVariantGeneration {
-  if(!genuineStore(store) || typeof project!=='string' || project.trim().length===0 || !isRef(ref) || Object.keys(ref).length!==3)
-    return deriveVariantGeneration(store,project,ref);
-  const exact={id:ref.id,revision:ref.revision,hash:ref.hash};
+  if(!genuineStore(store) || typeof project!=='string' || project.trim().length===0) return deriveVariantGeneration(store,project,ref);
+  const exact=plainExactRef(ref);
+  if(!exact) return deriveVariantGeneration(store,project,ref);
   return structuredClone(historicalProof(store,{reader:'variant.generation-read/v1',project,ref:exact},
     source=>deriveVariantGeneration(source,project,exact),
     ()=>variantSessionInvalid('The generation proof is cyclic')));

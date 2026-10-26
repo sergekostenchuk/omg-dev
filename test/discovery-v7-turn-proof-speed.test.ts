@@ -257,6 +257,8 @@ test('turn proof speed: every refusal of a damaged, foreign or padded input is t
     ['another project', 'q', f.set], ['an empty project', '', f.set], ['a blank project', '   ', f.set], ['a project that is no string', 7, f.set],
     ['a Ref without hash', f.project, { id: f.set.id, revision: f.set.revision }], ['a padded Ref', f.project, { ...f.set, extra: 1 }],
     ['another hash', f.project, { ...f.set, hash: '0'.repeat(64) }], ['another revision', f.project, { ...f.set, revision: 2 }],
+    ['a revision of zero', f.project, { ...f.set, revision: 0 }], ['a fractional revision', f.project, { ...f.set, revision: 1.5 }],
+    ['a hash that is no hash', f.project, { ...f.set, hash: 'not-a-hash' }], ['an empty id', f.project, { ...f.set, id: '' }],
     ['an unknown id', f.project, { ...f.set, id: 'discovery-variant-set:unknown' }], ['a member, not a result', f.project, f.members[0]],
     ['the receipt', f.project, f.receipt], ['the running intent', f.project, f.running], ['nothing', f.project, null],
     ['another recommendation', f.project, forge('discovery-variant-set', { ...set.value, recommendation: { member: f.members[0], reason: 'Forged' } })],
@@ -280,6 +282,38 @@ test('turn proof speed: every refusal of a damaged, foreign or padded input is t
   hidden.get = ((id: string, revision?: number) => id === f.receipt.id ? null : realGet(id, revision)) as typeof hidden.get;
   assert.ok('code' in outcome(() => readVariantGeneration(hidden, f.project, f.set)), 'the session of the receipt is hidden');
   for (const [label, ref] of generations(f)) assert.equal(readVariantGeneration(f.store, f.project, ref).verification, 'proven', label);
+});
+
+test('turn proof speed: only the plain closed Ref keys a kept proof — every other form derives in place and meets the old answer, cold and warm', async t => {
+  const f = await sharedWorld(t);
+  // [form, whether the old closed-form check refuses it]: the two the review named first, then the other forms the gate must not admit.
+  const forms = (ref: Ref): [string, unknown, boolean][] => [
+    ['an array carrying the three fields', Object.assign([], ref), true],
+    ['an inheritor with three foreign own keys', Object.assign(Object.create(ref), { a: 1, b: 2, c: 3 }), true],
+    ['a field that is not enumerable', Object.defineProperty({ id: ref.id, revision: ref.revision }, 'hash', { value: ref.hash }), true],
+    ['enumerable accessors', Object.defineProperties({}, { id: { get: () => ref.id, enumerable: true }, revision: { get: () => ref.revision, enumerable: true },
+      hash: { get: () => ref.hash, enumerable: true } }), false],
+    ['a Proxy over the Ref', new Proxy({ ...ref }, {}), false],
+    ['a symbol beside the fields', Object.assign({ ...ref }, { [Symbol('beside')]: 1 }), false],
+    ['no prototype', Object.assign(Object.create(null), ref), false],
+    ['a class instance', Object.assign(new (class Pointer {})(), ref), false],
+  ];
+  for (const [label, legit] of generations(f)) {
+    const ids = chain(f, legit), cold = emptyCache(f, t);
+    const meetsOld = (phase: string) => {
+      for (const [form, bad, refuses] of forms(legit)) {
+        const genuine = outcome(() => readVariantGeneration(cold, f.project, bad as Ref));
+        const inPlace = outcome(() => readVariantGeneration(historicalTrace(cold), f.project, bad as Ref));
+        assert.deepEqual(genuine, inPlace, `${label}, ${form}, ${phase}: the genuine Store answers as the in-place derivation does`);
+        if (refuses) assert.equal(refusalCode(genuine), 'discovery_variant_invalid', `${label}, ${form}, ${phase}: refused as the closed form always was`);
+      }
+    };
+    meetsOld('cold');
+    // None of them left a proof of the legitimate Ref behind: the genuine Store, asked with the plain Ref, still reads the chain.
+    assert.ok(countReads(ids, () => assert.equal(readVariantGeneration(cold, f.project, legit).verification, 'proven')) > 0, `${label}: the forms kept no proof`);
+    meetsOld('warm');
+    assert.equal(countReads(ids, () => readVariantGeneration(cold, f.project, legit)), 0, `${label}: the plain Ref keeps repeating for nothing beside them`);
+  }
 });
 
 test('turn proof speed: a damaged application proves no generation — the same refusal as in place, hot and cold, and nothing is kept from it', async t => {
