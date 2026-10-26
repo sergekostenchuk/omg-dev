@@ -10,7 +10,7 @@ import { proveIssuedAnswer, savedAcceptanceAct } from './projection-reader.js';
 import { historicalObservation } from './response-recovery.js';
 import type { ResearchAcceptanceBinding } from './research-consumer-transition.js';
 import type { ResearchAnswer, ResearchAssessment } from './research-model.js';
-import { DISCOVERY_ACCEPTANCE_ACT_KIND, discoveryAcceptanceActId, provenAcceptance,
+import { DISCOVERY_ACCEPTANCE_ACT_KIND, discoveryAcceptanceActId, isDiscoveryV7Draft, provenAcceptance,
   type DiscoveryAcceptanceAct } from './v7-contracts.js';
 
 /** DR2b 2b.1-SOURCES (codex-omg №14475, residue of №9569): the public read-only
@@ -200,6 +200,11 @@ function resolveFrame(store: Store, project: string, frameRef: Ref, at: string):
     missing(`${at}.acceptance`, 'The exact frame has no saved acceptance', frameRef);
   const question = exact<Question>(store, act.value.questionAfter, 'question', `${at}.question`);
   const draft = exact<DiscoveryDraft>(store, act.value.draftAfter, 'discovery-draft', `${at}.draft`);
+  // The shared era/stage boundary: the saved draft and question the act names
+  // must be Discovery v7 — a correct ref and an acceptance act of another
+  // stage never stand in for D1 (2B-SOURCES-03).
+  if (!isDiscoveryV7Draft(draft.value) || question.value.stage !== 'discovery')
+    mismatch(at, 'The frame is not of a Discovery v7 draft and question', frameRef);
   if (!savedAcceptanceAct(store, draft, question, 'frame', frameRef, answer.value.value))
     mismatch(at, 'The frame does not belong to this exact draft', frameRef);
   const proven = proveIssuedAnswer(store, draft,
@@ -216,39 +221,72 @@ function resolveFrame(store: Store, project: string, frameRef: Ref, at: string):
   return { record: answer, question, draft, acceptance: act, assessment, binding, inputs, grounds };
 }
 
-/** The brief acceptance in effect at the frame's draft revision, proven by the
- * draft's own saved prefix closure — the producer record written in the same
- * transaction as the frame's own revision. The closure names the accepted
- * brief answer and its act; the fact is read exactly, its observation must
- * still reproduce the saved source bytes and be the excerpt the frame's draft
- * carried. Returns null when the saved material proves no accepted brief —
- * the door does not exist for a non-closable acceptance and is never
- * replaced by a head read. */
+/** The brief acceptance in effect at the frame's draft revision. The accepted
+ * fact is proven through the shared reader's savedAcceptanceAct — the full
+ * historical check re-reads the exact questionBefore/questionAfter and the
+ * draft transition the saved act names, not a few act fields. The preferred
+ * path to the accepted brief is the draft's own saved prefix closure — the
+ * producer record written in the same transaction as the frame's revision;
+ * a revision a rebound frame assessment deliberately left unclosed proves
+ * the same acceptance through the brief question's own saved act, found in
+ * the draft's question list — a missing closure never means a missing
+ * acceptance. Returns null when the saved material proves no accepted
+ * brief — the door is never replaced by a head read. */
 function provenBrief(store: Store, project: string, frame: FrameProvenance): Observation | null {
   const draft = frame.draft;
+  const briefValue = draft.value.fields['brief'];
+  if (briefValue === undefined || briefValue === null) return null;
+  /** The shared historical proof of the saved brief act: a hidden before
+   * revision, a patched act or a managed mark is a null, never a passed basis. */
+  const prove = (question: Revision<Question>, answerRef: Ref): Observation | null => {
+    if (!savedAcceptanceAct(store, draft, question, 'brief', answerRef, briefValue)) return null;
+    const fact = exact<Fact>(store, answerRef, 'fact', 'mandate.brief');
+    if (fact.value.projectId !== project || fact.value.question !== question.id) return null;
+    const observation = fact.value.observation as unknown;
+    if (!object(observation) || !isRef(observation.source) || !object(observation.selector)
+      || observation.value === undefined || !same(observation.value, briefValue))
+      return null;
+    resolveStored(store, project, observation, 'mandate.brief');
+    return fact.value.observation;
+  };
   const closure = store.get<DiscoveryPrefixClosure>(discoveryPrefixClosureId(draft.id, draft.revision), 1);
-  if (!closure || closure.kind !== DISCOVERY_PREFIX_CLOSURE_KIND || hashJson(closure.value) !== closure.hash
-    || closure.value.draftId !== draft.id || closure.value.projectId !== project
-    || !same(closure.value.draft, reference(draft)))
-    return null;
-  const entry = closure.value.questions.find(item => item.answer !== null
-    && item.answer.field === 'brief' && item.answer.kind === 'fact' && isRef(item.question));
-  const accepted = entry?.answer;
-  if (!entry || !accepted || !isRef(accepted.answer) || !isRef(accepted.act)) return null;
-  const act = exact<DiscoveryAcceptanceAct>(store, accepted.act, DISCOVERY_ACCEPTANCE_ACT_KIND, 'mandate.brief');
-  if (act.value.projectId !== project || act.value.draftId !== draft.id || act.value.field !== 'brief'
-    || !same(act.value.answer, accepted.answer) || !same(act.value.questionAfter, entry.question))
-    return null;
-  const fact = exact<Fact>(store, accepted.answer, 'fact', 'mandate.brief');
-  if (fact.value.projectId !== project || fact.value.question !== entry.question.id) return null;
-  const observation = fact.value.observation as unknown;
-  if (!object(observation) || !isRef(observation.source) || !object(observation.selector)
-    || observation.value === undefined || !same(observation.value, accepted.value)
-    || !same(observation.value, draft.value.fields['brief'])
-    || accepted.observations !== 1 || !same(accepted.sources, [observation.source]))
-    return null;
-  resolveStored(store, project, observation, 'mandate.brief');
-  return fact.value.observation;
+  if (closure !== null) {
+    if (closure.kind !== DISCOVERY_PREFIX_CLOSURE_KIND || hashJson(closure.value) !== closure.hash
+      || closure.value.draftId !== draft.id || closure.value.projectId !== project
+      || !same(closure.value.draft, reference(draft)))
+      return null;
+    const entry = closure.value.questions.find(item => item.answer !== null
+      && item.answer.field === 'brief' && item.answer.kind === 'fact' && isRef(item.question));
+    const accepted = entry?.answer;
+    if (!entry || !accepted || !isRef(accepted.answer) || !isRef(accepted.act)) return null;
+    if (accepted.observations !== 1 || !same(accepted.value, briefValue)) return null;
+    const act = exact<DiscoveryAcceptanceAct>(store, accepted.act, DISCOVERY_ACCEPTANCE_ACT_KIND, 'mandate.brief');
+    if (act.value.projectId !== project || act.value.draftId !== draft.id || act.value.field !== 'brief'
+      || !same(act.value.answer, accepted.answer) || !same(act.value.questionAfter, entry.question))
+      return null;
+    const question = exact<Question>(store, entry.question, 'question', 'mandate.brief');
+    const brief = prove(question, accepted.answer);
+    if (brief === null || !same(accepted.sources, [brief.source])) return null;
+    return brief;
+  }
+  // No closure at this revision (a rebound frame assessment is deliberately
+  // unclosable): every answered revision of the draft's own brief question is
+  // a candidate, proven by its saved act — newest first.
+  for (const questionId of draft.value.questions) {
+    const head = store.get<Question>(questionId);
+    if (!head || head.kind !== 'question' || head.value.projectId !== project
+      || head.value.draftId !== draft.id || head.value.spec.field !== 'brief') continue;
+    for (const question of store.history<Question>(questionId).reverse()) {
+      const answerRef = question.value.answer;
+      if (question.value.status !== 'answered' || !isRef(answerRef)) continue;
+      const act = store.get<DiscoveryAcceptanceAct>(
+        discoveryAcceptanceActId(project, draft.id, 'brief', answerRef), 1);
+      if (!act || act.kind !== DISCOVERY_ACCEPTANCE_ACT_KIND || hashJson(act.value) !== act.hash) continue;
+      const brief = prove(question, answerRef);
+      if (brief !== null) return brief;
+    }
+  }
+  return null;
 }
 
 function resolvePrevious(store: Store, project: string, at: Ref, field: string,

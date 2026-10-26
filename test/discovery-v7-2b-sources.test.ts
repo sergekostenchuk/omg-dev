@@ -6,8 +6,12 @@ import { reference, type Ref } from "../src/pipeline/contracts.js";
 import type { Selector } from "../src/evidence/evidence.js";
 import type { Revision, Store } from "../src/storage/store.js";
 import type { DiscoveryDraft, Question } from "../src/discovery/discovery.js";
-import { createPartialV7Draft, V7_FRAME_INTERPRETATIONS_CONTRACT,
-  V7_FRAME_INTERPRETATIONS_KIND } from "../src/discovery/v7-contracts.js";
+import { createPartialV7Draft, discoveryAcceptanceActId, isDiscoveryV7Draft,
+  V7_BRIEF_FIELD, V7_FRAME_FIELD, V7_FRAME_INTERPRETATIONS_CONTRACT,
+  V7_FRAME_INTERPRETATIONS_KIND, V7_OBJECTIVE_FIELD, V7_PLAN_FIELD,
+  type DiscoveryAcceptanceAct } from "../src/discovery/v7-contracts.js";
+import { discoveryPrefixClosureId } from "../src/discovery/discovery.js";
+import { reuseResearch } from "../src/discovery/research-reuse.js";
 import { projectFrameInterpretations } from "../src/discovery/frame-interpretations.js";
 import { collectFrameInterpretationSubject, checkFrameInterpretationSubject,
   decodeFrameInterpretationSubject  , FRAME_SUBJECT_CONTRACT,
@@ -383,6 +387,86 @@ test("2b.1-S the local refusal catalogue is exactly the three subject codes; for
   assert.deepEqual([...local].sort(), ["frame_subject_invalid", "frame_subject_mismatch", "frame_subject_missing"]);
   assert.ok(foreign.has("research_acceptance_binding_invalid"), "the acceptance reader keeps its refusal");
   assert.ok(foreign.has("research_consumer_intent_invalid"), "the selector mechanism keeps its addressed refusal");
+});
+
+test("2b.1-S a rebound frame accepted through real reuse still resolves its own accepted brief; hot and cold reads agree", (t) => {
+  const f = discoveryFixture(t, "omg-2bs-reuse-"), project = "reuse";
+  const first = base(f, project);
+  // The second v7 draft of the same project, stage, specs, consumer and
+  // inputs — the exact reuse candidate of the first one's answered frame.
+  const draft2 = createPartialV7Draft(f.discovery, project, "concept", [reference(first.src)]);
+  const briefQ2 = questionOf(f.store, draft2, "brief");
+  f.engine.discovery.fact(briefQ2.id, briefQ2.revision, reference(first.src), { ...RANGE });
+  const objective2 = questionOf(f.store, draft2, "objective");
+  f.engine.discovery.decision(objective2.id, f.store.get<Question>(objective2.id)!.revision,
+    "owner", `Deliver ${project} outcome`);
+  const environment = reference(f.store.get(`fixture-research-environment:${project}`)!);
+  assert.equal(reuseResearch(f.store, f.discovery, f.store.get<DiscoveryDraft>(draft2.id)!, environment), 1,
+    "the real reuse door rebinds the first draft's paid frame assessment");
+  const frameQ2 = questionOf(f.store, draft2, "frame");
+  const frameRef2 = f.store.get<Question>(frameQ2.id)!.value.answer!;
+  const draftAfter = f.store.get<DiscoveryDraft>(draft2.id)!;
+  assert.equal(f.store.get(discoveryPrefixClosureId(draft2.id, draftAfter.revision)), null,
+    "a rebound frame assessment deliberately leaves the draft revision unclosed");
+  const req = requestOf(project, { ...first, draft: draft2, frameRef: frameRef2 });
+  const pkg = collectFrameInterpretationSubject(f.store, req);
+  assert.equal(pkg.mandate.observation.value, TEXT_BRIEF.slice(RANGE.start, RANGE.end),
+    "the accepted brief is proven by its own saved act without a prefix closure");
+  assert.equal(canonical(reference(pkg.frame.draft)), canonical(reference(draftAfter)));
+  assert.equal(pkg.frame.assessment?.value.reusedFrom !== undefined, true,
+    "the resolved frame really is the rebound acceptance");
+  assert.deepEqual(collectFrameInterpretationSubject(f.open(), req), pkg,
+    "a cold reopen resolves the same historical subject");
+  const checked = checkFrameInterpretationSubject(f.open(), req, structuredClone(pkg));
+  assert.deepEqual(checked, pkg);
+});
+
+test("2b.1-S a hidden before-revision of the saved brief act refuses; the acceptance is proven through the shared reader, not borrowed fields", (t) => {
+  const f = discoveryFixture(t, "omg-2bs-brief-"), project = "brick";
+  const b = base(f, project);
+  const req = requestOf(project, b);
+  const pkg = collectFrameInterpretationSubject(f.store, req);
+  assert.equal(pkg.mandate.observation.value, TEXT_BRIEF.slice(RANGE.start, RANGE.end));
+  // Hide the exact questionBefore revision the saved brief acceptance act names:
+  // a collect that returned the package anyway was trusting act fields, not history.
+  const briefAnswer = f.store.get<Question>(b.briefQ.id)!.value.answer!;
+  const act = f.store.get<DiscoveryAcceptanceAct>(
+    discoveryAcceptanceActId(project, b.draft.id, "brief", briefAnswer), 1)!;
+  const before = act.value.questionBefore!;
+  const get = f.store.get;
+  f.store.get = ((id: string, revision?: number) =>
+    (id === before.id && revision === before.revision ? null : get.call(f.store, id, revision))) as typeof f.store.get;
+  try {
+    for (const fn of [() => collectFrameInterpretationSubject(f.store, req),
+      () => checkFrameInterpretationSubject(f.store, req, structuredClone(pkg))]) {
+      assert.equal(code(fn), "frame_subject_missing");
+      assert.equal(field(fn), "mandate");
+    }
+  } finally { delete (f.store as { get?: unknown }).get; }
+});
+
+test("2b.1-S an accepted frame of another stage is not a D1 subject: the saved draft and question must stand at the Discovery v7 boundary", (t) => {
+  const f = discoveryFixture(t, "omg-2bs-stage-"), project = "stage-x";
+  const src = f.discovery.evidence.document(project, "brief-src", TEXT_BRIEF, "text/plain", 0);
+  // A concept-stage draft stamped era 7 through the public producer surface,
+  // answered by the ordinary producers — its frame is really saved and accepted.
+  const draft = f.discovery.create(project, "concept", "R0", "concept",
+    [V7_BRIEF_FIELD, V7_OBJECTIVE_FIELD, V7_FRAME_FIELD, V7_PLAN_FIELD], [reference(src)], 7);
+  assert.equal(isDiscoveryV7Draft(draft.value), false, "the draft is era 7 but not a Discovery draft");
+  const briefQ = questionOf(f.store, draft, "brief");
+  f.engine.discovery.fact(briefQ.id, briefQ.revision, reference(src), { ...RANGE });
+  const objectiveQ = questionOf(f.store, draft, "objective");
+  f.engine.discovery.decision(objectiveQ.id, f.store.get<Question>(objectiveQ.id)!.revision,
+    "owner", `Deliver ${project} outcome`);
+  const frameQ = questionOf(f.store, draft, "frame");
+  answerDiscoveryFixture(f.engine, project, f.store.get<DiscoveryDraft>(draft.id)!,
+    f.store.get<Question>(frameQ.id)!, validFrame(), src);
+  const frameRef = f.store.get<Question>(frameQ.id)!.value.answer!;
+  assert.equal(code(() => collectFrameInterpretationSubject(f.store,
+    { project, frame: frameRef, mandate: { source: reference(src), selector: { ...RANGE } } })),
+    "frame_subject_mismatch");
+  assert.equal(field(() => collectFrameInterpretationSubject(f.store,
+    { project, frame: frameRef, mandate: { source: reference(src), selector: { ...RANGE } } })), "frame");
 });
 
 /** A non-frame research-answer of the same project: the accepted plan answer. */

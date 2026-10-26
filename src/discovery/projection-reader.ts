@@ -797,12 +797,14 @@ export function savedAcceptanceAct(view: RecordView, draft: Revision<DiscoveryDr
       }
     }
 
-    // Managed binding
+    // Managed binding. Адрес не-research-answer (fact/decision) не несёт
+    // managed turn id вовсе — это отсутствие связки, а не испорченный managed
+    // ответ: такое принятие доказывается с binding === null ниже.
     let turnId: string | null = null;
     try {
       turnId = managedAnswerTurn(ref.id, draft.value.projectId);
     } catch {
-      return false;
+      turnId = null;
     }
     if (turnId !== null) {
       if (!a.binding || !isRef(a.binding)) return false;
