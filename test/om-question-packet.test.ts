@@ -2392,28 +2392,35 @@ test('E2 answer schema selection refuses missing null and unknown runtime kinds'
   for (const kind of ['node', 'fact', 'field'] as const) assert.ok(packetAnswerSchema(kind));
 });
 
-test('E2 current packet admits the exact A3.3 mechanism owner and rejects a selected task from another owner', { todo: "NR1 №3646: согласованная перезапись цепочки до новейшей записи — om-fsck её не видит; решение позже" }, async t => {
-  const p = packetFixture(t, 100_000, gardenGraph(), false), { f } = p;
+// A3.3: a mechanism-owned packet opened through the current managed gate — real series, ready E2, its E1 call and
+// part-response — shared by the ordinary replay below and the NR1 substantiation after it.
+function mechanismPacket(p: ReturnType<typeof packetFixture>) {
+  const { f } = p, owner = { kind: 'mechanism', mechanism: 'M5:addressing' } as const;
   const batch = p.routes.value.batches.find(row => row.task === 'input-field' && row.items.some(item => item.field === 'address'))!;
-  const owner = { kind: 'mechanism', mechanism: 'M5:addressing' } as const;
   const address = { project: f.project, owner, line: 1 };
   ok(openSeries(f.store, { ...address, scope: f.request.gaps, predecessor: null, basis: null }));
   const goal = { key: 'mechanism-packet', questions: batch.items.map(item => gapLineKey(f.project, item.target, item.field)).sort(),
     result: gapLineExpectedResult(f.project, batch.items[0]!.target, batch.items[0]!.field) };
-  const admission = { gaps: f.request.gaps, routes: reference(p.routes), batch: batch.id };
-  const series = ok(beginAttempt(f.store, { ...address, attempt: 1, goal, admission }));
+  const admission = { gaps: p.routes.value.request.gaps, routes: reference(p.routes), batch: batch.id };
+  const completion = { routes: reference(p.routes), batches: [batch.id] };
+  const series = ok(openAttempt(f.store, { ...address, attempt: 1, goal, admission, completion }));
+  const binding = ok(readCompletionBinding(f.store, f.project, reference(series), 1));
+  assert.ok(binding?.value, 'A current mechanism attempt has an actual completion binding');
+  assert.deepEqual(binding.value.plan, completion);
+  assert.deepEqual(binding.value.goal, { ...goal, questions: [...goal.questions].sort() });
   const request = { ...p.request, batch: batch.id, attempt: { series: reference(series), ordinal: 1 } };
   const ready = ok(writeQuestionPacket(f.store, request)).record;
   assert.equal(ready.value.state, 'ready'); assert.equal(ready.value.packetContract, BRIEF_PACKET_CONTRACT);
   assert.equal((ready.value.packet as Record<string, Json>).task, 'input-field');
+  assert.deepEqual(ready.value.request.attempt, { series: reference(series), ordinal: 1 });
   const adapter = f.store.write({ id: `adapter:${f.project}`, kind: 'dispatch-adapter', expected: 0,
     value: { projectId: f.project, protocol: 'codex-stdio' } });
-  const config = f.store.write({ id: `config:${f.project}`, kind: 'dispatch-config', expected: 0,
-    value: { projectId: f.project, model: 'fixture' } });
   const payload = ready.value.packet as Record<string, Json>, requestId = payload.requestId as string;
-  const call = ok(recordCall(f.store, f.project, { call: requestId, purpose: 'model-design', basis: null,
-    owner, admission, gaps: batch.items.map(item => ({ id: item.gap, goal: item.target, field: item.field, consumer: owner })),
-    series: reference(series), attempt: 1, goal, dispatch: { adapter: reference(adapter), config: reference(config) },
+  const assigned = new Set((payload.questions as { id: string }[]).map(item => item.id));
+  const call = ok(recordCall(f.store, f.project, { call: requestId, purpose: payload.purpose as never, basis: null,
+    owner, admission, gaps: batch.items.filter(item => assigned.has(item.gap)).map(item => ({ id: item.gap, goal: item.target,
+      field: item.field, consumer: owner })),
+    series: reference(series), attempt: 1, goal, dispatch: { adapter: reference(adapter), config: reference(p.configured) },
     packet: payload })).call;
   const response = f.store.write<PartResponseRecord>({ id: partResponseId(f.project, reference(call)), kind: 'part-response', expected: 0,
     value: { project: f.project, packet: reference(ready), call: reference(call), requestId,
@@ -2421,6 +2428,22 @@ test('E2 current packet admits the exact A3.3 mechanism owner and rejects a sele
         questionIds: batch.items.map(item => item.gap), reason: 'Mechanism provenance regression' }) } });
   assert.deepEqual(ok(readPacketResponse(f.store, { project: f.project, packet: reference(ready),
     call: reference(call), response: reference(response) })).call, call);
+  return { f, batch, owner, admission, goal, series, request, ready, payload, requestId, call, response };
+}
+
+test('E2 a packet admitted by the exact A3.3 mechanism owner replays its issued form after restart', async t => {
+  const p = packetFixture(t, 100_000, gardenGraph(), false);
+  const { f, request, ready } = mechanismPacket(p);
+  const before = snapshot(f.store);
+  assert.equal(prepareQuestionPacket(f.store, { ...request, batch: p.batch.id }).ok, false);
+  assert.deepEqual(snapshot(f.store), before);
+  f.restart();
+  assert.deepEqual(ok(readQuestionPacket(f.store, { project: f.project, record: reference(ready) })), ready);
+});
+
+test('E2 current packet admits the exact A3.3 mechanism owner and rejects a selected task from another owner', { todo: "NR1 №3646: согласованная перезапись цепочки до новейшей записи — om-fsck её не видит; решение позже" }, async t => {
+  const p = packetFixture(t, 100_000, gardenGraph(), false);
+  const { f, request, ready } = mechanismPacket(p);
   const before = snapshot(f.store);
   assert.equal(prepareQuestionPacket(f.store, { ...request, batch: p.batch.id }).ok, false);
   assert.deepEqual(snapshot(f.store), before);
