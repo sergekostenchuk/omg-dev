@@ -3,26 +3,64 @@ import { EngineError } from "./errors.js";
 
 export type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
 
+const invalid = (): EngineError => new EngineError("invalid_json", "Only finite, acyclic JSON values can be stored");
+/** `JSON.stringify(key)` plus the colon, for the few key names every record repeats. Bounded — a short key, a fixed number
+ * of entries — so no stored data can grow it. */
+const quotedKeys = new Map<string, string>();
+const QUOTED_KEY_LIMIT = 8192, QUOTED_KEY_LENGTH = 64;
+function quoted(key: string): string {
+  let text = quotedKeys.get(key);
+  if (text === undefined) {
+    text = `${JSON.stringify(key)}:`;
+    if (key.length <= QUOTED_KEY_LENGTH && quotedKeys.size < QUOTED_KEY_LIMIT) quotedKeys.set(key, text);
+  }
+  return text;
+}
+/** The order of `Array.prototype.sort()` on strings (UTF-16 code units), in place: a short insertion sort for the few keys
+ * of an ordinary record, the built-in sort beyond that. */
+function sortKeys(keys: string[]): void {
+  const count = keys.length;
+  if (count > 12) { keys.sort(); return; }
+  for (let i = 1; i < count; i++) {
+    const key = keys[i]!;
+    let j = i - 1;
+    while (j >= 0 && keys[j]! > key) { keys[j + 1] = keys[j]!; j--; }
+    keys[j + 1] = key;
+  }
+}
+
+/** The canonical text of a JSON value: object keys in code-unit order, no whitespace. Only finite numbers, strings, booleans,
+ * null, dense arrays and plain acyclic objects are values; anything else is `invalid_json`. The text is what every address
+ * and hash in the system is made of, so it is byte-for-byte the one this function always produced — and it reads a value in
+ * the same order, so a Proxy, a getter or a changing field is met exactly as before. */
 export function canonical(value: unknown): string {
   const seen = new Set<object>();
   function encode(item: unknown): string {
-    if (item === null || typeof item === "string" || typeof item === "boolean") return JSON.stringify(item);
-    if (typeof item === "number" && Number.isFinite(item)) return JSON.stringify(item);
-    if (typeof item !== "object" || item === null || seen.has(item)) {
-      throw new EngineError("invalid_json", "Only finite, acyclic JSON values can be stored");
-    }
-    seen.add(item);
+    if (item === null) return "null";
+    const kind = typeof item;
+    if (kind === "string") return JSON.stringify(item);
+    if (kind === "boolean") return item ? "true" : "false";
+    if (kind === "number" && Number.isFinite(item)) return JSON.stringify(item);
+    if (kind !== "object" || seen.has(item as object)) throw invalid();
+    seen.add(item as object);
     let result: string;
     if (Array.isArray(item)) {
       if (Object.keys(item).length !== item.length) throw new EngineError("invalid_json", "Sparse arrays are forbidden");
       result = `[${item.map(encode).join(",")}]`;
     } else {
-      if (![Object.prototype, null].includes(Object.getPrototypeOf(item))) {
-        throw new EngineError("invalid_json", "Only plain objects can be stored");
+      const prototype = Object.getPrototypeOf(item);
+      if (prototype !== Object.prototype && prototype !== null) throw new EngineError("invalid_json", "Only plain objects can be stored");
+      const keys = Object.keys(item as object);
+      sortKeys(keys);
+      result = "{";
+      for (let index = 0; index < keys.length; index++) {
+        const key = keys[index]!;
+        if (index) result += ",";
+        result += quoted(key) + encode((item as Record<string, unknown>)[key]);
       }
-      result = `{${Object.keys(item).sort().map(key => `${JSON.stringify(key)}:${encode((item as Record<string, unknown>)[key])}`).join(",")}}`;
+      result += "}";
     }
-    seen.delete(item);
+    seen.delete(item as object);
     return result;
   }
   return encode(value);
