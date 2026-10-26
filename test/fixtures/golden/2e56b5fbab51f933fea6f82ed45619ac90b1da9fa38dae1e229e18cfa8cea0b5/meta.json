@@ -1,5 +1,5 @@
 {
-  "producerDigest": "6bfbd1d427cb7df286271c76ad5a92ad0873e266a9fa073866369a5a10e8e13a",
+  "producerDigest": "34facfe589540d5f72f7864f77cd6cc10f90a420a1b39b89171a97b261ed6b3d",
   "inputs": [
     {
       "path": "package-lock.json",
@@ -143,7 +143,7 @@
     },
     {
       "path": "src/discovery/discovery-decision.ts",
-      "sha256": "f88c5d3995cef70fee7dbd28f1c1c2c8f2babbe8fc250242b1b4d33f506b540e"
+      "sha256": "f14519a6a362ca40e349e296cf81d7658b89cc746fed46630ceeb900d900c287"
     },
     {
       "path": "src/discovery/discovery-index.ts",
@@ -171,7 +171,7 @@
     },
     {
       "path": "src/discovery/dossier-assessment.ts",
-      "sha256": "47d751578dbf1a0f0581bfeef66d228039120c46f036d385e52e72d0295fab90"
+      "sha256": "e7b7f69bdf6db24878485f71f54dc0a3120e1262e49c26fc8b9aa819fba878bb"
     },
     {
       "path": "src/discovery/dossier-contradictions.ts",
@@ -184,6 +184,10 @@
     {
       "path": "src/discovery/early-research-outcome.ts",
       "sha256": "21b209600e0278a1461f5630cedb4094f90856989f37d2be2b44f0ecc9db3f3a"
+    },
+    {
+      "path": "src/discovery/frame-interpretation-subject.ts",
+      "sha256": "376ef941efaf3a26005139afa23b51f2790f16537e325c79113dcd2cd132dafb"
     },
     {
       "path": "src/discovery/frame-interpretations.ts",
@@ -231,7 +235,7 @@
     },
     {
       "path": "src/discovery/projection-reader.ts",
-      "sha256": "2ce9a9e387288c8be3b2d43ddf933a9f4d6c5dfce8a86e52ffcd71a537767fae"
+      "sha256": "bd3aadf79b852a63db2e5e5b5cb39773714fc448868e80242df47db06fa006ec"
     },
     {
       "path": "src/discovery/reader-pilot.ts",
@@ -263,7 +267,7 @@
     },
     {
       "path": "src/discovery/research-assessment.ts",
-      "sha256": "0ee1c7f11781a2c614213b888d3be8c6089d2465335f407f6b56e740bc951cc7"
+      "sha256": "4011c5d3ac6ebf975479a73952b65ebbd9a60ffd8100c1f1597691f0acf9b698"
     },
     {
       "path": "src/discovery/research-consumer-transition.ts",
@@ -299,7 +303,7 @@
     },
     {
       "path": "src/discovery/research-protocol.ts",
-      "sha256": "8b845e2c9ef23128c265193df2bb82765c62d5a1957b04305e3716c05cd51800"
+      "sha256": "e300d1ef1673a812d5ce13d02fb097dfb7669edfbf3e6ea627f9b23c54c6bbed"
     },
     {
       "path": "src/discovery/research-reuse.ts",
@@ -311,7 +315,7 @@
     },
     {
       "path": "src/discovery/research-runner.ts",
-      "sha256": "cfaf00eb788ece81e07b6e7081fb6869a54748de7333d8e3ccd3036184ce34f0"
+      "sha256": "11b5a56ee3e30b4a919974ab21bf0e6cf5b5e7b4891155ded10f59523b41719d"
     },
     {
       "path": "src/discovery/research-sources.ts",
@@ -319,7 +323,7 @@
     },
     {
       "path": "src/discovery/response-recovery.ts",
-      "sha256": "47df366575a43f2e4f0fcf948d7d4f7a29c9206b8e25e4d2a1c420d9de4df5ff"
+      "sha256": "da4cf9552e89c5044f426eedba62e56cbdadf496c72c7e0292289fbebf11f45e"
     },
     {
       "path": "src/discovery/response-replay.ts",
@@ -331,7 +335,7 @@
     },
     {
       "path": "src/discovery/selected-dossier.ts",
-      "sha256": "053d731c836c278789185103698fe03da5c0e1e68909e274355ebdd36feca47f"
+      "sha256": "bfc5ca957f5974165ddbf97aad85a1017b9e43d944188eaa8847ffebcd3dec5d"
     },
     {
       "path": "src/discovery/stage-neighbors.ts",
@@ -371,7 +375,7 @@
     },
     {
       "path": "src/discovery/v7-plan-questions.ts",
-      "sha256": "1a507568345c8f83db8f9ca2c87383528a5ba05e467c4c3c818e05a4eb59b008"
+      "sha256": "a2b7bb425c779df3adda4ee919ca11119511d9d1d042cb8924147819ab7c93a9"
     },
     {
       "path": "src/discovery/v7-progress.ts",
@@ -871,7 +875,7 @@
     },
     {
       "path": "src/product/early-stage-driver.ts",
-      "sha256": "66f4543222a6f346264b7150d7a8b7d6e470821579c9f7160c3172d0885faf55"
+      "sha256": "66a5ce57d7eb733f6b57dc2a0fb6891fbaf7d9205ed13f0cb407ab1ca5ba9746"
     },
     {
       "path": "src/product/engine.ts",
@@ -1003,48 +1007,48 @@
     "discovery": {
       "id": "stage:golden:discovery",
       "revision": 2,
-      "hash": "7bed2ed78ff7a984832d629e4af829a12f51dbba98562ea11dc0a62159d3d800"
+      "hash": "28bdd859dc84bb04099cf3a297208e824d15a6041fc0f41137a7965bee802cb4"
     },
     "concept": {
       "id": "stage:golden:concept",
       "revision": 2,
-      "hash": "4484bd41854a0a32379ca6541802acd1c9fa97f8915751a83dc910215492c08f"
+      "hash": "061f98616dcc129123fe1a00c343e7c40cec83998ed764c6ceb60ff9fbecf976"
     },
     "operation-map": {
       "id": "stage:golden:operation-map",
       "revision": 2,
-      "hash": "58adc98dde9b630dfcc78cfccc6c4eb4e8711230579297392c433588e65fd4a8"
+      "hash": "b9038faee1e952e839001e079ad921ba8d64dc7c2ef9f737f8f827296199356c"
     },
     "specification": {
       "id": "stage:golden:specification",
       "revision": 2,
-      "hash": "83583c6ea1789eb6c0ed2a1ec932152b08e2b0fa66bd51cf3d025157ca7f295d"
+      "hash": "36786edb680fc1f0d2cce469d45ff22bce4808917a3cb9e63a53ae9a93b67da0"
     },
     "features": {
       "id": "stage:golden:features",
       "revision": 2,
-      "hash": "947b1ca73b3f8dd9e8bfd095f0004b8d817db2f392707d6a052152c175df1903"
+      "hash": "12bfb59dff873781cf497cd65ddda4c3ac6c7388bf3a4e8296a273418c1f1bda"
     },
     "om-g2": {
       "id": "stage:golden:om-g2",
       "revision": 1,
-      "hash": "e532a038f59f53d34bf6d57bffbb875659cc67bf77bb60e227d4fa8f962128ca"
+      "hash": "9a57dd8c03580b6728d991bbdf37dc0999af567a0d7c0edef24a66dd502372a5"
     },
     "compilation": {
       "id": "stage:golden:compilation",
       "revision": 2,
-      "hash": "3d9f1d4a69c8cf12f2522784144acbd99ffaa018cdd2cb5b3fc53a3306767d46"
+      "hash": "2842998db39c7d27118630bed0358463a3efd073b57f1ea75f6db8ac37a60d47"
     },
     "execution": {
       "id": "stage:golden:execution",
       "revision": 1,
-      "hash": "65ec250a3f5f569c29cf8ce4b0fdac4513db5b6a05fe08f43ace31dd0611dbc1"
+      "hash": "4fe9e99172fa7fdd965216ac422f5798ff9b5a14b05f94cc25564d31366a9e24"
     }
   },
   "databaseId": "089133aa-dc16-4529-a3b9-be5ba223092f",
   "proofCache": "empty",
-  "externalRoot": "/Users/kostenchuksergey/omg-wt/omg-int-s50/.golden-build-NBmTBt/",
+  "externalRoot": "/Users/kostenchuksergey/omg-wt/omg-int-s51/.golden-build-icyOs5/",
   "format": "golden-sample/v1",
-  "sqliteFileSha256": "1379ffe197b2b65a135ea4187cd99098ff127fc2a80d665670de4b174101ef4c",
+  "sqliteFileSha256": "b492cb9cb4072cc0b11cd9d11b4157fc22a1b65ead9770f062da964068badb2e",
   "sqliteBytes": 14577664
 }
