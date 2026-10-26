@@ -1753,10 +1753,13 @@ export async function runDossierAssessmentSession(store:Store,project:string,sub
     environment=dossierExact<Environment>(store,reference(environment),'environment');
     const draft=store.get<DiscoveryDraft>(packet.basis.draft.ref.id),question=store.get<Question>((packet.basis.plan.value as any).question);
     dossierRequire(draft?.kind==='discovery-draft' && question?.kind==='question','The dossier needs its current saved research binding');
+    const profile=pilot?dossierExact<ReaderPilot>(store,reference(pilot),'reader-pilot'):undefined;
+    dossierRequire(!profile || object(profile.value) && profile.value.projectId===project,
+      'A new dossier session needs an exact profile of its own project');
     const role=resolveRoleMode('reviewer',environment.value.reviewer,'research');
     const value:DossierAssessmentSession={contract:DOSSIER_SESSION,projectId:project,subject:packet.subject,
       binding:{draft:reference(draft),question:reference(question),environment:reference(environment),inputs:draft.value.inputs},
-      role,dispatch:environment.value,profile:pilot?reference(dossierExact<ReaderPilot>(store,reference(pilot),'reader-pilot')):null,
+      role,dispatch:environment.value,profile:profile?reference(profile):null,
       prompt:DOSSIER_PROMPT,
       step:0,offset:0,notes:[],workspace:contextWorkspace(),previous:null,application:'',result:null};
     value.application=dossierApplicationId({id,revision:1,hash:''});

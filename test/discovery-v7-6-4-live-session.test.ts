@@ -560,6 +560,28 @@ test('live dossier: missing compatible samples and unaffordable real forecast re
 });
 
 import { configureReaderPilot, type ReaderPilot } from '../src/discovery/reader-pilot.js';
+test('live dossier: foreign exact profile refuses before publication and leaves the same subject usable',async t=>{
+  const f=await partial(t),packet=f.packet;liveAdapter(f,packet,'return',false);
+  const own=wideDelivery(f),{projectId,...settings}=own.value;assert.equal(projectId,'p');
+  await f.engine.execute({type:'create-project',project:'other',title:'Other dossier profile'});
+  f.engine.environments.configure('other',f.environment.value,0);
+  const foreign=configureReaderPilot(f.store,f.engine.environments,'other',settings,0);
+  for(const store of [f.store,f.open()]) {
+    for(const profile of [foreign,{...foreign,value:{...foreign.value,projectId:'p'}}])
+      await unchanged(f,store,async()=>{
+        await assert.rejects(()=>runDossierAssessmentSession(store,'p',packet.subject,f.environment,profile),
+          e=>e instanceof EngineError && e.code==='discovery_dossier_session_invalid');
+      });
+    assert.equal(store.list<DossierAssessmentSession>('assessment-session').filter(s=>s.value.contract==='dossier-session/v1').length,0);
+    assert.equal(store.list<DossierAssessmentApplication>('assessment-application').filter(a=>a.value.contract==='dossier-application/v1').length,0);
+    assert.equal(dossierCalls(store).length,0);
+  }
+  const result=await runDossierAssessmentSession(f.open(),'p',packet.subject,f.environment,own);
+  assert.equal(result.result!.result.verdict,'return');assert.deepEqual(result.result!.packet,packet);
+  assert.equal(dossierCalls(f.store).length,1);
+  for(const store of [f.store,f.open()])
+    assert.deepEqual(await unchanged(f,store,()=>runDossierAssessmentSession(store,'p',packet.subject)),result);
+});
 test('live dossier: bounded managed pages deliver the full saved packet and schema before terminal assessment',async t=>{
   const f=await partial(t,'Exact rejected argument '+ 'bounded material '.repeat(2000)),packet=f.packet;
   const terminal=liveAdapter(f,packet,'return',false);
