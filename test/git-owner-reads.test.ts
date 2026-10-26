@@ -15,6 +15,7 @@ import { EngineError } from '../src/errors.js';
 import { receiptId, type ArtifactReceipt, type CompiledTask } from '../src/compiler/model.js';
 import type { TaskRun } from '../src/execution/model.js';
 import type { Revision, Store } from '../src/storage/store.js';
+import { genuineStore } from '../src/storage/store-view.js';
 import { executionFixture } from './execution-fixture.js';
 import { validateGraph } from '../src/graph/validate.js';
 import { projectGraph } from '../src/graph/project.js';
@@ -29,6 +30,12 @@ const take = <T>(result: OmResult<T>): T => { assert.ok(result.ok, result.ok ? '
 
 const children = createRequire(import.meta.url)('node:child_process') as typeof import('node:child_process');
 const code = (expected: string) => (error: unknown) => error instanceof EngineError && error.code === expected;
+/** Intercepts Store.get for a window; the returned restore removes the own member so the Store is the genuine one again. */
+function intercept(store: Store, replacement: Store['get']): () => void {
+  const had = Object.getOwnPropertyDescriptor(store, 'get');
+  Object.defineProperty(store, 'get', { value: replacement, writable: true, configurable: true, enumerable: true });
+  return () => { if (had) Object.defineProperty(store, 'get', had); else delete (store as unknown as Record<string, unknown>)['get']; };
+}
 function privateConfiguration(t: TestContext) {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'omg-gitsrc4-')));
   const home = process.env['HOME'], xdg = process.env['XDG_CONFIG_HOME'];
@@ -366,15 +373,16 @@ test('GITSRC4 M8 writers keep gates and exact parents while selection uses a bou
   await t.test('a Git change inside the M8 gate read invalidates the active ancestry scope', () => {
     const config = join(common, 'config'), saved = readFileSync(config), get = f.store.get.bind(f.store);
     let changed = false;
-    f.store.get = ((...args: Parameters<Store['get']>) => {
+    const restore = intercept(f.store, ((...args: Parameters<Store['get']>) => {
       const row = get(...args);
       if (!changed && row?.kind === 'environment') { changed = true; writeFileSync(config, '[broken\n'); }
       return row;
-    }) as Store['get'];
+    }) as Store['get']);
     try {
       assert.throws(() => selectWriter(f.store, 'p', current, refs, path), code('git_failed'));
       assert.equal(changed, true, 'the mutation happened after the fresh selection graph was read');
-    } finally { f.store.get = get; writeFileSync(config, saved); }
+    } finally { restore(); writeFileSync(config, saved); }
+    assert.equal(genuineStore(f.store), true, 'the Store is the genuine one again once the window is over');
     assert.equal(selectWriter(f.store, 'p', current, refs, path)!.commit, latest.value.commit);
   });
 
