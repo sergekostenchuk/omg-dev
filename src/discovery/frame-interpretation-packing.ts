@@ -253,9 +253,20 @@ export function checkFrameInterpretationEnvelope(store: Store,
   const decoded = decodeFrameInterpretationEnvelope(presented);
   const staged = stageEnvelope(store, request, input);
   const prepared = envelopeValue(staged);
+  // Staging computes the expected form — it never substitutes a saved record.
+  // The presented archive must already exist byte-identically: kind, exact
+  // revision, hash and the complete value of the prepared staged record.
+  for (const [id, expected] of staged.packer.staged().records) {
+    const saved = store.get<Record<string, any>>(id, expected.revision);
+    if (!(saved?.kind === 'research-context' && saved.revision === expected.revision
+      && saved.hash === expected.hash && canonical(saved.value) === canonical(expected.value)))
+      mismatch('archive', 'The exact request archive is missing or substituted', reference(expected));
+  }
   requireResearchResultCapacity(decoded.capacity, staged.inputCapacity);
+  // Addressed material resolves only over really saved records — a cold store
+  // without the archive can never confirm a lawful page or its bytes.
   requirePacketMaterialDelivery(decoded.packet, decoded.archive,
-    (record, pointer) => archiveValue(store, staged.packer.staged().records, record, pointer));
+    (record, pointer) => archiveValue(store, null, record, pointer));
   for (const field of ENVELOPE_FIELDS)
     if (!same(decoded[field], prepared[field]))
       mismatch(field, 'The presented envelope does not match the prepared envelope',

@@ -211,6 +211,10 @@ export function prepareFrameInterpretationContextPacker(store: Store, projectId:
   // The proven basis stays private: the packet is packed only from this exact
   // verified request on the fixed request branch — no caller-supplied body,
   // options or another transport's subject fields can reach the shared packer.
+  // Everything returned is an independent copy: a mutated packet, Write,
+  // record or guard can never reach the closed commit payload, and commit
+  // re-verifies each staged value against its content-addressed id — a
+  // substituted byte refuses before any write.
   return { request: structuredClone(prepared), context: structuredClone(context),
     pack: (limit: number) => {
       requireCondition(Number.isSafeInteger(limit) && limit > 0, 'frame_pack_invalid',
@@ -219,12 +223,19 @@ export function prepareFrameInterpretationContextPacker(store: Store, projectId:
       requireCondition(Object.keys(body).length === 2 && body['role'] === 'frame-interpretation-request'
         && canonical(body['frameRequest']) === canonical(prepared), 'frame_pack_invalid',
         'The request packet carries exactly the proven request');
-      return packWorkingContext(store, projectId, provenBasis.draft.id, provenBasis.question.id,
-        body, limit, { purpose: 'frame-interpretation-request', common: true },
-        null, stage, records, provenBasis);
+      return structuredClone(packWorkingContext(store, projectId, provenBasis.draft.id,
+        provenBasis.question.id, body, limit, { purpose: 'frame-interpretation-request', common: true },
+        null, stage, records, provenBasis));
     },
-    staged: () => ({ writes: [...writes.values()], guards, records }),
-    commit: () => { if (writes.size) store.writeMany([...writes.values()], guards); } };
+    staged: () => ({ writes: structuredClone([...writes.values()]),
+      guards: structuredClone(guards),
+      records: new Map([...records].map(([id, row]) => [id, structuredClone(row)])) }),
+    commit: () => {
+      for (const write of writes.values())
+        requireCondition(write.id === `research-context:${hashJson(write.value)}`,
+          'frame_pack_invalid', 'The staged request archive was substituted');
+      if (writes.size) store.writeMany([...writes.values()], guards);
+    } };
 }
 
 function packWorkingContext(store: Store, projectId: string, draftId: string, questionId: string,

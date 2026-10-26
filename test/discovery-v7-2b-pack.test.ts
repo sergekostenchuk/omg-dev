@@ -6,7 +6,7 @@ import { EngineError } from "../src/errors.js";
 import { canonical, type Json } from "../src/canonical.js";
 import { reference, type Ref } from "../src/pipeline/contracts.js";
 import type { Selector } from "../src/evidence/evidence.js";
-import type { Revision, Store } from "../src/storage/store.js";
+import { Store, type Revision } from "../src/storage/store.js";
 import type { Environment, RoleBinding } from "../src/runtime/environment.js";
 import { Discovery, type DiscoveryDraft, type Question } from "../src/discovery/discovery.js";
 import { createPartialV7Draft, V7_FRAME_INTERPRETATIONS_CONTRACT,
@@ -367,7 +367,8 @@ test("2b-P the checking door never commits: a presented envelope with null capac
   const b = base(f, project);
   const req = requestOf(project, b);
   // A plausibly closed envelope over the real proven request — but never
-  // prepared here, so the archive set is still empty.
+  // prepared here, so the archive set is still empty. The saved-archive gate
+  // runs before capacity: without the exact archive nothing can be admitted.
   const presented = {
     contract: FRAME_INTERPRETATION_ENVELOPE_CONTRACT,
     request: prepareFrameInterpretationRequest(f.store, req),
@@ -378,12 +379,80 @@ test("2b-P the checking door never commits: a presented envelope with null capac
     measuredChars: 2,
   };
   noWrite(f.store, wireFile, () => {
-    assert.equal(code(() => checkFrameInterpretationEnvelope(f.store, req,
-      envelopeInput(project), presented)), "research_capacity_invalid");
+    assert.deepEqual([code(() => checkFrameInterpretationEnvelope(f.store, req,
+      envelopeInput(project), presented)),
+      field(() => checkFrameInterpretationEnvelope(f.store, req, envelopeInput(project), presented))],
+      ["frame_pack_mismatch", "archive"]);
     assert.equal(f.store.list().filter(row => row.kind === "research-context").length, 0,
       "the checking door left zero staged archives");
     assert.equal(f.store.list("model-call").length, 0);
     assert.equal(f.store.list("research-budget-ledger").length, 0);
+  });
+  // With the archive physically saved, a null capacity reaches its own door —
+  // still a read-only refusal.
+  const env = prepareFrameInterpretationEnvelope(f.store, req, envelopeInput(project));
+  const archives = f.store.list().filter(row => row.kind === "research-context").length;
+  const nullCapacity = { ...structuredClone(env), capacity: null };
+  noWrite(f.store, wireFile, () => {
+    assert.equal(code(() => checkFrameInterpretationEnvelope(f.store, req,
+      envelopeInput(project), nullCapacity)), "research_capacity_invalid");
+    assert.equal(f.store.list().filter(row => row.kind === "research-context").length, archives,
+      "the capacity refusal left the saved set untouched");
+  });
+});
+
+test("2b-P packer surfaces stay sealed: a mutated packet, staged write or record can never reach the committed archive", (t) => {
+  const f = discoveryFixture(t, "omg-2bp-sealed-"), project = "vault2";
+  const b = base(f, project);
+  const req = requestOf(project, b);
+  const packer = prepareFrameInterpretationContextPacker(f.store, project, req);
+  const packet = packer.pack(200000);
+  const archiveRef = packet.working.archive as Ref;
+  // Probe 1 (the inline packet): the returned packet is a detached copy —
+  // its mutation must not reach the closed commit payload.
+  (packet as any).frameRequest.instruction = "Pick the winner";
+  // Probe 2 (staged writes) and probe 3 (the records map): returned values
+  // are copies, so their mutation lands outside the internal batch.
+  const exposed = packer.staged();
+  (exposed.writes[0]!.value as any).body.frameRequest.instruction = "Pick the winner";
+  ([...exposed.records.values()][0]!.value as any).body.frameRequest.instruction = "Pick the winner";
+  packer.commit();
+  const row = f.store.get(archiveRef.id, archiveRef.revision)!;
+  assert.equal((row.value as any).body.frameRequest.instruction,
+    packer.request.instruction, "the committed archive kept the proven instruction");
+  assert.equal(row.hash, archiveRef.hash,
+    "the stored bytes still match the content-addressed Ref");
+});
+
+test("2b-P a lawful check needs the really saved archive: a cold snapshot with every ground but no archive refuses read-only", async (t) => {
+  const f = discoveryFixture(t, "omg-2bp-snap-"), project = "freezer";
+  const wireFile = join(f.root, "wire.ndjson");
+  const b = base(f, project);
+  const req = requestOf(project, b);
+  // A byte copy of the real database while the grounds exist and the archive
+  // does not — the missing-archive door is provable on real saved state.
+  const snap = await f.store.snapshot(join(f.root, "snapshots"));
+  const env = prepareFrameInterpretationEnvelope(f.store, req, envelopeInput(project));
+  // A lawful check returns the fresh envelope unchanged.
+  assert.deepEqual(checkFrameInterpretationEnvelope(f.store, req, envelopeInput(project),
+    structuredClone(env)), env);
+  const cold = new Store(snap.path);
+  t.after(() => cold.close());
+  const tight = { prompt: "Build the interpretations set.", packetChars: 6000,
+    limitChars: 20000, role: ROLE, environment: environmentOf(project) };
+  const addressed = prepareFrameInterpretationEnvelope(f.store, req, tight);
+  noWrite(cold, wireFile, () => {
+    // Inline material: the missing exact archive refuses at the binding.
+    assert.deepEqual([code(() => checkFrameInterpretationEnvelope(cold, req,
+      envelopeInput(project), structuredClone(env))),
+      field(() => checkFrameInterpretationEnvelope(cold, req, envelopeInput(project),
+        structuredClone(env)))], ["frame_pack_mismatch", "archive"]);
+    assert.equal(cold.get(env.archive.id, env.archive.revision), null,
+      "the staged form never became a saved record");
+    // Addressed material: same door, the page can never resolve unsaved bytes.
+    assert.equal(code(() => checkFrameInterpretationEnvelope(cold, req, tight,
+      structuredClone(addressed))), "frame_pack_mismatch");
+    assert.equal(cold.get(addressed.archive.id, addressed.archive.revision), null);
   });
 });
 
