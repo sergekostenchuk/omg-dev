@@ -179,6 +179,16 @@ const ownerRejected = (t: test.TestContext) => cachedWorld(t, 'owner-rejected', 
   const act = owner(f.store, choiceScope(f, 'reject_all'));
   return { f, data: { rejected: { decision: act.decision, state: act.state } } };
 });
+/** Intercept the writes of one Store at the prototype, so the instance itself stays genuine (its only own property is its
+ * path) and the common historical proofs of the real producers are kept as in production. Restores in stack order. */
+function onWrites(store: Store, wrap: (writes: Parameters<Store['writeMany']>[0], guards: Parameters<Store['writeMany']>[1],
+  write: (writes: Parameters<Store['writeMany']>[0], guards: Parameters<Store['writeMany']>[1]) => Revision<unknown>[]) => Revision<unknown>[]) {
+  const previous = Store.prototype.writeMany;
+  Store.prototype.writeMany = function (this: Store, writes: Parameters<Store['writeMany']>[0], guards?: Parameters<Store['writeMany']>[1]) {
+    return this === store ? wrap(writes, guards, (w, g) => previous.call(this, w, g)) : previous.call(this, writes, guards);
+  } as typeof previous;
+  return () => { Store.prototype.writeMany = previous; };
+}
 const money = (store: Store) => store.list().filter(row => ['model-call', 'research-budget-ledger'].includes(row.kind)).flatMap(row => store.history(row.id));
 function choiceScope(f: Awaited<ReturnType<typeof setup>>, kind: 'choose' | 'reject_all' = 'choose'): VariantChoiceScope {
   const set = f.store.list<VariantSet>('discovery-variant-set')[0]!, state = f.store.get<VariantState>(variantStateId('p', f.v.draft.id))!;
@@ -230,8 +240,8 @@ async function route(t: test.TestContext, kind: RouteKind) {
 import { EarlyStageDriver } from '../src/product/early-stage-driver.js';
 import { discoveryInspection } from '../src/discovery/discovery-outcome.js';
 async function withMaterials(t:test.TestContext, limit=false) {
-  const f=await setup(t,[planQuestion('q-one','industry'),planQuestion('q-two','industry')]), classifications:{claim:ClaimAddress;accepted:boolean}[]=[], write=f.store.writeMany.bind(f.store);
-  f.store.writeMany=((writes,guards)=>{
+  const f=await setup(t,[planQuestion('q-one','industry'),planQuestion('q-two','industry')]), classifications:{claim:ClaimAddress;accepted:boolean}[]=[];
+  const restoreWrites=onWrites(f.store,(writes,guards,write)=>{
     const rows=write(writes,guards);
     for(const row of rows)if(row.kind==='research-attempt'&&(row.value as any).end.type==='submitted') {
       const claims=(row.value as any).end.value.claims as any[];
@@ -239,7 +249,7 @@ async function withMaterials(t:test.TestContext, limit=false) {
       f.configure({classification:classifications});
     }
     return rows;
-  }) as typeof f.store.writeMany;
+  });
   const claim=(id:string,text:string)=>({id,kind:'hypothesis',text,axis:'industry',planQuestions:[{planAnswer:f.v.planAnswer,planQuestionId:'q-one'}],scope:{variants:'common'},basis:{howToVerify:'Compare independent sources'}});
   const unknown={...claim('unknown','Demand is unknown'),kind:'unknown',basis:{origin:'Saved research',unknownId:'demand',question:'What is demand?',affects:['market'],consumer:'product-owner',blocksCurrentStage:true,moment:'om-pass',closeCriterion:'Obtain independent evidence'}};
   const action=(claims:unknown[])=>({action:'answer',question:'$selected',value:{type:'submitted',contract:'discovery-claims/v7',value:{claims}},citations:[]});
@@ -247,7 +257,7 @@ async function withMaterials(t:test.TestContext, limit=false) {
   await f.run(1);assert.equal(classifications.length,2);
   const counter={...claim('counter','A has an unsupported counterargument'),refutedBy:[classifications[0]!.claim]};
   f.configure({actions:[action([]),action([counter])],...(limit?{assessorTokens:V7_STAGE_TOKEN_CEILING-1000}:{})});
-  const run=await f.run(1);f.store.writeMany=write;assert.equal(classifications.length,3,JSON.stringify({pauseCode:run.value.pauseCode,error:run.value.error,actions:f.wires().map(w=>w.subject.variantSubject?.kind??(w.subject.assessmentSubject?'assessment':w.subject.question?.id))}));
+  const run=await f.run(1);restoreWrites();assert.equal(classifications.length,3,JSON.stringify({pauseCode:run.value.pauseCode,error:run.value.error,actions:f.wires().map(w=>w.subject.variantSubject?.kind??(w.subject.assessmentSubject?'assessment':w.subject.question?.id))}));
   if(limit)return {...f,handoff:await saved(f,run),classifications};
   f.configure({none:true});
   const handoff=await saved(f,await f.run(5));
@@ -311,8 +321,8 @@ for(const limit of [false,true])test(`6.3 runner: ${limit?'budget':'no_variants'
 });
 for(const cut of ['handoff','dossier','pause'] as const)
 test(`6.3 runner: cut after ${cut} recovers the exact result without another send or snapshot`,async t=>{
-  const f=await setup(t);f.configure({none:true});const write=f.store.writeMany.bind(f.store);let hit=false;
-  f.store.writeMany=((writes,guards)=>{
+  const f=await setup(t);f.configure({none:true});let hit=false;
+  const restoreWrites=onWrites(f.store,(writes,guards,write)=>{
     if(!hit&&cut==='pause'&&writes.some(w=>w.kind==='research-run'&&(w.value as any).pauseCode==='research_dossier_assessment_unavailable')){
       hit=true;throw new EngineError('runner_cut','Cut before saving the final addressed pause');
     }
@@ -321,8 +331,8 @@ test(`6.3 runner: cut after ${cut} recovers the exact result without another sen
       hit=true;throw new EngineError('runner_cut','Cut after durable output');
     }
     return rows;
-  }) as typeof f.store.writeMany;
-  try{await f.run(3);}catch(error){assert.equal((error as EngineError).code,'runner_cut');}finally{f.store.writeMany=write;}
+  });
+  try{await f.run(3);}catch(error){assert.equal((error as EngineError).code,'runner_cut');}finally{restoreWrites();}
   assert.ok(hit);const handoff=f.store.list('discovery-variant-handoff')[0]!, existing=f.store.list(DOSSIER_MANIFEST_KIND)[0];
   const paid=money(f.store),wire=f.wires();
   if(cut==='pause')f.mode('bypass'); // Saved dossier recovery does not reactivate its old mode.
@@ -385,8 +395,8 @@ for(const shift of ['frame','plan','mode','selection'] as const)
 test(`6.3 runner: real second Store ${shift} race before dossier publication cannot escape the common guards`,async t=>{
   // The selection race starts from the shared real owner reject_all prefix.
   const f=shift==='selection'?await ownerRejected(t):await setup(t),other=f.open();f.configure({none:shift!=='selection'});
-  const write=f.store.writeMany.bind(f.store);let after='',paid:unknown,wire:unknown;
-  f.store.writeMany=((writes,guards)=>{
+  let after='',paid:unknown,wire:unknown;
+  const restoreWrites=onWrites(f.store,(writes,guards,write)=>{
     if(!after&&writes.some(w=>w.kind===DOSSIER_MANIFEST_KIND)){
       if(shift==='frame'){const q=other.list<Question>('question').find(q=>q.value.draftId===f.v.draft.id&&q.value.spec.field==='frame')!;new Discovery(other).reopen(q.id,q.revision);}
       else if(shift==='plan')f.nextEdition(other);
@@ -395,8 +405,8 @@ test(`6.3 runner: real second Store ${shift} race before dossier publication can
       after=history(other);paid=money(other);wire=f.wires();
     }
     return write(writes,guards);
-  }) as typeof f.store.writeMany;
-  try{await assert.rejects(()=>f.run(shift==='selection'?1:3),{code:'input_stale'});}finally{f.store.writeMany=write;}
+  });
+  try{await assert.rejects(()=>f.run(shift==='selection'?1:3),{code:'input_stale'});}finally{restoreWrites();}
   assert.ok(after);assert.equal(history(f.store),after);assert.deepEqual(money(f.store),paid);assert.deepEqual(f.wires(),wire);
   assert.equal(f.store.list(DOSSIER_MANIFEST_KIND).length,0);
   for(const store of [f.store,f.open()]){
@@ -420,15 +430,15 @@ async function rejectedAtDossierCut(t: test.TestContext, published: boolean, hot
 }
 async function cutAndRevise(f: World & { rejected: { decision: any; state: any } }, published: boolean) {
   const rejected=f.rejected;
-  const write=f.store.writeMany.bind(f.store);let cut=false;
-  f.store.writeMany=((writes,guards)=>{
+  let cut=false;
+  const restoreWrites=onWrites(f.store,(writes,guards,write)=>{
     const recipient=writes.some(w=>w.kind===DOSSIER_MANIFEST_KIND);
     if(recipient&&!cut&&!published){cut=true;throw new EngineError('runner_pending_cut','Stop before dossier publication');}
     const rows=write(writes,guards);
     if(recipient&&!cut){cut=true;throw new EngineError('runner_pending_cut','Stop after dossier publication');}
     return rows;
-  }) as typeof f.store.writeMany;
-  try{await assert.rejects(()=>f.run(1),{code:'runner_pending_cut'});}finally{f.store.writeMany=write;}
+  });
+  try{await assert.rejects(()=>f.run(1),{code:'runner_pending_cut'});}finally{restoreWrites();}
   assert.ok(cut);
   const pending=currentRun(f);assert.equal(pending.value.pauseCode,'research_partial_dossier_pending');
   const pause=JSON.parse(pending.value.error!), handoff=(await readVariantHandoff(f.store,'p',pause.handoff)).record;
@@ -454,9 +464,7 @@ test(`6.3-RUNNER-01: ${cold?'cold':'hot'} owner revise exits an unpublished reci
       .run('p',f.v.draft.id,1),{code:'discovery_dossier_stale'})); // default policy is not a new v7 admission
     assert.deepEqual(currentRun(f,store),f.pending);
   }
-  // The cut helper restored a bound own writeMany; remove that interceptor's
-  // shell before the new paid step, preserving this same hot Store and its data.
-  Reflect.deleteProperty(f.store,'writeMany');
+  // The cut was intercepted at the prototype, so this same hot Store never carried an own writeMany: it continues as is.
   const next=await f.run(1,store), pause=JSON.parse(next.value.error!);
   assert.equal(next.value.pauseCode,'research_deep_frontier_pending',JSON.stringify(next.value));
   const deep=(await readVariantHandoff(store,'p',pause.handoff)).record;
