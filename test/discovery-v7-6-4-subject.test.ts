@@ -1,10 +1,11 @@
-import test from 'node:test';
+import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
-import { writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { canonical, hashJson, type Json } from '../src/canonical.js';
 import { reference, type Ref } from '../src/pipeline/contracts.js';
-import { EngineError } from '../src/errors.js';
 import { Store } from '../src/storage/store.js';
 import { uniqueTransactionGuards } from '../src/runtime/environment.js';
 import { processStart } from '../src/runtime/process-identity.js';
@@ -42,6 +43,7 @@ import { publishVariantHandoff } from '../src/discovery/discovery-outcome.js';
 import type { VariantNone } from '../src/discovery/discovery-variants.js';
 import { prepareDossierAssessmentSubject, requireDossierAssessmentSubject, requireDossierAssessmentPacket } from '../src/discovery/dossier-assessment.js';
 import { DOSSIER_ASSESSMENT_SUBJECT_CONTRACT, DOSSIER_ASSESSMENT_PACKET_CONTRACT } from '../src/discovery/research-model.js';
+import { storeRefused, storeUnchanged } from './store-unchanged.js';
 
 // Real paid generation/selection preparation shared in shape with the accepted 4P.1 scenarios.
 const money = (store: Store) => ({ calls: store.list('model-call').flatMap(row => store.history(row.id)),
@@ -175,21 +177,52 @@ const all = (store: Store) => {
     revisions: db.prepare('SELECT * FROM revisions ORDER BY entity_id,revision').all() } as never); }
   finally { db.close(); }
 };
-async function unchanged<T>(f: Paid, store: Store, action: () => Promise<T>, refuses = false): Promise<T | undefined> {
-  const before = all(store), calls = money(store), wires = f.wires();
-  let result: T | undefined;
-  if (refuses) await assert.rejects(action, error => error instanceof EngineError);
-  else result = await action();
+/** The per-action part of a read check: the real refusal or result through
+ * the accepted storeUnchanged/storeRefused window — the Store's own commits
+ * plus SQLite data_version must be equal, so a write by any connection is
+ * seen. The full heads/revisions dump, the paid calls, the budget ledger and
+ * the model wire are compared once per read-only fixed-point block in
+ * fixed(), not once per row. */
+async function still<T>(store: Store, action: () => Promise<T>, refuses = false): Promise<T | undefined> {
+  if (refuses) { await storeRefused(store, action); return undefined; }
+  return await storeUnchanged(store, action);
+}
+/** One byte fixed point per read-only block: the complete heads/revisions
+ * dump plus the paid calls, the ledger and the wire are compared across the
+ * whole block while every action inside keeps its own stamp window — a write
+ * anywhere is caught exactly once per block, not once per row. */
+async function fixed<T>(f: Paid, store: Store, block: () => Promise<T>): Promise<T> {
+  const before = all(store), calls = money(store), wires = f.wires(), result = await block();
   assert.equal(all(store), before); assert.deepEqual(money(store), calls); assert.deepEqual(f.wires(), wires);
   return result;
 }
-async function setup(t: test.TestContext, model = false) {
-  const f = await paid(t);
+/** A byte fork of a world real producers already built: VACUUM INTO copies
+ * the whole file into a new Store — every saved record, revision and hash
+ * identical at the fork point — and each test continues on its own isolated
+ * copy, so its later writes never reach another test's world. The fork is
+ * never a stand-in for a producer run; it only avoids repeating one. */
+const forkDir = mkdtempSync(join(tmpdir(), 'omg-64-fork-'));
+/** A shared base world is built on this file-level context instead of a
+ * test's own: its fixture cleanup is collected and runs once at file end, so
+ * the root, settings, wire and adapter it produced stay alive for every
+ * fork. */
+const baseTeardowns: (() => void)[] = [];
+const baseT = { after: (fn: () => void) => { baseTeardowns.push(fn); } } as test.TestContext;
+after(() => { for (const fn of baseTeardowns.splice(0)) fn(); });
+function forkStore(t: test.TestContext, store: Store): Store {
+  const copy = join(forkDir, `fork-${rand()}.sqlite`);
+  const db = new DatabaseSync(store.path, { readOnly: true });
+  try { db.exec(`VACUUM INTO '${copy.replaceAll("'", "''")}'`); } finally { db.close(); }
+  const clone = new Store(copy);
+  t.after(() => { clone.close(); try { rmSync(copy); } catch {} });
+  return clone;
+}
+async function selectWorld(f: Paid, model = false) {
   const decision = model ? await modelChoose(f) : selected(f).act.decision;
   const scope = publishVariantScope(f.store, 'p', reference(decision)).scope;
   return { ...f, scopeRecord: scope, input: { scope: reference(scope), plan: f.v.planAnswer } };
 }
-type Selected = Awaited<ReturnType<typeof setup>>;
+type Selected = Awaited<ReturnType<typeof selectWorld>>;
 function claim(f: Selected, question: string, axis: string, text: string, variants: 'common' | Ref[] = [f.scopeRecord.value.member]): Json {
   return { id: `h-${rand()}`, kind: 'hypothesis', text, axis,
     planQuestions: [{ planAnswer: f.v.planAnswer, planQuestionId: question }], scope: { variants },
@@ -235,6 +268,31 @@ async function complete(f: Selected) {
   await assess(f, market);
   return { industry, market };
 }
+type CompleteWorld = Selected & { entries: { industry: Entry; market: Entry } };
+/** The one producer-built paid world of this file — two assessed plan
+ * questions, the variant snapshot and the paid two-member set — byte-forked
+ * per test. The fork point is before the decision because the set admits
+ * exactly one actor: owner and model each choose on their own copy. The
+ * owner-decided complete sweep is shared as well: the owner test and the
+ * statuses test read the same real past on their own isolated stores. */
+let paidBase: Paid | null = null, completeBase: CompleteWorld | null = null;
+async function paidWorld(t: test.TestContext): Promise<Paid> {
+  if (!paidBase) paidBase = await paid(baseT);
+  return { ...paidBase, store: forkStore(t, paidBase.store) } as Paid;
+}
+async function completeWorld(t: test.TestContext): Promise<CompleteWorld> {
+  if (!completeBase) {
+    if (!paidBase) paidBase = await paid(baseT);
+    const f = { ...paidBase, store: forkStore(baseT, paidBase.store) } as Paid;
+    const selected = await selectWorld(f), entries = await complete(selected);
+    completeBase = { ...selected, entries };
+  }
+  return { ...completeBase, store: forkStore(t, completeBase.store) };
+}
+async function modelWorld(t: test.TestContext): Promise<CompleteWorld> {
+  const selected = await selectWorld(await paidWorld(t), true), entries = await complete(selected);
+  return { ...selected, entries };
+}
 function revise(f: Selected, store = f.store) {
   const state = store.get<VariantState>(variantStateId('p', f.draft.id))!;
   const scope: VariantChoiceScope = { ...f.scope!, mode: reference(store.get('project-mode:p')!), operation: store.get(state.value.decision!.id)!.kind === 'discovery-variant-model-decision' ? 'override' : 'revise',
@@ -245,10 +303,10 @@ function revise(f: Selected, store = f.store) {
 
 for (const model of [false, true])
 test(`6.4 dossier subject: real ${model ? 'model' : 'owner'} complete snapshot has one exact historical packet without writes or payment`, async t => {
-  const f = await setup(t, model); await complete(f);
+  const f = model ? await modelWorld(t) : await completeWorld(t);
   const saved = produceSelectedDossier(f.store, 'p', f.input), root = reference(saved.record);
-  const packet = (await unchanged(f, f.store, () => prepareDossierAssessmentSubject(f.store, 'p', root)))!;
-  await unchanged(f, f.store, async () => assert.deepEqual(await prepareDossierAssessmentSubject(f.store, 'p', root), packet));
+  const packet = (await still(f.store, () => prepareDossierAssessmentSubject(f.store, 'p', root)))!;
+  await still(f.store, async () => assert.deepEqual(await prepareDossierAssessmentSubject(f.store, 'p', root), packet));
   assert.equal(packet.subject.contract, DOSSIER_ASSESSMENT_SUBJECT_CONTRACT);
   assert.equal(packet.subject.kind, 'dossier'); assert.equal(packet.subject.root.kind, 'selected');
   assert.equal(packet.contract, DOSSIER_ASSESSMENT_PACKET_CONTRACT);
@@ -262,22 +320,22 @@ test(`6.4 dossier subject: real ${model ? 'model' : 'owner'} complete snapshot h
   const late = await deep(f, 'q-market', [claim(f, 'q-market', 'market', 'Late unknown reopens current coverage')]);
   const mr = await assess(f, late, 'unknown', false);
   const second = produceSelectedDossier(f.store, 'p', f.input);
-  const secondPacket = (await unchanged(f, f.store, () => prepareDossierAssessmentSubject(f.store, 'p', reference(second.record))))!;
+  const secondPacket = (await still(f.store, () => prepareDossierAssessmentSubject(f.store, 'p', reference(second.record))))!;
   assert.notEqual(secondPacket.subject.identity, packet.subject.identity);
   applyDiscoveryAssessment(f.store, 'p', reference(mr));
   revise(f); modeOf(f.store, model ? 'questions' : 'bypass'); nextPlan(f, f.store);
   for (const store of [f.store, new Store(f.store.path)]) {
     if (store !== f.store) t.after(() => store.close());
-    await unchanged(f, store, async () => {
+    await fixed(f, store, () => still(store, async () => {
       assert.deepEqual(await prepareDossierAssessmentSubject(store, 'p', root), packet);
       assert.deepEqual(await requireDossierAssessmentSubject(store, 'p', packet.subject), packet);
       assert.deepEqual(await requireDossierAssessmentPacket(store, 'p', packet), packet);
-    });
+    }));
   }
 });
 
 test('6.4 dossier subject: all statuses, addressed unknown and both blocking contradiction/refutation sides carry content; truncation refuses', async t => {
-  const f = await setup(t), entries = await complete(f), target = addresses(entries.industry)[0]!;
+  const f = await completeWorld(t), target = addresses(f.entries.industry)[0]!;
   const contrary = { ...(claim(f, 'q-market', 'market', 'Retained counterargument') as Record<string, Json>),
     contradicts: [target], refutedBy: [target] } as unknown as Json;
   const rejected = await deep(f, 'q-market', [contrary]); await assess(f, rejected, 'rejected');
@@ -286,7 +344,7 @@ test('6.4 dossier subject: all statuses, addressed unknown and both blocking con
       consumer: 'feasibility', blocksCurrentStage: false, moment: 'feasibility', closeCriterion: 'Identify deployment' } } as unknown as Json;
   await deep(f, 'q-market', [unknown]);
   const saved = produceSelectedDossier(f.store, 'p', f.input), root = reference(saved.record);
-  const packet = (await unchanged(f, f.store, () => prepareDossierAssessmentSubject(f.store, 'p', root)))!;
+  const packet = (await still(f.store, () => prepareDossierAssessmentSubject(f.store, 'p', root)))!;
   assert.ok(packet.materials.some(item => item.status === 'rejected' && (item.value as any).text === 'Retained counterargument' && item.assessment));
   assert.equal(packet.unknowns[0]!.material.status, 'unassessed');
   assert.equal((packet.unknowns[0]!.material.value as any).basis.question, 'Which deployment?');
@@ -297,34 +355,38 @@ test('6.4 dossier subject: all statuses, addressed unknown and both blocking con
     assert.ok(packet.materials.some(item => canonical(item.address) === canonical(side.address)));
   }
   // Only exact roots are inputs, never structural completeness or caller arrays.
-  for (const input of [undefined, null, {}, { ...root, revision: null }, { ...root, hash: '0'.repeat(64) },
-    { ...root, id: 'foreign-root' }, { root, complete: true }, reference(saved.manifest)])
-    await unchanged(f, f.store, () => prepareDossierAssessmentSubject(f.store, 'p', input), true);
-  await unchanged(f, f.store, () => prepareDossierAssessmentSubject(f.store, 'foreign', root), true);
-  for (const field of Object.keys(packet.subject)) {
-    const missing: any = structuredClone(packet.subject); delete missing[field];
-    await unchanged(f, f.store, () => requireDossierAssessmentSubject(f.store, 'p', missing), true);
-    await unchanged(f, f.store, () => requireDossierAssessmentSubject(f.store, 'p', { ...packet.subject, [field]: null }), true);
-  }
-  for (const candidate of [{ ...packet.subject, contract: 'dossier-assessment-subject/v99' },
-    { ...packet.subject, kind: 'attempts' }])
-    await unchanged(f, f.store, () => requireDossierAssessmentSubject(f.store, 'p', candidate), true);
-  const wrong: any = { ...packet.subject, manifest: root }; delete wrong.identity;
-  wrong.identity = `dossier-assessment:p:${hashJson(wrong)}`;
-  await unchanged(f, f.store, () => requireDossierAssessmentSubject(f.store, 'p', wrong), true);
-  const truncated = structuredClone(packet); truncated.contradictions[0]!.sides.pop();
-  for (const candidate of [{ ...packet, contract: 'dossier-assessment-packet/v99' }, { ...packet, manifest: packet.root },
-    { ...packet, materials: packet.materials.slice(1) }, { ...packet, unknowns: [] },
-    { ...packet, contradictions: [] }, truncated])
-    await unchanged(f, f.store, () => requireDossierAssessmentPacket(f.store, 'p', candidate), true);
+  await fixed(f, f.store, async () => {
+    for (const input of [undefined, null, {}, { ...root, revision: null }, { ...root, hash: '0'.repeat(64) },
+      { ...root, id: 'foreign-root' }, { root, complete: true }, reference(saved.manifest)])
+      await still(f.store, () => prepareDossierAssessmentSubject(f.store, 'p', input), true);
+    await still(f.store, () => prepareDossierAssessmentSubject(f.store, 'foreign', root), true);
+    for (const field of Object.keys(packet.subject)) {
+      const missing: any = structuredClone(packet.subject); delete missing[field];
+      await still(f.store, () => requireDossierAssessmentSubject(f.store, 'p', missing), true);
+      await still(f.store, () => requireDossierAssessmentSubject(f.store, 'p', { ...packet.subject, [field]: null }), true);
+    }
+    for (const candidate of [{ ...packet.subject, contract: 'dossier-assessment-subject/v99' },
+      { ...packet.subject, kind: 'attempts' }])
+      await still(f.store, () => requireDossierAssessmentSubject(f.store, 'p', candidate), true);
+    const wrong: any = { ...packet.subject, manifest: root }; delete wrong.identity;
+    wrong.identity = `dossier-assessment:p:${hashJson(wrong)}`;
+    await still(f.store, () => requireDossierAssessmentSubject(f.store, 'p', wrong), true);
+    const truncated = structuredClone(packet); truncated.contradictions[0]!.sides.pop();
+    for (const candidate of [{ ...packet, contract: 'dossier-assessment-packet/v99' }, { ...packet, manifest: packet.root },
+      { ...packet, materials: packet.materials.slice(1) }, { ...packet, unknowns: [] },
+      { ...packet, contradictions: [] }, truncated])
+      await still(f.store, () => requireDossierAssessmentPacket(f.store, 'p', candidate), true);
+  });
   const lost = packet.unknowns[0]!.material.address.container;
   for (const store of [f.store, new Store(f.store.path)]) {
     if (store !== f.store) t.after(() => store.close());
-    await unchanged(f, store, async () => assert.deepEqual(await requireDossierAssessmentPacket(store, 'p', packet), packet));
-    const get = store.get;
-    store.get = ((id, rev) => id === lost.id ? null : get.call(store, id, rev)) as typeof store.get;
-    try { await unchanged(f, store, () => requireDossierAssessmentSubject(store, 'p', packet.subject), true); }
-    finally { delete (store as any).get; }
+    await fixed(f, store, async () => {
+      await still(store, async () => assert.deepEqual(await requireDossierAssessmentPacket(store, 'p', packet), packet));
+      const get = store.get;
+      store.get = ((id, rev) => id === lost.id ? null : get.call(store, id, rev)) as typeof store.get;
+      try { await still(store, () => requireDossierAssessmentSubject(store, 'p', packet.subject), true); }
+      finally { delete (store as any).get; }
+    });
   }
 });
 
@@ -335,7 +397,7 @@ test('6.4 dossier subject: genuine no_variants partial keeps nonempty rejected m
   const handoff = await publishVariantHandoff(f.store, 'p', { draft: reference(f.store.get(f.draft.id)!),
     result: reference(none), decision: null, scope: null, earlyLimit: false });
   const saved = await producePartialDossier(f.store, 'p', reference(handoff.record)), root = reference(saved.record);
-  const packet = (await unchanged(f, f.store, () => prepareDossierAssessmentSubject(f.store, 'p', root)))!;
+  const packet = (await still(f.store, () => prepareDossierAssessmentSubject(f.store, 'p', root)))!;
   assert.equal(packet.subject.root.kind, 'partial'); assert.equal(packet.manifest.value.completeness, 'partial');
   assert.equal(packet.manifest.value.reasons[0]!.code, 'no_variants');
   assert.equal(packet.coverage, null); assert.equal(packet.route.scope, null); assert.equal(packet.route.member, null);
@@ -344,11 +406,11 @@ test('6.4 dossier subject: genuine no_variants partial keeps nonempty rejected m
   modeOf(f.store, 'bypass'); nextPlan(f, f.store);
   for (const store of [f.store, new Store(f.store.path)]) {
     if (store !== f.store) t.after(() => store.close());
-    await unchanged(f, store, async () => {
+    await fixed(f, store, () => still(store, async () => {
       assert.deepEqual(await prepareDossierAssessmentSubject(store, 'p', root), packet);
       assert.deepEqual(await requireDossierAssessmentSubject(store, 'p', packet.subject), packet);
       assert.deepEqual(await requireDossierAssessmentPacket(store, 'p', packet), packet);
-    });
+    }));
   }
 });
 
