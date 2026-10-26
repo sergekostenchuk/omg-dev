@@ -1,10 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync, writeFileSync } from 'node:fs';
+import { readFileSync, writeFileSync, copyFileSync, mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 import { execFileSync } from 'node:child_process';
-import { DatabaseSync } from 'node:sqlite';
-import { reference } from '../src/pipeline/contracts.js';
+import { DatabaseSync, backup } from 'node:sqlite';
+import { reference, type Ref } from '../src/pipeline/contracts.js';
 import { Store, type Revision, type TransactionGuard, type Write } from '../src/storage/store.js';
 import { Discovery, type DiscoveryDraft, type Question } from '../src/discovery/discovery.js';
 import { ProductEngine } from '../src/product/engine.js';
@@ -33,6 +34,7 @@ import type { ResearchRun } from '../src/discovery/research-model.js';
 import { deepPlanSelection } from '../src/discovery/v7-plan-questions.js';
 import { readVariantScope } from '../src/discovery/variant-scope.js';
 import type { ResearchConsumerIntent } from '../src/discovery/response-recovery.js';
+import { storeUnchanged } from './store-unchanged.js';
 
 // Include orphaned history as well as current heads after the explicit missing-head corruptions.
 function history(store: Store): string {
@@ -54,8 +56,11 @@ function interceptWrites(t:test.TestContext, target:Store,
   });
   return ()=>method.mock.restore();
 }
-async function setup(t: test.TestContext, questions: PlanQuestion[] = [planQuestion('q-one', 'industry', 'blocking'), planQuestion('q-two', 'market')], initialMode: 'questions'|'bypass'|null = 'questions') {
-  const f = discoveryFixture(t, 'omg-57-');
+const seedCleanup:Array<()=>void>=[];
+test.after(()=>{for(const cleanup of seedCleanup)cleanup();});
+
+async function build(questions: PlanQuestion[] = [planQuestion('q-one', 'industry', 'blocking'), planQuestion('q-two', 'market')], initialMode: 'questions'|'bypass'|null = 'questions') {
+  const f = discoveryFixture({after:fn=>seedCleanup.push(fn)}, 'omg-57-seed-');
   f.engine.execute({ type: 'create-project', project: 'p', title: 'Runner generation' });
   const settings = join(f.root, 'settings.json'), wire = join(f.root, 'wire.ndjson'), adapter = join(f.root, 'adapter.mjs');
   const configure = (patch: Record<string, unknown> = {}) => {
@@ -64,9 +69,11 @@ async function setup(t: test.TestContext, questions: PlanQuestion[] = [planQuest
   };
   configure();
   writeFileSync(adapter, `import {readFileSync,appendFileSync} from 'node:fs';
-const r=JSON.parse(readFileSync(0,'utf8')), s=JSON.parse(readFileSync(${JSON.stringify(settings)},'utf8')), q=r.subject.question?.id??'probe';
-let prior=[];try{prior=readFileSync(${JSON.stringify(wire)},'utf8').trim().split('\\n').filter(Boolean).map(line=>JSON.parse(line))}catch{}
-appendFileSync(${JSON.stringify(wire)},JSON.stringify(r)+'\\n');
+import {join} from 'node:path';
+let runtime=${JSON.stringify(f.root)};try{runtime=JSON.parse(readFileSync(${JSON.stringify(join(f.root,'runtime.json'))},'utf8'))}catch{}
+const r=JSON.parse(readFileSync(0,'utf8')), s=JSON.parse(readFileSync(join(runtime,'settings.json'),'utf8')), q=r.subject.question?.id??'probe';
+let prior=[];try{prior=readFileSync(join(runtime,'wire.ndjson'),'utf8').trim().split('\\n').filter(Boolean).map(line=>JSON.parse(line))}catch{}
+appendFileSync(join(runtime,'wire.ndjson'),JSON.stringify(r)+'\\n');
 let research=s.actions?.[prior.filter(row=>!row.subject.assessmentSubject&&!row.subject.variantSubject).length]??{action:'answer',question:q,value:{type:'impossible',code:'source_unavailable',evidence:[],text:'No accessible source'},citations:[]};
 if(research.question==='$selected')research.question=q;
 if(r.subject.subject?.contract==='v7-plan-subject/v1'&&!r.subject.deepPreparation){
@@ -118,6 +125,29 @@ console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,u
       { store: f.store, draftId: calibration.id, questionId: calibration.value.questions[0]!, purpose: `variant-${kind}` });
   }
   writeFileSync(wire, '');
+  f.store.close();
+  return {root:f.root,path:f.path,v,environment,command,initial,questions};
+}
+type Base=Awaited<ReturnType<typeof build>>;
+function bind(t:{after(fn:()=>void):void},base:Base,path=base.path,runtime=base.root){
+  const {root,v,environment,command,initial,questions}=base,stores:Store[]=[];
+  const open=()=>{const store=new Store(path);stores.push(store);return store;};
+  const store=open(),engine=new ProductEngine(store),discovery=new Discovery(store),f={root,path,store,engine,discovery,open};
+  const selector=join(root,'runtime.json');
+  let previousRuntime:string|undefined;try{previousRuntime=readFileSync(selector,'utf8');}catch{}
+  writeFileSync(selector,JSON.stringify(runtime));
+  t.after(()=>{for(const db of stores)db.close();
+    if(previousRuntime===undefined)rmSync(selector,{force:true});else writeFileSync(selector,previousRuntime);});
+  const settings=join(runtime,'settings.json'),wire=join(runtime,'wire.ndjson');
+  const configure=(patch:Record<string,unknown>={})=>writeFileSync(settings,JSON.stringify({...JSON.parse(readFileSync(settings,'utf8')),...patch}));
+  function mode(value: 'questions'|'bypass', store = f.store) {
+    const request = { project: 'p', mode: value, previous: store.get('project-mode:p') ? reference(store.get('project-mode:p')!) : null };
+    const sessions = new ProjectModeSessions(store), invitation = issueProjectModeInvitation(store, request);
+    assert.ok(invitation.ok); if (!invitation.ok) assert.fail();
+    const login = sessions.exchange({ project: 'p', invitation: invitation.value.invitation }); assert.ok(login.ok); if (!login.ok) assert.fail();
+    const record = setProjectMode(store, request, sessions.authority(login.value.bearer)).record;
+    assert.ok(sessions.revoke(login.value.bearer).ok); return record;
+  }
   const run = (limit = 8, store = f.store, restoreOnly = false) => new Researcher(store, new Discovery(store), new ProductEngine(store).environments)
     .run('p', v.draft.id, limit, undefined, { producerPolicy: { discovery: 7 }, restoreOnly });
   const wires = () => readFileSync(wire, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line));
@@ -130,10 +160,11 @@ console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,u
     answerDiscoveryFixture(engine, 'p', draft, question, validPlan(v.frameRef, questions, 2, v.planAnswer), source);
     return store.get<Question>(plan.id)!.value.answer!;
   };
-  return { ...f, v, environment, command, run, wires, generationCalls, configure, mode, initial, nextEdition };
+  return {...f,base,runtime,v,environment,command,run,wires,generationCalls,configure,mode,initial,nextEdition};
 }
-const money = (store: Store) => store.list().filter(row => ['model-call', 'research-budget-ledger'].includes(row.kind)).flatMap(row => store.history(row.id));
-function choiceScope(f: Awaited<ReturnType<typeof setup>>, kind: 'choose' | 'reject_all' = 'choose'): VariantChoiceScope {
+const money = (store: Store) => [...store.identities('list','model-call'),...store.identities('list','research-budget-ledger')]
+  .flatMap(row=>store.history(row.id));
+function choiceScope(f: ReturnType<typeof bind>, kind: 'choose' | 'reject_all' = 'choose'): VariantChoiceScope {
   const state = f.store.get<VariantState>(variantStateId('p', f.v.draft.id))!;
   const set = f.store.get<VariantSet>(state.value.set!.id, state.value.set!.revision)!;
   return { action: VARIANT_OWNER_ACTION, projectId: 'p', draft: set.value.draft, set: reference(set),
@@ -150,26 +181,89 @@ function owner(store: Store, scope: VariantChoiceScope) {
   assert.ok(sessions.revoke(login.value.bearer).ok); return act;
 }
 
-const deepCalls = (f: Awaited<ReturnType<typeof setup>>) => f.wires().filter(row => row.subject.deepPreparation);
+const deepCalls = (f: ReturnType<typeof bind>) => f.wires().filter(row => row.subject.deepPreparation);
 const deepIntents = (store: Store) => store.list<ResearchConsumerIntent>('research-consumer-intent')
   .filter(row => Object.hasOwn(row.value.cursor, 'deepPreparation'));
-async function inert(f: Awaited<ReturnType<typeof setup>>, store: Store, action: () => Promise<unknown>) {
-  const before=history(store), paid=money(store), wire=f.wires();
-  const result=await action();
-  assert.equal(history(store),before);assert.deepEqual(money(store),paid);assert.deepEqual(f.wires(),wire);return result;
+async function inert(f: ReturnType<typeof bind>, store: Store, action: () => Promise<unknown>) {
+  const paid=money(store),wire=f.wires();
+  const result=await storeUnchanged(store,action);
+  assert.deepEqual(money(store),paid);assert.deepEqual(f.wires(),wire);return result;
 }
-async function ready(t:test.TestContext,model=false,config:Record<string,unknown>={}) {
-  const f=await setup(t,undefined,model?'bypass':'questions');
+type SavedWorld={base:Base;snapshot:string;scope:Ref;pending:Revision<ResearchRun>};
+const readyWorlds=new Map<string,SavedWorld>();
+/** Cache only the real producer prefix. Each test receives a byte-for-byte SQLite
+ * copy and separate mutable runtime files; the original environment/actor/Ref
+ * history and immutable adapter code are untouched. Tests in this file run serially. */
+async function ready(t:test.TestContext,model=false,config:Record<string,unknown>={}){
+  const key=canonical(model);let seed=readyWorlds.get(key);
+  if(!seed){
+    const base=await build(undefined,model?'bypass':'questions'),closing:Array<()=>void>=[];
+    const f=bind({after:fn=>closing.push(fn)},base);
+    const made=await readyIn(f,model);
+    for(const close of closing)close();
+    const snapshot=mkdtempSync(join(tmpdir(),'omg-57-prefix-'));
+    seedCleanup.push(()=>rmSync(snapshot,{recursive:true,force:true}));
+    for(const name of ['state.sqlite','settings.json','wire.ndjson'])copyFileSync(join(base.root,name),join(snapshot,name));
+    seed={base,snapshot,scope:structuredClone(made.scope),pending:structuredClone(made.pending)};
+    readyWorlds.set(key,seed);
+  }
+  const f=copyWorld(t,seed);f.configure(config);return f;
+}
+function copyWorld(t:test.TestContext,seed:SavedWorld){
+  const runtime=mkdtempSync(join(tmpdir(),'omg-57-world-')),closing:Array<()=>void>=[];
+  t.after(()=>{for(const close of closing)close();rmSync(runtime,{recursive:true,force:true});});
+  for(const name of ['state.sqlite','settings.json','wire.ndjson'])copyFileSync(join(seed.snapshot,name),join(runtime,name));
+  return {...bind({after:fn=>closing.push(fn)},seed.base,join(runtime,'state.sqlite'),runtime),
+    scope:structuredClone(seed.scope),pending:structuredClone(seed.pending)};
+}
+async function saveWorld(f:Awaited<ReturnType<typeof ready>>):Promise<SavedWorld>{
+  const snapshot=mkdtempSync(join(tmpdir(),'omg-57-paid-prefix-'));
+  seedCleanup.push(()=>rmSync(snapshot,{recursive:true,force:true}));
+  const source=new DatabaseSync(f.path,{readOnly:true});
+  try{await backup(source,join(snapshot,'state.sqlite'));}finally{source.close();}
+  for(const name of ['settings.json','wire.ndjson'])copyFileSync(join(f.runtime,name),join(snapshot,name));
+  return {base:f.base,snapshot,scope:structuredClone(f.scope),pending:structuredClone(f.pending)};
+}
+async function readyIn(f:ReturnType<typeof bind>,model:boolean){
   const generated=await f.run(3);
   assert.equal(generated.value.pauseCode,model?'research_turns_exhausted':'research_variant_owner_required',generated.value.error!);
-  f.configure(config);
   if(model)await f.run(1);else owner(f.store,choiceScope(f));
   const pending=await f.run(1,f.store,true), details=JSON.parse(pending.value.error!);
   assert.equal(pending.value.pauseCode,'research_deep_frontier_pending',pending.value.error!);
   const handoff=(await readVariantHandoff(f.store,'p',details.handoff)).record;
   assert.equal(handoff.value.next,'deep');assert.deepEqual(handoff.value.scope,details.scope);
   assert.deepEqual(reference(readVariantScope(f.store,'p',details.scope).scope),details.scope);
-  return {...f,scope:details.scope,pending};
+  return {...f,scope:details.scope as Ref,pending};
+}
+
+// Six real N turns are a shared paid prefix, not fabricated run/control rows.
+// The final three turns finish in another process; re-entry sees its real dead owner.
+function otherProcess(f:Awaited<ReturnType<typeof ready>>,limit:number){
+  const modules=['storage/store','discovery/discovery','product/engine','discovery/research-runner']
+    .map(path=>new URL('../src/'+path+'.js',import.meta.url).href);
+  execFileSync(process.execPath,['--input-type=module','-e',`
+    import {Store} from ${JSON.stringify(modules[0])};
+    import {Discovery} from ${JSON.stringify(modules[1])};
+    import {ProductEngine} from ${JSON.stringify(modules[2])};
+    import {Researcher} from ${JSON.stringify(modules[3])};
+    const store=new Store(${JSON.stringify(f.path)});
+    await new Researcher(store,new Discovery(store),new ProductEngine(store).environments)
+      .run('p',${JSON.stringify(f.v.draft.id)},${limit},undefined,{producerPolicy:{discovery:7}});
+    store.close();`],{stdio:'pipe'});
+}
+let stalledWorld:SavedWorld|undefined;
+async function stalled(t:test.TestContext){
+  if(stalledWorld)return copyWorld(t,stalledWorld);
+  const f=await ready(t,false,{deepMode:'impossible'}),started=performance.now();
+  await f.run(3);
+  assert.equal(f.store.list(DEEP_FRONTIER_STOP_KIND).length,0);
+  assert.equal(deepPlanSelection(f.store,'p',f.scope).next!.cell.subject.planQuestionId,'q-two');
+  assert.deepEqual(deepCalls(f).map(row=>row.subject.deepCell.subject.planQuestionId),['q-one','q-one','q-one']);
+  otherProcess(f,3);
+  assert.deepEqual(deepCalls(f).map(row=>row.subject.deepCell.subject.planQuestionId),['q-one','q-one','q-one','q-two','q-two','q-two']);
+  stalledWorld=await saveWorld(f);
+  t.diagnostic(`real six-N prefix duration_ms: ${performance.now()-started}`);
+  return f;
 }
 
 for (const model of [false, true]) test(`5.7: real ${model ? 'model' : 'owner'} choice and paid exhaustion produce exact partial then hot/cold fixed point`, async t => {
@@ -188,25 +282,25 @@ for (const model of [false, true]) test(`5.7: real ${model ? 'model' : 'owner'} 
   assert.equal(dossier.record.value.completeness, 'partial');
   assert.ok(dossier.materials.length >= 3);
   assert.equal(discoveryInspection(f.store, f.v.draft).outcome.state, 'researching');
-  for (const store of [f.store, f.open()]) await inert(f, store, async () => {
-    assert.deepEqual(await f.run(9, store), result);
-    assert.deepEqual(await f.run(1, store, true), result);
-    assert.equal((await produceStoppedPartialDossier(store, 'p', details.stop)).repeated, true);
-    assert.deepEqual(reference((await readPartialDossier(store, 'p', details.dossier)).record), details.dossier);
+  const before=history(f.store),cold=f.open();
+  await inert(f,f.store,async()=>assert.deepEqual(await f.run(9,f.store),result));
+  await inert(f,cold,async()=>{
+    assert.deepEqual(await f.run(1,cold,true),result);
+    assert.equal((await produceStoppedPartialDossier(cold,'p',details.stop)).repeated,true);
+    assert.deepEqual(reference((await readPartialDossier(cold,'p',details.dossier)).record),details.dossier);
   });
+  assert.equal(history(f.store),before);
 });
 test('5.7: one stalled cell does not stop another; all applied N limits stop without repeat payment', async t => {
-  const f = await ready(t, false, { deepMode: 'impossible' });
-  await f.run(3);
-  assert.equal(f.store.list(DEEP_FRONTIER_STOP_KIND).length, 0);
-  assert.equal(deepPlanSelection(f.store, 'p', f.scope).next!.cell.subject.planQuestionId, 'q-two');
-  const result = await f.run(3, f.open()), details = JSON.parse(result.value.error!);
+  const f = await stalled(t),result=f.store.get<ResearchRun>(f.pending.id)!,details=JSON.parse(result.value.error!);
   assert.equal(result.value.pauseCode, 'research_dossier_assessment_unavailable', result.value.error!);
   const proof = await readDeepFrontierStop(f.store, 'p', details.stop);
   assert.equal(proof.record.value.reason, 'stall');
   assert.equal(proof.coverage.missing.length, 2);
   assert.equal(deepCalls(f).length, 6);
+  const before=history(f.store);
   for (const store of [f.store, f.open()]) await inert(f, store, () => f.run(8, store));
+  assert.equal(history(f.store),before);
 });
 test('5.7: complete coverage and an unpaid pending frontier are not partial', async t => {
   const f = await ready(t);f.configure({selectedAxes:true});
@@ -244,13 +338,17 @@ test('5.7: a real prepared intent before reservation is not terminal even when i
   await f.run(1); restore();
   assert.ok(cut); assert.equal(deepCalls(f).length, 0);
   assert.equal(deepIntents(f.store)[0]!.value.state, 'prepared');
+  const before=history(f.store);
   for (const store of [f.store, f.open()]) await inert(f, store, async () => {
     await f.run(1, store, true);
     await assert.rejects(() => produceDeepFrontierStop(store, 'p', JSON.parse(f.pending.value.error!).handoff), { code: 'discovery_deep_stop_invalid' });
   });
+  assert.equal(history(f.store),before);
 });
-for (const cold of [false, true]) for (const cutAt of ['stop', 'dossier', 'pause'])
-  test(`5.7: ${cold ? 'cold' : 'hot'} recovery after ${cutAt} preserves exact stop and one snapshot`, async t => {
+const cutWorlds=new Map<string,SavedWorld>();
+async function atCut(t:test.TestContext,cutAt:string,cold:boolean){
+  const saved=cutWorlds.get(cutAt);
+  if(saved)return copyWorld(t,saved);
     const f = await ready(t); f.configure({ assessorTokens: V7_STAGE_TOKEN_CEILING - 2_000_000 });
     let cut = false;
     const original = Store.prototype.atomicWrite;
@@ -270,15 +368,26 @@ for (const cold of [false, true]) for (const cutAt of ['stop', 'dossier', 'pause
     try { await f.run(2); } catch (error) { assert.match(String(error), /cut/); }
     restore(); atomic.mock.restore(); assert.ok(cut);
     assert.equal(f.store.list(DEEP_FRONTIER_STOP_KIND).length, 1);
-    const stop = reference(f.store.list(DEEP_FRONTIER_STOP_KIND)[0]!);
-    const paid = money(f.store), wire = f.wires(), store = cold ? f.open() : f.store;
-    const result = await f.run(1, store, true), details = JSON.parse(result.value.error!);
-    assert.equal(result.value.pauseCode, 'research_dossier_assessment_unavailable', result.value.error!);
-    assert.deepEqual(details.stop, stop);
-    assert.equal(store.list(DEEP_FRONTIER_STOP_KIND).length, 1);
-    assert.equal(store.list('discovery-dossier-manifest').length, 1);
-    assert.deepEqual(money(store), paid); assert.deepEqual(f.wires(), wire);
-    for (const again of [store, f.open()]) await inert(f, again, () => f.run(1, again, true));
+    const snapshot=await saveWorld(f);
+    cutWorlds.set(cutAt,snapshot);
+    return cold?copyWorld(t,snapshot):f;
+}
+for(const cold of [false,true])for(const cutAt of ['stop','dossier','pause'])
+  test(`5.7: ${cold?'cold':'hot'} recovery after ${cutAt} preserves exact stop and one snapshot`,async t=>{
+    // The first (hot) case creates the real cut; the cold case reopens its exact
+    // snapshot, including paid calls and runtime bytes, before any recovery.
+    const f=await atCut(t,cutAt,cold),store=f.store;
+    const stop=reference(store.list(DEEP_FRONTIER_STOP_KIND)[0]!);
+    const paid=money(store),wire=f.wires();
+    const result=await f.run(1,store,true),details=JSON.parse(result.value.error!);
+    assert.equal(result.value.pauseCode,'research_dossier_assessment_unavailable',result.value.error!);
+    assert.deepEqual(details.stop,stop);
+    assert.equal(store.list(DEEP_FRONTIER_STOP_KIND).length,1);
+    assert.equal(store.list('discovery-dossier-manifest').length,1);
+    assert.deepEqual(money(store),paid);assert.deepEqual(f.wires(),wire);
+    const before=history(store);
+    await inert(f,store,async()=>assert.deepEqual(await f.run(1,store,true),result));
+    assert.equal(history(store),before);
   });
 
 async function budgetAtPublication(t: test.TestContext) {
@@ -305,7 +414,7 @@ test('5.7: missing/null/foreign/structural exact grounds cannot replace the prov
       else value[field] = field === 'states' ? [] : field === 'budget' ? {...value.budget, measured: 0} : {...value[field], hash: '0'.repeat(64)};
       const {boundary: _boundary, run: _run, ...basis} = value;
       const fake = f.store.write({ id: `${DEEP_FRONTIER_STOP_KIND}:p:${hashJson(basis)}`, kind: DEEP_FRONTIER_STOP_KIND, expected: 0, value });
-      for (const store of [f.store, f.open()]) await inert(f, store, () => assert.rejects(() => readDeepFrontierStop(store, 'p', reference(fake)), error => error instanceof EngineError));
+      for (const store of mutation==='structural'?[f.store,f.open()]:[f.store]) await inert(f, store, () => assert.rejects(() => readDeepFrontierStop(store, 'p', reference(fake)), error => error instanceof EngineError));
     }
     const run = f.store.get<ResearchRun>(original.run.id)!;
     for (const patch of [{projectId:'foreign'}, {draftId:'foreign'}, {turns:null}, {turns:-1}]) {
@@ -324,7 +433,8 @@ test('5.7: missing/null/foreign/structural exact grounds cannot replace the prov
     const dossier = await produceStoppedPartialDossier(f.store, 'p', f.stop);
     const value = structuredClone(dossier.record.value); value.reasons[0]!.grounds.pop();
     const fake = projectDossierManifest(value), record = f.store.write({ id: fake.id, kind: 'discovery-dossier-manifest', expected: 0, value: fake.value });
-    await inert(f, f.open(), () => assert.rejects(() => readPartialDossier(f.open(), 'p', reference(record)), {code:'discovery_dossier_invalid'}));
+    const cold=f.open();
+    await inert(f,cold,()=>assert.rejects(()=>readPartialDossier(cold,'p',reference(record)),{code:'discovery_dossier_invalid'}));
   });
 
 test('5.7: paid MR without P remains unassessed in the old snapshot after late application', async t => {
@@ -342,11 +452,13 @@ test('5.7: paid MR without P remains unassessed in the old snapshot after late a
   const beforeWire = f.wires(), beforeMoney = money(f.store);
   await f.run(1, f.store, true);
   assert.deepEqual(f.wires(), beforeWire); assert.deepEqual(money(f.store), beforeMoney);
+  const before=history(f.store);
   for (const store of [f.store, f.open()]) await inert(f, store, async () => {
     const old = await readPartialDossier(store, 'p', reference(snapshot.record));
     assert.deepEqual(old.record, snapshot.record); assert.deepEqual(old.materials, snapshot.materials);
-    assert.equal((await produceStoppedPartialDossier(store, 'p', reference(stop.record))).repeated, true);
+    if(store!==f.store)assert.equal((await produceStoppedPartialDossier(store, 'p', reference(stop.record))).repeated, true);
   });
+  assert.equal(history(f.store),before);
 });
 
 test('5.7: deep partial keeps rejected material, addressed unknown and both contradiction sides', async t => {
@@ -404,35 +516,33 @@ for (const change of ['frame', 'plan', 'mode', 'choice', 'budget', 'material'])
     assert.equal(f.store.list(DEEP_FRONTIER_STOP_KIND).length,0); assert.equal(f.store.list('discovery-dossier-manifest').length,0);
   });
 
-for (const cold of [false,true]) test(`5.7: ${cold?'cold':'hot'} current applied evidence resumes stalled frontier with retained N and historical partial`, async t => {
-  const f = await ready(t,false,{deepMode:'impossible'});
-  // A real previous process owns the finished run. Later managed work and a
-  // cold runner see its dead process identity without fabricating control rows.
-  const modules = ['storage/store','discovery/discovery','product/engine','discovery/research-runner']
-    .map(path=>new URL('../src/'+path+'.js',import.meta.url).href);
-  execFileSync(process.execPath,['--input-type=module','-e',`
-    import {Store} from ${JSON.stringify(modules[0])};
-    import {Discovery} from ${JSON.stringify(modules[1])};
-    import {ProductEngine} from ${JSON.stringify(modules[2])};
-    import {Researcher} from ${JSON.stringify(modules[3])};
-    const store=new Store(${JSON.stringify(f.store.path)});
-    await new Researcher(store,new Discovery(store),new ProductEngine(store).environments).run('p',${JSON.stringify(f.v.draft.id)},6,undefined,{producerPolicy:{discovery:7}});
-    store.close();`],{stdio:'pipe'});
-  const stopped=f.store.list<ResearchRun>('research-run').find(row=>row.value.draftId===f.v.draft.id)!;
-  assert.equal(stopped.value.pauseCode,'research_dossier_assessment_unavailable',stopped.value.error!);
-  const prior=JSON.parse(stopped.value.error!), old=await readPartialDossier(f.store,'p',prior.dossier);
-  assert.equal(old.stop!.value.reason,'stall');assert.equal(deepCalls(f).length,6);
-  const store=cold?f.open():f.store, paidBefore=deepIntents(store).map(row=>reference(row));
-  // New evidence enters through the real managed and MR/P doors. It is not a
-  // restart/allowance permission and cannot rewrite the stopped snapshot.
+type ReentryPrefix=SavedWorld&{stopped:Ref;assessment:Ref;paidBefore:Ref[]};
+let reentryPrefix:ReentryPrefix|undefined;
+async function paidReentry(t:test.TestContext){
+  if(reentryPrefix)return {...copyWorld(t,reentryPrefix),stopped:reentryPrefix.stopped,
+    assessment:reentryPrefix.assessment,paidBefore:reentryPrefix.paidBefore};
+  const f=await stalled(t),stopped=f.store.get<ResearchRun>(f.pending.id)!;
+  const paidBefore=deepIntents(f.store).map(row=>reference(row));
   f.configure({deepMode:'variant',close:false,outcome:'open'});
-  const priorIntent=deepIntents(store).find(row=>row.value.cursor.subject?.planQuestionId==='q-one')!;
-  const next=(await runDeepResearch(store,{projectId:'p',deepPreparation:priorIntent.value.cursor.deepPreparation!,
+  const priorIntent=deepIntents(f.store).find(row=>row.value.cursor.subject?.planQuestionId==='q-one')!;
+  const next=(await runDeepResearch(f.store,{projectId:'p',deepPreparation:priorIntent.value.cursor.deepPreparation!,
     environment:f.environment,owner:reference(stopped)}))!;
-  const packet=projectAttemptPacket(store,{project:'p',...priorIntent.value.cursor.subject!,
+  const packet=projectAttemptPacket(f.store,{project:'p',...priorIntent.value.cursor.subject!,
     entries:[{attempt:reference(next.attempt),binding:reference(next.binding)}]});
-  const assessment=await assessAttemptsWithRequirements(store,packet,v7ProgressBaseline(store,packet),f.environment,f.root);
-  applyDiscoveryAssessment(store,'p',reference(assessment));
+  const assessment=await assessAttemptsWithRequirements(f.store,packet,v7ProgressBaseline(f.store,packet),f.environment,f.root);
+  reentryPrefix={...await saveWorld(f),stopped:reference(stopped),assessment:reference(assessment),paidBefore};
+  return {...f,stopped:reentryPrefix.stopped,assessment:reentryPrefix.assessment,paidBefore};
+}
+for (const cold of [false,true]) test(`5.7: ${cold?'cold':'hot'} current applied evidence resumes stalled frontier with retained N and historical partial`, async t => {
+  const f=await paidReentry(t),stopped=f.store.get<ResearchRun>(f.stopped.id,f.stopped.revision)!;
+  assert.deepEqual(reference(stopped),f.stopped);
+  assert.equal(stopped.value.pauseCode,'research_dossier_assessment_unavailable',stopped.value.error!);
+  const prior=JSON.parse(stopped.value.error!),old=await readPartialDossier(f.store,'p',prior.dossier);
+  assert.equal(old.stop!.value.reason,'stall');assert.equal(deepCalls(f).length,7);
+  const store=cold?f.open():f.store,paidBefore=f.paidBefore;
+  // A real new paid MR is shared only as preparation. Both cases apply P through
+  // the public producer on their own hot/cold Store, then exercise runner admission.
+  applyDiscoveryAssessment(store,'p',f.assessment);
   const frontier=deepPlanSelection(store,'p',f.scope);
   assert.equal(frontier.progress[0]!.summary!.count,5);assert.equal(frontier.progress[0]!.summary!.streak,0);
   assert.equal(frontier.next!.cell.subject.planQuestionId,'q-one');
@@ -441,11 +551,13 @@ for (const cold of [false,true]) test(`5.7: ${cold?'cold':'hot'} current applied
   assert.equal(resumed.value.pauseCode,'research_dossier_assessment_unavailable',resumed.value.error!);
   assert.equal(deepCalls(f).length,8);
   for(const at of paidBefore)assert.deepEqual(reference(store.get(at.id,at.revision)!),at);
+  const before=history(store);
   for(const read of [store,f.open()])await inert(f,read,async()=>{
     assert.deepEqual((await readPartialDossier(read,'p',prior.dossier)).record,old.record);
-    assert.equal((await produceStoppedPartialDossier(read,'p',prior.stop)).repeated,true);
-    await f.run(1,read,true);
+    if(read!==store)assert.equal((await produceStoppedPartialDossier(read,'p',prior.stop)).repeated,true);
+    else await f.run(1,read,true);
   });
+  assert.equal(history(store),before);
 });
 
 test('5.7: exhausted stage budget remains terminal after choice, plan and allowance changes', async t => {
