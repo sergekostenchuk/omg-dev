@@ -218,8 +218,7 @@ async function acceptedFact(f: ReturnType<typeof fixture>, options: { suffix?: s
   return { fact, assessment, accepted, route, task };
 }
 
-async function assessedFact(f: ReturnType<typeof fixture>, verdict: 'supported' | 'insufficient' | 'conflicting' | 'off-form',
-  mode: 'managed' | 'standalone') {
+async function assessedFact(f: ReturnType<typeof fixture>, verdict: 'supported' | 'insufficient' | 'conflicting' | 'off-form') {
   const batch = f.route.value.batches.find(item => item.model === 'MC1' && item.items.some(question => question.target === f.target))!;
   assert.ok(batch);
   const source = f.store.get<{ content: string }>(`source:${f.project}:brief`)!;
@@ -229,11 +228,9 @@ async function assessedFact(f: ReturnType<typeof fixture>, verdict: 'supported' 
     result: gapLineExpectedResult(f.project, batch.items[0]!.target, batch.items[0]!.field) };
   ok(openSeries(f.store, { project: f.project, block: f.block, line: 1,
     slice: 'answers:e5', predecessor: null, basis: null }));
-  // LG07 ag-a (№10521): managed callers open through G7 with the real completion plan; standalone keeps the raw attempt.
-  const series = ok(mode === 'managed'
-    ? managedOpenAttempt(f.store, { project: f.project, block: f.block, line: 1, attempt: 1, goal,
-      completion: { routes: reference(f.route), batches: [batch.id] } })
-    : beginAttempt(f.store, { project: f.project, block: f.block, line: 1, attempt: 1, goal }));
+  // LG07 ag-a (№10521): the attempt is opened through G7 with the real completion plan of its MC1 batch; no standalone opening is left.
+  const series = ok(managedOpenAttempt(f.store, { project: f.project, block: f.block, line: 1, attempt: 1, goal,
+    completion: { routes: reference(f.route), batches: [batch.id] } }));
   const scenario = join(f.root, 'assessment-scenario.json'), trace = join(f.root, 'assessment-trace.jsonl');
   const command = { executable: process.execPath, args: [adapterFixture, '--scenario', scenario, '--trace', trace] };
   const config = f.engine.environments.configure(f.project, { workspace: f.root,
@@ -244,6 +241,11 @@ async function assessedFact(f: ReturnType<typeof fixture>, verdict: 'supported' 
     value: { projectId: f.project, protocol: 'codex-stdio' } });
   const packet = ok(writeQuestionPacket(f.store, { project: f.project, routes: reference(f.route), batch: batch.id,
     environment: reference(config), attempt: { series: reference(series), ordinal: 1 }, previous: [] })).record;
+  const binding = ok(readCompletionBinding(f.store, f.project, reference(series), 1));
+  assert.ok(binding, 'The managed opening writes its binding');
+  assert.deepEqual(binding.value.plan, { routes: reference(f.route), batches: [batch.id] });
+  assert.equal(packet.value.state, 'ready');
+  assert.deepEqual(packet.value.request.attempt, { series: reference(series), ordinal: 1 });
   const originalStep = { research: { protocol: '$answerProtocol', requestId: '$requestId', action: 'answer',
     results: batch.items.map(item => ({ questionId: item.gap, value: source.value.content.slice(0, 8),
       citations: [{ source: reference(source), selector: { kind: 'text-range', start: 0, end: source.value.content.length } }] })) },
@@ -917,7 +919,7 @@ test('G4b reports an unknown result contract on a real repository fact without t
 
 test('G4b does not mistake a real E5 terminal verdict for its separate accepted D5 answer', async t => {
   for (const verdict of ['supported', 'insufficient', 'conflicting', 'off-form'] as const) await t.test(verdict, async child => {
-    const f = fixture(child, 'repository-fact'), assessed = await assessedFact(f, verdict, 'managed');
+    const f = fixture(child, 'repository-fact'), assessed = await assessedFact(f, verdict);
     const fact = f.blocking.find(row => row.value.gap.target === f.target)!;
     const task = f.route.value.routes.find(row => row.gap === fact.value.gap.id)!.task!;
     const route = verdict === 'supported' ? ok(writeRoutes(f.store, { project: f.project, gaps: f.request.gaps,
@@ -958,7 +960,7 @@ test('G4b reads an ordinary applied MC1 off-form result by its E4 product contra
 });
 
 test('G4b keeps a direct E5 assessor transport distinct from an ordinary MC1 after restart', async t => {
-  const f = fixture(t, 'repository-fact'), assessed = await assessedFact(f, 'off-form', 'managed');
+  const f = fixture(t, 'repository-fact'), assessed = await assessedFact(f, 'off-form');
   const fact = f.blocking.find(row => row.value.gap.target === f.target)!;
   const request: AnswersGateRequest = { ...f.request,
     results: [{ gap: reference(fact), result: assessed.terminal.value.assessor, candidate: null }] };
@@ -1488,7 +1490,7 @@ test('C58 H1.0c one answer_missing_for_blocking_gap code keeps absent, null, D3,
   });
   for (const verdict of ['insufficient', 'conflicting', 'off-form'] as const)
     await t.test(`${verdict === 'off-form' ? '14' : '13'} H1.0c an E5 ${verdict} terminal carries its exact terminal and verdict`, async child => {
-      const f = fixture(child, 'repository-fact'), assessed = await assessedFact(f, verdict, 'managed'), fact = factOf(f);
+      const f = fixture(child, 'repository-fact'), assessed = await assessedFact(f, verdict), fact = factOf(f);
       const intent = ok(readAssessmentIntentAt(f.store, f.project, assessed.terminal.value.intent));
       const entry = await covered(f, verdict, [{ gap: reference(fact), result: reference(assessed.terminal), candidate: null }]);
       assert.equal(entry.cause.emission, `assessment-${verdict}`);
@@ -1514,7 +1516,7 @@ test('C58 H1.0c one answer_missing_for_blocking_gap code keeps absent, null, D3,
       assert.deepEqual(transport.cause.sources[2]!.ref, assessed.terminal.value.intent);
     });
   await t.test('11 H1.0c a supported E5 terminal is not its separately accepted D5', async child => {
-    const f = fixture(child, 'repository-fact'), assessed = await assessedFact(f, 'supported', 'managed'), fact = factOf(f);
+    const f = fixture(child, 'repository-fact'), assessed = await assessedFact(f, 'supported'), fact = factOf(f);
     const task = f.route.value.routes.find(row => row.gap === fact.value.gap.id)!.task!;
     const route = ok(writeRoutes(f.store, { project: f.project, gaps: f.request.gaps, tasks: [{ record: task }],
       catalog: { paths: [], records: [] }, previous: reference(f.route) }));
@@ -1627,7 +1629,7 @@ test('C57 H1.0c answer_version_stale and record_foreign carry their exact distin
       reference(f.route)]);
   });
   await t.test('18 H1.0c an E5 terminal of another question keeps every foreign condition', async child => {
-    const f = fixture(child, 'repository-fact', true, true), assessed = await assessedFact(f, 'insufficient', 'managed');
+    const f = fixture(child, 'repository-fact', true, true), assessed = await assessedFact(f, 'insufficient');
     const intent = ok(readAssessmentIntentAt(f.store, f.project, assessed.terminal.value.intent));
     const question = ok(readMc1Question(f.store, { project: f.project, record: intent.question.record }));
     const foreign = f.blocking.find(row => row.value.gap.kind === 'repository-fact' && row.id !== question.record.value.request.gap.id
@@ -2570,7 +2572,7 @@ const reHashed = <T>(record: Revision<T>, value: T): Revision<T> => ({ ...record
 test('15 H1.0c another attempt\'s N explains the gap but is journal-only for this attempt', async t => {
   // LG07 ag-rest (№10753 п.3): the earlier attempt is a real managed one — it pays its own MC1→E4→E5 N and ends
   // by the claim its G7 derives; the next lawful managed attempt of the same line keeps the open question.
-  const f = fixture(t, 'repository-fact'), foreign = await assessedFact(f, 'insufficient', 'managed');
+  const f = fixture(t, 'repository-fact'), foreign = await assessedFact(f, 'insufficient');
   const priorBinding = ok(readCompletionBinding(f.store, f.project, reference(foreign.series), 1))!;
   const priorWork = ok(readCompletionWorkAt(f.store, f.project,
     reference(f.store.get(completionWorkId(f.project, priorBinding.id))!)));
@@ -3593,7 +3595,7 @@ test('X7 H1.0c a journal-only G4b row of another binding stays readable in the A
   // LG07 ag-b (№10588): every attempt of the series is a managed one with its own MC1 batch and E2 — attempt 1 pays a
   // real E4 and E5, attempts 2 and 3 a real E4 off its form — and G7 closes each with the claim it derives itself.
   const f = fixture(t, 'repository-fact');
-  const first = await assessedFact(f, 'insufficient', 'managed');
+  const first = await assessedFact(f, 'insufficient');
   const address = { project: f.project, block: f.block, line: 1 }, plan = { routes: reference(f.route), batches: [first.batch.id] };
   const closeOwn = (attempt: number) => {
     const binding = ok(readCompletionBinding(f.store, f.project, reference(f.store.get(seriesIdOf(f))!), attempt));
