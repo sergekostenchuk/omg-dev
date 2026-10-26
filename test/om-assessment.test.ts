@@ -101,7 +101,7 @@ function e5Prefix(store: Store, twoFacts: boolean) {
     catalog: { paths: ['e5-source.txt'], records: [] }, previous: null }));
   return { horizon, routes };
 }
-function fixture(t: TestContext, twoFacts = false, managed = false, completion = true, twoRoots = false, fileEvidence = false) {
+function fixture(t: TestContext, twoFacts = false, managed = false, twoRoots = false, fileEvidence = false) {
   const seeded = seedCopy(`e5:${twoFacts}`, store => e5Prefix(store, twoFacts), 'omg-e5-');
   const { root, database: path } = seeded, { horizon, routes } = seeded.data, project = 'garden';
   let store = new Store(path);
@@ -126,7 +126,6 @@ function fixture(t: TestContext, twoFacts = false, managed = false, completion =
       horizon: reference(horizon.gate), transition: reference(prepared) }));
     ok(applySeriesActivation(store, { project, prepared: reference(prepared), issuance: reference(issuance) }));
   }
-  assert.equal(completion, true, 'Current E5 preparation always uses completion');
   const plan = { routes: reference(routes), batches: rootBatches.map(row => row.id).sort() };
   const series = ok(managedOpenAttempt(store, { project, block, line: 1, attempt: 1, goal, completion: plan }));
   const binding = ok(readCompletionBinding(store, project, reference(series), 1));
@@ -143,6 +142,9 @@ function fixture(t: TestContext, twoFacts = false, managed = false, completion =
     value: { projectId: project, protocol: 'codex-stdio' } });
   const packet = ok(writeQuestionPacket(store, { project, routes: reference(routes), batch: batch.id,
     environment: reference(config), attempt: { series: reference(series), ordinal: 1 }, previous: [] })).record;
+  assert.equal(packet.value.state, 'ready', 'The fixture writes a real ready E2 packet');
+  assert.deepEqual(packet.value.request.attempt, { series: reference(series), ordinal: 1 });
+  assert.equal(store.list('model-call').length, 0, 'The fixture pays nothing before the first original()');
   const questionId = batch.items[0]!.gap;
   const originalStep = { research: { protocol: '$answerProtocol', requestId: '$requestId', action: 'answer',
     results: batch.items.map(item => ({ questionId: item.gap, value: 'UTF-8', citations: [{ source: reference(source),
@@ -713,7 +715,7 @@ test('E5 refuses intent creation if a guarded source moves between preparation a
 
 test('E5 retains paid physical evidence when its exact adapter or captured file ceases before application', async t => {
   for (const change of ['adapter', 'file'] as const) await t.test(change, async child => {
-    const f = fixture(child, false, false, true, false, change === 'file');
+    const f = fixture(child, false, false, false, change === 'file');
     const request = await f.original(), paid = await paidAssessment(f, request);
     const disposition = ok(prepareAssessmentDisposition(f.store, f.project, reference(paid.intent)))!;
     assert.equal(ok(prepareCompletionCause(f.store, f.project, disposition.assignment)).cause, null);
@@ -836,7 +838,7 @@ test('explicit G7 closure atomically guards every E5 result used to prove the fu
 });
 
 test('19 H1.0a E5 registers every original fact and atomically retains S plus N until the single explicit G7 close', async t => {
-  const f = fixture(t, true, false, true), request = await f.original();
+  const f = fixture(t, true, false), request = await f.original();
   f.assessor('supported', 'insufficient');
   const first = ok(await assessFact(f.store, request));
   assert.ok(first.value.accepted);
@@ -873,7 +875,7 @@ test('20 H1.0a complete managed S/N/T composition controls G7 and physical E6 co
     ['conflicting', 'off-form'], ['off-form', 'interrupted'], ['off-form', 'off-form'],
   ] as const;
   for (const choices of combinations) await t.test(choices.join('+'), async child => {
-    const f = fixture(child, true, choices[0] === 'supported', true), request = await f.original();
+    const f = fixture(child, true, choices[0] === 'supported'), request = await f.original();
     const step = (verdict: typeof choices[number]) => verdict === 'interrupted'
       ? { rawStdout: '{broken', exitCode: 7, stderr: 'intentional assessor failure' }
       : { research: verdict === 'off-form' ? { answer: 'no typed verdict' }
@@ -923,7 +925,7 @@ test('20 H1.0a complete managed S/N/T composition controls G7 and physical E6 co
 });
 
 test('C28 H1.0a managed accepted E5 remains a lawful D2 source after explicit G7 and restart', async t => {
-  const f = fixture(t, false, false, true), chain = await completedFactClosure(f, true);
+  const f = fixture(t, false, false), chain = await completedFactClosure(f, true);
   assert.equal(ok(confirmAnswerGapClosure(f.store, chain.confirmation)).key, chain.checked.key);
   f.restart();
   assert.equal(ok(confirmAnswerGapClosure(f.store, chain.confirmation)).key, chain.checked.key);
@@ -933,7 +935,7 @@ test('C28 H1.0a managed accepted E5 remains a lawful D2 source after explicit G7
 });
 
 test('C10 H1.0a G7 carries product-head guards from before the full managed derivation', async t => {
-  const f = fixture(t, true, false, true), request = await f.original();
+  const f = fixture(t, true, false), request = await f.original();
   f.assessor('supported','supported');
   const first = ok(await assessFact(f.store, request));
   ok(await assessFact(f.store, {...request,questionId:f.questionIds[1]!}));
@@ -960,7 +962,7 @@ test('C10 H1.0a G7 carries product-head guards from before the full managed deri
 });
 
 test('24 H1.0a a complete MC1 root cannot hide an unpaid MC2 root in the initial plan', async t => {
-  const f=fixture(t,false,false,true,true), firstRequest=await f.original();
+  const f=fixture(t,false,false,true), firstRequest=await f.original();
   f.assessor(); const first=ok(await assessFact(f.store,firstRequest));
   const binding=ok(readCompletionBinding(f.store,f.project,reference(f.series),1))!;
   const getWork=()=>ok(readCompletionWorkAt(f.store,f.project,reference(f.store.get(completionWorkId(f.project,binding.id))!)));
@@ -989,7 +991,7 @@ test('24 H1.0a a complete MC1 root cannot hide an unpaid MC2 root in the initial
 });
 
 test('18 H1.0a answered assessor transport is still I until its exact E5 application',async t=>{
-  const f=fixture(t,false,false,true),request=await f.original(),intent=ok(writeAssessmentIntent(f.store,request));
+  const f=fixture(t,false,false),request=await f.original(),intent=ok(writeAssessmentIntent(f.store,request));
   const admission=ok(readAssessmentIntentAt(f.store,f.project,reference(intent)));
   const admitted=ok(recordCall(f.store,f.project,{call:admission.call,purpose:'fact-assessment',basis:admission.basis,
     block:admission.block,gaps:admission.gaps,series:admission.series,attempt:admission.attempt,goal:admission.goal,
@@ -1187,7 +1189,7 @@ test('C38 H1.0a neighbouring S during receipt preserves target admission while t
 
 test('30 H1.0b file cause is rederived from exact saved bytes after restart and restoration', async t => {
   for (const change of ['invalid-json', 'missing', 'path-alias'] as const) await t.test(change, async t => {
-    const f = fixture(t, false, false, true, false, true), request = await f.original();
+    const f = fixture(t, false, false, false, true), request = await f.original();
     const intent = ok(writeAssessmentIntent(f.store, request)), input = { project: f.project, intent: reference(intent) };
     const original = readFileSync(f.sourcePath);
     assert.equal(ok(prepareAssessmentFileTerminationCause(f.store, input)).cause, null);
@@ -1215,7 +1217,7 @@ test('30 H1.0b file cause is rederived from exact saved bytes after restart and 
 });
 
 test('3 H1.0b unchanged bytes and an unrelated real Source cannot prove file termination', async t => {
-  const f = fixture(t, false, false, true, false, true), request = await f.original();
+  const f = fixture(t, false, false, false, true), request = await f.original();
   const intent = ok(writeAssessmentIntent(f.store, request)), input = { project: f.project, intent: reference(intent) };
   const unchanged = { kind: 'file-observation' as const, source: reference(f.source),
     observation: { kind: 'read' as const, bytes: readFileSync(f.sourcePath).toString('base64') } };
@@ -1226,7 +1228,7 @@ test('3 H1.0b unchanged bytes and an unrelated real Source cannot prove file ter
 });
 
 test('17 H1.0b missing original history and unknown observations are not file-change proofs', async t => {
-  const f = fixture(t, false, false, true, false, true), request = await f.original();
+  const f = fixture(t, false, false, false, true), request = await f.original();
   const intent = ok(writeAssessmentIntent(f.store, request)), input = { project: f.project, intent: reference(intent) };
   for (const [observation, observationCode] of [
     [{ kind: 'unavailable', code: 'EIO' }, 'model_call_record_invalid'], [{ kind: 'read', bytes: 'invalid base64!' }, 'model_call_record_invalid'],
@@ -1248,7 +1250,7 @@ test('17 H1.0b missing original history and unknown observations are not file-ch
 
 
 test('31 H1.0b a different already-applied B1 fact is a required file prerequisite', async t => {
-  const f = fixture(t, true, false, true, false, true), first = await f.original();
+  const f = fixture(t, true, false, false, true), first = await f.original();
   f.assessor('supported', 'insufficient');
   const accepted = ok(await assessFact(f.store, first)).value.accepted!;
   ok(await assessFact(f.store, { ...first, questionId: f.questionIds[1]! }));
@@ -1307,7 +1309,7 @@ test('31 H1.0b a different already-applied B1 fact is a required file prerequisi
 
 test('11 H1.0b received S and N cease application with exact receipt, unchanged physical expense and historical repeat', async t => {
   for (const verdict of ['supported', 'insufficient', 'conflicting'] as const) await t.test(verdict, async t => {
-    const f = fixture(t, false, false, true, false, true), request = await f.original();
+    const f = fixture(t, false, false, false, true), request = await f.original();
     const intent = ok(writeAssessmentIntent(f.store, request));
     const admission = ok(readAssessmentIntentAt(f.store, f.project, reference(intent)));
     const admitted = ok(recordCall(f.store, f.project, { call: admission.call, purpose: 'fact-assessment', basis: admission.basis,
@@ -1355,7 +1357,7 @@ test('11 H1.0b received S and N cease application with exact receipt, unchanged 
 
 
 test('18 H1.0b missing fact intents remain mandatory and a ceased child cannot hide its unpaid neighbour', async t => {
-  const f = fixture(t, true, false, true, false, true), request = await f.original();
+  const f = fixture(t, true, false, false, true), request = await f.original();
   const binding = ok(readCompletionBinding(f.store, f.project, reference(f.series), 1))!;
   const current = () => ok(readCompletionWorkAt(f.store, f.project, reference(f.store.get(completionWorkId(f.project, binding.id))!)));
   const facts = current().assignments.filter(row => row.value.kind === 'fact'); assert.equal(facts.length, 2);
@@ -1402,7 +1404,7 @@ function configureAssessment(f: ReturnType<typeof fixture>, update: (value: Envi
   return new Environments(f.store).configure(f.project, config, old.revision);
 }
 test('3 H1.0b equivalent environment revisions and unrelated role settings do not justify termination', async t => {
-  const f = fixture(t, false, false, true), request = await f.original(), paid = await paidAssessment(f, request);
+  const f = fixture(t, false, false), request = await f.original(), paid = await paidAssessment(f, request);
   const disposition = ok(prepareAssessmentDisposition(f.store, f.project, reference(paid.intent)))!;
   configureAssessment(f, value => { value.fullCheck.args = ['-v']; value.implementer.model = 'other-original-worker-model'; });
   assert.equal(ok(prepareCompletionCause(f.store, f.project, disposition.assignment)).cause, null);
@@ -1410,7 +1412,7 @@ test('3 H1.0b equivalent environment revisions and unrelated role settings do no
   f.restart(); assert.deepEqual(ok(await assessFact(f.store, request)), result); assert.equal(f.sent().length, 2);
 });
 test('11 H1.0b lawful replacement of the required assessor binding terminates once and reads without current workspace', async t => {
-  const f = fixture(t, false, false, true), request = await f.original(), paid = await paidAssessment(f, request);
+  const f = fixture(t, false, false), request = await f.original(), paid = await paidAssessment(f, request);
   const replacement = configureAssessment(f, value => { value.reviewer.actor = 'different-assessor'; });
   const result = ok(applyAssessmentResult(f.store, paid.apply)); assert.equal(result.value.verdict, 'application-terminated');
   if (result.value.verdict !== 'application-terminated' || result.value.cause.kind !== 'required-record-replaced') assert.fail('replacement cause required');
@@ -1426,7 +1428,7 @@ test('11 H1.0b lawful replacement of the required assessor binding terminates on
   assert.deepEqual(f.store.list().map(reference), history); assert.equal(f.sent().length, 2); writeFileSync(f.sourcePath, data);
 });
 test('17 H1.0b invalid replacement environment cannot masquerade as a cause even with a recomputed Ref', async t => {
-  const f = fixture(t, false, false, true), request = await f.original(), paid = await paidAssessment(f, request);
+  const f = fixture(t, false, false), request = await f.original(), paid = await paidAssessment(f, request);
   const disposition = ok(prepareAssessmentDisposition(f.store, f.project, reference(paid.intent)))!;
   const replacement = configureAssessment(f, value => { value.reviewer.model = 'changed-model'; });
   const cause = ok(prepareCompletionCause(f.store, f.project, disposition.assignment)).cause!;
@@ -1464,7 +1466,7 @@ test('1 H1.0b environment reader preserves optional fields and exact history ind
 test('36 H1.0b semantic apply and application termination race for one terminal and one work revision', async t => {
   for (const first of ['semantic', 'termination'] as const) for (const verdict of ['supported', 'insufficient'] as const)
     await t.test(`${first} wins over ${verdict}`, async child => {
-      const f = fixture(child, false, false, true, false, true), request = await f.original(), paid = await paidAssessment(f, request, verdict);
+      const f = fixture(child, false, false, false, true), request = await f.original(), paid = await paidAssessment(f, request, verdict);
       const bytes = readFileSync(f.sourcePath), originalWrite = f.store.writeMany.bind(f.store);
       if (first === 'semantic') writeFileSync(f.sourcePath, '{changed');
       let raced = false, winner: ReturnType<typeof applyAssessmentResult> | null = null;
@@ -1498,7 +1500,7 @@ test('36 H1.0b semantic apply and application termination race for one terminal 
 test('34 H1.0b claim and not-dispatched exclude each other under both transaction orders', async t => {
   const { prepareCompletionCessation } = await import('../src/om/model-call.js');
   for (const first of ['claim', 'cessation'] as const) await t.test(first, async child => {
-    const f = fixture(child, false, false, true, false, true), request = await f.original();
+    const f = fixture(child, false, false, false, true), request = await f.original();
     const intent = ok(writeAssessmentIntent(f.store, request)), admission = ok(readAssessmentIntentAt(f.store, f.project, reference(intent)));
     const e1 = ok(recordCall(f.store, f.project, { call: admission.call, purpose: 'fact-assessment', basis: admission.basis,
       block: admission.block, gaps: admission.gaps, series: admission.series, attempt: admission.attempt,
@@ -1548,7 +1550,7 @@ test('34 H1.0b claim and not-dispatched exclude each other under both transactio
 
 test('17 H1.0b termination rederives every mandatory source and G4b reads the technical outcome after restart', { todo: "NR1 №3591/№3646: записанное читается доверенно; эту порчу базы ловит om-fsck на старте (test/om-fsck.test.ts)" }, async t => {
   const { writeAnswersGate, readAnswersGate } = await import('../src/om/answers-gate.js');
-  const f = fixture(t, false, false, true, false, true), request = await f.original(), paid = await paidAssessment(f, request);
+  const f = fixture(t, false, false, false, true), request = await f.original(), paid = await paidAssessment(f, request);
   const bytes = readFileSync(f.sourcePath); writeFileSync(f.sourcePath, 'Changed required evidence');
   const terminal = ok(applyAssessmentResult(f.store, paid.apply));
   assert.equal(terminal.value.verdict, 'application-terminated');
@@ -1590,7 +1592,7 @@ test('46 H1.0b saved Environment proof reads after its workspace and executable 
 
 test('37 H1.0b a prepared D5 leaf loses to termination and an orphan leaf is an integrity error', { todo: "NR1 №3646: согласованная перезапись цепочки до новейшей записи — om-fsck её не видит; решение позже" }, async t => {
   for (const orphan of [false, true]) await t.test(orphan ? '17 orphan D5 cannot become termination' : '37 termination excludes a previously prepared D5', async child => {
-    const f = fixture(child, false, false, true, false, true), request = await f.original(), paid = await paidAssessment(f, request);
+    const f = fixture(child, false, false, false, true), request = await f.original(), paid = await paidAssessment(f, request);
     const leaf = ok(prepareE5AcceptedAnswer(f.store, paid.apply));
     if (orphan) ok(writeGuarded(f.store, { unit: 'E5', target: leaf.record.id, writes: leaf.writes, guards: leaf.guards }));
     writeFileSync(f.sourcePath, 'changed');
@@ -1609,7 +1611,7 @@ test('37 H1.0b a prepared D5 leaf loses to termination and an orphan leaf is an 
 });
 
 test('33 H1.0b replacement Environment racing termination is guarded and reuses the same paid receipt', async t => {
-  const f = fixture(t, false, false, true), request = await f.original(), paid = await paidAssessment(f, request);
+  const f = fixture(t, false, false), request = await f.original(), paid = await paidAssessment(f, request);
   configureAssessment(f, v => { v.reviewer.actor = 'changed-one'; });
   const write = f.store.writeMany.bind(f.store); let moved = false;
   f.store.writeMany = ((writes, guards) => {
@@ -1632,7 +1634,7 @@ test('33 H1.0b replacement Environment racing termination is guarded and reuses 
 });
 
 test('39 H1.0b late unpaid E1 retains the prior not-dispatched proof and never gains a claim', async t => {
-  const f = fixture(t, false, false, true, false, true), request = await f.original();
+  const f = fixture(t, false, false, false, true), request = await f.original();
   const intent = ok(writeAssessmentIntent(f.store, request)), admission = ok(readAssessmentIntentAt(f.store, f.project, reference(intent)));
   const disposition = ok(prepareAssessmentDisposition(f.store, f.project, reference(intent)))!;
   const callRequest = { call: admission.call, purpose: 'fact-assessment' as const, basis: admission.basis, block: admission.block,
@@ -1658,7 +1660,7 @@ test('39 H1.0b late unpaid E1 retains the prior not-dispatched proof and never g
 
 test('6 H1.0b settled E1 without physical evidence is not a never-dispatched assignment', async t => {
   const { settleCall } = await import('../src/om/call-record.js');
-  const f = fixture(t, false, false, true, false, true), request = await f.original();
+  const f = fixture(t, false, false, false, true), request = await f.original();
   const intent = ok(writeAssessmentIntent(f.store, request)), admission = ok(readAssessmentIntentAt(f.store, f.project, reference(intent)));
   const disposition = ok(prepareAssessmentDisposition(f.store, f.project, reference(intent)))!;
   const call = ok(recordCall(f.store, f.project, { call: admission.call, purpose: 'fact-assessment', basis: admission.basis, block: admission.block,
@@ -1674,7 +1676,7 @@ test('6 H1.0b settled E1 without physical evidence is not a never-dispatched ass
 
 
 test('22 H1.0b a physical terminal resolves its own MC1 root but retains the other initial root as I', async t => {
-  const f = fixture(t, false, false, true, true);
+  const f = fixture(t, false, false, true);
   const packet = f.store.list('question-packet')[0]!;
   const first = { project: f.project, packet: reference(packet), dispatch: f.dispatch, role: 'implementer' as const };
   writeFileSync(f.scenario, JSON.stringify({ database: f.store.path, steps: [
@@ -1703,7 +1705,7 @@ test('22 H1.0b a physical terminal resolves its own MC1 root but retains the oth
 
 
 test('35 H1.0b independent roots retry their shared work CAS without replacing either E1 plan', t => {
-  const f = fixture(t, false, false, true, true), first = f.store.list('question-packet')[0]!;
+  const f = fixture(t, false, false, true), first = f.store.list('question-packet')[0]!;
   const second = f.otherRoot(), packets = [first, f.store.get(second.request.packet.id)!];
   const prepare = (packet: typeof first) => {
     const result = prepareQuestionPacket(f.store, (packet.value as unknown as import('../src/om/question-packet.js').QuestionPacketRecord).request);
@@ -1737,7 +1739,7 @@ test('35 H1.0b independent roots retry their shared work CAS without replacing e
 
 test('3 H1.0b equivalent configure before assessor claim preserves exact intent, E1 and sole physical expense', async t => {
   for (const entry of ['transport', 'assessFact', 'race'] as const) await t.test(entry, async child => {
-    const f = fixture(child, false, false, true), request = await f.original();
+    const f = fixture(child, false, false), request = await f.original();
     const intent = ok(writeAssessmentIntent(f.store, request)), admission = ok(readAssessmentIntentAt(f.store, f.project, reference(intent)));
     const e1 = { call: admission.call, purpose: 'fact-assessment' as const, basis: admission.basis, block: admission.block,
       gaps: admission.gaps, series: admission.series, attempt: admission.attempt, goal: admission.goal,
@@ -1781,7 +1783,7 @@ test('3 H1.0b equivalent configure before assessor claim preserves exact intent,
 
 test('C28 H1.0b saved mandatory fact intent admits its first E1 after compatible configure', async t => {
   for (const entry of ['direct', 'assessFact'] as const) await t.test(entry, async child => {
-    const f = fixture(child, false, false, true), request = await f.original();
+    const f = fixture(child, false, false), request = await f.original();
     const intent = ok(writeAssessmentIntent(f.store, request));
     configureAssessment(f, () => {}); f.assessor(); f.restart();
     const admission = ok(readAssessmentIntentAt(f.store, f.project, reference(intent)));
@@ -1805,7 +1807,7 @@ test('3 H1.0b staged assessor role agrees at cessation, transport and historical
     // field outside the roles is no cause by one formula (№1604), so it is checked once.
     for (const changed of ['implementer', 'reviewer', 'common', ...(stage === 'intent' ? ['none'] as const : [])] as const)
       await t.test(`${stage}/${changed}`, async child => {
-        const f = fixture(child, false, false, true), request = await f.original();
+        const f = fixture(child, false, false), request = await f.original();
         const intent = ok(writeAssessmentIntent(f.store, request)), admission = ok(readAssessmentIntentAt(f.store, f.project, reference(intent)));
         const e1 = { call: admission.call, purpose: 'fact-assessment' as const, basis: admission.basis, block: admission.block,
           gaps: admission.gaps, series: admission.series, attempt: admission.attempt, goal: admission.goal,
