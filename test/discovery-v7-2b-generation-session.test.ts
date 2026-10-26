@@ -155,7 +155,8 @@ test("2b-SES a saved envelope becomes one prepared session: deterministic identi
   assert.equal(session.kind, FRAME_INTERPRETATION_SESSION_KIND);
   assert.equal(session.revision, 1);
   assert.equal(session.value.contract, FRAME_INTERPRETATION_SESSION_CONTRACT);
-  assert.equal(session.id, `frame-interpretation-session:${project}:${session.id.split(":").at(-1)}`);
+  assert.equal(session.id, `frame-interpretation-session:${project}:${hashJson(session.value)}`,
+    "the deterministic identity derives from the whole bound value");
   // Bound grounds are the proven request and envelope — never today's heads.
   assert.equal(canonical(session.value.request), canonical(env.request));
   assert.equal(canonical(session.value.envelope), canonical(env));
@@ -281,7 +282,7 @@ test("2b-SES late heads of frame, brief, Source and environment leave the exact 
   });
 });
 
-test("2b-SES a second Store racing the create finds the winner; a forged or mutated session never passes the reader", (t) => {
+test("2b-SES a second Store racing the create lands between the absent read and expected:0 — the first prepare returns the lawful winner", (t) => {
   const f = discoveryFixture(t, "omg-2bs-race-"), project = "vault";
   const wireFile = join(f.root, "wire.ndjson");
   saveEnvironment(f, project);
@@ -289,22 +290,35 @@ test("2b-SES a second Store racing the create finds the winner; a forged or muta
   const req = requestOf(project, b);
   const input = envelopeInput(project, f.root);
   const env = prepareFrameInterpretationEnvelope(f.store, req, input);
-  const session = prepareFrameInterpretationSession(f.store, req, input, structuredClone(env));
-  // A racing Store creating "the same" session lands on expected:0 — the
-  // winner is never overwritten; its prepare is a plain repeat read.
-  const other = f.open();
-  assert.equal(code(() => other.writeMany([{ id: session.id,
-    kind: FRAME_INTERPRETATION_SESSION_KIND, expected: 0,
-    value: { ...structuredClone(session.value), result: { imitation: true } } }])),
-    "revision_conflict");
-  assert.equal((f.store.get<FrameInterpretationSession>(session.id)!.value).result, null,
-    "the winner is never overwritten");
-  noWrite(other, wireFile, () => {
-    const raced = prepareFrameInterpretationSession(other, req, input, structuredClone(env));
-    assert.equal(canonical(raced.value), canonical(session.value));
-    assert.equal(sessions(other).length, 1, "no duplicate session exists");
-  });
-  // Forged rows presented to the reader refuse at their exact door.
+  const first = f.store, second = f.open();
+  const before = state(first, wireFile);
+  // Inside the first prepare's own writeMany — after its absent head read and
+  // before its expected:0 insert commits — the second Store lawfully prepares
+  // the same session and wins the create.
+  let winner: Revision<FrameInterpretationSession> | null = null;
+  const original = first.writeMany.bind(first);
+  (first as any).writeMany = (writes: Parameters<Store["writeMany"]>[0],
+    guards?: Parameters<Store["writeMany"]>[1]) => {
+    if (!winner)
+      winner = prepareFrameInterpretationSession(second, req, input, structuredClone(env));
+    return original(writes, guards);
+  };
+  let raced: Revision<FrameInterpretationSession>;
+  try { raced = prepareFrameInterpretationSession(first, req, input, structuredClone(env)); }
+  finally { delete (first as any).writeMany; } // no own method is left on the Store
+  const won = winner as Revision<FrameInterpretationSession> | null;
+  assert.ok(won, "the second store created the session inside the window");
+  assert.equal(raced.id, won.id, "the first prepare returns the exact winner ref");
+  assert.equal(canonical(raced.value), canonical(won.value));
+  assert.equal(sessions(first).length, 1, "the race wrote no duplicate session");
+  const session = f.store.get<FrameInterpretationSession>(raced.id, raced.revision)!;
+  // The write touched exactly the one session row — nothing else moved.
+  const after = state(first, wireFile);
+  assert.equal(after.calls, "[]"); assert.equal(after.ledger, "[]"); assert.equal(after.wire, null);
+  const newIds = (JSON.parse(after.heads) as { id: string; kind: string }[])
+    .filter(row => !(JSON.parse(before.heads) as { id: string }[]).some(o => o.id === row.id));
+  assert.deepEqual(newIds.map(row => row.kind), [FRAME_INTERPRETATION_SESSION_KIND]);
+  // Forged or missing refs refuse at their exact reader doors.
   noWrite(f.store, wireFile, () => {
     assert.equal(code(() => readFrameInterpretationSession(f.store, project,
       { id: `frame-interpretation-session:${project}:${"0".repeat(64)}`, revision: 1, hash: "0".repeat(64) })),
@@ -314,18 +328,19 @@ test("2b-SES a second Store racing the create finds the winner; a forged or muta
     assert.equal(code(() => readFrameInterpretationSession(f.store, project,
       { id: session.id, revision: 1, hash: "1".repeat(64) })), "frame_session_mismatch");
   });
-  // A directly written forged row — right kind, wrong derived id — is caught
-  // at the noncanonical-address check.
-  const forged = structuredClone(session.value);
-  forged.archive = env.archive; // still the same archive — but under a foreign project field
-  forged.project = "other-yard";
-  const forgedId = `frame-interpretation-session:other-yard:${"a".repeat(64)}`;
-  f.store.writeMany([{ id: forgedId, kind: FRAME_INTERPRETATION_SESSION_KIND, expected: 0, value: forged }]);
+  // A fully consistent session of the same project under a wrong address —
+  // every byte lawful — refuses at the derived-id door alone; this probe
+  // stands or falls with that comparison, not another inconsistency.
+  const wrongId = `frame-interpretation-session:${project}:wrong-address`;
+  f.store.writeMany([{ id: wrongId, kind: FRAME_INTERPRETATION_SESSION_KIND,
+    expected: 0, value: structuredClone(session.value) }]);
   noWrite(f.store, wireFile, () => {
-    const c = code(() => readFrameInterpretationSession(f.store, "other-yard",
-      { id: forgedId, revision: 1, hash: f.store.get(forgedId)!.hash }));
-    assert.ok(["frame_session_missing", "frame_session_mismatch", "frame_session_invalid",
-      "frame_request_mismatch", "frame_pack_mismatch"].includes(c), `forged session refused, got ${c}`);
+    const row = f.store.get(wrongId)!;
+    assert.deepEqual([code(() => readFrameInterpretationSession(f.store, project,
+      { id: row.id, revision: row.revision, hash: row.hash })),
+      field(() => readFrameInterpretationSession(f.store, project,
+        { id: row.id, revision: row.revision, hash: row.hash }))],
+      ["frame_session_mismatch", "record"]);
   });
 });
 
@@ -373,6 +388,14 @@ test("2b-SES masquerading paid, selected, applied or foreign-purpose fields refu
     value: { ...environmentValue(project, f.root), timeoutMs: 91000 } }])[0]!;
   forge("environment", v => { v.environment = reference(laterEnv); },
     ["frame_session_mismatch", "environment"], true);
+  // A role that is no declared role of the saved environment — same model and
+  // effort, so the wire bytes and capacity stay identical and the membership
+  // door itself fires — for the reader on a record under its own derived id.
+  const foreignRole: RoleBinding = { actor: "outside-actor", model: IMPLEMENTER.model,
+    effort: IMPLEMENTER.effort, command: { executable: "outside-runner", args: ["run"] } };
+  forge("role", v => { v.role = structuredClone(foreignRole);
+    v.input.role = structuredClone(foreignRole); },
+    ["frame_session_mismatch", "role"], true);
   noWrite(f.store, wireFile, () => {
     for (const { id, revision, hash, expected } of probes) {
       const ref = { id, revision, hash };
@@ -390,6 +413,15 @@ test("2b-SES masquerading paid, selected, applied or foreign-purpose fields refu
     // measures it before the field compare reaches the input field.
     assert.equal(code(() => prepareFrameInterpretationSession(f.store, req, roleSwap,
       structuredClone(env))), "research_capacity_invalid");
+    // Same model and effort but a foreign actor and command: the rebuilt
+    // envelope and capacity match byte for byte, so the prepare membership
+    // door itself refuses — not an earlier capacity or input door.
+    const foreignInput = { ...input, role: { actor: "outside-actor", model: IMPLEMENTER.model,
+      effort: IMPLEMENTER.effort, command: { executable: "outside-runner", args: ["run"] } } };
+    assert.deepEqual([code(() => prepareFrameInterpretationSession(f.store, req, foreignInput,
+      structuredClone(env))),
+      field(() => prepareFrameInterpretationSession(f.store, req, foreignInput, structuredClone(env)))],
+      ["frame_session_mismatch", "role"]);
     // An environment of another project refuses at the envelope's own binding.
     const foreignProject = { ...input, environment: environmentValue("other-yard", f.root) };
     assert.equal(field(() => prepareFrameInterpretationSession(f.store, req, foreignProject,
