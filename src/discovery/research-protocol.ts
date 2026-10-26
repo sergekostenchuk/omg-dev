@@ -233,11 +233,14 @@ function preparedAssessmentCall(reservation: AssessmentReservation | null, call:
 export function prepareResearchEnvelope(role: RoleBinding, environment: Environment, prompt: string,
   context: unknown, audit?: Pick<ResearchCallAudit, 'store' | 'draftId' | 'questionId' | 'purpose' | 'pilot' | 'contextContract'>,
   capacity?: Record<string, any>, requestId = '00000000-0000-0000-0000-000000000000',
-  requestContract?: string) {
+  requestContract?: string, requestLimitChars?: number) {
   requireCondition(!packetDossierSubject(context) && !packetDossierSubject(capacity?.bindings)
     && audit?.purpose !== 'dossier-assessor', 'discovery_dossier_transport_invalid',
   'A dossier needs the asynchronous envelope preflight');
-  return buildResearchEnvelope(role, environment, prompt, context, audit, capacity, requestId, requestContract);
+  requireCondition(requestLimitChars === undefined || Number.isSafeInteger(requestLimitChars) && requestLimitChars > 0,
+    'research_request_limit_invalid', 'A separate physical request limit must be a positive safe integer');
+  return buildResearchEnvelope(role, environment, prompt, context, audit, capacity, requestId, requestContract,
+    undefined, requestLimitChars);
 }
 
 /** Callable dossier preflight: accepted async proof, ordinary capacity arithmetic,
@@ -280,7 +283,8 @@ export async function prepareDossierResearchEnvelope(role: RoleBinding, environm
 function buildResearchEnvelope(role: RoleBinding, environment: Environment, prompt: string,
   context: unknown, audit?: Pick<ResearchCallAudit, 'store' | 'draftId' | 'questionId' | 'purpose' | 'pilot' | 'contextContract'>,
   capacity?: Record<string, any>, requestId = '00000000-0000-0000-0000-000000000000',
-  requestContract?: string, dossier?: Awaited<ReturnType<typeof prepareDossierContextPacker>>) {
+  requestContract?: string, dossier?: Awaited<ReturnType<typeof prepareDossierContextPacker>>,
+  requestLimitChars?: number) {
   const draft = audit?.store.get<DiscoveryDraft>(audit.draftId);
   const planSubject = packetPlanSubject(capacity?.bindings ?? {});
   const assessmentSubject = packetAssessmentSubject(context);
@@ -324,8 +328,9 @@ function buildResearchEnvelope(role: RoleBinding, environment: Environment, prom
   const envelope = { protocol: "omg-agent/v1", requestId, mode: "research", model: role.model,
     effort: role.effort, ...(role.speed ? { speed: role.speed } : {}), prompt: consolidating ? ((context as any)?.consolidation?.tightening ? TIGHTENING_INSTRUCTION : '') + CONSOLIDATION_INSTRUCTION : finalizing ? finalInstruction : packetState && !packetState.initial && !dossier ? continuationPrompt(audit!.purpose, prompt) + (audit!.purpose === 'analyst' && !planSubject ? COMPACT_CHECKPOINT_INSTRUCTION : '') : prompt };
   const packingContext = capacity === undefined ? context : { ...context as Record<string, unknown>, resultCapacity: capacity };
-  const requestLimit = capacity === undefined ? audit?.pilot?.value.maxRequestChars ?? DEFAULT_RESEARCH_REQUEST_CHARS
-    : capacity.envelopeLimitChars;
+  const requestLimit = requestLimitChars === undefined
+    ? (capacity === undefined ? audit?.pilot?.value.maxRequestChars ?? DEFAULT_RESEARCH_REQUEST_CHARS : capacity.envelopeLimitChars)
+    : Math.min(requestLimitChars, audit?.pilot?.value.maxRequestChars ?? requestLimitChars);
   const outputLimit = researchResponseOutputLimit(audit?.pilot?.value.physicalLimits?.maxReplyChars ?? null);
   const overhead = JSON.stringify(outputLimit).length + 32 + Math.max(JSON.stringify({ ...envelope, subject: {} }).length,
     controls && !consolidating ? JSON.stringify({...envelope,prompt:finalInstruction,subject:{}}).length : 0) + (packetState ? 4000 : 0);
