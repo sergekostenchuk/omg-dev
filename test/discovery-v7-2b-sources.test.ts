@@ -12,6 +12,7 @@ import { createPartialV7Draft, discoveryAcceptanceActId, isDiscoveryV7Draft,
   type DiscoveryAcceptanceAct } from "../src/discovery/v7-contracts.js";
 import { discoveryPrefixClosureId } from "../src/discovery/discovery.js";
 import { reuseResearch } from "../src/discovery/research-reuse.js";
+import { savedAcceptanceAct } from "../src/discovery/projection-reader.js";
 import { projectFrameInterpretations } from "../src/discovery/frame-interpretations.js";
 import { collectFrameInterpretationSubject, checkFrameInterpretationSubject,
   decodeFrameInterpretationSubject  , FRAME_SUBJECT_CONTRACT,
@@ -30,6 +31,31 @@ const TEXT_BRIEF = "XX Учёт материалов ведётся на цен�
 const RANGE = { kind: "text-range", start: 3, end: 62 } as const;
 const JSON_DOC = JSON.stringify({ meta: { author: "owner" },
   brief: "Учёт материалов: склад и списание на объектах", extra: { notes: ["a", "b"] } });
+
+/** A read-only block boundary: every head and every revision history, the
+ * model calls and the ledger stay byte-identical across the action. */
+const noWrite = async <T>(store: Store, action: () => T | Promise<T>): Promise<T> => {
+  const snap = () => canonical(store.list().map(row => reference(row)));
+  const hist = () => canonical(store.list().map(row => [row.id, store.history(row.id).map(r => r.revision)]));
+  const before = snap(), beforeHist = hist(), calls = canonical(store.list("model-call")),
+    ledger = canonical(store.list("ledger"));
+  const result = await action();
+  assert.equal(snap(), before); assert.equal(hist(), beforeHist);
+  assert.equal(canonical(store.list("model-call")), calls);
+  assert.equal(canonical(store.list("ledger")), ledger);
+  return result;
+};
+const noWriteSync = <T>(store: Store, action: () => T): T => {
+  const snap = () => canonical(store.list().map(row => reference(row)));
+  const hist = () => canonical(store.list().map(row => [row.id, store.history(row.id).map(r => r.revision)]));
+  const before = snap(), beforeHist = hist(), calls = canonical(store.list("model-call")),
+    ledger = canonical(store.list("ledger"));
+  const result = action();
+  assert.equal(snap(), before); assert.equal(hist(), beforeHist);
+  assert.equal(canonical(store.list("model-call")), calls);
+  assert.equal(canonical(store.list("ledger")), ledger);
+  return result;
+};
 
 const code = (fn: () => unknown): string => {
   try { fn(); } catch (error) {
@@ -389,7 +415,7 @@ test("2b.1-S the local refusal catalogue is exactly the three subject codes; for
   assert.ok(foreign.has("research_consumer_intent_invalid"), "the selector mechanism keeps its addressed refusal");
 });
 
-test("2b.1-S a rebound frame accepted through real reuse still resolves its own accepted brief; hot and cold reads agree", (t) => {
+test("2b.1-S a rebound frame accepted through real reuse still resolves its own accepted brief; hot and cold reads agree", async (t) => {
   const f = discoveryFixture(t, "omg-2bs-reuse-"), project = "reuse";
   const first = base(f, project);
   // The second v7 draft of the same project, stage, specs, consumer and
@@ -419,6 +445,23 @@ test("2b.1-S a rebound frame accepted through real reuse still resolves its own 
     "a cold reopen resolves the same historical subject");
   const checked = checkFrameInterpretationSubject(f.open(), req, structuredClone(pkg));
   assert.deepEqual(checked, pkg);
+  // A late brief re-acceptance after the frame is real history — but the
+  // mandate stays the acceptance in effect at the frame's saved draft
+  // revision: the late source never stands in for it.
+  const late = f.discovery.evidence.document(project, "late-src", TEXT_BRIEF, "text/plain", 0);
+  const briefHead = f.store.get<Question>(briefQ2.id)!;
+  f.discovery.reopen(briefHead.id, briefHead.revision);
+  f.engine.discovery.fact(briefQ2.id, f.store.get<Question>(briefQ2.id)!.revision, reference(late), { ...RANGE });
+  assert.deepEqual(await noWrite(f.store, () => collectFrameInterpretationSubject(f.store, req)), pkg,
+    "the historical package is unchanged by the late acceptance");
+  assert.deepEqual(collectFrameInterpretationSubject(f.open(), req), pkg, "a cold store agrees");
+  const cold = f.open();
+  assert.deepEqual(await noWrite(cold, () => checkFrameInterpretationSubject(cold, req, structuredClone(pkg))), pkg);
+  assert.equal(code(() => collectFrameInterpretationSubject(f.store,
+    { project, frame: frameRef2, mandate: { source: reference(late), selector: { ...RANGE } } })),
+    "frame_subject_mismatch", "the late source is not the historical mandate");
+  assert.equal(field(() => collectFrameInterpretationSubject(f.store,
+    { project, frame: frameRef2, mandate: { source: reference(late), selector: { ...RANGE } } })), "mandate");
 });
 
 test("2b.1-S a hidden before-revision of the saved brief act refuses; the acceptance is proven through the shared reader, not borrowed fields", (t) => {
@@ -443,6 +486,42 @@ test("2b.1-S a hidden before-revision of the saved brief act refuses; the accept
       assert.equal(field(fn), "mandate");
     }
   } finally { delete (f.store as { get?: unknown }).get; }
+});
+
+test("2b.1-S the shared reader still refuses a malformed managed research-answer address; only proven non-managed answers carry no turn", (t) => {
+  const f = discoveryFixture(t, "omg-2bs-managed-"), project = "managed-x";
+  const b = base(f, project);
+  const head = f.store.get<DiscoveryDraft>(b.draft.id)!;
+  // Positive right beside it: the real fact acceptance of this draft proves
+  // through the same shared door — absence of a managed turn is its lawful form.
+  const briefQ = f.store.get<Question>(b.briefQ.id)!;
+  assert.equal(noWriteSync(f.store,
+    () => savedAcceptanceAct(f.store, head, briefQ, "brief", briefQ.value.answer!, head.value.fields.brief!)), true);
+  // A consistent crafted act — real transitions, real assessment — but its
+  // answer carries a malformed managed research-answer address: the shared
+  // reader must refuse it, not read it as a binding-less acceptance.
+  const planQ = questionOf(f.store, b.draft, "plan");
+  const planted = { planted: true } as unknown as Json;
+  const fakeAssessment = f.store.write({ id: `research-assessment:${project}:planted`, kind: "research-assessment",
+    expected: 0, value: { projectId: project, question: reference(planQ), value: planted,
+      observations: [{}], verdict: "supported", reasons: [], researcher: "a", assessor: "b",
+      environment: reference(b.src) } as never });
+  const fakeAnswer = f.store.write({ id: `research-answer:${project}:managed-v1:%`, kind: "research-answer",
+    expected: 0, value: { projectId: project, question: planQ.id, value: planted,
+      assessment: reference(fakeAssessment) } as never });
+  const badRef = reference(fakeAnswer);
+  const qAfter = f.store.write<Question>({ id: planQ.id, kind: "question", expected: planQ.revision,
+    value: { ...planQ.value, status: "answered", answer: badRef } });
+  const dAfter = f.store.write<DiscoveryDraft>({ id: b.draft.id, kind: "discovery-draft", expected: head.revision,
+    value: { ...head.value, fields: { ...head.value.fields, plan: planted } } });
+  const realAct = f.store.get<DiscoveryAcceptanceAct>(discoveryAcceptanceActId(project, b.draft.id, "frame", b.frameRef), 1)!;
+  f.store.write({ id: discoveryAcceptanceActId(project, b.draft.id, "plan", badRef), kind: "discovery-acceptance-act",
+    expected: 0, value: { ...realAct.value, field: "plan", draftBefore: reference(head), draftAfter: reference(dAfter),
+      questionBefore: reference(planQ), questionAfter: reference(qAfter), answer: badRef,
+      assessment: reference(fakeAssessment), binding: null } });
+  assert.equal(noWriteSync(f.store,
+    () => savedAcceptanceAct(f.store, dAfter, f.store.get<Question>(planQ.id)!, "plan", badRef, planted)), false,
+    "a malformed managed research-answer address is refused, not read as a binding-less acceptance");
 });
 
 test("2b.1-S an accepted frame of another stage is not a D1 subject: the saved draft and question must stand at the Discovery v7 boundary", (t) => {

@@ -282,6 +282,10 @@ function provenBrief(store: Store, project: string, frame: FrameProvenance): Obs
       const act = store.get<DiscoveryAcceptanceAct>(
         discoveryAcceptanceActId(project, draft.id, 'brief', answerRef), 1);
       if (!act || act.kind !== DISCOVERY_ACCEPTANCE_ACT_KIND || hashJson(act.value) !== act.hash) continue;
+      // Only an acceptance in effect at the frame's saved draft revision counts:
+      // a later re-acceptance lives past it and never rewrites the historical
+      // mandate (2B-SOURCES-02).
+      if (!isRef(act.value.draftAfter) || act.value.draftAfter.revision > draft.revision) continue;
       const brief = prove(question, answerRef);
       if (brief !== null) return brief;
     }

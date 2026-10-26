@@ -797,14 +797,18 @@ export function savedAcceptanceAct(view: RecordView, draft: Revision<DiscoveryDr
       }
     }
 
-    // Managed binding. Адрес не-research-answer (fact/decision) не несёт
-    // managed turn id вовсе — это отсутствие связки, а не испорченный managed
-    // ответ: такое принятие доказывается с binding === null ниже.
+    // Managed binding. Доказанный вид ответа решает, есть ли turn id вовсе:
+    // fact/decision/design (ветвь assessment === null выше — там research-answer
+    // уже отвергнут) managed turn не несут — для них связки просто нет. У
+    // research-answer ошибка адресной идентичности остаётся отказом — испорченный
+    // managed-адрес не читается как ответ без связки.
     let turnId: string | null = null;
-    try {
-      turnId = managedAnswerTurn(ref.id, draft.value.projectId);
-    } catch {
-      turnId = null;
+    if (a.assessment !== null) {
+      try {
+        turnId = managedAnswerTurn(ref.id, draft.value.projectId);
+      } catch {
+        return false;
+      }
     }
     if (turnId !== null) {
       if (!a.binding || !isRef(a.binding)) return false;
