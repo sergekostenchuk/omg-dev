@@ -308,7 +308,7 @@ test('E4 cycle saves delivery overflow without a second dispatch or context trun
 
 
 async function e4WorksHandoff(t: TestContext, split: boolean) {
-  const f = e4WorksFixture(t, true), config = split ? f.environment(currentPacketWire(f.packet.value.packet, null) - 1) : f.configured;
+  const f = e4WorksFixture(t), config = split ? f.environment(currentPacketWire(f.packet.value.packet, null) - 1) : f.configured;
   const packet = split ? valueOf(writeQuestionPacket(f.store, { ...f.packetRequest, environment: reference(config) })).record : f.packet;
   assert.equal(packet.value.state, 'ready'); assert.equal(packet.value.plan!.mode, split ? 'parts' : 'whole');
   const count = packet.value.plan!.assignments.length;

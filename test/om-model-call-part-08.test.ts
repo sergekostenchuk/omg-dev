@@ -525,7 +525,7 @@ test('MP3 №3171 (novelty): an existing empty directory is new knowledge the fi
 
 
 test('LP5 (№3278 rows 17, 19) a reuse carries a non-empty D7 to today\'s handoff: the same assignments by their common key, today\'s binding ids and scopes, every consumer and its tests kept; an old D7 is refused; G5 reads the reuse as a checked source of today\'s handoff', { todo: "NR1 №3646: согласованная перезапись цепочки до новейшей записи — om-fsck её не видит; решение позже" }, async t => {
-  const f = e4WorksFixture(t, true), project = f.project;
+  const f = e4WorksFixture(t), project = f.project;
   const series = () => reference(f.store.get(f.series.id)!);
   const first = valueOf(readCompletionBinding(f.store, project, series(), 1))!;
   valueOf(writeAnswersRegistration(f.store, { project, binding: reference(first) }));

@@ -319,7 +319,7 @@ export async function e4ManagedFixture(t: TestContext, kind: Parameters<typeof e
 }
 
 /** The current works carrier opens only its own M6 batch; callers explicitly execute and G7-close it. */
-export function e4ManagedWorksFixture(t: TestContext) { return e4WorksFixture(t, true); }
+export function e4ManagedWorksFixture(t: TestContext) { return e4WorksFixture(t); }
 
 
 export function e4Fact(f: ReturnType<typeof e4Fixture>) {
@@ -347,8 +347,8 @@ export function e4Node(f: ReturnType<typeof e4Fixture>, packet: Revision<Questio
 
 
 
-/** A first works pass through C2/C4/C5, with a genuine owner assignment and no accepted L3. */
-export function e4WorksFixture(t: TestContext, managed = false) {
+/** A first works pass through C2/C4/C5, with a genuine owner assignment and no accepted L3; its attempt is the managed one, opened over this works batch. */
+export function e4WorksFixture(t: TestContext) {
   const root = mkdtempSync(join(tmpdir(), 'omg-e4-works-')), database = join(root, 'state.sqlite'), project = 'garden';
   let store = new Store(database), engine = new ProductEngine(store);
   t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
@@ -406,8 +406,11 @@ export function e4WorksFixture(t: TestContext, managed = false) {
   const goal = { key: 'e4-work', questions: batch.items.map(item => gapLineKey(project, item.target, item.field)),
     result: gapLineExpectedResult(project, batch.items[0]!.target, batch.items[0]!.field) };
   // LP5: a managed attempt plans exactly this works batch of the routes (its completion owner and work registry).
-  const series = valueOf((managed ? managedOpenAttempt : beginAttempt)(store, { ...address, attempt: 1, goal,
-    ...(managed ? { completion: { routes: reference(routes), batches: [batch.id] } } : {}) } as never));
+  const completion = { routes: reference(routes), batches: [batch.id] };
+  const series = valueOf(managedOpenAttempt(store, { ...address, attempt: 1, goal, completion } as never));
+  const workBinding = valueOf(readCompletionBinding(store, project, reference(series), 1));
+  assert.ok(workBinding, 'The managed opening writes its binding');
+  assert.deepEqual(workBinding.value.plan, completion);
   const scenario = join(root, 'scenario.json'), trace = join(root, 'trace.jsonl');
   const command = { executable: process.execPath, args: [fixturePath, '--scenario', scenario, '--trace', trace] };
   function environment(requestCapacityChars = 100_000) {
@@ -422,6 +425,8 @@ export function e4WorksFixture(t: TestContext, managed = false) {
   const packetRequest: QuestionPacketRequest = { project, routes: reference(routes), batch: batch.id, environment: reference(configured),
     attempt: { series: reference(series), ordinal: 1 }, previous: [], works: { producer: reference(ledger.producer), ledger: reference(ledger.record) } };
   const packet = valueOf(writeQuestionPacket(store, packetRequest)).record;
+  assert.equal(packet.value.state, 'ready');
+  assert.deepEqual(packet.value.request.attempt, { series: reference(series), ordinal: 1 });
   const request: ModelCallRequest = { project, packet: reference(packet), dispatch: { adapter: reference(adapter), config: reference(configured) }, role: 'implementer' };
   const work = structuredClone(desired.nodes.find(node => node.id === 'garden-produce-work')!);
   const tests = structuredClone(desired.tests.filter(test => work.tests.includes(test.id)));
@@ -440,6 +445,7 @@ export function e4WorksFixture(t: TestContext, managed = false) {
     return { protocol: '$answerProtocol', requestId: '$requestId', action: 'answer', proposal,
       bindings: position === plan.assignments.length - 1 ? bindings : [] };
   }
+  assert.ok(!existsSync(trace), 'The target E4 has sent nothing yet');
   return { project, packet, request, packetRequest, series, ledger, bindings, work, answer, environment, configured, address, goal,
     graph, layer2, upperFrame, frame2, lines, gapRead, routes, batch, desired, root,
     get store() { return store; }, restart() { store.close(); store = new Store(database); engine = new ProductEngine(store); },

@@ -3566,7 +3566,7 @@ test('RB1 (№4285, №4291, №4293): the root over a reopened frame is om-brie
 });
 
 test('RB1 current managed works root without reopening refuses forged om-brief/v3 admission while exact reads preserve both revisions after restart', t => {
-  const f = e4WorksFixture(t, true), first = f.packet;
+  const f = e4WorksFixture(t), first = f.packet;
   const binding = ok(readCompletionBinding(f.store, f.project, f.packetRequest.attempt!.series, f.packetRequest.attempt!.ordinal));
   assert.ok(binding);
   assert.deepEqual(binding.value.plan, { routes: reference(f.routes), batches: [f.batch.id] });
