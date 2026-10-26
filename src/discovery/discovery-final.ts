@@ -82,9 +82,13 @@ function originalBrief(store:Store,project:string,draft:Revision<DiscoveryDraft>
   const boundary=draftBoundary(store,draft);
   let candidates=draft.value.questions.map(id=>store.getAtEvent<Question>(boundary,id)).filter(row=>row?.value?.spec?.field==='brief');
   // The draft write can precede its question-after in the same atomic acceptance.
-  // Only its exact saved act can name that after-revision; presence alone proves nothing.
+  // Only the canonical act can name that after-revision. The shared reader below
+  // must prove this same act and its transition, bounded by the saved draft.
   const sameBatch=store.list<DiscoveryAcceptanceAct>(DISCOVERY_ACCEPTANCE_ACT_KIND).filter(row=>
-    row.value?.projectId===project && row.value.draftId===draft.id && row.value.field==='brief' && same(row.value.draftAfter,reference(draft)));
+    row.value?.projectId===project && row.value.draftId===draft.id && row.value.field==='brief'
+    && row.revision===1 && isRef(row.value.answer)
+    && row.id===discoveryAcceptanceActId(project,draft.id,'brief',row.value.answer)
+    && same(row.value.draftAfter,reference(draft)));
   requireFinal(sameBatch.length<=1,'The original brief has mixed acceptances');
   if(sameBatch.length){
     const act=exact<DiscoveryAcceptanceAct>(store,reference(sameBatch[0]!),DISCOVERY_ACCEPTANCE_ACT_KIND);
@@ -107,6 +111,12 @@ function originalBrief(store:Store,project:string,draft:Revision<DiscoveryDraft>
   const acceptanceId=discoveryAcceptanceActId(project,draft.id,'brief',q.answer);
   const saved=store.get<DiscoveryAcceptanceAct>(acceptanceId,1);requireFinal(saved,'The original brief acceptance is missing');
   const acceptance=exact<DiscoveryAcceptanceAct>(store,reference(saved),DISCOVERY_ACCEPTANCE_ACT_KIND);
+  requireFinal(same(acceptance.value.questionAfter,reference(question))
+    && isRef(acceptance.value.draftAfter) && acceptance.value.draftAfter.id===draft.id
+    && acceptance.value.draftAfter.revision<=draft.revision
+    && (acceptance.value.draftAfter.revision<draft.revision || same(acceptance.value.draftAfter,reference(draft)))
+    && (!sameBatch.length || same(reference(acceptance),reference(sameBatch[0]!))),
+    'The original brief acceptance does not prove this question before the saved draft');
   const observation=proven.proof.provenance.observation;
   requireFinal(observation.projectId===project,'The brief observation belongs to another project');
   const source=exact<Source>(store,observation.source,'source');

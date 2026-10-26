@@ -8,7 +8,7 @@ import { EngineError } from '../src/errors.js';
 import { Store } from '../src/storage/store.js';
 import { uniqueTransactionGuards } from '../src/runtime/environment.js';
 import { processStart } from '../src/runtime/process-identity.js';
-import type { DiscoveryDraft, Question } from '../src/discovery/discovery.js';
+import type { DiscoveryDraft, Question, Fact } from '../src/discovery/discovery.js';
 import { Discovery } from '../src/discovery/discovery.js';
 import { ProductEngine } from '../src/product/engine.js';
 import type { ResearchRun } from '../src/discovery/research-model.js';
@@ -34,7 +34,8 @@ import { V7_PLAN_SUBJECT_CONTRACT } from '../src/discovery/v7-managed-attempt.js
 import { provePlanQuestions } from '../src/discovery/v7-plan-questions.js';
 import { answerDiscoveryFixture } from './product-fixture.js';
 import { runDeepResearch } from '../src/discovery/deep-research-execution.js';
-import { V7_AXES, DISCOVERY_CLAIMS_CONTRACT } from '../src/discovery/v7-contracts.js';
+import { V7_AXES, DISCOVERY_CLAIMS_CONTRACT, DISCOVERY_ACCEPTANCE_ACT_KIND,
+  type DiscoveryAcceptanceAct } from '../src/discovery/v7-contracts.js';
 import type { ClaimAddress } from '../src/discovery/claim-address.js';
 import { produceSelectedDossier } from '../src/discovery/selected-dossier.js';
 import { producePartialDossier } from '../src/discovery/dossier-manifest.js';
@@ -59,10 +60,15 @@ const generation = () => ({ action: 'variants', variants: [1, 2].map(i => ({ key
 
 /** The real paid line of 4B.1/4O.2: two assessed plan questions, the variant snapshot, real project modes and the real
  * paid generation of a two-member set with its first state. */
-async function paid(t: test.TestContext, answer: unknown = generation(), withMaterial: boolean|string = false, withBrief=true) {
+async function paid(t: test.TestContext, answer: unknown = generation(), withMaterial: boolean|string = false, withBrief=true, withObjective=false) {
   const f = await researchSetup(t, { adapter: 'reply', prefix: 'omg-64-transport-' }), project = 'p', runs = new Map<string, string>();
   await f.engine.execute({ type: 'create-project', project, title: 'Selected variant scope' });
   if(withBrief)acceptBrief(f,ORIGINAL_BRIEF);
+  if(withObjective) {
+    const draft=f.store.get<DiscoveryDraft>(f.v.draft.id)!;
+    const question=draft.value.questions.map(id=>f.store.get<Question>(id)!).find(q=>q.value.spec.field==='objective')!;
+    f.discovery.decision(question.id,question.revision,'owner','Deliver the accepted assignment');
+  }
   const prepare = (selected = f.subject()) => {
     const context = { history: [], readings: [] };
     const draft = f.store.get<DiscoveryDraft>(f.v.draft.id)!, question = f.store.get<Question>(f.v.plan.id)!;
@@ -309,9 +315,9 @@ function wideDelivery(f:Paid) {
     maxRequestChars:3000000,maxReadChars:128000,maxReplyChars:100000,maxCalls:100,maxReportedTokens:100000,
     physicalLimits:{maxRequestChars:3000000,maxReplyChars:100000,basis:'Full local dossier delivery'}},0);
 }
-async function partial(t:test.TestContext, material?:string, withBrief=true) {
+async function partial(t:test.TestContext, material?:string, withBrief=true, withObjective=false) {
   const f=await paid(t,(snapshot:Ref)=>({action:'no_variants',reasons:[{code:'bounded_search',message:'No bounded variant',grounds:[snapshot]}],
-    searchLimits:['Saved sweep'],unknowns:['Demand unknown']}),material??true,withBrief);
+    searchLimits:['Saved sweep'],unknowns:['Demand unknown']}),material??true,withBrief,withObjective);
   const none=f.store.list<VariantNone>('discovery-variant-none')[0]!;
   const handoff=await publishVariantHandoff(f.store,'p',{draft:reference(f.store.get(f.draft.id)!),result:reference(none),decision:null,scope:null,earlyLimit:false});
   const root=reference((await producePartialDossier(f.store,'p',reference(handoff.record))).record);
@@ -408,6 +414,12 @@ test('final owner: exact paid supported and verbatim original accepted brief aft
   ownerPacket=(await unchanged(owner,owner.store,()=>prepareDiscoveryFinalSubject(owner.store,'p',reference(ownerD6))))!;
   assertFinal(ownerPacket);assert.equal(ownerPacket.assessment.value.result.result.verdict,'supported');
   assert.equal(ownerPacket.dossier.manifest.value.completeness,'complete');
+  // The legal atomic acceptance writes draftAfter before questionAfter.
+  assert.deepEqual(ownerPacket.brief.acceptance.value.draftAfter,ownerPacket.subject.basis.draft);
+  const event=owner.store.eventsPage(0,owner.store.lastEvent(),256).find(row=>
+    row.id===ownerPacket.subject.basis.draft.id && row.revision===ownerPacket.subject.basis.draft.revision)!;
+  assert.ok(event);
+  assert.equal(owner.store.getAtEvent<Question>(event.sequence,ownerPacket.brief.question.id)!.value.status,'open');
 });
 test('final model: cold exact selected input retains original field and paid grounds',async()=>{
   await modelWorld();
@@ -506,4 +518,41 @@ test('final rich: paid return preserves rejected/unassessed/unknown and both blo
 test('final rich: cold packet losing a blocking side refuses without buying again',async()=>{
   const store=owner.open(),fake=structuredClone(richPacket);fake.dossier.contradictions[0]!.sides.pop();
   await unchanged(owner,store,()=>requireDiscoveryFinalPacket(store,'p',fake),true);
+});
+
+
+test('final history: same-text late Source and shadow act cannot replace the canonical original brief hot/cold',async()=>{
+  const f=await partial(lifetime,undefined,true,true);
+  liveAdapter(f,f.packet,'return',false);
+  const d6=await assessDossier(f.store,'p',f.packet.subject,f.environment);
+  const original=(await unchanged(f,f.store,()=>prepareDiscoveryFinalSubject(f.store,'p',reference(d6))))!;
+  assertFinal(original);
+  assert.ok(original.brief.acceptance.value.draftAfter.revision<original.subject.basis.draft.revision);
+  acceptBrief(f,'An intervening assignment');
+  const lateSource=acceptBrief(f,ORIGINAL_BRIEF);
+  assert.equal(lateSource.hash,original.brief.source.hash);
+  assert.ok(lateSource.revision>original.brief.source.revision);
+  const question=f.store.get<DiscoveryDraft>(f.v.draft.id)!.value.questions.map(id=>f.store.get<Question>(id)!)
+    .find(q=>q.value.spec.field==='brief')!;
+  const lateAct=f.store.list<DiscoveryAcceptanceAct>(DISCOVERY_ACCEPTANCE_ACT_KIND)
+    .find(row=>canonical(row.value.answer)===canonical(question.value.answer))!;
+  assert.ok(lateAct);assert.ok(lateAct.value.draftAfter.revision>original.subject.basis.draft.revision);
+  await unchanged(f,f.store,async()=>{
+    assert.deepEqual(await prepareDiscoveryFinalSubject(f.store,'p',reference(d6)),original);
+  });
+  f.store.write({id:'final-test:shadow-brief-act',kind:DISCOVERY_ACCEPTANCE_ACT_KIND,expected:0,
+    value:{...lateAct.value,draftAfter:original.subject.basis.draft}});
+  const forged=structuredClone(original),fact=f.store.get<Fact>(question.value.answer!.id,question.value.answer!.revision)!;
+  forged.brief={question,fact,acceptance:lateAct,source:lateSource,observation:fact.value.observation,text:ORIGINAL_BRIEF};
+  forged.subject.basis.brief={question:reference(question),fact:question.value.answer!,acceptance:reference(lateAct),
+    source:reference(lateSource),selector:forged.brief.observation.selector};
+  const {identity:_,...basis}=forged.subject;
+  forged.subject.identity='discovery-final:'+hashJson(basis as unknown as Json);
+  for(const store of [f.store,f.open()])await unchanged(f,store,async()=>{
+    assert.deepEqual(await prepareDiscoveryFinalSubject(store,'p',reference(d6)),original);
+    assert.deepEqual(await requireDiscoveryFinalSubject(store,'p',original.subject),original);
+    assert.deepEqual(await requireDiscoveryFinalPacket(store,'p',original),original);
+    await assert.rejects(()=>requireDiscoveryFinalSubject(store,'p',forged.subject),e=>e instanceof EngineError);
+    await assert.rejects(()=>requireDiscoveryFinalPacket(store,'p',forged),e=>e instanceof EngineError);
+  });
 });
