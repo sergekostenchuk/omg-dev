@@ -1,6 +1,7 @@
-import test from 'node:test';
+import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { canonical, hashJson, type Json } from '../src/canonical.js';
@@ -16,6 +17,7 @@ import type { ResearchRun } from '../src/discovery/research-model.js';
 import { prepareResearchConsumerIntent } from '../src/discovery/response-recovery.js';
 import { researchCall } from '../src/discovery/research-protocol.js';
 import { REQUEST_MANIFEST_CONTRACT } from '../src/discovery/request-parts.js';
+import { storeRefused, storeUnchanged } from './store-unchanged.js';
 import { assessAttempts, assessAttemptsWithRequirements } from '../src/discovery/research-assessment.js';
 import { projectAttemptPacket } from '../src/discovery/v7-attempt-assessment.js';
 import { applyDiscoveryAssessment, v7ProgressBaseline } from '../src/discovery/v7-progress.js';
@@ -165,28 +167,76 @@ function nextPlan(f: Paid, store: Store) {
 }
 
 // Every heads/history row, the paid calls, the budget ledger and the model wire must be untouched by a summary.
+// The dump compares identity + kind + the stored sha256 of every revision — the content hash written
+// with the row — instead of hauling every body: a committed write always lands in this projection.
 const all = (store: Store) => {
   const db = new DatabaseSync(store.path, { readOnly: true });
   try { return canonical({ heads: db.prepare('SELECT * FROM heads ORDER BY entity_id').all(),
-    revisions: db.prepare('SELECT * FROM revisions ORDER BY entity_id,revision').all() } as never); }
+    revisions: db.prepare('SELECT entity_id,revision,kind,sha256 FROM revisions ORDER BY entity_id,revision').all() } as never); }
   finally { db.close(); }
 };
-async function still<T>(f: { wires: () => unknown }, store: Store, action: () => Promise<T>, refuses: boolean | string = false): Promise<T | undefined> {
-  const before = all(store), calls = money(store), wires = f.wires();
-  let result: T | undefined;
-  if (refuses) await assert.rejects(action, error => error instanceof EngineError && (refuses === true || error.code === refuses));
-  else result = await action();
+/** The cheap part of a read check, kept on every action: the real refusal or
+ * result through the accepted storeUnchanged/storeRefused window (the Store's
+ * own commits + SQLite data_version must be equal — any write to the file by
+ * any connection moves the stamp), plus the paid calls, the budget ledger and
+ * the model wire byte-identical. The full heads/revisions dump is not per
+ * action: it happens once per read-only fixed-point block in fixed(). */
+async function still<T>(store: Store, action: () => Promise<T>, refuses: boolean | string = false): Promise<T | undefined> {
+  if (refuses) { await storeRefused(store, action, error => error instanceof EngineError && (refuses === true || (error as EngineError).code === refuses)); return undefined; }
+  return await storeUnchanged(store, action);
+}
+/** One byte fixed point per read-only block: the full heads/revisions dump,
+ * the paid calls, the budget ledger and the model wire are compared across
+ * the whole block while every action inside keeps its own stamp window — a
+ * write anywhere is caught exactly once per block, not once per row. */
+async function fixed<T>(f: { wires: () => unknown }, store: Store, block: () => Promise<T>): Promise<T> {
+  const before = all(store), calls = money(store), wires = f.wires(), result = await block();
   assert.equal(all(store), before); assert.deepEqual(money(store), calls); assert.deepEqual(f.wires(), wires);
   return result;
 }
-async function setup(t: test.TestContext, model = false) {
-  const f = await paid(t);
+/** A byte fork of a world real producers already built: VACUUM INTO copies the
+ * whole file into a new Store — every saved record, revision and hash identical
+ * at the fork point — and each test continues on its own isolated copy, so its
+ * later writes never reach another test's world. The fork is never a stand-in
+ * for a producer run; it only avoids repeating one. */
+const forkDir = mkdtempSync(join(tmpdir(), 'omg-88-fork-'));
+/** A shared base world is built on this file-level context instead of a test's
+ * own: its fixture cleanup is collected and runs once at file end, so the
+ * root, settings, wire and adapter it produced stay alive for every fork. */
+const baseTeardowns: (() => void)[] = [];
+const baseT = { after: (fn: () => void) => { baseTeardowns.push(fn); } } as test.TestContext;
+after(() => { for (const fn of baseTeardowns.splice(0)) fn(); });
+/** VACUUM INTO writes the whole logical database — WAL included — as one
+ * standalone file; the fork is never a stand-in for a producer run, it only
+ * avoids repeating one. */
+function forkStore(t: test.TestContext, store: Store): Store {
+  const copy = join(forkDir, `fork-${rand()}.sqlite`);
+  const db = new DatabaseSync(store.path, { readOnly: true });
+  try { db.exec(`VACUUM INTO '${copy.replaceAll("'", "''")}'`); } finally { db.close(); }
+  const clone = new Store(copy);
+  t.after(() => { clone.close(); try { rmSync(copy); } catch {} });
+  return clone;
+}
+async function selectWorld(f: Paid, model = false) {
   const decision = model ? await modelChoose(f)
     : (() => { const act = answerVariantChoice(f.store, f.scope!, mint(f.store, f.scope!).authority); return act.decision; })();
   const scope = publishVariantScope(f.store, 'p', reference(decision)).scope;
   return { ...f, scopeRecord: scope, input: { scope: reference(scope), plan: f.v.planAnswer } };
 }
-type Selected = Awaited<ReturnType<typeof setup>>;
+type Selected = Awaited<ReturnType<typeof selectWorld>>;
+type CompleteWorld = Selected & { entries: { industry: Entry; market: Entry } };
+/** The one producer-built paid world of the complete-snapshot section —
+ * calibrated, variant set generated — byte-forked per test. The fork point is
+ * before the decision because the set admits exactly one actor: owner and
+ * model each choose on their own isolated copy, then run the same complete
+ * sweep there. */
+let paidBase: Paid | null = null;
+async function completeWorld(t: test.TestContext, model: boolean): Promise<CompleteWorld> {
+  if (!paidBase) paidBase = await paid(baseT);
+  const f = { ...paidBase, store: forkStore(t, paidBase.store) } as Paid;
+  const selected = await selectWorld(f, model), entries = await complete(selected);
+  return { ...selected, entries };
+}
 function claim(f: Selected, question: string, axis: string, text: string, variants: 'common' | Ref[] = [f.scopeRecord.value.member]): Json {
   return { id: `h-${rand()}`, kind: 'hypothesis', text, axis,
     planQuestions: [{ planAnswer: f.v.planAnswer, planQuestionId: question }], scope: { variants },
@@ -270,12 +320,13 @@ function assertAwaiting(summary: DossierSnapshotStageSummary, text: string) {
   assert.doesNotMatch(text, /supported: true|accepted: true|conceptAdmission: true/);
 }
 
-for (const model of [false, true])
-test(`8.8 dossier summary: real ${model ? 'model' : 'owner'} complete snapshot is one exact historical summary awaiting assessment, without writes or payment`, async t => {
-  const f = await setup(t, model); await complete(f);
+/** The identical complete-snapshot assertions, run once for the owner decision
+ * and once for a real model decision — each on its own fork of the same
+ * producer-built world; only the decision kind differs. */
+async function completeSnapshot(t: test.TestContext, f: CompleteWorld, model: boolean) {
   const saved = produceSelectedDossier(f.store, 'p', f.input), root = reference(saved.record), carrier = saved.record.value;
-  const summary = (await still(f, f.store, () => summarize(f.store, root)))!, s = summary.snapshot;
-  await still(f, f.store, async () => assert.deepEqual(await summarize(f.store, root), summary));
+  const summary = (await still(f.store, () => summarize(f.store, root)))!, s = summary.snapshot;
+  await still(f.store, async () => assert.deepEqual(await summarize(f.store, root), summary));
   assert.equal(summary.contract, 'stage-summary/dossier-snapshot/v1'); assert.equal(summary.project, 'p'); assert.equal(summary.stage, 'discovery');
   assert.deepEqual(s.root, { kind: 'selected', ref: root });
   assert.deepEqual(s.manifest, reference(saved.manifest));
@@ -310,23 +361,32 @@ test(`8.8 dossier summary: real ${model ? 'model' : 'owner'} complete snapshot i
   const late = await deep(f, 'q-market', [claim(f, 'q-market', 'market', 'Late unknown reopens current coverage')]);
   const mr = await assess(f, late, 'unknown', false);
   const second = produceSelectedDossier(f.store, 'p', f.input);
-  const later = (await still(f, f.store, () => summarize(f.store, reference(second.record))))!;
+  const later = (await still(f.store, () => summarize(f.store, reference(second.record))))!;
   assert.notEqual(later.snapshot.subject, s.subject); assert.notDeepEqual(later.snapshot.root, s.root);
   assert.deepEqual(await summarize(f.store, root), summary);
   applyDiscoveryAssessment(f.store, 'p', reference(mr));
   revise(f); modeOf(f.store, model ? 'questions' : 'bypass'); nextPlan(f, f.store);
-  for (const store of [f.store, new Store(f.store.path)]) {
-    if (store !== f.store) t.after(() => store.close());
-    await still(f, store, async () => {
-      assert.deepEqual(await summarize(store, root), summary);
-      assert.deepEqual(await summarize(store, reference(second.record)), later);
-      assert.equal(renderStageSummary(await summarize(store, root)), text);
-    });
-  }
+  // The historical block is read-only end to end: one byte fixed point over it.
+  await fixed(f, f.store, async () => {
+    for (const store of [f.store, new Store(f.store.path)]) {
+      if (store !== f.store) t.after(() => store.close());
+      await still(store, async () => {
+        assert.deepEqual(await summarize(store, root), summary);
+        assert.deepEqual(await summarize(store, reference(second.record)), later);
+        assert.equal(renderStageSummary(await summarize(store, root)), text);
+      });
+    }
+  });
+}
+
+for (const model of [false, true])
+test(`8.8 dossier summary: real ${model ? 'model' : 'owner'} complete snapshot is one exact historical summary awaiting assessment, without writes or payment`, async t => {
+  const f = await completeWorld(t, model);
+  await completeSnapshot(t, f, model);
 });
 
 test('8.8 dossier summary: addressed unknown and both blocking contradiction sides keep content and resolvable return addresses; wrong inputs refuse', async t => {
-  const f = await setup(t), entries = await complete(f), target = addresses(entries.industry)[0]!;
+  const f = await completeWorld(t, false), entries = f.entries, target = addresses(entries.industry)[0]!;
   const contrary = { ...(claim(f, 'q-market', 'market', 'Retained counterargument') as Record<string, Json>),
     contradicts: [target], refutedBy: [target] } as unknown as Json;
   const rejected = await deep(f, 'q-market', [contrary]); await assess(f, rejected, 'rejected');
@@ -335,7 +395,7 @@ test('8.8 dossier summary: addressed unknown and both blocking contradiction sid
       consumer: 'feasibility', blocksCurrentStage: false, moment: 'feasibility', closeCriterion: 'Identify deployment' } } as unknown as Json;
   await deep(f, 'q-market', [unknown]);
   const saved = produceSelectedDossier(f.store, 'p', f.input), root = reference(saved.record);
-  const summary = (await still(f, f.store, () => summarize(f.store, root)))!, s = summary.snapshot;
+  const summary = (await still(f.store, () => summarize(f.store, root)))!, s = summary.snapshot;
   // A complete snapshot may still carry open uncertainty and conflict: complete is never "nothing left to answer".
   assert.equal(s.completeness, 'complete');
   assert.deepEqual(s.materials, { accepted: countOf(saved.materials, 'accepted'), rejected: countOf(saved.materials, 'rejected'), unassessed: countOf(saved.materials, 'unassessed') });
@@ -382,38 +442,41 @@ test('8.8 dossier summary: addressed unknown and both blocking contradiction sid
   const ask = async (request: unknown, project = 'p', stage: unknown = 'discovery', store = f.store) =>
     (stageSummary as (...args: unknown[]) => unknown)(store, project, stage, request);
   const shaped = 'stage_summary_dossier_request_invalid';
-  for (const request of [{ section: 'dossier-snapshot' }, { section: 'dossier-snapshot', decision: s.route.decision }, { section: 'dossier-snapshot', root: null },
-    { section: 'dossier-snapshot', root: undefined }, { section: 'dossier-snapshot', root: [root] }, { section: 'dossier-snapshot', root, complete: true },
-    { section: 'dossier-snapshot', root, manifest: reference(saved.manifest) }, { section: 'dossier-snapshot', root: { ...root, revision: null } },
-    { section: 'dossier-snapshot', root: { id: root.id, revision: root.revision } }])
-    await still(f, f.store, () => ask(request), shaped);
-  for (const stage of ['concept', 'design', null, 'Discovery', 7])
-    await still(f, f.store, () => ask(valid, 'p', stage), shaped);
-  // A well-formed request that names no exact saved root of this project is the proof door's typed refusal.
-  for (const request of [{ section: 'dossier-snapshot', root: { ...root, hash: '0'.repeat(64) } }, { section: 'dossier-snapshot', root: { ...root, id: 'foreign-root' } },
-    { section: 'dossier-snapshot', root: reference(saved.manifest) }, { section: 'dossier-snapshot', root: carrierPart(saved, 'decision') },
-    { section: 'dossier-snapshot', root: carrierPart(saved, 'scope') }, { section: 'dossier-snapshot', root: carrierPart(saved, 'plan') },
-    { section: 'dossier-snapshot', root: { id: reference(saved.manifest).id, revision: reference(saved.manifest).revision, hash: root.hash } },
-    { section: 'dossier-snapshot', root: { id: root.id, revision: root.revision, hash: reference(saved.manifest).hash } }])
-    await still(f, f.store, () => ask(request), true);
-  await still(f, f.store, () => ask(valid, 'foreign'), true);
-  // Without the section name the request is not this door's at all: the synchronous index check refuses it.
-  for (const request of [null, {}, [], [root], { root }, { section: 'dossier-summary', root }])
-    await still(f, f.store, () => ask(request), 'stage_summary_index_request_invalid');
-  // Only this section answers with a Promise; the synchronous sections keep throwing synchronously and refuse what is not theirs.
-  await still(f, f.store, async () => assert.ok(stageSummary(f.store, 'p', 'discovery', valid as DossierSnapshotSummaryRequest) instanceof Promise));
-  await still(f, f.store, async () => assert.throws(() => stageSummary(f.store, 'p', 'discovery', { section: 'dossier-summary', root } as never),
-    (error: unknown) => error instanceof EngineError && error.code === 'stage_summary_index_request_invalid'));
-  // A lost exact ground is a refusal, never a quiet "unassessed" downgrade.
-  const lost = s.unknowns[0]!.claim.container;
-  for (const store of [f.store, new Store(f.store.path)]) {
-    if (store !== f.store) t.after(() => store.close());
-    await still(f, store, async () => assert.deepEqual(await ask(valid, 'p', 'discovery', store), summary));
-    const get = store.get;
-    store.get = ((id: string, rev?: number) => id === lost.id ? null : get.call(store, id, rev)) as typeof store.get;
-    try { await still(f, store, () => ask(valid, 'p', 'discovery', store), true); }
-    finally { delete (store as any).get; }
-  }
+  // Every wrong input below refuses and writes nothing: the whole table is one byte fixed point.
+  await fixed(f, f.store, async () => {
+    for (const request of [{ section: 'dossier-snapshot' }, { section: 'dossier-snapshot', decision: s.route.decision }, { section: 'dossier-snapshot', root: null },
+      { section: 'dossier-snapshot', root: undefined }, { section: 'dossier-snapshot', root: [root] }, { section: 'dossier-snapshot', root, complete: true },
+      { section: 'dossier-snapshot', root, manifest: reference(saved.manifest) }, { section: 'dossier-snapshot', root: { ...root, revision: null } },
+      { section: 'dossier-snapshot', root: { id: root.id, revision: root.revision } }])
+      await still(f.store, () => ask(request), shaped);
+    for (const stage of ['concept', 'design', null, 'Discovery', 7])
+      await still(f.store, () => ask(valid, 'p', stage), shaped);
+    // A well-formed request that names no exact saved root of this project is the proof door's typed refusal.
+    for (const request of [{ section: 'dossier-snapshot', root: { ...root, hash: '0'.repeat(64) } }, { section: 'dossier-snapshot', root: { ...root, id: 'foreign-root' } },
+      { section: 'dossier-snapshot', root: reference(saved.manifest) }, { section: 'dossier-snapshot', root: carrierPart(saved, 'decision') },
+      { section: 'dossier-snapshot', root: carrierPart(saved, 'scope') }, { section: 'dossier-snapshot', root: carrierPart(saved, 'plan') },
+      { section: 'dossier-snapshot', root: { id: reference(saved.manifest).id, revision: reference(saved.manifest).revision, hash: root.hash } },
+      { section: 'dossier-snapshot', root: { id: root.id, revision: root.revision, hash: reference(saved.manifest).hash } }])
+      await still(f.store, () => ask(request), true);
+    await still(f.store, () => ask(valid, 'foreign'), true);
+    // Without the section name the request is not this door's at all: the synchronous index check refuses it.
+    for (const request of [null, {}, [], [root], { root }, { section: 'dossier-summary', root }])
+      await still(f.store, () => ask(request), 'stage_summary_index_request_invalid');
+    // Only this section answers with a Promise; the synchronous sections keep throwing synchronously and refuse what is not theirs.
+    await still(f.store, async () => assert.ok(stageSummary(f.store, 'p', 'discovery', valid as DossierSnapshotSummaryRequest) instanceof Promise));
+    await still(f.store, async () => assert.throws(() => stageSummary(f.store, 'p', 'discovery', { section: 'dossier-summary', root } as never),
+      (error: unknown) => error instanceof EngineError && error.code === 'stage_summary_index_request_invalid'));
+    // A lost exact ground is a refusal, never a quiet "unassessed" downgrade.
+    const lost = s.unknowns[0]!.claim.container;
+    for (const store of [f.store, new Store(f.store.path)]) {
+      if (store !== f.store) t.after(() => store.close());
+      await still(store, async () => assert.deepEqual(await ask(valid, 'p', 'discovery', store), summary));
+      const get = store.get;
+      store.get = ((id: string, rev?: number) => id === lost.id ? null : get.call(store, id, rev)) as typeof store.get;
+      try { await still(store, () => ask(valid, 'p', 'discovery', store), true); }
+      finally { delete (store as any).get; }
+    }
+  });
 });
 const carrierPart = (saved: ReturnType<typeof produceSelectedDossier>, key: 'decision' | 'scope' | 'plan'): Ref => saved.record.value[key];
 
@@ -424,7 +487,7 @@ test('8.8 dossier summary: genuine no_variants partial names its reason and reje
   const handoff = await publishVariantHandoff(f.store, 'p', { draft: reference(f.store.get(f.draft.id)!),
     result: reference(none), decision: null, scope: null, earlyLimit: false });
   const saved = await producePartialDossier(f.store, 'p', reference(handoff.record)), root = reference(saved.record);
-  const summary = (await still(f, f.store, () => summarize(f.store, root)))!, s = summary.snapshot;
+  const summary = (await still(f.store, () => summarize(f.store, root)))!, s = summary.snapshot;
   const reason = saved.record.value.reasons[0]!;
   assert.deepEqual(s.root, { kind: 'partial', ref: root });
   assert.equal(s.completeness, 'partial'); assert.deepEqual(s.manifest, root);
@@ -453,16 +516,18 @@ test('8.8 dossier summary: genuine no_variants partial names its reason and reje
   const value: DossierManifest = structuredClone(saved.record.value); value.reasons[0]!.code = 'stall';
   const projected = projectDossierManifest(value);
   const fake = f.store.write({ id: projected.id, kind: DOSSIER_MANIFEST_KIND, expected: 0, value: projected.value });
-  await still(f, f.store, () => summarize(f.store, reference(fake)), true);
+  await still(f.store, () => summarize(f.store, reference(fake)), true);
   // Historical: the same partial summary after a new mode and a new accepted plan edition, hot and cold, with no head discovery.
   modeOf(f.store, 'bypass'); nextPlan(f, f.store);
-  for (const store of [f.store, new Store(f.store.path)]) {
-    if (store !== f.store) t.after(() => store.close());
-    await still(f, store, async () => assert.deepEqual(await summarize(store, root), summary));
-  }
-  const cold = new Store(f.store.path); t.after(() => cold.close());
-  cold.list = (() => assert.fail('A historical summary must not discover material from current heads')) as typeof cold.list;
-  try { assert.deepEqual(await summarize(cold, root), summary); } finally { delete (cold as any).list; }
+  await fixed(f, f.store, async () => {
+    for (const store of [f.store, new Store(f.store.path)]) {
+      if (store !== f.store) t.after(() => store.close());
+      await still(store, async () => assert.deepEqual(await summarize(store, root), summary));
+    }
+    const cold = new Store(f.store.path); t.after(() => cold.close());
+    cold.list = (() => assert.fail('A historical summary must not discover material from current heads')) as typeof cold.list;
+    try { assert.deepEqual(await summarize(cold, root), summary); } finally { delete (cold as any).list; }
+  });
   // The subject stays the exact historical one the dossier-assessment door proves.
   assert.equal((await prepareDossierAssessmentSubject(f.store, 'p', root)).subject.identity, s.subject);
 });
@@ -531,6 +596,7 @@ console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,u
   writeFileSync(wire, '');
   const run = (limit = 8, store = f.store, restoreOnly = false) => new Researcher(store, new Discovery(store), new ProductEngine(store).environments)
     .run('p', v.draft.id, limit, undefined, { producerPolicy: { discovery: 7 }, restoreOnly });
+  const open = (store = f.store) => new Store(store.path);
   const wires = () => readFileSync(wire, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line));
   const nextEdition = (store = f.store) => {
     const discovery = new Discovery(store), engine = new ProductEngine(store);
@@ -540,7 +606,7 @@ console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,u
     answerDiscoveryFixture(engine, 'p', draft, question, validPlan(v.frameRef, questions, 2, v.planAnswer), source);
     return store.get<Question>(plan.id)!.value.answer!;
   };
-  return { ...f, v, environment, run, wires, configure, mode, nextEdition };
+  return { ...f, v, environment, run, wires, configure, mode, nextEdition, open };
 }
 function runnerChoiceScope(f: Awaited<ReturnType<typeof runnerSetup>>): VariantChoiceScope {
   const state = f.store.get<VariantState>(variantStateId('p', f.v.draft.id))!;
@@ -569,6 +635,24 @@ async function ready(t: test.TestContext, config: Record<string, unknown> = {}) 
   assert.equal(handoff.value.next, 'deep'); assert.deepEqual(handoff.value.scope, details.scope);
   assert.deepEqual(reference(readVariantScope(f.store, 'p', details.scope).scope), details.scope);
   return { ...f, scope: details.scope, pending };
+}
+type ReadyWorld = Awaited<ReturnType<typeof ready>>;
+/** The one producer-built stopped-run world — calibrated runner, real sweep,
+ * owner choice and the deep frontier pending — byte-forked per stop kind:
+ * the budget stop and the stall stop are different continuations of the same
+ * real shared past, each on its own isolated store copy. */
+let readyBase: ReadyWorld | null = null, readySettings = '';
+async function stoppedWorld(t: test.TestContext): Promise<ReadyWorld> {
+  if (!readyBase) {
+    readyBase = await ready(baseT);
+    readySettings = readFileSync(join(readyBase.root, 'settings.json'), 'utf8');
+  }
+  // The adapter path is baked into the saved environment, so every fork keeps
+  // the shared settings file — but it is restored to the base bytes first, so
+  // no earlier test's configure() patch (e.g. a low token ceiling) bleeds in.
+  writeFileSync(join(readyBase.root, 'settings.json'), readySettings);
+  const store = forkStore(t, readyBase.store);
+  return { ...readyBase, store, open: (s: Store = store) => new Store(s.path) };
 }
 /** What the summary of a stopped partial must show, taken from the saved stop and the saved manifest, never recomputed. */
 async function expectStop(store: Store, details: { stop: Ref; dossier: Ref; handoff: Ref; scope: Ref }, summary: DossierSnapshotStageSummary, reason: 'budget' | 'stall') {
@@ -626,12 +710,12 @@ async function expectStop(store: Store, details: { stop: Ref; dossier: Ref; hand
 }
 
 test('8.8 dossier summary: owner choice stopped by the paid budget keeps its missing cell, progress counters and accounting at the stop boundary', async t => {
-  const f = await ready(t);
+  const f = await stoppedWorld(t);
   f.configure({ assessorTokens: V7_STAGE_TOKEN_CEILING - 2_000_000 });
-  const result = await f.run(2), details = JSON.parse(result.value.error!);
+  const result = await f.run(2, f.store), details = JSON.parse(result.value.error!);
   assert.equal(result.value.pauseCode, 'research_dossier_assessment_unavailable', result.value.error!);
   const root = details.dossier as Ref;
-  const summary = (await still(f, f.store, () => summarize(f.store, root)))!;
+  const summary = (await still(f.store, () => summarize(f.store, root)))!;
   const { proof, text } = await expectStop(f.store, details, summary, 'budget');
   assert.deepEqual(summary.snapshot.stop!.missing.map(cell => cell.planQuestionId), ['q-two']);
   assert.equal(proof.coverage.missing.length, 1);
@@ -639,22 +723,32 @@ test('8.8 dossier summary: owner choice stopped by the paid budget keeps its mis
   assert.match(text, /исчерпан да/);
   // Historical hot/cold: a new mode and a new accepted plan edition change today's heads, not the saved stopped snapshot.
   t.diagnostic(`budget stop P/N: ${JSON.stringify(summary.snapshot.stop!.progress.map(row => [row.planQuestionId, row.count, row.streak, row.outcome]))}`);
-  f.nextEdition(); f.mode('bypass');
-  for (const store of [f.store, f.open()]) await still(f, store, async () => {
-    assert.deepEqual(await summarize(store, root), summary);
-    assert.equal(renderStageSummary(await summarize(store, root)), text);
-    assert.deepEqual(await f.run(9, store), result);
+  f.nextEdition(f.store); f.mode('bypass', f.store);
+  await fixed(f, f.store, async () => {
+    for (const store of [f.store, f.open()]) await still(store, async () => {
+      assert.deepEqual(await summarize(store, root), summary);
+      assert.equal(renderStageSummary(await summarize(store, root)), text);
+      assert.deepEqual(await f.run(9, store), result);
+    });
   });
 });
 
 test('8.8 dossier summary: stalled N limits keep every missing cell and its progress counters; the stalled snapshot is not a budget stop', async t => {
-  const f = await ready(t, { deepMode: 'impossible' });
-  await f.run(3);
-  const result = await f.run(3, f.open()), details = JSON.parse(result.value.error!);
+  const f = await stoppedWorld(t);
+  f.configure({ deepMode: 'impossible' });
+  await f.run(5, f.store);
+  const result = await f.run(1, f.open()), details = JSON.parse(result.value.error!);
   assert.equal(result.value.pauseCode, 'research_dossier_assessment_unavailable', result.value.error!);
   const root = details.dossier as Ref;
-  const summary = (await still(f, f.store, () => summarize(f.store, root)))!;
-  const { proof } = await expectStop(f.store, details, summary, 'stall');
+  const { summary, proof } = await fixed(f, f.store, async () => {
+    const summary = (await still(f.store, () => summarize(f.store, root)))!;
+    const proof = (await expectStop(f.store, details, summary, 'stall')).proof;
+    // The stopped summary answers with the stop's own reason and its own refusal of foreign and neighbouring Refs.
+    for (const root2 of [details.stop, details.handoff, details.scope, { ...root, hash: '0'.repeat(64) }])
+      await still(f.store, () => summarize(f.store, root2), true);
+    await still(f.store, () => summarize(f.store, root, 'foreign'), true);
+    return { summary, proof };
+  });
   const stop = summary.snapshot.stop!;
   assert.equal(proof.coverage.missing.length, 2);
   assert.deepEqual(stop.missing.map(cell => cell.planQuestionId).sort(), ['q-one', 'q-two']);
@@ -666,10 +760,9 @@ test('8.8 dossier summary: stalled N limits keep every missing cell and its prog
   }
   t.diagnostic(`stall stop P/N: ${JSON.stringify(stop.progress.map(row => [row.planQuestionId, row.count, row.streak, row.outcome]))}`);
   assert.equal(stop.budget.exhausted, false);
-  // The stopped summary answers with the stop's own reason and its own refusal of foreign and neighbouring Refs.
-  for (const root2 of [details.stop, details.handoff, details.scope, { ...root, hash: '0'.repeat(64) }])
-    await still(f, f.store, () => summarize(f.store, root2), true);
-  await still(f, f.store, () => summarize(f.store, root, 'foreign'), true);
-  f.nextEdition(); f.mode('bypass');
-  for (const store of [f.store, f.open()]) await still(f, store, async () => assert.deepEqual(await summarize(store, root), summary));
+  f.nextEdition(f.store); f.mode('bypass', f.store);
+  await fixed(f, f.store, async () => {
+    const cold = f.open();
+    await still(cold, async () => assert.deepEqual(await summarize(cold, root), summary));
+  });
 });
