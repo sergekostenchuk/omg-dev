@@ -1,3 +1,7 @@
+import { DOSSIER_ASSESSMENT_KIND, DOSSIER_ASSESSMENT_CONTRACT, type PaidDossierAssessment } from './dossier-manifest.js';
+import { runDossierAssessmentSession, readDossierAssessmentSessionAt, DOSSIER_APPLICATION,
+  type DossierAssessmentApplication } from './assessment-session.js';
+import type { ModelCall } from '../runtime/model-usage.js';
 import { packetAssessmentSubject, methodologyAssessmentTransport, requirementsAssessmentTransport, assessmentQuestionContract, type AssessmentTransportSubject } from './continuation-packet.js';
 import { proveAttemptPacket, checkProgressBaseline, baselineGuards, checkDiscoveryAssessmentForm,
   DISCOVERY_ASSESSMENT_KIND, type ProvenAttemptPacket } from './v7-attempt-assessment.js';
@@ -701,4 +705,79 @@ export async function assessAttemptsWithRequirements(store: Store, packet: V7Att
   requireCondition(saved.value.contract === DISCOVERY_ASSESSMENT_CONTRACT_V3,
     'discovery_assessment_invalid', 'The selected producer retains its v3 requirements contract');
   return saved as Revision<DiscoveryAttemptsAssessmentV3>;
+}
+
+
+function dossierAssessmentInvalid(condition:unknown,message:string):asserts condition {
+  requireCondition(condition,'discovery_dossier_assessment_invalid',message);
+}
+const paidDossierAssessmentId=(value:PaidDossierAssessment)=>
+  `discovery-dossier-assessment:v1:${hashJson([value.subject,value.session,value.application])}`;
+
+/** Private derivation from the shared reader/executor's proven result. It cannot
+ * be called with a caller packet and does not replay the same chain twice. */
+function dossierAssessmentValue(store:Store,project:string,
+  proof:Awaited<ReturnType<typeof readDossierAssessmentSessionAt>>):PaidDossierAssessment {
+  dossierAssessmentInvalid(proof.result!==null && isRef(proof.application),
+    'A continuing dossier session is not an assessment');
+  const application=exact<DossierAssessmentApplication>(store,proof.application,'assessment-application');
+  dossierAssessmentInvalid(application.value.contract===DOSSIER_APPLICATION && application.value.state==='applied'
+    && same(application.value.after,reference(proof.session)) && isRef(application.value.received),
+    'The dossier terminal lost its exact applied application');
+  const call=exact<ModelCall>(store,application.value.received,'model-call');
+  dossierAssessmentInvalid(isRef(call.value.request?.record) && isRef(call.value.response?.record),
+    'The dossier assessment needs its original complete request and response');
+  return {contract:DOSSIER_ASSESSMENT_CONTRACT,projectId:project,subject:proof.session.value.subject,
+    manifest:proof.session.value.subject.manifest,session:reference(proof.session),application:reference(application),
+    call:reference(call),request:call.value.request.record,response:call.value.response.record,result:proof.result};
+}
+
+/** Historical D6: all persisted fields derive from the same paid terminal at
+ * its original boundary, independently of today's plan, choice or runtime. */
+export async function readDossierAssessmentAt(store:Store,project:string,at:unknown):Promise<Revision<PaidDossierAssessment>> {
+  dossierAssessmentInvalid(isRef(at),'An exact dossier assessment is required');
+  const saved=exact<PaidDossierAssessment>(store,at,DOSSIER_ASSESSMENT_KIND);
+  dossierAssessmentInvalid(saved.revision===1 && saved.value!==null && typeof saved.value==='object' && !Array.isArray(saved.value) && saved.value.contract===DOSSIER_ASSESSMENT_CONTRACT
+    && saved.value.projectId===project,'The dossier assessment is foreign or has an unknown era');
+  dossierAssessmentInvalid(isRef(saved.value.session),'The dossier assessment needs its exact terminal session');
+  const derived=dossierAssessmentValue(store,project,await readDossierAssessmentSessionAt(store,project,saved.value.session));
+  return requirePublishedDossierAssessment(saved,derived);
+}
+function requirePublishedDossierAssessment(saved:Revision<PaidDossierAssessment>,derived:PaidDossierAssessment) {
+  dossierAssessmentInvalid(saved.kind===DOSSIER_ASSESSMENT_KIND && saved.revision===1 && hashJson(saved.value)===saved.hash,
+    'The dossier assessment must be one immutable exact record');
+  dossierAssessmentInvalid(saved.id===paidDossierAssessmentId(derived) && same(saved.value,derived),
+    'The saved dossier assessment differs from its exact paid terminal');
+  return saved;
+}
+
+/** Publication is one immutable expected:0 write. Historical source heads are
+ * not current-admission guards: their exact revisions are the proof. */
+function publishProvenDossierAssessment(store:Store,value:PaidDossierAssessment):Revision<PaidDossierAssessment> {
+  const id=paidDossierAssessmentId(value);
+  const prior=store.get<PaidDossierAssessment>(id);
+  if(prior)return requirePublishedDossierAssessment(prior,value);
+  try { return store.writeMany<PaidDossierAssessment>([{id,kind:DOSSIER_ASSESSMENT_KIND,expected:0,value}])[0]!; }
+  catch(error) {
+    if(!(error instanceof EngineError) || error.code!=='revision_conflict')throw error;
+    const winner=store.get<PaidDossierAssessment>(id);
+    if(!winner)throw error;
+    return requirePublishedDossierAssessment(winner,value);
+  }
+}
+export async function publishDossierAssessment(store:Store,project:string,terminal:unknown):Promise<Revision<PaidDossierAssessment>> {
+  dossierAssessmentInvalid(typeof project==='string' && project.length>0 && isRef(terminal),
+    'An exact terminal dossier session and project are required');
+  const proof=await readDossierAssessmentSessionAt(store,project,terminal);
+  return publishProvenDossierAssessment(store,dossierAssessmentValue(store,project,proof));
+}
+
+/** A saved terminal is restored by the managed executor before new allowance
+ * or current-runtime admission; publication itself never sends or pays. */
+export async function assessDossier(store:Store,project:string,subject:unknown,environment?:Revision<Environment>,
+  pilot?:Revision<ReaderPilot>,signal?:AbortSignal,options:NonNullable<Parameters<typeof runDossierAssessmentSession>[6]>={}) {
+  dossierAssessmentInvalid(options!==null && typeof options==='object' && !Array.isArray(options),'Dossier execution options must be an object');
+  const terminal=await runDossierAssessmentSession(store,project,subject,environment,pilot,signal,options);
+  dossierAssessmentInvalid(terminal.result!==null,'The saved dossier session has no terminal assessment');
+  return publishProvenDossierAssessment(store,dossierAssessmentValue(store,project,terminal));
 }

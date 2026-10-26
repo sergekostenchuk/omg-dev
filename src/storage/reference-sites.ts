@@ -320,6 +320,11 @@ const RECORD_REFERENCE_SEMANTICS: readonly RecordReferenceSemantics[] = [
   // DRS1a2: the v2 intent is the v1 form without cursor.context — every other
   // field keeps the structural scan (preparation, guards, subject, capacity data).
   { kind: "research-consumer-intent", contract: "research-consumer-intent/v2", data: capacityData(["cursor", "resultCapacity"]) },
+  // D6 publication keeps its exact producer/paid anchors. The full projected
+  // packet and model judgments are data; the anchors retain their source graph.
+  { kind: "discovery-dossier-assessment", contract: "discovery-dossier-assessment/v1", data: [], refs: [
+    ["subject", "root", "ref"], ["subject", "manifest"], ["manifest"], ["session"], ["application"],
+    ["call"], ["request"], ["response"]] },
   // DR6 6.1/6.2: the structural dossier snapshot declares its exact references only — the draft, the accepted frame
   // and plan answers, the grounds of each partial reason, every claim container of the axes, unknowns and
   // contradiction sides, the assessment of each side and the grounds of each resolution.

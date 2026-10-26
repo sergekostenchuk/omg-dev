@@ -1,6 +1,6 @@
 import { withHistoricalReads, pendingSnapshotView } from '../history/proofs.js';
 import { type DiscoveryDraft, type Question } from './discovery.js';
-import type { ResearchAnswer, PaidDiscoveryAttemptsAssessment, V7ProgressApplication, V7AttemptAccount, V7ProgressState } from './research-model.js';
+import type { DossierAssessmentSubject, DossierAssessmentProjection, ResearchAnswer, PaidDiscoveryAttemptsAssessment, V7ProgressApplication, V7AttemptAccount, V7ProgressState } from './research-model.js';
 import { currentPlan, proveAttempt, provePlanQuestions } from './v7-plan-questions.js';
 import { canonical, hashJson, type Json } from '../canonical.js';
 import { EngineError } from '../errors.js';
@@ -37,6 +37,15 @@ import { proveIssuedAnswer, savedAcceptanceAct } from './projection-reader.js';
  * the assessment of the snapshot (6.4–6.6) build on this form. */
 export const DOSSIER_MANIFEST_KIND = 'discovery-dossier-manifest' as const;
 export const DOSSIER_MANIFEST_CONTRACT = 'discovery-dossier-manifest/v1' as const;
+/** D6 judgment is a separate paid record; it never changes the snapshot's completeness. */
+export const DOSSIER_ASSESSMENT_KIND = 'discovery-dossier-assessment' as const;
+export const DOSSIER_ASSESSMENT_CONTRACT = 'discovery-dossier-assessment/v1' as const;
+export interface PaidDossierAssessment {
+  contract:typeof DOSSIER_ASSESSMENT_CONTRACT; projectId:string;
+  subject:DossierAssessmentSubject; manifest:Ref; session:Ref; application:Ref;
+  call:Ref; request:Ref; response:Ref; result:DossierAssessmentProjection;
+}
+
 /** The containers a v7 claim lives in — the two routes of resolveClaimAddress (ClaimAddress.containerKind). */
 export const DOSSIER_CLAIM_CONTAINERS = Object.freeze(['research-answer', V7_ATTEMPT_KIND] as const);
 /** The reasons a snapshot is partial (карта, ndisc.d6.n4): every variant rejected,
