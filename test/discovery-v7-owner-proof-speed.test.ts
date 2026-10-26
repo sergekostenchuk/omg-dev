@@ -27,6 +27,7 @@ import { researchSetup, produce, rand } from './discovery-v7-fixture.js';
 import type { OmResult } from '../src/om/refusal.js';
 import { DISCOVERY_CLAIMS_CONTRACT } from '../src/discovery/v7-contracts.js';
 import { storeUnchanged } from './store-unchanged.js';
+import { withHistoricalReads } from '../src/history/proofs.js';
 
 // Real paid generation/selection preparation shared in shape with the accepted 4P.1 scenarios.
 const money = (store: Store) => ({ calls: store.list('model-call').flatMap(row => store.history(row.id)),
@@ -143,7 +144,7 @@ test('owner proof: a repeated exact historical owner read on a genuine Store is 
   const again = readsOf(t, f.store, first.decision.id, () => readVariantOwnerDecision(f.store, 'p', ref));
   assert.equal(again, 0, 'the kept proof is not derived again');
   assert.equal(proof.verification, 'proven'); assert.deepEqual(reference(proof.decision), ref); assert.deepEqual(reference(proof.state), reference(second.state));
-  // Each entry receives its own copy, also inside one synchronous region.
+  // Each entry receives its own copy across operations.
   const a = readVariantOwnerDecision(f.store, 'p', ref), b = readVariantOwnerDecision(f.store, 'p', ref);
   assert.notEqual(a, b); assert.notEqual(a.decision, b.decision);
   (a.decision.value as any).projectId = 'mutated'; (a.state as any).hash = '0'.repeat(64);
@@ -153,6 +154,16 @@ test('owner proof: a repeated exact historical owner read on a genuine Store is 
   const derived = readVariantOwnerDecision(fresh, 'p', ref);
   (derived.decision.value as any).projectId = 'mutated'; (derived.session as any).id = 'mutated';
   assert.deepEqual(readVariantOwnerDecision(fresh, 'p', ref), proof);
+  // Inside one explicit synchronous region too: the deriving entry and a repeated one each get their own copy.
+  const region = new Store(f.store.path); t.after(() => region.close());
+  withHistoricalReads(() => {
+    const first = readVariantOwnerDecision(region, 'p', ref);
+    (first.decision.value as any).projectId = 'mutated'; (first.state as any).hash = '0'.repeat(64);
+    const repeated = readVariantOwnerDecision(region, 'p', ref);
+    assert.deepEqual(repeated, proof);
+    (repeated.grant.value as any).id = 'mutated';
+    assert.deepEqual(readVariantOwnerDecision(region, 'p', ref), proof);
+  });
   // The cold Store derives the same proof; a historical read writes no record.
   await storeUnchanged(f.store, () => readVariantOwnerDecision(f.store, 'p', ref));
   assert.deepEqual(readVariantOwnerDecision(cold, 'p', ref), proof);
@@ -204,4 +215,22 @@ test('owner proof: a kept historical proof authorizes nothing — a new owner ac
   assert.throws(() => answerVariantChoice(f.store, next, live.authority), (error: unknown) => error instanceof EngineError);
   assert.equal(f.store.list('discovery-variant-owner-decision').length, before + 1);
   assert.deepEqual(readVariantOwnerDecision(f.store, 'p', ref).decision, second.decision);
+});
+
+test('owner proof: a Ref whose accessors change between reads never keeps a proof under another identity', async t => {
+  const f = await paid(t), { second } = owned(f), real = reference(second.decision);
+  const absent: Ref = { id: real.id + '-absent', revision: real.revision, hash: '0'.repeat(64) };
+  assert.equal(f.store.get(absent.id, absent.revision), null);
+  // The review's probe: id and hash answer the absent identity while they are checked and keyed (three reads) and the
+  // real one afterwards; a reader that proved the original Ref would keep the real proof under the absent key.
+  let ids = 0, hashes = 0;
+  const shifting = { get id() { return ++ids <= 3 ? absent.id : real.id; }, revision: absent.revision,
+    get hash() { return ++hashes <= 3 ? absent.hash : real.hash; } } as Ref;
+  for (const store of [f.store, new Store(f.store.path)]) {
+    if (store !== f.store) t.after(() => store.close());
+    try { readVariantOwnerDecision(store, 'p', shifting); } catch (error) { assert.ok(error instanceof EngineError); }
+    refuses(() => readVariantOwnerDecision(store, 'p', { ...absent }));
+    assert.deepEqual(reference(readVariantOwnerDecision(store, 'p', { ...real }).decision), real);
+    refuses(() => readVariantOwnerDecision(store, 'p', { ...absent }));
+  }
 });

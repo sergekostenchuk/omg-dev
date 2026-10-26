@@ -290,6 +290,13 @@ function proveOwnerVariant(store: Store, project: string, ref: Ref, visiting: Se
     return { verification: 'proven', decision: row, state, session, grant };
   } finally { visiting.delete(row.id); }
 }
+function plainExactRef(ref: unknown): Ref | null {
+  if (!ref || typeof ref !== 'object' || Object.getPrototypeOf(ref) !== Object.prototype) return null;
+  const fields = Object.getOwnPropertyDescriptors(ref), names = Object.keys(fields);
+  if (names.length !== 3 || !['id', 'revision', 'hash'].every(name => names.includes(name) && 'value' in fields[name]!)) return null;
+  const exact = { id: fields['id']!.value, revision: fields['revision']!.value, hash: fields['hash']!.value };
+  return isRef(exact) ? exact : null;
+}
 /** Exact historical proof, independent of today's mode/state heads, bearer registry and session liveness. On a genuine
  * Store the complete proof of one exact project + Ref is kept by the common historicalProof: every read inside goes
  * through its source and each derivation starts its own visiting set, so cycles and predecessors are proved as before.
@@ -298,10 +305,12 @@ function proveOwnerVariant(store: Store, project: string, ref: Ref, visiting: Se
 export function readVariantOwnerDecision(store: Store, project: string, ref: Ref): ProvenVariantOwnerDecision {
   if (!(store instanceof Store) || typeof project !== 'string' || project.length === 0)
     return ownerVariantInvalid('An owner reader requires its Store and project');
-  if (!genuineStore(store) || !isRef(ref) || Object.keys(ref).length !== 3) return proveOwnerVariant(store, project, ref, new Set());
-  const exact = { id: ref.id, revision: ref.revision, hash: ref.hash };
+  // Only a plain exact Ref of three data fields is a key: its values are taken once, and that very snapshot is what the
+  // derivation proves. A Ref with accessors, extra keys or another prototype derives in place as before.
+  const exact = plainExactRef(ref);
+  if (!genuineStore(store) || !exact) return proveOwnerVariant(store, project, ref, new Set());
   return structuredClone(historicalProof(store, { reader: 'discovery.variant-owner-decision/v1', project, ref: exact },
-    source => proveOwnerVariant(source, project, ref, new Set()),
+    source => proveOwnerVariant(source, project, exact, new Set()),
     () => ownerVariantInvalid('The owner act has a foreign, cyclic or changed immutable identity')));
 }
 function repeatedOwnerVariant(store: Store, scope: VariantChoiceScope): VariantOwnerOutcome | null {
