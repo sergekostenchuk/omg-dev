@@ -127,18 +127,19 @@ function bind(t: { after(fn: () => void): void }, base: Base) {
   // Keep these producer tests at the handoff boundary now that the runner has a recipient.
   // Only the new handoff tail is cut; paid production and its identity/CAS stay real.
   const run = async (limit = 8, store = f.store, restoreOnly = false) => {
-    const write = store.writeMany.bind(store);
-    store.writeMany = ((writes, guards) => {
+    // An own writeMany left on the instance would make the Store non-genuine for the rest of the test; intercept at the
+    // prototype instead.
+    const restore = onWrites(store, (writes, guards, write) => {
       if (writes.some(w => w.kind === DOSSIER_MANIFEST_KIND))
         throw new EngineError('partial_recipient_cut', 'Exercise the standalone producer after the real handoff');
       return write(writes, guards);
-    }) as typeof store.writeMany;
+    });
     try { return await new Researcher(store, new Discovery(store), new ProductEngine(store).environments)
       .run('p', v.draft.id, limit, undefined, { producerPolicy: { discovery: 7 }, restoreOnly }); }
     catch (error) {
       if (!(error instanceof EngineError) || error.code !== 'partial_recipient_cut') throw error;
       return store.list<import('../src/discovery/research-model.js').ResearchRun>('research-run').find(r => r.value.draftId === v.draft.id)!;
-    } finally { store.writeMany = write; }
+    } finally { restore(); }
   };
   const wires = () => readFileSync(wire, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line));
   const generationCalls = () => wires().filter(row => row.subject.variantSubject);
@@ -166,6 +167,16 @@ function restore(root: string, dir: string) {
     rmSync(join(root, file), { force: true });
     if (existsSync(join(dir, file))) copyFileSync(join(dir, file), join(root, file));
   }
+}
+/** Intercept the writes of one Store at the prototype, so the instance itself stays genuine (its only own property is its
+ * path) and the common historical proofs of the real producers are kept as in production. Restores in stack order. */
+function onWrites(store: Store, wrap: (writes: Parameters<Store['writeMany']>[0], guards: Parameters<Store['writeMany']>[1],
+  write: (writes: Parameters<Store['writeMany']>[0], guards: Parameters<Store['writeMany']>[1]) => Revision<unknown>[]) => Revision<unknown>[]) {
+  const previous = Store.prototype.writeMany;
+  Store.prototype.writeMany = function (this: Store, writes: Parameters<Store['writeMany']>[0], guards?: Parameters<Store['writeMany']>[1]) {
+    return this === store ? wrap(writes, guards, (w, g) => previous.call(this, w, g)) : previous.call(this, writes, guards);
+  } as typeof previous;
+  return () => { Store.prototype.writeMany = previous; };
 }
 const money = (store: Store) => store.list().filter(row => ['model-call', 'research-budget-ledger'].includes(row.kind)).flatMap(row => store.history(row.id));
 function choiceScope(f: Awaited<ReturnType<typeof setup>>, kind: 'choose' | 'reject_all' = 'choose'): VariantChoiceScope {
@@ -265,9 +276,9 @@ test(`6.3 partial: new publication refuses ${change} after the real handoff with
 });
 for(const change of ['frame','plan','mode','selection'] as const)
 test(`6.3 partial: second Store changing ${change} in the publication window loses the atomic write`,async t=>{
-  const f=await route(t,change==='selection'?'owner':'no_variants'), other=f.open(), write=f.store.writeMany.bind(f.store);
+  const f=await route(t,change==='selection'?'owner':'no_variants'), other=f.open();
   let after='',wire:unknown,calls:unknown;
-  f.store.writeMany=((writes,guards)=>{
+  const restore=onWrites(f.store,(writes,guards,write)=>{
     if(!after&&writes.some(w=>w.kind===DOSSIER_MANIFEST_KIND)){
       if(change==='frame'){const q=other.list<Question>('question').find(q=>q.value.draftId===f.v.draft.id&&q.value.spec.field==='frame')!;new Discovery(other).reopen(q.id,q.revision);}
       else if(change==='plan')f.nextEdition(other);
@@ -277,8 +288,8 @@ test(`6.3 partial: second Store changing ${change} in the publication window los
       after=history(other);wire=f.wires();calls=money(other);
     }
     return write(writes,guards);
-  }) as typeof f.store.writeMany;
-  try{await assert.rejects(()=>producePartialDossier(f.store,'p',reference(f.handoff)),{code:'input_stale'});}finally{f.store.writeMany=write;}
+  });
+  try{await assert.rejects(()=>producePartialDossier(f.store,'p',reference(f.handoff)),{code:'input_stale'});}finally{restore();}
   assert.ok(after);assert.equal(history(f.store),after);assert.deepEqual(f.wires(),wire);assert.deepEqual(money(f.store),calls);
   assert.equal(f.store.list(DOSSIER_MANIFEST_KIND).length,0);
 });
@@ -299,8 +310,8 @@ test('6.3 partial: a saved imitation cannot change exact grounds, reason or axes
 
 
 async function withMaterials(t:test.TestContext, limit=false) {
-  const f=await setup(t,[planQuestion('q-one','industry'),planQuestion('q-two','industry')]), classifications:{claim:ClaimAddress;accepted:boolean}[]=[], write=f.store.writeMany.bind(f.store);
-  f.store.writeMany=((writes,guards)=>{
+  const f=await setup(t,[planQuestion('q-one','industry'),planQuestion('q-two','industry')]), classifications:{claim:ClaimAddress;accepted:boolean}[]=[];
+  const restore=onWrites(f.store,(writes,guards,write)=>{
     const rows=write(writes,guards);
     for(const row of rows)if(row.kind==='research-attempt'&&(row.value as any).end.type==='submitted') {
       const claims=(row.value as any).end.value.claims as any[];
@@ -308,7 +319,7 @@ async function withMaterials(t:test.TestContext, limit=false) {
       f.configure({classification:classifications});
     }
     return rows;
-  }) as typeof f.store.writeMany;
+  });
   const claim=(id:string,text:string)=>({id,kind:'hypothesis',text,axis:'industry',planQuestions:[{planAnswer:f.v.planAnswer,planQuestionId:'q-one'}],scope:{variants:'common'},basis:{howToVerify:'Compare independent sources'}});
   const unknown={...claim('unknown','Demand is unknown'),kind:'unknown',basis:{origin:'Saved research',unknownId:'demand',question:'What is demand?',affects:['market'],consumer:'product-owner',blocksCurrentStage:true,moment:'om-pass',closeCriterion:'Obtain independent evidence'}};
   const action=(claims:unknown[])=>({action:'answer',question:'$selected',value:{type:'submitted',contract:'discovery-claims/v7',value:{claims}},citations:[]});
@@ -316,7 +327,7 @@ async function withMaterials(t:test.TestContext, limit=false) {
   await f.run(1);assert.equal(classifications.length,2);
   const counter={...claim('counter','A has an unsupported counterargument'),refutedBy:[classifications[0]!.claim]};
   f.configure({actions:[action([]),action([counter])],...(limit?{assessorTokens:V7_STAGE_TOKEN_CEILING-1000}:{})});
-  const run=await f.run(1);f.store.writeMany=write;assert.equal(classifications.length,3,JSON.stringify({pauseCode:run.value.pauseCode,error:run.value.error,actions:f.wires().map(w=>w.subject.variantSubject?.kind??(w.subject.assessmentSubject?'assessment':w.subject.question?.id))}));
+  const run=await f.run(1);restore();assert.equal(classifications.length,3,JSON.stringify({pauseCode:run.value.pauseCode,error:run.value.error,actions:f.wires().map(w=>w.subject.variantSubject?.kind??(w.subject.assessmentSubject?'assessment':w.subject.question?.id))}));
   if(limit)return {...f,handoff:await saved(f,run),classifications};
   f.configure({none:true});
   const handoff=await saved(f,await f.run(5));
@@ -372,8 +383,8 @@ async function paidBeforeProgress(t: test.TestContext, restoreBeforeHandoff = fa
     basis:{howToVerify:'Independent evidence'}};
   f.configure({assessorTokens:V7_STAGE_TOKEN_CEILING-1000, actions:[{action:'answer', question:'$selected',
     value:{type:'submitted', contract:'discovery-claims/v7', value:{claims:[claim]}}, citations:[]}]});
-  const write = f.store.writeMany.bind(f.store); let cut = false, address: ClaimAddress | undefined;
-  f.store.writeMany = ((writes, guards) => {
+  let cut = false, address: ClaimAddress | undefined;
+  const restore = onWrites(f.store, (writes, guards, write) => {
     if (!cut && writes.some(w => w.kind === 'v7-progress-application')) {
       cut = true; throw new EngineError('partial_paid_cut', 'Paid MR saved; stop immediately before atomic P');
     }
@@ -383,10 +394,10 @@ async function paidBeforeProgress(t: test.TestContext, restoreBeforeHandoff = fa
       f.configure({classification:[{claim:address, accepted:true}]});
     }
     return rows;
-  }) as typeof f.store.writeMany;
+  });
   try { await f.run(1); }
   catch (error) { if (!(error instanceof EngineError) || error.code !== 'partial_paid_cut') throw error; }
-  finally { f.store.writeMany = write; }
+  finally { restore(); }
   assert.ok(cut); assert.ok(address);
   const paid = f.store.list<PaidDiscoveryAttemptsAssessment>('discovery-assessment');
   assert.equal(paid.length, 1); assert.equal(f.store.list('v7-progress-application').length, 0);
@@ -435,6 +446,6 @@ test(`6.3-PARTIAL-01: proof fault (${lost}) refuses without an unassessed downgr
     try {
       await unchanged(f, store, () => readPartialDossier(store, 'p', reference(first.record)), true);
       await unchanged(f, store, () => producePartialDossier(store, 'p', reference(f.handoff)), true);
-    } finally { store.get = get; }
+    } finally { Reflect.deleteProperty(store, 'get'); }
   }
 });
