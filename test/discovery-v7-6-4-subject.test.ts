@@ -180,12 +180,16 @@ const all = (store: Store) => {
 /** The per-action part of a read check: the real refusal or result through
  * the accepted storeUnchanged/storeRefused window — the Store's own commits
  * plus SQLite data_version must be equal, so a write by any connection is
- * seen. The full heads/revisions dump, the paid calls, the budget ledger and
- * the model wire are compared once per read-only fixed-point block in
- * fixed(), not once per row. */
-async function still<T>(store: Store, action: () => Promise<T>, refuses = false): Promise<T | undefined> {
-  if (refuses) { await storeRefused(store, action); return undefined; }
-  return await storeUnchanged(store, action);
+ * seen — and the model wire compared directly around the very action, so a
+ * one-off adapter call that writes nothing is still caught at its own door.
+ * The full heads/revisions dump, the paid calls and the budget ledger are
+ * compared once per read-only fixed-point block in fixed(), not once per row. */
+async function still<T>(f: Pick<Paid, 'wires'>, store: Store, action: () => Promise<T>, refuses = false): Promise<T | undefined> {
+  const wires = f.wires();
+  if (refuses) { await storeRefused(store, action); assert.deepEqual(f.wires(), wires); return undefined; }
+  const result = await storeUnchanged(store, action);
+  assert.deepEqual(f.wires(), wires);
+  return result;
 }
 /** One byte fixed point per read-only block: the complete heads/revisions
  * dump plus the paid calls, the ledger and the wire are compared across the
@@ -305,8 +309,8 @@ for (const model of [false, true])
 test(`6.4 dossier subject: real ${model ? 'model' : 'owner'} complete snapshot has one exact historical packet without writes or payment`, async t => {
   const f = model ? await modelWorld(t) : await completeWorld(t);
   const saved = produceSelectedDossier(f.store, 'p', f.input), root = reference(saved.record);
-  const packet = (await still(f.store, () => prepareDossierAssessmentSubject(f.store, 'p', root)))!;
-  await still(f.store, async () => assert.deepEqual(await prepareDossierAssessmentSubject(f.store, 'p', root), packet));
+  const packet = (await still(f, f.store, () => prepareDossierAssessmentSubject(f.store, 'p', root)))!;
+  await still(f, f.store, async () => assert.deepEqual(await prepareDossierAssessmentSubject(f.store, 'p', root), packet));
   assert.equal(packet.subject.contract, DOSSIER_ASSESSMENT_SUBJECT_CONTRACT);
   assert.equal(packet.subject.kind, 'dossier'); assert.equal(packet.subject.root.kind, 'selected');
   assert.equal(packet.contract, DOSSIER_ASSESSMENT_PACKET_CONTRACT);
@@ -320,13 +324,13 @@ test(`6.4 dossier subject: real ${model ? 'model' : 'owner'} complete snapshot h
   const late = await deep(f, 'q-market', [claim(f, 'q-market', 'market', 'Late unknown reopens current coverage')]);
   const mr = await assess(f, late, 'unknown', false);
   const second = produceSelectedDossier(f.store, 'p', f.input);
-  const secondPacket = (await still(f.store, () => prepareDossierAssessmentSubject(f.store, 'p', reference(second.record))))!;
+  const secondPacket = (await still(f, f.store, () => prepareDossierAssessmentSubject(f.store, 'p', reference(second.record))))!;
   assert.notEqual(secondPacket.subject.identity, packet.subject.identity);
   applyDiscoveryAssessment(f.store, 'p', reference(mr));
   revise(f); modeOf(f.store, model ? 'questions' : 'bypass'); nextPlan(f, f.store);
   for (const store of [f.store, new Store(f.store.path)]) {
     if (store !== f.store) t.after(() => store.close());
-    await fixed(f, store, () => still(store, async () => {
+    await fixed(f, store, () => still(f, store, async () => {
       assert.deepEqual(await prepareDossierAssessmentSubject(store, 'p', root), packet);
       assert.deepEqual(await requireDossierAssessmentSubject(store, 'p', packet.subject), packet);
       assert.deepEqual(await requireDossierAssessmentPacket(store, 'p', packet), packet);
@@ -344,7 +348,7 @@ test('6.4 dossier subject: all statuses, addressed unknown and both blocking con
       consumer: 'feasibility', blocksCurrentStage: false, moment: 'feasibility', closeCriterion: 'Identify deployment' } } as unknown as Json;
   await deep(f, 'q-market', [unknown]);
   const saved = produceSelectedDossier(f.store, 'p', f.input), root = reference(saved.record);
-  const packet = (await still(f.store, () => prepareDossierAssessmentSubject(f.store, 'p', root)))!;
+  const packet = (await still(f, f.store, () => prepareDossierAssessmentSubject(f.store, 'p', root)))!;
   assert.ok(packet.materials.some(item => item.status === 'rejected' && (item.value as any).text === 'Retained counterargument' && item.assessment));
   assert.equal(packet.unknowns[0]!.material.status, 'unassessed');
   assert.equal((packet.unknowns[0]!.material.value as any).basis.question, 'Which deployment?');
@@ -358,33 +362,33 @@ test('6.4 dossier subject: all statuses, addressed unknown and both blocking con
   await fixed(f, f.store, async () => {
     for (const input of [undefined, null, {}, { ...root, revision: null }, { ...root, hash: '0'.repeat(64) },
       { ...root, id: 'foreign-root' }, { root, complete: true }, reference(saved.manifest)])
-      await still(f.store, () => prepareDossierAssessmentSubject(f.store, 'p', input), true);
-    await still(f.store, () => prepareDossierAssessmentSubject(f.store, 'foreign', root), true);
+      await still(f, f.store, () => prepareDossierAssessmentSubject(f.store, 'p', input), true);
+    await still(f, f.store, () => prepareDossierAssessmentSubject(f.store, 'foreign', root), true);
     for (const field of Object.keys(packet.subject)) {
       const missing: any = structuredClone(packet.subject); delete missing[field];
-      await still(f.store, () => requireDossierAssessmentSubject(f.store, 'p', missing), true);
-      await still(f.store, () => requireDossierAssessmentSubject(f.store, 'p', { ...packet.subject, [field]: null }), true);
+      await still(f, f.store, () => requireDossierAssessmentSubject(f.store, 'p', missing), true);
+      await still(f, f.store, () => requireDossierAssessmentSubject(f.store, 'p', { ...packet.subject, [field]: null }), true);
     }
     for (const candidate of [{ ...packet.subject, contract: 'dossier-assessment-subject/v99' },
       { ...packet.subject, kind: 'attempts' }])
-      await still(f.store, () => requireDossierAssessmentSubject(f.store, 'p', candidate), true);
+      await still(f, f.store, () => requireDossierAssessmentSubject(f.store, 'p', candidate), true);
     const wrong: any = { ...packet.subject, manifest: root }; delete wrong.identity;
     wrong.identity = `dossier-assessment:p:${hashJson(wrong)}`;
-    await still(f.store, () => requireDossierAssessmentSubject(f.store, 'p', wrong), true);
+    await still(f, f.store, () => requireDossierAssessmentSubject(f.store, 'p', wrong), true);
     const truncated = structuredClone(packet); truncated.contradictions[0]!.sides.pop();
     for (const candidate of [{ ...packet, contract: 'dossier-assessment-packet/v99' }, { ...packet, manifest: packet.root },
       { ...packet, materials: packet.materials.slice(1) }, { ...packet, unknowns: [] },
       { ...packet, contradictions: [] }, truncated])
-      await still(f.store, () => requireDossierAssessmentPacket(f.store, 'p', candidate), true);
+      await still(f, f.store, () => requireDossierAssessmentPacket(f.store, 'p', candidate), true);
   });
   const lost = packet.unknowns[0]!.material.address.container;
   for (const store of [f.store, new Store(f.store.path)]) {
     if (store !== f.store) t.after(() => store.close());
     await fixed(f, store, async () => {
-      await still(store, async () => assert.deepEqual(await requireDossierAssessmentPacket(store, 'p', packet), packet));
+      await still(f, store, async () => assert.deepEqual(await requireDossierAssessmentPacket(store, 'p', packet), packet));
       const get = store.get;
       store.get = ((id, rev) => id === lost.id ? null : get.call(store, id, rev)) as typeof store.get;
-      try { await still(store, () => requireDossierAssessmentSubject(store, 'p', packet.subject), true); }
+      try { await still(f, store, () => requireDossierAssessmentSubject(store, 'p', packet.subject), true); }
       finally { delete (store as any).get; }
     });
   }
@@ -397,7 +401,7 @@ test('6.4 dossier subject: genuine no_variants partial keeps nonempty rejected m
   const handoff = await publishVariantHandoff(f.store, 'p', { draft: reference(f.store.get(f.draft.id)!),
     result: reference(none), decision: null, scope: null, earlyLimit: false });
   const saved = await producePartialDossier(f.store, 'p', reference(handoff.record)), root = reference(saved.record);
-  const packet = (await still(f.store, () => prepareDossierAssessmentSubject(f.store, 'p', root)))!;
+  const packet = (await still(f, f.store, () => prepareDossierAssessmentSubject(f.store, 'p', root)))!;
   assert.equal(packet.subject.root.kind, 'partial'); assert.equal(packet.manifest.value.completeness, 'partial');
   assert.equal(packet.manifest.value.reasons[0]!.code, 'no_variants');
   assert.equal(packet.coverage, null); assert.equal(packet.route.scope, null); assert.equal(packet.route.member, null);
@@ -406,7 +410,7 @@ test('6.4 dossier subject: genuine no_variants partial keeps nonempty rejected m
   modeOf(f.store, 'bypass'); nextPlan(f, f.store);
   for (const store of [f.store, new Store(f.store.path)]) {
     if (store !== f.store) t.after(() => store.close());
-    await fixed(f, store, () => still(store, async () => {
+    await fixed(f, store, () => still(f, store, async () => {
       assert.deepEqual(await prepareDossierAssessmentSubject(store, 'p', root), packet);
       assert.deepEqual(await requireDossierAssessmentSubject(store, 'p', packet.subject), packet);
       assert.deepEqual(await requireDossierAssessmentPacket(store, 'p', packet), packet);
