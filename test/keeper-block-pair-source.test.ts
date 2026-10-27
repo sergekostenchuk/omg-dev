@@ -94,7 +94,21 @@ test('block pair: full saved L3 block and genuinely paid accepted constitution, 
   assert.equal(pair.artifact.material.members.length, 4);
   assert.ok(pair.artifact.material.boundary.length && pair.artifact.grounds.works);
   assert.equal(pair.checkId, keeperCheckKey(pair.pair.key));
-  pair.artifact.material.members.length = 0; (pair.pair.artifact.value as any).subject.boundary.length = 0;
+  pair.artifact.material.members.length = 0;
+  assert.deepEqual(pair.artifact.container, expected.artifact.container);
+  assert.deepEqual(pair.artifact.grounds, expected.artifact.grounds);
+  assert.equal(hashJson(pair.artifact.container.value as unknown as Json), pair.artifact.container.hash);
+  const changedMaterial = structuredClone(pair.artifact.material);
+  pair.artifact.grounds.graph.value = null;
+  assert.deepEqual(pair.artifact.container, expected.artifact.container);
+  assert.deepEqual(pair.artifact.material, changedMaterial);
+  assert.equal(hashJson(pair.artifact.container.value as unknown as Json), pair.artifact.container.hash);
+  const changedGrounds = structuredClone(pair.artifact.grounds);
+  pair.artifact.container.value.subject.boundary.length = 0;
+  assert.deepEqual(pair.artifact.material, changedMaterial); assert.deepEqual(pair.artifact.grounds, changedGrounds);
+  assert.deepEqual(pair.artifact.address, expected.artifact.address); assert.deepEqual(pair.pair, expected.pair);
+  (pair.pair.artifact.value as any).subject.boundary.length = 0;
+  assert.deepEqual(pair.artifact.material, changedMaterial); assert.deepEqual(pair.artifact.grounds, changedGrounds);
   f.reopen(); assert.deepEqual(await quiet(f, read), expected); assert.deepEqual(all(f.store), before);
 
 });

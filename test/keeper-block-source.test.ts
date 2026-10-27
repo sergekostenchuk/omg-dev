@@ -62,8 +62,20 @@ test('block source: getter snapshot, repeat/racing Stores, commit cut, late head
   f.store.write({ id: candidate.id, kind: candidate.kind, expected: candidate.revision, value: candidate.value as Json });
   const before = all(f.store);
   const expected = structuredClone(source);
-  source.material.members.length = 0; source.container.value.subject.boundary.length = 0;
+  source.material.members.length = 0;
+  assert.deepEqual(source.container, expected.container); assert.deepEqual(source.grounds, expected.grounds);
+  assert.equal(hashJson(source.container.value as unknown as Json), source.container.hash);
+  const changedMaterial = structuredClone(source.material);
   source.grounds.graph.value = null;
+  assert.deepEqual(source.container, expected.container); assert.deepEqual(source.material, changedMaterial);
+  assert.equal(hashJson(source.container.value as unknown as Json), source.container.hash);
+  const changedGrounds = structuredClone(source.grounds);
+  source.container.value.subject.boundary.length = 0;
+  assert.deepEqual(source.material, changedMaterial); assert.deepEqual(source.grounds, changedGrounds);
+  assert.deepEqual(source.address, expected.address);
+  source.address.container.hash = '0'.repeat(64);
+  assert.equal(source.container.hash, expected.container.hash);
+  assert.deepEqual(source.material, changedMaterial); assert.deepEqual(source.grounds, changedGrounds);
   await storeUnchanged(f.store, async () => {
     assert.deepEqual(prepareKeeperBlockSource(f.store, input), expected);
     assert.deepEqual(readKeeperBlockSourceAt(cold, 'garden', expected.address.container), expected);

@@ -47,8 +47,8 @@ function identity(input: BlockSubjectRequest): string {
   return `${KEEPER_BLOCK_SOURCE_KIND}:${input.project}:${hashJson(input as unknown as Json)}`;
 }
 function delivered(container: Revision<KeeperBlockContainer>): KeeperBlockSource {
-  return structuredClone({ container, address: { container: reference(container), pointer: '/subject' as const },
-    material: container.value.subject, grounds: container.value.subject.grounds });
+  return { container: structuredClone(container), address: { container: reference(container), pointer: '/subject' },
+    material: structuredClone(container.value.subject), grounds: structuredClone(container.value.subject.grounds) };
 }
 
 /** Prove the complete saved material against the historical candidate, never today's graph or a caller inventory. */
