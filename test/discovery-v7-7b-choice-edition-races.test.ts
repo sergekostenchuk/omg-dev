@@ -1,10 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { canonical } from '../src/canonical.js';
 import { EngineError } from '../src/errors.js';
 import { reference } from '../src/pipeline/contracts.js';
 import { Store } from '../src/storage/store.js';
 import { readProjectMode } from '../src/product/project-mode.js';
+import { ProductEngine } from '../src/product/engine.js';
 import { ConditionChoiceSessions, FinalAcceptanceSessions, acceptDiscoveryFinal, issueConditionChoiceInvitation,
   issueFinalAcceptanceInvitation, resolveDiscoveryCondition } from '../src/product/owner-authority.js';
 import { CONDITION_RESOLUTION_KIND, MANIFEST_SUCCESSOR_KIND, conditionResolutionId,
@@ -160,4 +163,35 @@ test('7b.3 edition races: a revocation before the commit writes nothing, and a l
   finally { Store.prototype.writeMany = previous; }
   const restored = await quiet(f, f.store, () => resolveDiscoveryCondition(f.store, a.request));
   assert.equal(restored.repeated, true); assert.equal(restored.resolved, true); assert.deepEqual(counts(f.store), [1, 1, 2]);
+});
+
+async function cli(door: string, path: string, input: unknown) {
+  const child = spawn(process.execPath, [fileURLToPath(new URL('../src/cli.js', import.meta.url)), door, path], { stdio: ['pipe', 'pipe', 'pipe'] });
+  let stdout = '', stderr = '';
+  child.stdout.setEncoding('utf8'); child.stderr.setEncoding('utf8');
+  child.stdout.on('data', data => stdout += data); child.stderr.on('data', data => stderr += data);
+  child.stdin.end(JSON.stringify(input));
+  const code = await new Promise<number | null>((resolve, reject) => { child.on('error', reject); child.on('close', resolve); });
+  const line = (code === 0 ? stdout : stderr).split('\n').find(value => value.startsWith('{'));
+  assert.ok(line, `CLI returned no JSON: ${stderr}`);
+  assert.doesNotMatch(stdout, /"(?:invitation|bearer|proof|session)"\s*:/);
+  return { code, output: JSON.parse(line), stderr };
+}
+
+test('7b.3 edition CLI: the owner door publishes the positive edition and closes its session; the command door grants no authority', async t => {
+  const f = await world(t), first = await accepted(f);
+  const command = { type: 'discovery-final-condition', project: 'p', manifest: reference(first.manifest), conditionId: 'pick1',
+    optionId: 'pick1-yes', reason: 'The owner chooses' };
+  await refused(f, f.store, async () => new ProductEngine(f.store).execute(command), 'owner_authority_invalid');
+  const result = await cli('owner-final-condition', f.path, command);
+  assert.equal(result.code, 0, result.stderr);
+  assert.equal(result.output.resolved, true); assert.equal(result.output.unresolved, false); assert.equal(result.output.reason, null);
+  assert.deepEqual(result.output.conditionStatus, { resolved: ['pick1'], open: ['evidence-1', 'pick2', 'scope', 'debt'] });
+  const edition = f.store.get<any>(result.output.edition.manifest.id, 1)!;
+  assert.deepEqual(edition.value.previous, reference(first.manifest));
+  assert.ok(f.store.list<any>('owner-session').filter(row => row.id.startsWith('owner-final-condition-session:'))
+    .every(row => row.value.state === 'closed'), 'the owner session of the door is closed');
+  const repeated = await cli('command', f.path, command);
+  assert.equal(repeated.code, 0, repeated.stderr); assert.equal(repeated.output.repeated, true);
+  assert.deepEqual(repeated.output.edition, result.output.edition);
 });
