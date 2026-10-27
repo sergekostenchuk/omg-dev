@@ -7,7 +7,8 @@ import { readDiscoveryFinalAssessmentPaidResultAt } from './discovery-final-asse
 import type { DiscoveryFinalAssessmentSource } from './discovery-final-assessment-source.js';
 import { DISCOVERY_MANIFEST_CONTRACT, DISCOVERY_MANIFEST_KIND, discoveryManifestId, readDiscoveryManifestStructural,
   type DiscoveryManifest } from './discovery-manifest.js';
-import { checkFinalBundle, type V7FinalBundle } from './v7-final-contracts.js';
+import { V8_FINAL_CONTRACT, checkFinalBundle, type FinalConditionClass, type V7FinalBundle } from './v7-final-contracts.js';
+import type { DiscoveryFinalAssessmentClassReview, DiscoveryFinalAssessmentResult } from './discovery-final-assessment-result.js';
 
 /** DR7 7b.1+7b.2 (codex-omg2 №16106 п.1): the authoritative decision on one exact assessed D7 bundle and the atomic
  * publication of its accepted manifest (map ndisc.d7.n6). Only the whole bundle of a really paid assessment with the
@@ -193,6 +194,11 @@ export interface DiscoveryAcceptanceGrounds {
   assessment: Ref; paid: Ref; draft: Ref; bundle: V7FinalBundle; source: DiscoveryFinalAssessmentSource;
 }
 export async function provenAcceptanceGrounds(store: Store, project: string, assessmentRef: Ref): Promise<DiscoveryAcceptanceGrounds> {
+  return (await provenAcceptanceBasis(store, project, assessmentRef)).grounds;
+}
+/** The proven grounds and the paid supported answer they rest on — with its class reviews (7b.3-class). */
+async function provenAcceptanceBasis(store: Store, project: string, assessmentRef: Ref):
+  Promise<{ grounds: DiscoveryAcceptanceGrounds; review: DiscoveryFinalAssessmentResult }> {
   const proven = await readDiscoveryFinalAssessmentPaidResultAt(store, project, assessmentRef);
   if (!proven.output || !proven.result) acceptanceInvalid('assessment', 'Only a really paid assessment can be accepted');
   if (proven.result.verdict !== 'supported')
@@ -200,8 +206,27 @@ export async function provenAcceptanceGrounds(store: Store, project: string, ass
   const source = proven.source, bundle = checkFinalBundle(proven.result.candidate);
   if (!same(bundle, source.bundle) || !same(proven.result.candidate, source.packet.candidate))
     acceptanceInvalid('bundle', 'The assessed bundle is not the whole bundle of its paid D7');
-  return { assessment: exact(reference(proven.output)), paid: exact(reference(source.paid)),
-    draft: exact(source.packet.final.subject.basis.draft), bundle, source };
+  return { grounds: { assessment: exact(reference(proven.output)), paid: exact(reference(source.paid)),
+    draft: exact(source.packet.final.subject.basis.draft), bundle, source }, review: proven.result.result };
+}
+function classRefuse(code: string, field: string, message: string, conditionId: string): never {
+  throw new EngineError(code, `[${field}] ${message}`, { field, conditionId });
+}
+/** 7b.3-class (codex-omg2 №16183, №16299): the proven class of one owner condition of an accepted bundle — the class the
+ * D7 model gave in the versioned form discovery-final/v8, confirmed by the paid supported answer that reviewed exactly
+ * that bundle. A condition of discovery-final/v7 has no class (condition_class_unproven); evidence is no owner choice. */
+export function provenConditionClass(bundle: V7FinalBundle, review: DiscoveryFinalAssessmentResult, conditionId: string):
+  { condition: Record<string, unknown>; class: FinalConditionClass; classReason: string; review: DiscoveryFinalAssessmentClassReview } {
+  const condition = bundle.verdict.conditions.find(item => plain(item) && item.id === conditionId) as Record<string, unknown> | undefined;
+  if (!condition) classRefuse('discovery_condition_class_invalid', 'conditionId', 'The condition is not one of this accepted bundle', conditionId);
+  if (condition.kind !== 'owner_choice')
+    classRefuse('discovery_condition_not_owner_choice', 'conditionId', 'An evidence condition is no owner choice and has no class', conditionId);
+  if (bundle.contract !== V8_FINAL_CONTRACT)
+    classRefuse('discovery_condition_class_unproven', 'bundle', `The owner condition of a ${bundle.contract} bundle has no class; it is never read as a choice`, conditionId);
+  const found = review.classes?.find(item => item.conditionId === conditionId);
+  if (!found || found.class !== condition.class || found.judgement !== 'confirmed')
+    classRefuse('discovery_condition_class_unproven', 'assessment', 'The paid assessment did not confirm the class of this condition', conditionId);
+  return structuredClone({ condition, class: condition.class as FinalConditionClass, classReason: condition.classReason as string, review: found });
 }
 /** The current project mode, proven; a project without one has no acceptance. */
 export function provenAcceptanceMode(store: Store, project: string, at?: Ref): ProjectModeStatus {
@@ -272,34 +297,90 @@ export interface AcceptedDiscovery {
   bundle: Revision<AcceptedFinalBundle>;
   admission: { kind: 'owner'; record: Revision<FinalAcceptanceAct> } | { kind: 'machine'; record: Revision<FinalMachineAdmission> };
   grounds: DiscoveryAcceptanceGrounds;
-  /** DR7 7b.3: the conditions of the bundle, derived on reading. Nothing resolves a condition of this contract yet — an
-   * evidence condition waits for 7b.3e, an owner choice for its proven class — so every condition stays open. */
-  resolutions: Revision<ConditionResolution>[];
+  /** DR7 7b.3 (codex-omg2 №16299): the proven positive resolutions of this edition, in their order — each an accepting
+   * owner choice of a condition whose proven class is choice — and the conditions of the bundle, derived from them. */
+  resolutions: Revision<PositiveConditionResolution>[];
   conditions: { resolved: string[]; open: string[] };
 }
+/** An accepted edition with the paid supported answer its grounds rest on, for the class proofs over it. */
+export interface AcceptedDiscoveryBasis { accepted: AcceptedDiscovery; review: DiscoveryFinalAssessmentResult }
 /** The historical reader of an accepted manifest: the structural record, then the paid supported assessment, the saved
  * whole bundle and the admission are proven again from their exact Refs; late heads and a cold Store change nothing.
- * DR7 7b.3 (codex-omg2 №16169): a later edition would resolve a condition, and no owner choice of this contract has a
- * proven class (a choice inside the bundle, against a boundary or a risk), so a later edition is refused — also one
- * that names a real saved owner act as its resolution. */
+ * DR7 7b.3 (codex-omg2 №16299): a later edition proves its previous edition by the same reader, keeps its draft, bundle,
+ * assessment and admission, and adds exactly one positive resolution — an accepting owner choice of a condition proven
+ * to be of class choice — named by the one successor record of that previous edition. */
 export async function readAcceptedDiscoveryManifestAt(store: Store, project: string, at: unknown): Promise<AcceptedDiscovery> {
-  const ref = acceptanceSnapshot(at, 'manifest') as Ref;
-  const manifest = readDiscoveryManifestStructural(store, project, ref).record;
-  if (manifest.value.previous !== null || manifest.value.resolutions.length !== 0)
-    acceptanceInvalid('previous', 'No condition of this contract is resolved by a later edition: the class of an owner choice is unproven',
-      { ref }, 'discovery_condition_class_unproven');
-  return readFirstAcceptance(store, project, manifest);
+  return (await readAcceptedDiscoveryBasisAt(store, project, at)).accepted;
 }
-/** What an owner choice is proven against: the accepted edition, its saved bundle and the resolutions it carries. */
-export interface EditionView { manifest: Revision<DiscoveryManifest>; bundle: Revision<AcceptedFinalBundle>; resolutions: Revision<ConditionResolution>[] }
+export async function readAcceptedDiscoveryBasisAt(store: Store, project: string, at: unknown): Promise<AcceptedDiscoveryBasis> {
+  return readAcceptedEdition(store, project, acceptanceSnapshot(at, 'manifest') as Ref, new Set());
+}
+async function readAcceptedEdition(store: Store, project: string, ref: Ref, seen: Set<string>): Promise<AcceptedDiscoveryBasis> {
+  const manifest = readDiscoveryManifestStructural(store, project, ref).record;
+  // An edition met again on its own chain is a cycle, never a history.
+  if (seen.has(manifest.id)) acceptanceInvalid('previous', 'The chain of editions returns to an edition already read', { ref });
+  seen.add(manifest.id);
+  if (manifest.value.previous === null) return readFirstAcceptance(store, project, manifest);
+  // The edition is checked against its predecessor's exact saved records before that predecessor is proven again, so a
+  // forged or lost ground is refused without the paid proof; the proven predecessor must then be that same view.
+  const light = readEditionView(store, project, manifest.value.previous);
+  const resolution = checkEdition(store, project, manifest, light);
+  const prior = await readAcceptedEdition(store, project, manifest.value.previous, seen);
+  if (!same(prior.accepted.manifest, light.manifest) || !same(prior.accepted.bundle, light.bundle)
+    || !same(prior.accepted.resolutions, light.resolutions))
+    acceptanceInvalid('previous', 'The proven previous edition is not the one its saved records name', { ref });
+  return assembleEdition(manifest, prior, resolution);
+}
+/** What an owner choice is proven against: an accepted edition, its saved bundle and the resolutions it carries. */
+export interface EditionView { manifest: Revision<DiscoveryManifest>; bundle: Revision<AcceptedFinalBundle>; resolutions: Revision<PositiveConditionResolution>[] }
 /** The exact saved records of an edition, read without proving the paid assessment. */
 export function readEditionView(store: Store, project: string, ref: Ref): EditionView {
   const manifest = readDiscoveryManifestStructural(store, project, ref).record;
   return { manifest, bundle: exactRecord<AcceptedFinalBundle>(store, manifest.value.bundle, ACCEPTED_FINAL_BUNDLE_KIND, `${ACCEPTED_FINAL_BUNDLE_KIND}:`, 'bundle'),
     resolutions: manifest.value.resolutions.map(item =>
-      exactRecord<ConditionResolution>(store, item, CONDITION_RESOLUTION_KIND, `${CONDITION_RESOLUTION_KIND}:`, 'resolution')) };
+      exactRecord<PositiveConditionResolution>(store, item, CONDITION_RESOLUTION_KIND, `${CONDITION_RESOLUTION_KIND}:`, 'resolution')) };
 }
-async function readFirstAcceptance(store: Store, project: string, manifest: Revision<DiscoveryManifest>): Promise<AcceptedDiscovery> {
+/** A later edition over its predecessor: named with its added resolution by the one successor record of that predecessor,
+ * keeping its accepted bodies, adding exactly one resolution, which is a positive owner choice made on that predecessor. */
+function checkEdition(store: Store, project: string, manifest: Revision<DiscoveryManifest>, predecessor: EditionView): Revision<PositiveConditionResolution> {
+  const ref = reference(manifest), previous = manifest.value.previous!, value = manifest.value, kept = predecessor.manifest.value;
+  if (!same(previous, reference(predecessor.manifest))) acceptanceInvalid('previous', 'The edition names another previous edition', { ref });
+  if (value.resolutions.length !== kept.resolutions.length + 1)
+    acceptanceInvalid('manifest', 'A later edition adds exactly one resolution to its previous edition', { ref });
+  const added = value.resolutions[value.resolutions.length - 1]!;
+  const successor = readManifestSuccessor(store, project, previous);
+  if (!successor || !same(successor.value.successor, ref) || !same(successor.value.resolution, added))
+    acceptanceInvalid('successor', 'The previous edition names this edition and its resolution as its one successor', { ref });
+  if (!same(value.draft, kept.draft) || !same(value.bundle, kept.bundle) || !same(value.assessment, kept.assessment)
+    || !same(value.admission, kept.admission) || !same(value.resolutions.slice(0, -1), kept.resolutions))
+    acceptanceInvalid('manifest', 'A later edition keeps the accepted bodies and the resolutions of its previous edition', { ref });
+  const resolution = proveConditionResolution(store, project, added, predecessor);
+  if (resolution.value.contract !== CONDITION_RESOLUTION_POSITIVE_CONTRACT)
+    acceptanceInvalid('resolution', 'Only a positive resolution of a proven choice is a resolution of an edition; an owner act is not', { ref: added });
+  return resolution as Revision<PositiveConditionResolution>;
+}
+/** The edition over its proven predecessor: the class of the resolved condition is proven choice by the paid answer
+ * of the predecessor's grounds, which the resolution names exactly. */
+function assembleEdition(manifest: Revision<DiscoveryManifest>, prior: AcceptedDiscoveryBasis,
+  resolution: Revision<PositiveConditionResolution>): AcceptedDiscoveryBasis {
+  const grounds = prior.accepted.grounds, ref = reference(manifest);
+  if (!same(resolution.value.grounds, { draft: grounds.draft, paid: grounds.paid, assessment: grounds.assessment }))
+    acceptanceInvalid('resolution', 'The resolution names other grounds than the accepted bundle', { ref });
+  if (provenConditionClass(grounds.bundle, prior.review, resolution.value.conditionId).class !== 'choice')
+    acceptanceInvalid('resolution', 'Only a condition proven to be of class choice is resolved inside the accepted bundle', { ref },
+      'discovery_condition_class_unproven');
+  const resolutions = [...prior.accepted.resolutions, resolution];
+  return { accepted: structuredClone({ ...prior.accepted, manifest, resolutions,
+    conditions: conditionsOf(grounds.bundle, resolutions) }), review: prior.review };
+}
+/** The next edition over an already proven predecessor: the same checks as the historical reader, without proving the
+ * predecessor's paid grounds again. */
+export function extendAcceptedEdition(store: Store, project: string, prior: AcceptedDiscoveryBasis, at: Ref): AcceptedDiscoveryBasis {
+  const manifest = readDiscoveryManifestStructural(store, project, exact(at)).record;
+  if (manifest.value.previous === null) acceptanceInvalid('previous', 'A first acceptance extends no edition', { ref: at });
+  return assembleEdition(manifest, prior, checkEdition(store, project, manifest, prior.accepted));
+}
+async function readFirstAcceptance(store: Store, project: string, manifest: Revision<DiscoveryManifest>): Promise<AcceptedDiscoveryBasis> {
   if (manifest.value.resolutions.length !== 0)
     acceptanceInvalid('manifest', 'A first acceptance has no previous manifest and no resolutions');
   // The saved records are read exactly before the paid assessment is proven again, so a lost or substituted record is
@@ -310,7 +391,7 @@ async function readFirstAcceptance(store: Store, project: string, manifest: Revi
     : exactRecord<FinalMachineAdmission>(store, manifest.value.admission.record, FINAL_MACHINE_ADMISSION_KIND, `${FINAL_MACHINE_ADMISSION_KIND}:`, 'admission');
   if (manifest.value.admission.kind === 'owner' && (admitted.value as { scope?: { decision?: unknown } }).scope?.decision !== 'accept')
     acceptanceInvalid('act', 'A declining owner act publishes no accepted manifest');
-  const grounds = await provenAcceptanceGrounds(store, project, manifest.value.assessment);
+  const { grounds, review } = await provenAcceptanceBasis(store, project, manifest.value.assessment);
   if (!same(manifest.value.draft, grounds.draft)) acceptanceInvalid('draft', 'The manifest names another draft than its assessed D7');
   const bundleValue = bundle.value as unknown as Record<string, unknown>;
   if (bundle.revision !== 1 || !exactKeys(bundleValue, ['contract', 'projectId', 'paid', 'bundle']) || bundleValue.contract !== ACCEPTED_FINAL_BUNDLE_CONTRACT
@@ -322,9 +403,8 @@ async function readFirstAcceptance(store: Store, project: string, manifest: Revi
     : { kind: 'machine' as const, record: proveFinalMachineAdmission(store, project, manifest.value.admission.record, grounds) };
   if (admission.kind === 'owner' && admission.record.value.scope.decision !== 'accept')
     acceptanceInvalid('act', 'A declining owner act publishes no accepted manifest');
-  const ids = grounds.bundle.verdict.conditions.map(condition => (condition as { id: string }).id);
-  return structuredClone({ verification: 'accepted', manifest, bundle, admission, grounds, resolutions: [],
-    conditions: { resolved: [], open: ids } });
+  return { accepted: structuredClone({ verification: 'accepted' as const, manifest, bundle, admission, grounds, resolutions: [],
+    conditions: conditionsOf(grounds.bundle, []) }), review };
 }
 
 /* DR7 7b.3 (codex-omg2 №16156 п.1, №16160, №16169): the owner's authorized choice on one owner_choice condition of an
@@ -343,7 +423,11 @@ export const CONDITION_CHOICE_GRANT_LIFETIME_MS = 10 * 60_000;
 export const CONDITION_CHOICE_SESSION_LIFETIME_MS = 30 * 60_000;
 export const CONDITION_RESOLUTION_KIND = 'discovery-condition-resolution' as const;
 export const CONDITION_RESOLUTION_CONTRACT = 'discovery-condition-resolution/v1' as const;
+/** 7b.3 (codex-omg2 №16299): the positive resolution — an accepting owner choice of a condition proven to be of class
+ * choice. The owner act of v1 keeps its meaning (resolves nothing) and is never read as this one. */
+export const CONDITION_RESOLUTION_POSITIVE_CONTRACT = 'discovery-condition-resolution/v2' as const;
 export const MANIFEST_SUCCESSOR_KIND = 'discovery-manifest-successor' as const;
+export const MANIFEST_SUCCESSOR_CONTRACT = 'discovery-manifest-successor/v1' as const;
 
 /** One exact owner choice: the project, the exact edition it is made on and its saved bundle, the condition of that
  * bundle, the offered option and the owner's reason. */
@@ -362,6 +446,15 @@ export interface ConditionOption { optionId: string; label: string; consequences
 export interface ConditionResolution {
   contract: typeof CONDITION_RESOLUTION_CONTRACT; database: string; projectId: string; predecessor: Ref; bundle: Ref; conditionId: string;
   kind: 'owner_choice'; option: ConditionOption; scope: ConditionChoiceScope; authority: { grant: Ref; session: Ref }; at: number;
+}
+/** The positive resolution: the owner act of v1 with the proven class choice and the exact grounds it was proven on. */
+export interface PositiveConditionResolution extends Omit<ConditionResolution, 'contract'> {
+  contract: typeof CONDITION_RESOLUTION_POSITIVE_CONTRACT; class: 'choice'; grounds: { draft: Ref; paid: Ref; assessment: Ref };
+}
+export type ConditionAct = ConditionResolution | PositiveConditionResolution;
+/** The one successor of an edition: the next edition and the positive resolution it adds. */
+export interface ManifestSuccessor {
+  contract: typeof MANIFEST_SUCCESSOR_CONTRACT; projectId: string; predecessor: Ref; successor: Ref; resolution: Ref;
 }
 export function requireConditionChoiceScope(value: unknown): ConditionChoiceScope {
   if (!plain(value) || !exactKeys(value, ['projectId', 'predecessor', 'bundle', 'conditionId', 'optionId', 'reason'])
@@ -390,9 +483,9 @@ export const manifestSuccessorId = (predecessor: Ref) => `${MANIFEST_SUCCESSOR_K
 
 /** The saved owner choice on one condition at its canonical address, with the edition it names, before it is proven;
  * null when there is none. */
-export function readSavedResolution(store: Store, id: string): { row: Revision<ConditionResolution>; predecessor: Ref } | null {
+export function readSavedResolution(store: Store, id: string): { row: Revision<ConditionAct>; predecessor: Ref } | null {
   if (!store.get(id, 1)) return null;
-  const row = soleRecord<ConditionResolution>(store, id, CONDITION_RESOLUTION_KIND, 'resolution');
+  const row = soleRecord<ConditionAct>(store, id, CONDITION_RESOLUTION_KIND, 'resolution');
   const value = row.value as unknown as Record<string, unknown>;
   if (!exactRef(value.predecessor)) acceptanceInvalid('resolution', 'A saved owner choice names its exact predecessor edition', { id });
   return { row, predecessor: exact(value.predecessor as Ref) };
@@ -412,17 +505,48 @@ export function offeredConditionOption(accepted: EditionView, conditionId: strin
   if (!option) acceptanceInvalid('optionId', 'The owner chooses one option the condition offers', {}, 'discovery_condition_resolution_invalid');
   return { condition: condition!, option: structuredClone(option) as ConditionOption };
 }
-/** The one write of an owner act: the saved choice at its canonical address. */
-export function conditionResolutionWrites(project: string, accepted: AcceptedDiscovery, resolution: ConditionResolution): Write[] {
-  return [{ id: conditionResolutionId(project, accepted.manifest.value.bundle, resolution.conditionId), kind: CONDITION_RESOLUTION_KIND,
-    expected: 0, value: resolution }];
+/** The one successor record of an edition at its canonical address, in its closed form; null when there is none. */
+export function readManifestSuccessor(store: Store, project: string, predecessor: Ref): Revision<ManifestSuccessor> | null {
+  const id = manifestSuccessorId(predecessor);
+  if (!store.get(id, 1)) return null;
+  const row = soleRecord<ManifestSuccessor>(store, id, MANIFEST_SUCCESSOR_KIND, 'successor');
+  const value = row.value as unknown as Record<string, unknown>;
+  if (!exactKeys(value, ['contract', 'projectId', 'predecessor', 'successor', 'resolution']) || value.contract !== MANIFEST_SUCCESSOR_CONTRACT
+    || value.projectId !== project || !exactRef(value.predecessor) || !same(value.predecessor, exact(predecessor))
+    || !exactRef(value.successor) || !exactRef(value.resolution))
+    acceptanceInvalid('successor', 'The successor record names exactly its predecessor, its successor and the resolution', { id });
+  return row;
+}
+/** The conditions of the bundle the positive resolutions fulfil and those still open, in the bundle's order. */
+function conditionsOf(bundle: V7FinalBundle, resolutions: Revision<PositiveConditionResolution>[]): { resolved: string[]; open: string[] } {
+  const ids = bundle.verdict.conditions.map(condition => (condition as { id: string }).id);
+  const done = new Set(resolutions.map(row => row.value.conditionId));
+  return { resolved: ids.filter(id => done.has(id)), open: ids.filter(id => !done.has(id)) };
+}
+/** The writes of one owner act: the act alone; for a positive resolution also the next edition and the one successor
+ * record of its predecessor. */
+export function conditionResolutionWrites(project: string, accepted: AcceptedDiscovery, act: ConditionAct): { writes: Write[]; edition: Ref | null } {
+  const record = { id: conditionResolutionId(project, accepted.manifest.value.bundle, act.conditionId), revision: 1,
+    hash: hashJson(act as unknown as Json) };
+  const writes: Write[] = [{ id: record.id, kind: CONDITION_RESOLUTION_KIND, expected: 0, value: act }];
+  if (act.contract !== CONDITION_RESOLUTION_POSITIVE_CONTRACT) return { writes, edition: null };
+  const predecessor = exact(reference(accepted.manifest));
+  const value: DiscoveryManifest = { ...structuredClone(accepted.manifest.value), previous: predecessor,
+    resolutions: [...accepted.manifest.value.resolutions.map(exact), record] };
+  const id = discoveryManifestId(value), edition = { id, revision: 1, hash: hashJson(value as unknown as Json) };
+  const successor: ManifestSuccessor = { contract: MANIFEST_SUCCESSOR_CONTRACT, projectId: project, predecessor, successor: edition, resolution: record };
+  writes.push({ id, kind: DISCOVERY_MANIFEST_KIND, expected: 0, value },
+    { id: manifestSuccessorId(predecessor), kind: MANIFEST_SUCCESSOR_KIND, expected: 0, value: successor });
+  return { writes, edition };
 }
 /** The saved owner act, proved from its own grounds over the edition it was made on: this bundle, an offered option, the exact scope and the exact open session and grant inside their windows. */
-export function proveConditionResolution(store: Store, project: string, ref: unknown, predecessor: EditionView): Revision<ConditionResolution> {
-  const row = exactRecord<ConditionResolution>(store, ref, CONDITION_RESOLUTION_KIND, `${CONDITION_RESOLUTION_KIND}:`, 'resolution');
+export function proveConditionResolution(store: Store, project: string, ref: unknown, predecessor: EditionView): Revision<ConditionAct> {
+  const row = exactRecord<ConditionAct>(store, ref, CONDITION_RESOLUTION_KIND, `${CONDITION_RESOLUTION_KIND}:`, 'resolution');
   const value = row.value as unknown as Record<string, unknown>, at = reference(row);
+  const positive = value.contract === CONDITION_RESOLUTION_POSITIVE_CONTRACT;
   if (row.revision !== 1 || !exactKeys(value, ['contract', 'database', 'projectId', 'predecessor', 'bundle', 'conditionId', 'kind', 'option', 'scope',
-    'authority', 'at']) || value.contract !== CONDITION_RESOLUTION_CONTRACT || value.database !== store.databaseId || value.projectId !== project
+    'authority', 'at', ...(positive ? ['class', 'grounds'] : [])])
+    || (value.contract !== CONDITION_RESOLUTION_CONTRACT && !positive) || value.database !== store.databaseId || value.projectId !== project
     || value.kind !== 'owner_choice' || !exactRef(value.predecessor) || !same(value.predecessor, reference(predecessor.manifest))
     || !exactRef(value.bundle) || !same(value.bundle, predecessor.manifest.value.bundle) || !text(value.conditionId)
     || row.id !== conditionResolutionId(project, value.bundle, value.conditionId) || !Number.isSafeInteger(value.at))
@@ -436,6 +560,15 @@ export function proveConditionResolution(store: Store, project: string, ref: unk
   const offered = offeredConditionOption(predecessor, scope.conditionId, scope.optionId);
   if (!same(value.option, offered.option))
     acceptanceInvalid('option', 'The saved option is the offered one verbatim, with its consequences', { ref: at });
+  // A positive resolution is an accepting choice of the class choice on exactly the grounds of the accepted bundle; the
+  // class itself is proven against the paid answer of those grounds by its reader.
+  if (positive) {
+    const grounds = value.grounds as Record<string, unknown>;
+    if (value.class !== 'choice' || offered.option.choice !== 'accept' || !plain(grounds) || !exactKeys(grounds, ['draft', 'paid', 'assessment'])
+      || !same(grounds, { draft: predecessor.manifest.value.draft, paid: (predecessor.bundle.value as { paid?: unknown }).paid,
+        assessment: predecessor.manifest.value.assessment }))
+      acceptanceInvalid('resolution', 'A positive resolution is an accepting choice of class choice on the exact grounds of the bundle', { ref: at });
+  }
   requireActSession(store, value.authority, scope, value.at as number, CONDITION_CHOICE_SPEC, at);
   return row;
 }

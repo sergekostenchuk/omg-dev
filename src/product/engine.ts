@@ -76,8 +76,11 @@ export function discoveryDecisionOutput(result: DiscoveryAcceptanceOutcome) {
     accepted: result.accepted ? acceptedDiscoveryOutput(result.accepted) : null, repeated: result.repeated };
 }
 export function discoveryConditionOutput(result: ConditionResolutionOutcome) {
-  return { choice: result.choice, act: reference(result.resolution), edition: result.edition,
-    resolved: result.resolved, unresolved: !result.resolved, reason: result.unproven, route: result.route, repeated: result.repeated };
+  // 7b.3 (codex-omg2 №16299): resolved/unresolved name the chosen condition; conditionStatus is the proven state of all
+  // conditions of the latest edition — closing every condition permits no further stage by itself.
+  return { choice: result.choice, act: reference(result.resolution), edition: result.edition ? acceptedDiscoveryOutput(result.edition) : null,
+    resolved: result.resolved, unresolved: !result.resolved, reason: result.unproven, route: result.route,
+    conditionStatus: result.conditions, repeated: result.repeated };
 }
 
 export type { Project, StageContent } from "./stage-checks.js";

@@ -202,9 +202,10 @@ test('7b.3 forged acts and editions: no edition resolves a condition, and a rewr
   const { f, first } = await accepted(t);
   const o = await chooser(f.store, first, 'owner-1', 'narrow');
   const act = (await resolveDiscoveryCondition(f.store, o.request, o.authority)).resolution;
-  // A later edition naming the real accepting act as its resolution: the class of the choice is unproven.
+  // A later edition naming the real accepting act as its resolution, without the successor record of its predecessor.
+  // (7b.3 CHOICE-EDITIONS, codex-omg2 №16299: editions now exist, so the planted one is refused as an unnamed edition.)
   const planted = edition(first, reference(act));
-  await refused(f, f.store, () => readAcceptedDiscoveryManifestAt(overlay(f.store, planted.rows), 'p', planted.ref), 'discovery_condition_class_unproven');
+  await refused(f, f.store, () => readAcceptedDiscoveryManifestAt(overlay(f.store, planted.rows), 'p', planted.ref), 'discovery_acceptance_invalid');
   // The saved act at its canonical address: its option rewritten, its predecessor re-pointed under a consistent hash, or
   // another revision answered — each is a typed refusal on the public repeat.
   const rewritten = structuredClone(act) as any; rewritten.value.option.consequences = ['Everything ships at once'];

@@ -25,12 +25,14 @@ import { FINAL_ACCEPTANCE_ACTION, FINAL_ACCEPTANCE_ACT_CONTRACT, FINAL_ACCEPTANC
   type AcceptedDiscovery, type DiscoveryAcceptanceGrounds, type FinalAcceptanceAct, type FinalAcceptanceScope,
   type FinalAcceptanceSession, type FinalAcceptanceSessionGrant, type FinalMachineAdmission,
   CONDITION_CHOICE_ACTION, CONDITION_CHOICE_GRANT_CONTRACT, CONDITION_CHOICE_GRANT_LIFETIME_MS, CONDITION_CHOICE_GRANT_PREFIX,
-  CONDITION_CHOICE_SESSION_CONTRACT, CONDITION_CHOICE_SESSION_LIFETIME_MS, CONDITION_RESOLUTION_CONTRACT, conditionChoiceSessionId,
-  conditionResolutionId, conditionResolutionWrites, manifestSuccessorId, readEditionView, readSavedResolution, type EditionView, offeredConditionOption, proveConditionResolution,
+  CONDITION_CHOICE_SESSION_CONTRACT, CONDITION_CHOICE_SESSION_LIFETIME_MS, CONDITION_RESOLUTION_CONTRACT, CONDITION_RESOLUTION_POSITIVE_CONTRACT, conditionChoiceSessionId,
+  conditionResolutionId, conditionResolutionWrites, extendAcceptedEdition, manifestSuccessorId, provenConditionClass, readAcceptedDiscoveryBasisAt,
+  readEditionView, readManifestSuccessor, readSavedResolution, type AcceptedDiscoveryBasis, type ConditionAct, type EditionView, offeredConditionOption, proveConditionResolution,
   readConditionChoiceGrant, readConditionChoiceSession, requireConditionChoiceScope, type ConditionChoiceGrant,
-  type ConditionChoiceScope, type ConditionChoiceSession, type ConditionResolution } from "../discovery/discovery-acceptance.js";
+  type ConditionChoiceScope, type ConditionChoiceSession } from "../discovery/discovery-acceptance.js";
 import { delivered, isPlainObject, isText, refused, type OmResult, type Refusal, type Sealed } from "../om/refusal.js";
 import { proveClaimAddress, type ClaimAddress } from "../discovery/claim-address.js";
+import { V8_FINAL_CONTRACT, type FinalConditionClass } from "../discovery/v7-final-contracts.js";
 
 /**
  * H2.0 (№1353, вариант Б; договор №2719): owner authority — the separately authenticated path that alone may produce
@@ -1696,17 +1698,22 @@ export class ConditionChoiceSessions {
 export interface ConditionChoiceRoute {
   target: 'D7'; predecessor: Ref; bundle: Ref; paid: Ref; assessment: Ref; conditionId: string; optionId: string;
 }
+/** Why an accepting act resolves nothing inside the accepted bundle: the old contract proves no class, or the proven
+ * class is a boundary or a risk, which need a new D7. */
+export type ConditionUnresolvedReason = 'condition_class_unproven' | 'condition_class_boundary' | 'condition_class_risk';
 export interface ConditionResolutionOutcome {
   choice: 'accept' | 'decline';
-  /** The saved owner act, proven on the edition it was made on. */
-  resolution: Revision<ConditionResolution>;
-  /** No edition is published: the act fulfils no condition, which stays open. */
-  edition: null;
-  resolved: false;
-  /** Why an accepting choice resolves nothing yet; null for the owner's refusal. */
-  unproven: 'condition_class_unproven' | null;
-  /** The return address of an accepting choice; null for the owner's refusal. */
+  /** The saved owner act or positive resolution, proven on the edition it was made on. */
+  resolution: Revision<ConditionAct>;
+  /** The proven next edition of a positive resolution; null for an act that resolves nothing. */
+  edition: AcceptedDiscovery | null;
+  resolved: boolean;
+  /** Why an accepting act resolves nothing; null for a resolution and for the owner's refusal. */
+  unproven: ConditionUnresolvedReason | null;
+  /** The return address of an accepting act that resolves nothing; null otherwise. */
   route: ConditionChoiceRoute | null;
+  /** The proven conditions of the latest edition this outcome stands on: the new edition, or its predecessor. */
+  conditions: { resolved: string[]; open: string[] };
   repeated: boolean;
 }
 type ChoiceRequest = { projectId: string; manifest: Ref; conditionId: string; reason: string }
@@ -1747,12 +1754,14 @@ function refuseEvidence(store: Store, accepted: EditionView, input: ChoiceReques
     { conditionId: input.conditionId, claims: input.claims.length, door: 'owner-final-condition' });
 }
 /**
- * DR7 7b.3 (codex-omg2 №16169): the single producer of the owner's act on one condition of an accepted bundle. Only a
- * minted condition-choice authority bound to this exact edition, condition and option may write the act, at its canonical
- * address, under the guards of the project, the exact open session and the absent successor of the edition. The act
- * resolves nothing: an accepting choice returns condition_class_unproven with the address of a new D7, a declining one is
- * the owner's refusal; the condition stays open and no edition is published. An evidence condition is refused without a
- * write until 7b.3e. A saved act with the same option is returned proven again; another option is a conflict.
+ * DR7 7b.3 (codex-omg2 №16169, №16299): the single producer of the owner's act on one condition of an accepted bundle.
+ * Only a minted condition-choice authority bound to this exact edition, condition and option may write, at the act's
+ * canonical address, under the guards of the project, the exact open session and the absent successor of the edition.
+ * An accepting option of a condition whose class is proven choice is a positive resolution: it is saved atomically with
+ * the next edition and the one successor record of its predecessor. Every other act resolves nothing — an accepting
+ * one returns its reason (no proven class in the legacy form, or a boundary/risk class) with the address of a new D7, a
+ * declining one is the owner's refusal; no edition is published. An evidence condition is refused without a write until
+ * 7b.3e. A saved act with the same option is returned proven again; another option is a conflict.
  */
 export async function resolveDiscoveryCondition(store: Store, request: unknown, authority?: unknown): Promise<ConditionResolutionOutcome> {
   requireCondition(store instanceof Store, 'discovery_condition_resolution_invalid', 'An owner choice needs a Store');
@@ -1765,33 +1774,57 @@ export async function resolveDiscoveryCondition(store: Store, request: unknown, 
   const view = readEditionView(store, projectId, input.manifest);
   if (input.claims) return refuseEvidence(store, view, input);
   offeredConditionOption(view, input.conditionId, input.optionId);
-  const predecessor = await readAcceptedDiscoveryManifestAt(store, projectId, input.manifest);
+  const basis = await readAcceptedDiscoveryBasisAt(store, projectId, input.manifest), predecessor = basis.accepted;
   const offered = offeredConditionOption(predecessor, input.conditionId, input.optionId);
   const resolutionId = conditionResolutionId(projectId, predecessor.manifest.value.bundle, input.conditionId);
-  const outcome = (proven: Revision<ConditionResolution>, repeated: boolean): ConditionResolutionOutcome => {
+  /** The class of the condition over a proven edition: null for the legacy discovery-final/v7 form only; a damaged or
+   * unconfirmed class of the versioned form is a typed refusal, never the legacy case. */
+  const classOver = (over: AcceptedDiscoveryBasis): FinalConditionClass | null => over.accepted.grounds.bundle.contract === V8_FINAL_CONTRACT
+    ? provenConditionClass(over.accepted.grounds.bundle, over.review, input.conditionId).class : null;
+  const outcome = (proven: Revision<ConditionAct>, base: AcceptedDiscoveryBasis, repeated: boolean): ConditionResolutionOutcome => {
     const accept = proven.value.option.choice === 'accept';
-    return { choice: accept ? 'accept' : 'decline', resolution: structuredClone(proven), edition: null, resolved: false,
-      unproven: accept ? 'condition_class_unproven' : null,
+    if (proven.value.contract === CONDITION_RESOLUTION_POSITIVE_CONTRACT) {
+      const successor = readManifestSuccessor(store, projectId, proven.value.predecessor);
+      if (!successor || !sameScope(successor.value.resolution, reference(proven)))
+        throw new EngineError('discovery_acceptance_invalid', 'A positive resolution is saved without its edition',
+          { project: projectId, conditionId: input.conditionId, door: 'owner-final-condition' });
+      const edition = extendAcceptedEdition(store, projectId, base, successor.value.successor).accepted;
+      return { choice: 'accept', resolution: structuredClone(proven), edition, resolved: true, unproven: null, route: null,
+        conditions: structuredClone(edition.conditions), repeated };
+    }
+    const cls = accept ? classOver(base) : null;
+    const unproven: ConditionUnresolvedReason | null = !accept ? null
+      : cls === null ? 'condition_class_unproven' : cls === 'boundary' ? 'condition_class_boundary' : cls === 'risk' ? 'condition_class_risk'
+      : (() => { throw new EngineError('discovery_acceptance_invalid', 'An accepting act of a proven choice is saved as a positive resolution',
+        { project: projectId, conditionId: input.conditionId, door: 'owner-final-condition' }); })();
+    return { choice: accept ? 'accept' : 'decline', resolution: structuredClone(proven), edition: null, resolved: false, unproven,
       route: accept ? { target: 'D7', predecessor: exactRef(proven.value.predecessor), bundle: exactRef(proven.value.bundle),
-        paid: exactRef(predecessor.grounds.paid), assessment: exactRef(predecessor.grounds.assessment),
-        conditionId: proven.value.conditionId, optionId: proven.value.option.optionId } : null, repeated };
+        paid: exactRef(base.accepted.grounds.paid), assessment: exactRef(base.accepted.grounds.assessment),
+        conditionId: proven.value.conditionId, optionId: proven.value.option.optionId } : null,
+      conditions: structuredClone(predecessor.conditions), repeated };
   };
-  const saved = (repeated: boolean): ConditionResolutionOutcome | null => {
+  const saved = async (repeated: boolean): Promise<ConditionResolutionOutcome | null> => {
     // The saved row is read exactly at its canonical address, in its closed form, before any of its fields is used.
     const found = readSavedResolution(store, resolutionId);
     if (!found) return null;
-    const proven = proveConditionResolution(store, projectId, reference(found.row), predecessor);
+    // The saved act is proven on the edition it names: this predecessor or one of its proven ancestors.
+    let base = basis;
+    while (!sameScope(reference(base.accepted.manifest), found.predecessor) && base.accepted.manifest.value.previous)
+      base = await readAcceptedDiscoveryBasisAt(store, projectId, base.accepted.manifest.value.previous);
+    const proven = proveConditionResolution(store, projectId, reference(found.row), base.accepted);
     // Only a compatible saved act is this result; another option is an explicit conflict, never the old act as success.
     if (proven.value.option.optionId !== input.optionId)
       throw new EngineError('discovery_condition_resolution_conflict', 'The owner has already chosen another option on this condition',
         { project: projectId, conditionId: input.conditionId, chosen: proven.value.option.optionId, door: 'owner-final-condition' });
-    return outcome(proven, repeated);
+    return outcome(proven, base, repeated);
   };
-  const before = saved(true);
+  const before = await saved(true);
   if (before) return before;
   const stale = () => new EngineError('discovery_condition_resolution_stale',
     'The edition gained a successor or the owner session moved before the act was written', { project: projectId, door: 'owner-final-condition' });
   if (store.get(manifestSuccessorId(input.manifest))) throw stale();
+  // A positive resolution only for an accepting option of a condition whose class is proven choice.
+  const positive = offered.option.choice === 'accept' && classOver(basis) === 'choice';
   const scope: ConditionChoiceScope = { projectId, predecessor: exactRef(reference(predecessor.manifest)),
     bundle: exactRef(predecessor.manifest.value.bundle), conditionId: input.conditionId, optionId: input.optionId, reason: input.reason };
   const admitted = requireConditionChoiceAuthority(authority, { store, action: CONDITION_CHOICE_ACTION, scope });
@@ -1799,21 +1832,25 @@ export async function resolveDiscoveryCondition(store: Store, request: unknown, 
   // The second exercise closes the check-to-write window; the pinned open session revision is a transaction guard.
   const applied = requireConditionChoiceAuthority(authority, { store, action: CONDITION_CHOICE_ACTION, scope });
   if (!applied.ok) return acceptanceFailure(applied);
-  const resolution: ConditionResolution = { contract: CONDITION_RESOLUTION_CONTRACT, database: store.databaseId, projectId,
-    predecessor: scope.predecessor, bundle: scope.bundle, conditionId: input.conditionId, kind: 'owner_choice', option: offered.option,
-    scope, authority: { grant: applied.value.grant, session: applied.value.session }, at: applied.value.at };
-  // CONDITION-DECLINE-CAS-01: the edition still has no successor at the commit, for either choice.
+  const base = { database: store.databaseId, projectId, predecessor: scope.predecessor, bundle: scope.bundle, conditionId: input.conditionId,
+    kind: 'owner_choice' as const, option: offered.option, scope, authority: { grant: applied.value.grant, session: applied.value.session },
+    at: applied.value.at };
+  const act: ConditionAct = positive
+    ? { contract: CONDITION_RESOLUTION_POSITIVE_CONTRACT, ...base, class: 'choice', grounds: { draft: exactRef(predecessor.grounds.draft),
+      paid: exactRef(predecessor.grounds.paid), assessment: exactRef(predecessor.grounds.assessment) } }
+    : { contract: CONDITION_RESOLUTION_CONTRACT, ...base };
+  // CONDITION-DECLINE-CAS-01: the edition still has no successor at the commit, for every act.
   const guards = uniqueTransactionGuards([reference(project), applied.value.session, { id: manifestSuccessorId(scope.predecessor), absent: true }]);
-  try { store.writeMany(conditionResolutionWrites(projectId, predecessor, resolution), guards); }
+  try { store.writeMany(conditionResolutionWrites(projectId, predecessor, act).writes, guards); }
   catch (error) {
     if (error instanceof EngineError && ['revision_conflict', 'input_stale'].includes(error.code)) {
-      const winner = saved(true);
+      const winner = await saved(true);
       if (winner) return winner;
       throw stale();
     }
     throw error;
   }
-  const written = saved(false);
+  const written = await saved(false);
   if (!written) throw new EngineError('owner_authority_internal', 'The owner act was not saved');
   return written;
 }

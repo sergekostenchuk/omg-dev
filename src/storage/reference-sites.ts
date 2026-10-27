@@ -410,6 +410,13 @@ const RECORD_REFERENCE_SEMANTICS: readonly RecordReferenceSemantics[] = [
   // its bundle and its authority records.
   { kind: "discovery-condition-resolution", contract: "discovery-condition-resolution/v1", data: [], refs: [
     ["predecessor"], ["bundle"], ["scope", "predecessor"], ["scope", "bundle"], ["authority", "grant"], ["authority", "session"]] },
+  // DR7 7b.3 (codex-omg2 №16299): the positive resolution names in addition the exact grounds its class was proven on;
+  // the successor names the predecessor edition, its one next edition and the resolution that edition adds.
+  { kind: "discovery-condition-resolution", contract: "discovery-condition-resolution/v2", data: [], refs: [
+    ["predecessor"], ["bundle"], ["scope", "predecessor"], ["scope", "bundle"], ["authority", "grant"], ["authority", "session"],
+    ["grounds", "draft"], ["grounds", "paid"], ["grounds", "assessment"]] },
+  { kind: "discovery-manifest-successor", contract: "discovery-manifest-successor/v1", data: [], refs: [
+    ["predecessor"], ["successor"], ["resolution"]] },
   // DR4-M: structural reference sites only. These records do not prove paid or owner provenance.
   { kind: "discovery-variant-snapshot", contract: "discovery-variant-snapshot/v1", data: [], refs: [
     ["draft"], ["frame"], ["plan"], ["questions", INDEX, "question"], ["questions", INDEX, "progress"],
