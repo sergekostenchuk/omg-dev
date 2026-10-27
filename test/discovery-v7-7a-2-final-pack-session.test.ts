@@ -27,6 +27,7 @@ import { publishVariantScope } from '../src/discovery/variant-scope.js';
 import { ProjectModeSessions, VariantChoiceSessions, issueProjectModeInvitation, issueVariantChoiceInvitation } from '../src/product/owner-authority.js';
 import { setProjectMode } from '../src/product/project-mode.js';
 import { researchSetup, produce, rand, validPlan, type PlanQuestion } from './discovery-v7-fixture.js';
+import { storeUnchanged } from './store-unchanged.js';
 import type { OmResult } from '../src/om/refusal.js';
 import { DISCOVERY_DEEP_PREPARATION_CONTRACT, produceDeepPreparation, type DeepPreparation } from '../src/discovery/deep-research.js';
 import { DISCOVERY_COVERAGE_CELL_CONTRACT } from '../src/discovery/coverage.js';
@@ -180,13 +181,19 @@ const all = (store: Store) => {
     revisions: db.prepare('SELECT * FROM revisions ORDER BY entity_id,revision').all(), events:db.prepare('SELECT * FROM events ORDER BY sequence').all() } as never); }
   finally { db.close(); }
 };
-async function unchanged<T>(f: Paid, store: Store, action: () => Promise<T>, refuses = false): Promise<T | undefined> {
-  const before = all(store), calls = money(store), wires = f.wires();
-  let result: T | undefined;
-  if (refuses) await assert.rejects(action, error => error instanceof EngineError);
-  else result = await action();
-  assert.equal(all(store), before); assert.deepEqual(money(store), calls); assert.deepEqual(f.wires(), wires);
-  return result;
+async function unchanged<T>(f: Paid, store: Store, action: () => Promise<T>,
+  mode: 'stamp' | 'full' | 'cross-store' = 'stamp'): Promise<T> {
+  const before = mode === 'stamp' ? null : all(store), calls = money(store), wires = f.wires();
+  try {
+    // The partial recovery below reads through a second connection, whose
+    // legitimate proof-cache writes can move this connection's data_version.
+    // It keeps the full product-history comparison instead of a stamp.
+    return mode === 'cross-store' ? await action() : await storeUnchanged(store, action);
+  } finally {
+    const after = before === null ? null : all(store), afterCalls = money(store), afterWires = f.wires();
+    if (before !== null) assert.equal(after, before);
+    assert.deepEqual(afterCalls, calls); assert.deepEqual(afterWires, wires);
+  }
 }
 async function setup(t: test.TestContext, model = false) {
   const f = await paid(t);
@@ -490,11 +497,11 @@ test('final pack: real owner selected retains the complete paid D6 and both bloc
   assert.ok(JSON.stringify(original).length>cell.value.envelope.measuredChars);
   revise(owner);modeOf(owner.store,'bypass');nextPlan(owner,owner.store);
   acceptBrief(owner,'A later accepted assignment with the same Source id.');
-  for(const store of [owner.store,owner.open()]) await unchanged(owner,store,async()=>{
+  for(const [store,mode] of [[owner.store,'full'],[owner.open(),'stamp']] as const) await unchanged(owner,store,async()=>{
     assert.deepEqual(await readDiscoveryFinalSessionAt(store,'p',reference(cell)),cell);
     assert.deepEqual(await requireDiscoveryFinalEnvelope(store,'p',richPacket.subject,input,cell.value.envelope),cell.value.envelope);
     assert.deepEqual(await prepareDiscoveryFinalSession(store,'p',richPacket.subject,input),cell);
-  });
+  },mode);
 });
 
 test('final pack: real paid model selection keeps its saved role and environment on a cold Store',async()=>{
@@ -508,7 +515,7 @@ test('final pack: real paid model selection keeps its saved role and environment
   await unchanged(model,cold,async()=>{
     assert.deepEqual(await readDiscoveryFinalSessionAt(cold,'p',reference(cell)),cell);
     assert.deepEqual(await prepareDiscoveryFinalSession(cold,'p',packet.subject,input),cell);
-  });
+  },'full');
 });
 
 let partialCell:Revision<DiscoveryFinalSession>,partialInput:DiscoveryFinalEnvelopeInput;
@@ -525,7 +532,7 @@ test('final pack: paid return with nonempty partial remains partial and does not
   assert.equal(Object.hasOwn(prepared.original.packet,'verdict'),false);
   await unchanged(negative,negative.open(),async()=>{
     assert.deepEqual(await readDiscoveryFinalSessionAt(negative.open(),'p',reference(partialCell)),partialCell);
-  });
+  },'cross-store');
 });
 
 test('final pack: exact physical envelope boundary and refusal before any archive or session write',async()=>{
@@ -539,7 +546,7 @@ test('final pack: exact physical envelope boundary and refusal before any archiv
     await assert.rejects(()=>prepareDiscoveryFinalSession(negative.store,'p',partialPacket.subject,{...exact,limitChars:length-1}),
       error=>error instanceof EngineError&&error.code==='discovery_final_envelope_limit');
     assert.deepEqual(await prepareDiscoveryFinalEnvelope(negative.store,'p',partialPacket.subject,partialInput),partialCell.value.envelope);
-  });
+  },'full');
   await unchanged(owner,owner.store,async()=>{
     const freshInput=finalInput(owner);
     const staged=await stageDiscoveryFinalEnvelope(owner.store,'p',ownerPacket.subject,freshInput);
@@ -548,7 +555,7 @@ test('final pack: exact physical envelope boundary and refusal before any archiv
     assert.ok(limitChars>freshInput.packetChars);
     await assert.rejects(()=>prepareDiscoveryFinalSession(owner.store,'p',ownerPacket.subject,{...freshInput,limitChars}),
       error=>error instanceof EngineError&&error.code==='discovery_final_envelope_limit');
-  });
+  },'full');
 });
 
 test('final pack: simultaneous Stores converge on one prepared session without a second paid call',async()=>{
@@ -561,7 +568,7 @@ test('final pack: simultaneous Stores converge on one prepared session without a
   const saved=owner.store.eventsPage(before,owner.store.lastEvent(),1000);
   assert.equal(saved.filter(event=>event.kind===DISCOVERY_FINAL_SESSION_KIND).length,1);
   assert.equal(hotResult.revision,1);assert.deepEqual(money(owner.store),calls);assert.deepEqual(owner.wires(),wire);
-  await unchanged(owner,cold,async()=>assert.deepEqual(await prepareDiscoveryFinalSession(cold,'p',ownerPacket.subject,input),hotResult));
+  await unchanged(owner,cold,async()=>assert.deepEqual(await prepareDiscoveryFinalSession(cold,'p',ownerPacket.subject,input),hotResult),'full');
 });
 
 test('final pack: archived and inline result admission prove the same D6 with independent result limits',async()=>{
@@ -586,7 +593,7 @@ test('final pack: archived and inline result admission prove the same D6 with in
     const oversized=structuredClone(reply);oversized.bundle.verdict.reason+='x';
     await assert.rejects(()=>checkDiscoveryFinalResearchReply(negative.store,'p',partialPacket,limit,transport.capacity,oversized),
       e=>e instanceof EngineError&&e.code==='research_result_capacity');
-  });
+  },'full');
 });
 
 test('final pack: request and result limits are independent and the saved pilot caps still apply',async()=>{
@@ -622,7 +629,7 @@ test('final pack: request and result limits are independent and the saved pilot 
       e=>e instanceof EngineError&&e.code==='budget_transport_limit');
     assert.throws(()=>prepareResearchEnvelope(role,env,'p'.repeat(41_000),{},audit,base,undefined,undefined,60_000),
       e=>e instanceof EngineError&&e.code==='pilot_request_limit');
-  });
+  },'full');
 });
 
 test('final pack: mixed subjects, incomplete envelopes, foreign role and changed archive or capacity refuse',async()=>{
@@ -660,13 +667,13 @@ test('final pack: mixed subjects, incomplete envelopes, foreign role and changed
       const row={...cell,id:`${DISCOVERY_FINAL_SESSION_KIND}:p:${hash}`,hash,value};
       await assert.rejects(()=>readDiscoveryFinalSessionAt(mask(negative.store,reference(row),row),'p',reference(row)),e=>e instanceof EngineError);
     }
-  });
+  },'full');
 });
 
 test('final pack: missing archive, archive part and rehashed capacity cannot impersonate paid grounds hot or cold',async()=>{
   const archive=negative.store.get<any>(partialCell.value.archive.id,partialCell.value.archive.revision)!;
   assert.ok(archive.value.parts.length);const part=archive.value.parts[0] as Ref;
-  for(const store of [negative.store,negative.open()]) await unchanged(negative,store,async()=>{
+  for(const [store,mode] of [[negative.store,'full'],[negative.open(),'stamp']] as const) await unchanged(negative,store,async()=>{
     for(const ref of [partialCell.value.archive,part,partialPacket.subject.basis.brief.source,
       partialPacket.subject.basis.assessment,partialPacket.subject.basis.response]) {
       const masked=mask(store,ref);
@@ -688,14 +695,14 @@ test('final pack: missing archive, archive part and rehashed capacity cannot imp
       await assert.rejects(()=>checkDiscoveryFinalResearchReply(store,'p',partialPacket,RESULT_LIMIT,capacity,
         candidate(partialPacket,'no_go')),e=>e instanceof EngineError);
     }
-  });
+  },mode);
 });
 
 test('final pack: absent original brief cannot synthesize a session',async()=>{
   await absentWorld();
-  for(const store of [absent.store,absent.open()]) await unchanged(absent,store,async()=>{
+  for(const [store,mode] of [[absent.store,'full'],[absent.open(),'stamp']] as const) await unchanged(absent,store,async()=>{
     await assert.rejects(()=>prepareDiscoveryFinalSubject(store,'p',reference(absentD6)),e=>e instanceof EngineError);
     await assert.rejects(()=>prepareDiscoveryFinalSession(store,'p',null,finalInput(absent)),e=>e instanceof EngineError);
-  });
+  },mode);
 });
 
