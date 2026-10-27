@@ -456,6 +456,11 @@ const RECORD_REFERENCE_SEMANTICS: readonly RecordReferenceSemantics[] = [
   // pointers, the project and the check version are data; no other Ref-like value is a reference.
   { kind: "keeper-check-key", contract: "keeper-check-key/v1", data: [], refs: [
     ["artifact", "container"], ["constitution", "container"]] },
+  // OMG-V7-KEEPER-BLOCK-PAIR-SOURCE (codex-omg2 №16245): the saved block source names exactly its candidate and the
+  // grounds of its block subject; the block material and the values of its grounds are data, a null ground is no Ref.
+  { kind: "keeper-block-source", contract: "keeper-block-source/v1", data: [], refs: [
+    ["candidate"], ["subject", "candidate"], ["subject", "grounds", "graph"], ["subject", "grounds", "frame"],
+    ["subject", "grounds", "proposals", INDEX], ["subject", "grounds", "works", "producer"], ["subject", "grounds", "works", "ledger"]] },
 ];
 
 const object = (value: unknown): value is Record<string, unknown> =>
