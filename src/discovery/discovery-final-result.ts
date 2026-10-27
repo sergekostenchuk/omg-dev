@@ -4,7 +4,8 @@ import type { Ref } from '../pipeline/contracts.js';
 import type { Store, TransactionGuard, Write } from '../storage/store.js';
 import { DISCOVERY_FINAL_PACKET, requireDiscoveryFinalPacket, requireDiscoveryFinalSubject,
   type DiscoveryFinalPacket, type DiscoveryFinalSubject } from './discovery-final.js';
-import { V7_FINAL_SCHEMA, checkV7Final, type V7FinalBundle } from './v7-final-contracts.js';
+import { FINAL_BUNDLE_CONTRACTS, V7_FINAL_CONTRACT, checkFinalBundle, finalBundleSchema, type FinalBundleContract,
+  type V7FinalBundle } from './v7-final-contracts.js';
 import { buildResearchResultCapacity, requireResearchResultCapacity, measureResearchResult,
   type ResearchResultCapacity, type ResearchResultCapacityInput } from './research-delivery.js';
 import { RESULT_CAPACITY_REFUSAL, readFinalCapacityProjection } from './early-research-outcome.js';
@@ -52,13 +53,18 @@ function deepFreeze<T>(value: T): T {
   return value;
 }
 
-/** Exact subject plus the unchanged shared D7 schema. Each declaration owns its
+/** Exact subject plus the unchanged shared D7 schema of the prepared form version. Each declaration owns its
  * immutable copy, so callers cannot modify the shared D7 contract or another call. */
-function declaration(packet: DiscoveryFinalPacket): Record<string, unknown> {
+function declaration(packet: DiscoveryFinalPacket, form: FinalBundleContract): Record<string, unknown> {
   return deepFreeze({ type: 'object', additionalProperties: false,
     required: ['contract', 'subject', 'bundle'], properties: {
       contract: { const: DISCOVERY_FINAL_RESULT }, subject: { const: structuredClone(packet.subject) },
-      bundle: structuredClone(V7_FINAL_SCHEMA) } });
+      bundle: structuredClone(finalBundleSchema(form)) } });
+}
+/** 7b.3-class: the D7 form version of a preparation — discovery-final/v7 unless the saved preparation names another. */
+function formOf(form: unknown): FinalBundleContract {
+  valid((FINAL_BUNDLE_CONTRACTS as readonly unknown[]).includes(form), 'The final result names an unknown D7 form version');
+  return form as FinalBundleContract;
 }
 function admission(packet: DiscoveryFinalPacket, schema: Record<string, unknown>, limit: number): ResearchResultCapacityInput {
   return { operation: packet.subject.identity, generation: 0,
@@ -89,7 +95,8 @@ function savedArchiveProjection(store: Store, address: { record: Ref; pointer: s
 /** Pure projection of a candidate over its supplied packet. It does not prove
  * the packet or claim the candidate was paid or accepted; use the checked door
  * below when an independently proven packet is needed. */
-export function projectDiscoveryFinal(packet: DiscoveryFinalPacket, reply: unknown): DiscoveryFinalResultProjection {
+export function projectDiscoveryFinal(packet: DiscoveryFinalPacket, reply: unknown,
+  form: FinalBundleContract = V7_FINAL_CONTRACT): DiscoveryFinalResultProjection {
   valid(keys(packet, ['contract', 'subject', 'assessment', 'dossier', 'basis', 'brief', 'terminal'])
     && packet.contract === DISCOVERY_FINAL_PACKET && object(packet.subject)
     && object(packet.dossier) && object(packet.dossier.manifest) && object(packet.assessment)
@@ -103,7 +110,7 @@ export function projectDiscoveryFinal(packet: DiscoveryFinalPacket, reply: unkno
   valid(object(reply) && keys(reply, ['bundle', 'contract', 'subject'])
     && reply.contract === DISCOVERY_FINAL_RESULT && same(reply.subject, packet.subject),
     'The result must name the complete exact final subject');
-  const bundle = checkV7Final(reply.bundle);
+  const bundle = checkFinalBundle(reply.bundle, formOf(form));
   valid(same(bundle.dossier, packet.dossier.manifest.ref), 'The D7 bundle must name the exact dossier manifest');
   const result: DiscoveryFinalResult = { contract: DISCOVERY_FINAL_RESULT,
     subject: structuredClone(packet.subject), bundle: structuredClone(bundle) };
@@ -114,9 +121,10 @@ export function projectDiscoveryFinal(packet: DiscoveryFinalPacket, reply: unkno
  * The limit comes from the caller's admission; it is not a physical wire claim. */
 export async function prepareDiscoveryFinalResultTransport(store: Store, project: string,
   subject: unknown, envelopeLimitChars: number,
-  options?: { archive: 'staged' }): Promise<DiscoveryFinalResultTransport> {
+  options?: { archive: 'staged' }, form: FinalBundleContract = V7_FINAL_CONTRACT): Promise<DiscoveryFinalResultTransport> {
+  const version = formOf(form);
   const packet = await requireDiscoveryFinalSubject(store, project, subject);
-  const schema = declaration(packet);
+  const schema = declaration(packet, version);
   valid(options === undefined || keys(options, ['archive']) && options.archive === 'staged',
     'The final result archive option has an unknown form');
   const input = admission(packet, schema, envelopeLimitChars);
@@ -139,13 +147,13 @@ export async function prepareDiscoveryFinalResultTransport(store: Store, project
  * resolver or a structurally plausible D6 packet. The same paid D6 reader,
  * declaration and capacity builder used by the producer own this proof. */
 export async function requireDiscoveryFinalResultCapacity(store: Store, project: string,
-  subject: unknown, limit: number, saved: unknown): Promise<DiscoveryFinalResultTransport> {
+  subject: unknown, limit: number, saved: unknown, form: FinalBundleContract = V7_FINAL_CONTRACT): Promise<DiscoveryFinalResultTransport> {
   let subjectSnapshot: unknown, capacitySnapshot: unknown;
   try { subjectSnapshot = JSON.parse(canonical(subject)); }
   catch { throw new EngineError('discovery_final_subject_invalid', 'The final subject must be a stable data value'); }
   try { capacitySnapshot = JSON.parse(canonical(saved)); }
   catch { throw new EngineError('research_capacity_invalid', 'The result admission must be a stable data value'); }
-  const proven = await prepareDiscoveryFinalResultTransport(store, project, subjectSnapshot, limit, { archive: 'staged' });
+  const proven = await prepareDiscoveryFinalResultTransport(store, project, subjectSnapshot, limit, { archive: 'staged' }, form);
   valid(proven.archive && 'archive' in proven.capacity.mandatory,
     'The final result admission lost its exact archive');
   const address = proven.capacity.mandatory.archive;
@@ -164,7 +172,9 @@ export async function requireDiscoveryFinalResultCapacity(store: Store, project:
  * the caller's independently known limit, then measure the complete serialized
  * reply. No session or model call is created. */
 export async function checkDiscoveryFinalResearchReply(store: Store, project: string,
-  packetInput: unknown, envelopeLimitChars: number, saved: unknown, reply: unknown) {
+  packetInput: unknown, envelopeLimitChars: number, saved: unknown, reply: unknown,
+  form: FinalBundleContract = V7_FINAL_CONTRACT) {
+  const version = formOf(form);
   let packetSnapshot: unknown;
   try { packetSnapshot = JSON.parse(canonical(packetInput)); }
   catch { throw new EngineError('discovery_final_subject_invalid', 'The final packet must be a stable data value'); }
@@ -181,7 +191,7 @@ export async function checkDiscoveryFinalResearchReply(store: Store, project: st
   try { replySnapshot = JSON.parse(canonical(reply)); }
   catch { throw new EngineError('discovery_final_result_invalid', 'The final reply must be a stable data value'); }
   const packet = await requireDiscoveryFinalPacket(store, project, packetSnapshot);
-  const schema = declaration(packet);
+  const schema = declaration(packet, version);
   const input = admission(packet, schema, envelopeLimitChars);
   const mandatory = object(capacity) && object(capacity.mandatory) ? capacity.mandatory : null;
   if (mandatory && Object.hasOwn(mandatory, 'archive')) {
@@ -196,7 +206,7 @@ export async function checkDiscoveryFinalResearchReply(store: Store, project: st
         return projection;
       });
   } else requireResearchResultCapacity(capacity, input);
-  const projection = projectDiscoveryFinal(packet, replySnapshot);
+  const projection = projectDiscoveryFinal(packet, replySnapshot, version);
   const measurement = measureResearchResult(capacity as ResearchResultCapacity, FORM, projection.result);
   if (!measurement.fits) throw new EngineError(RESULT_CAPACITY_REFUSAL,
     'The complete final reply exceeds its admitted serialized envelope', measurement);

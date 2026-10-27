@@ -7,7 +7,7 @@ import { readDiscoveryFinalAssessmentPaidResultAt } from './discovery-final-asse
 import type { DiscoveryFinalAssessmentSource } from './discovery-final-assessment-source.js';
 import { DISCOVERY_MANIFEST_CONTRACT, DISCOVERY_MANIFEST_KIND, discoveryManifestId, readDiscoveryManifestStructural,
   type DiscoveryManifest } from './discovery-manifest.js';
-import { checkV7Final, type V7FinalBundle } from './v7-final-contracts.js';
+import { checkFinalBundle, type V7FinalBundle } from './v7-final-contracts.js';
 
 /** DR7 7b.1+7b.2 (codex-omg2 №16106 п.1): the authoritative decision on one exact assessed D7 bundle and the atomic
  * publication of its accepted manifest (map ndisc.d7.n6). Only the whole bundle of a really paid assessment with the
@@ -197,7 +197,7 @@ export async function provenAcceptanceGrounds(store: Store, project: string, ass
   if (!proven.output || !proven.result) acceptanceInvalid('assessment', 'Only a really paid assessment can be accepted');
   if (proven.result.verdict !== 'supported')
     acceptanceInvalid('assessment', 'Only an assessment with the verdict supported is acceptable; a return is not', {}, 'discovery_acceptance_not_supported');
-  const source = proven.source, bundle = checkV7Final(proven.result.candidate);
+  const source = proven.source, bundle = checkFinalBundle(proven.result.candidate);
   if (!same(bundle, source.bundle) || !same(proven.result.candidate, source.packet.candidate))
     acceptanceInvalid('bundle', 'The assessed bundle is not the whole bundle of its paid D7');
   return { assessment: exact(reference(proven.output)), paid: exact(reference(source.paid)),

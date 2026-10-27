@@ -46,8 +46,8 @@ export const V7_FINAL_CONSTITUTION_SCHEMA: Json = object({
 const verdictSchema = (outcomes: readonly string[], conditions: Json): Json =>
   object({ outcome: { enum: [...outcomes] }, reason: text, conditions });
 
-const positiveBundle = (outcome: V7FinalPositiveOutcome, conditions: Json): Json => object({
-  contract: { const: V7_FINAL_CONTRACT }, dossier: refSchema, verdict: verdictSchema([outcome], conditions),
+const positiveBundle = (outcome: V7FinalPositiveOutcome, conditions: Json, contract: string = V7_FINAL_CONTRACT): Json => object({
+  contract: { const: contract }, dossier: refSchema, verdict: verdictSchema([outcome], conditions),
   summary: V7_FINAL_POSITIVE_SUMMARY_SCHEMA, projection: V7_FINAL_PROJECTION_SCHEMA,
   constitution: V7_FINAL_CONSTITUTION_SCHEMA });
 
@@ -62,18 +62,48 @@ export const V7_FINAL_SCHEMA: Json = { oneOf: [
     summary: V7_FINAL_NEGATIVE_SUMMARY_SCHEMA, projection: { type: "null" }, constitution: { type: "null" } }),
 ] };
 
+/** DR7 7b.3-class (codex-omg2 №16183): the next, explicitly versioned D7 form. It differs from discovery-final/v7 only
+ * in the owner_choice condition, which must carry its class and the model's reason for it: choice — a choice inside the
+ * already defined bundle; boundary — the choice changes the bounds, the constitution or the projection; risk — the
+ * choice takes on a new risk. Only a choice may later be resolved inside the accepted bundle; boundary and risk need a
+ * new D7. discovery-final/v7 stays its own historical contract: no class is added to it, and a missing class is never
+ * read as a choice. The version of a bundle is fixed by its saved preparation, never by a model answer. */
+export const V8_FINAL_CONTRACT = "discovery-final/v8" as const;
+export const FINAL_BUNDLE_CONTRACTS = Object.freeze([V7_FINAL_CONTRACT, V8_FINAL_CONTRACT] as const);
+export type FinalBundleContract = typeof FINAL_BUNDLE_CONTRACTS[number];
+export const FINAL_CONDITION_CLASSES = Object.freeze(["choice", "boundary", "risk"] as const);
+export type FinalConditionClass = typeof FINAL_CONDITION_CLASSES[number];
+const [evidenceSchema, ownerChoiceSchema] = (conditionSchema as { oneOf: [Json, { required: string[]; properties: Record<string, Json> }] }).oneOf;
+const classedOwnerChoiceSchema: Json = { ...ownerChoiceSchema, required: [...ownerChoiceSchema.required, "class", "classReason"],
+  properties: { ...ownerChoiceSchema.properties,
+    class: { enum: [...FINAL_CONDITION_CLASSES], description: "choice — выбор внутри уже определённого комплекта: границы, конституция и проекция не меняются, новый риск не принимается; boundary — любой вариант меняет границы, конституцию или проекцию комплекта; risk — вариант принимает новый риск. При сомнении это не choice." },
+    classReason: { type: "string", minLength: 1, description: "Обоснование класса по точному условию и последствиям каждого варианта." } } };
+/** The JSON schema of the classed D7 form: the same bundles, with the classed owner_choice. */
+export const V8_FINAL_SCHEMA: Json = { oneOf: [
+  positiveBundle("go", { type: "array", maxItems: 0 }, V8_FINAL_CONTRACT),
+  positiveBundle("conditional", { type: "array", minItems: 1, items: { oneOf: [evidenceSchema, classedOwnerChoiceSchema] } }, V8_FINAL_CONTRACT),
+  object({ contract: { const: V8_FINAL_CONTRACT }, dossier: refSchema,
+    verdict: verdictSchema(V7_FINAL_NEGATIVE_OUTCOMES, { type: "array", maxItems: 0 }),
+    summary: V7_FINAL_NEGATIVE_SUMMARY_SCHEMA, projection: { type: "null" }, constitution: { type: "null" } }),
+] };
+/** The schema of one D7 form version. */
+export function finalBundleSchema(contract: FinalBundleContract): Json {
+  return contract === V8_FINAL_CONTRACT ? V8_FINAL_SCHEMA : V7_FINAL_SCHEMA;
+}
+
 // The same validator options as Discovery's field schemas: one rule set for the schema and the code check.
-const validFinal = new Ajv({ strict: true, allowUnionTypes: true }).compile(V7_FINAL_SCHEMA as object);
+const ajv = new Ajv({ strict: true, allowUnionTypes: true });
+const validators = { [V7_FINAL_CONTRACT]: ajv.compile(V7_FINAL_SCHEMA as object), [V8_FINAL_CONTRACT]: ajv.compile(V8_FINAL_SCHEMA as object) };
 
 export interface V7FinalVerdict<O extends string> { outcome: O; reason: string; conditions: Json[] }
 export interface V7FinalPositiveBundle {
-  contract: typeof V7_FINAL_CONTRACT; dossier: Ref; verdict: V7FinalVerdict<V7FinalPositiveOutcome>;
+  contract: FinalBundleContract; dossier: Ref; verdict: V7FinalVerdict<V7FinalPositiveOutcome>;
   summary: { what: string; forWhom: string; why: string; firstResult: string; successCriterion: string; nonGoals: string[] };
   projection: { users: string[]; payers: string[]; rules: string[]; externalSystems: string[]; unresolved: string[] };
   constitution: { goal: string; consumers: string[]; nonGoals: string[]; successCriterion: string };
 }
 export interface V7FinalNegativeBundle {
-  contract: typeof V7_FINAL_CONTRACT; dossier: Ref; verdict: V7FinalVerdict<V7FinalNegativeOutcome>;
+  contract: FinalBundleContract; dossier: Ref; verdict: V7FinalVerdict<V7FinalNegativeOutcome>;
   summary: { reasons: string[]; found: string[]; needed: string[] };
   projection: null; constitution: null;
 }
@@ -104,11 +134,20 @@ function textFields(value: Record<string, unknown>, rule: string, required: Reco
 
 /** The code checks of the D7 form — the same rules as V7_FINAL_SCHEMA, stated
  * with addressed refusals. The verdict alone selects the bundle; its summary,
- * projection and constitution must be that bundle's own forms. */
+ * projection and constitution must be that bundle's own forms. Only discovery-final/v7. */
 export function checkV7Final(value: unknown): V7FinalBundle {
+  return checkFinalBundle(value, V7_FINAL_CONTRACT);
+}
+/** The code checks of one D7 form version. With `expected`, the bundle must be exactly that version — the version of
+ * its saved preparation; without it, a historical bundle is read by its own known version. An unknown version, and in
+ * discovery-final/v8 an owner_choice without a known class or its reason, is an addressed refusal. */
+export function checkFinalBundle(value: unknown, expected?: FinalBundleContract): V7FinalBundle {
   if (!obj(value)) refuse("final", "the D7 bundle is an object");
-  if (value["contract"] !== V7_FINAL_CONTRACT)
-    refuse("final.contract", `only ${V7_FINAL_CONTRACT} is a known D7 form; another version is never read as this one`);
+  const contract = value["contract"];
+  if (expected !== undefined ? contract !== expected : !(FINAL_BUNDLE_CONTRACTS as readonly unknown[]).includes(contract))
+    refuse("final.contract", expected !== undefined ? `only ${expected} is a known D7 form; another version is never read as this one`
+      : `the D7 form version ${JSON.stringify(contract ?? null)} is unknown`);
+  const classed = contract === V8_FINAL_CONTRACT;
   exactKeys(value, ["contract", "dossier", "verdict", "summary", "projection", "constitution"], "final");
   if (!isRef(value["dossier"])) refuse("final.dossier", "the bundle names the exact Ref of its dossier snapshot");
   const verdict = value["verdict"];
@@ -141,6 +180,13 @@ export function checkV7Final(value: unknown): V7FinalBundle {
     for (const choice of ["accept", "decline"])
       if (!options.some(option => (option as Record<string, unknown>)["choice"] === choice))
         refuse(rule, `an owner condition offers both acceptance and refusal; the ${choice} option is missing`);
+    // 7b.3-class: the classed form states the class of every owner condition and the model's reason for it.
+    if (classed) {
+      const at = `final.verdict.conditions.${index}`;
+      if (!(FINAL_CONDITION_CLASSES as readonly unknown[]).includes(entry["class"]))
+        refuse(`${at}.class`, `an owner condition of ${V8_FINAL_CONTRACT} has the class choice, boundary or risk`);
+      if (!nonempty(entry["classReason"])) refuse(`${at}.classReason`, "the class of an owner condition states its reason");
+    }
   });
   const summary = value["summary"];
   if (!obj(summary)) refuse("final.summary", "the summary is an object");
@@ -158,6 +204,7 @@ export function checkV7Final(value: unknown): V7FinalBundle {
     if (value["constitution"] !== null) refuse("final.constitution", "a negative bundle has no constitution: it is null, not filled in");
   }
   // The schema is the same rule set, also for the condition forms and the exact Ref shape.
-  if (!validFinal(value)) refuse("final", `the bundle does not match the D7 form: ${JSON.stringify(validFinal.errors?.[0] ?? null)}`);
+  const validate = validators[contract as FinalBundleContract];
+  if (!validate(value)) refuse("final", `the bundle does not match the D7 form: ${JSON.stringify(validate.errors?.[0] ?? null)}`);
   return JSON.parse(canonical(value as Json)) as V7FinalBundle;
 }

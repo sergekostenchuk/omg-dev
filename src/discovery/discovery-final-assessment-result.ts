@@ -3,7 +3,7 @@ import { EngineError } from '../errors.js';
 import { isRef, type Ref } from '../pipeline/contracts.js';
 import type { Store } from '../storage/store.js';
 import type { ClaimAddress } from './claim-address.js';
-import { checkV7Final, type V7FinalBundle } from './v7-final-contracts.js';
+import { V8_FINAL_CONTRACT, checkFinalBundle, type FinalConditionClass, type V7FinalBundle } from './v7-final-contracts.js';
 import { requireDiscoveryFinalAssessmentSubject,
   type DiscoveryFinalAssessmentPacket, type DiscoveryFinalAssessmentSubject } from './discovery-final-assessment-subject.js';
 
@@ -24,6 +24,13 @@ export const DISCOVERY_FINAL_ASSESSMENT_PROJECTION = 'discovery-final-assessment
  * dossier claim or unknown, a contradiction, a partial-dossier reason or a dossier axis. */
 export type DiscoveryFinalAssessmentAddress = { candidate: string } | { record: Ref } | { claim: ClaimAddress }
   | { unknown: ClaimAddress } | { contradiction: string } | { partialReason: number } | { axis: string };
+/** 7b.3-class (codex-omg2 №16183): the assessor's explicit review of the class of one owner condition of a classed
+ * candidate — confirmed only when a choice hides no change of the bounds, the constitution or the projection and no
+ * new risk (or a boundary/risk class is the right one), with its reason and bases. */
+export interface DiscoveryFinalAssessmentClassReview {
+  conditionId: string; class: FinalConditionClass; judgement: 'confirmed' | 'rejected'; reason: string;
+  bases: DiscoveryFinalAssessmentAddress[];
+}
 export interface DiscoveryFinalAssessmentResult {
   contract: typeof DISCOVERY_FINAL_ASSESSMENT_RESULT;
   subject: DiscoveryFinalAssessmentSubject;
@@ -31,6 +38,8 @@ export interface DiscoveryFinalAssessmentResult {
   reasons: string[];
   bases: DiscoveryFinalAssessmentAddress[];
   return: null | { targets: DiscoveryFinalAssessmentAddress[]; reason: string; bases: DiscoveryFinalAssessmentAddress[] };
+  /** Present exactly for a classed (discovery-final/v8) candidate: one review per owner condition, in its order. */
+  classes?: DiscoveryFinalAssessmentClassReview[];
 }
 export interface DiscoveryFinalAssessmentProjection {
   contract: typeof DISCOVERY_FINAL_ASSESSMENT_PROJECTION;
@@ -125,8 +134,15 @@ function addresses(value: unknown, at: string, packet: DiscoveryFinalAssessmentP
 function provenPacket(packet: DiscoveryFinalAssessmentPacket): void {
   if (!object(packet) || !object(packet.subject) || !object(packet.final))
     invalid('packet', 'A final assessment answer is read only against its proven packet');
-  if (canonical(checkV7Final(packet.candidate)) !== canonical(packet.subject.candidate))
+  if (canonical(checkFinalBundle(packet.candidate)) !== canonical(packet.subject.candidate))
     invalid('packet.candidate', 'The packet candidate is not its subject\'s exact candidate');
+}
+/** The owner conditions whose class the assessor reviews: those of a classed candidate, in its order; null for a
+ * candidate of an unclassed form, whose answer has no class review at all. */
+export function reviewedConditionClasses(candidate: V7FinalBundle): { conditionId: string; class: FinalConditionClass }[] | null {
+  if (candidate.contract !== V8_FINAL_CONTRACT) return null;
+  return candidate.verdict.conditions.filter(condition => object(condition) && condition.kind === 'owner_choice')
+    .map(condition => ({ conditionId: (condition as { id: string }).id, class: (condition as { class: FinalConditionClass }).class }));
 }
 
 /** The one closed decoder of the assessor's answer. The packet comes from the accepted final-assessment subject
@@ -137,7 +153,8 @@ export function decodeDiscoveryFinalAssessmentResult(value: unknown, packet: Dis
   // Proxy that would answer differently on a second read is never consulted again.
   let input: unknown;
   try { input = JSON.parse(canonical(value)); } catch { invalid('result', 'The answer is not a plain JSON value'); }
-  shape(input, ['contract', 'subject', 'verdict', 'reasons', 'bases', 'return'], 'result');
+  const reviewed = reviewedConditionClasses(packet.candidate);
+  shape(input, ['contract', 'subject', 'verdict', 'reasons', 'bases', 'return', ...(reviewed ? ['classes'] : [])], 'result');
   if (input.contract !== DISCOVERY_FINAL_ASSESSMENT_RESULT)
     invalid('contract', `Only ${DISCOVERY_FINAL_ASSESSMENT_RESULT} is a known final assessment answer`);
   if (canonical(input.subject) !== canonical(packet.subject))
@@ -155,6 +172,22 @@ export function decodeDiscoveryFinalAssessmentResult(value: unknown, packet: Dis
     text(input.return.reason, 'return.reason');
     addresses(input.return.targets, 'return.targets', packet, known);
     addresses(input.return.bases, 'return.bases', packet, known);
+  }
+  if (reviewed) {
+    // 7b.3-class: one explicit review per owner condition of the classed candidate, of exactly its class.
+    list(input.classes, 'classes', 0);
+    if (input.classes.length !== reviewed.length) invalid('classes', 'The answer reviews the class of every owner condition, and only those');
+    input.classes.forEach((review, index) => {
+      const at = `classes.${index}`, expected = reviewed[index]!;
+      shape(review, ['conditionId', 'class', 'judgement', 'reason', 'bases'], at);
+      if (review.conditionId !== expected.conditionId || review.class !== expected.class)
+        invalid(at, 'The review names another owner condition or another class than the candidate, in its order');
+      if (review.judgement !== 'confirmed' && review.judgement !== 'rejected') invalid(`${at}.judgement`, 'The class is confirmed or rejected');
+      text(review.reason, `${at}.reason`);
+      addresses(review.bases, `${at}.bases`, packet, known);
+    });
+    if (input.verdict === 'supported' && input.classes.some(review => (review as { judgement: unknown }).judgement !== 'confirmed'))
+      invalid('classes', 'A supported answer confirms the class of every owner condition; a rejected class is a return');
   }
   return input as unknown as DiscoveryFinalAssessmentResult;
 }

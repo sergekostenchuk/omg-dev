@@ -9,6 +9,7 @@ import type { DiscoveryDraft, Question } from './discovery.js';
 import { addContextLookup, contextProgress, contextWorkspace, packContextWorkspace,
   requireCompleteContextPacket, type ContextWorkspace } from './context-workspace.js';
 import type { FinalContinuation } from './continuation-packet.js';
+import { V7_FINAL_CONTRACT } from './v7-final-contracts.js';
 import { DISCOVERY_FINAL_RESULT, checkDiscoveryFinalResearchReply,
   type DiscoveryFinalResultProjection } from './discovery-final-result.js';
 import { DISCOVERY_FINAL_SESSION, DISCOVERY_FINAL_SESSION_KIND, readDiscoveryFinalSessionAt,
@@ -394,7 +395,7 @@ async function projectFinalStep(store: Store, admission: ReturnType<typeof readD
     requireCompleteContextPacket(workspace, paid.subject);
     const checked = await checkDiscoveryFinalResearchReply(store, session.value.projectId,
       admission.context.request.packet, admission.prepared.value.input.resultLimitChars,
-      admission.context.resultCapacity, response);
+      admission.context.resultCapacity, response, admission.prepared.value.input.form ?? V7_FINAL_CONTRACT);
     workspace = contextProgress(workspace, paid.subject);
     const value: DiscoveryFinalPaidResult = { contract: DISCOVERY_FINAL_PAID_RESULT,
       projectId: session.value.projectId, prepared: session.value.prepared,

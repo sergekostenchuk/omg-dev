@@ -4,7 +4,7 @@ import { reference, type Ref } from '../pipeline/contracts.js';
 import type { Store, TransactionGuard, Write } from '../storage/store.js';
 import { requireDiscoveryFinalAssessmentSubject,
   type DiscoveryFinalAssessmentPacket, type DiscoveryFinalAssessmentSubject } from './discovery-final-assessment-subject.js';
-import { DISCOVERY_FINAL_ASSESSMENT_RESULT, projectDiscoveryFinalAssessment,
+import { DISCOVERY_FINAL_ASSESSMENT_RESULT, projectDiscoveryFinalAssessment, reviewedConditionClasses,
   type DiscoveryFinalAssessmentProjection, type DiscoveryFinalAssessmentResult } from './discovery-final-assessment-result.js';
 import { buildResearchResultCapacity, requireResearchResultCapacity, measureResearchResult,
   type ResearchResultCapacity, type ResearchResultCapacityInput } from './research-delivery.js';
@@ -55,12 +55,19 @@ const address = { oneOf: [closed({ candidate: { type: 'string' } }), closed({ re
   closed({ axis: text })] };
 const addresses = { type: 'array', minItems: 1, uniqueItems: true, items: address };
 
-/** The closed answer schema over the exact subject. Each declaration owns its immutable copy. */
+/** The closed answer schema over the exact subject. Each declaration owns its immutable copy. A classed candidate's
+ * answer also reviews the class of every owner condition, in its order (7b.3-class); an unclassed one has no review. */
 function declaration(packet: DiscoveryFinalAssessmentPacket): Record<string, unknown> {
+  const reviewed = reviewedConditionClasses(packet.candidate);
+  const classes = reviewed ? { classes: { type: 'array', minItems: reviewed.length, maxItems: reviewed.length,
+    description: 'Для каждого owner_choice кандидата по порядку: подтверди класс (confirmed) или отклони (rejected). choice подтверждается, только если ни один вариант не меняет границы, конституцию или проекцию комплекта и не принимает новый риск; иначе отклони. Отклонённый класс — это return.',
+    items: closed({ conditionId: text, class: { enum: ['choice', 'boundary', 'risk'] }, judgement: { enum: ['confirmed', 'rejected'] },
+      reason: text, bases: structuredClone(addresses) }) } } : {};
   return deepFreeze(closed({ contract: { const: DISCOVERY_FINAL_ASSESSMENT_RESULT }, subject: { const: structuredClone(packet.subject) },
     verdict: { enum: ['supported', 'return'] }, reasons: { type: 'array', minItems: 1, uniqueItems: true, items: text },
     bases: structuredClone(addresses),
-    return: { oneOf: [{ type: 'null' }, closed({ targets: structuredClone(addresses), reason: text, bases: structuredClone(addresses) })] } }));
+    return: { oneOf: [{ type: 'null' }, closed({ targets: structuredClone(addresses), reason: text, bases: structuredClone(addresses) })] },
+    ...classes }));
 }
 /** `subject` of the common physical builder is reserved for a V7PlanSubject; the assessment subject keeps its own name. */
 function admission(packet: DiscoveryFinalAssessmentPacket, schema: Record<string, unknown>, limit: number): ResearchResultCapacityInput {

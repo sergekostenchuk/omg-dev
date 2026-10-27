@@ -2,7 +2,7 @@ import { canonical, hashJson, type Json } from '../canonical.js';
 import { EngineError } from '../errors.js';
 import { isRef, type Ref } from '../pipeline/contracts.js';
 import type { Store } from '../storage/store.js';
-import { checkV7Final, type V7FinalBundle } from './v7-final-contracts.js';
+import { checkFinalBundle, type V7FinalBundle } from './v7-final-contracts.js';
 import { prepareDiscoveryFinalSubject, requireDiscoveryFinalSubject,
   type DiscoveryFinalPacket, type DiscoveryFinalSubject } from './discovery-final.js';
 
@@ -59,7 +59,7 @@ function assemble(project: string, candidate: V7FinalBundle,
 }
 /** The closed subject form: the full candidate and the full final subject, and
  * an identity the caller cannot pick shorter or substitute. The candidate form
- * is checked only by checkV7Final — its refusal is the form's own. */
+ * is checked only by the D7 form of its own version — its refusal is the form's own. */
 function decodeSubject(input: unknown): DiscoveryFinalAssessmentSubject {
   shape(input, ['contract', 'kind', 'identity', 'projectId', 'candidate', 'subject'], 'subject');
   if (input.contract !== DISCOVERY_FINAL_ASSESSMENT_SUBJECT)
@@ -67,7 +67,7 @@ function decodeSubject(input: unknown): DiscoveryFinalAssessmentSubject {
   if (input.kind !== 'final-assessment') invalid('kind', 'Only a final-assessment subject is read here');
   if (typeof input.projectId !== 'string' || !input.projectId.length)
     invalid('projectId', 'A final assessment subject needs its project');
-  const candidate = checkV7Final(input.candidate);
+  const candidate = checkFinalBundle(input.candidate);
   const { identity: presented, ...basis } = input;
   const expected = { ...basis, candidate };
   if (presented !== identity(expected as Omit<DiscoveryFinalAssessmentSubject, 'identity'>))
@@ -90,7 +90,7 @@ export async function prepareDiscoveryFinalAssessmentSubject(store: Store, proje
   if (typeof project !== 'string' || !project.length)
     invalid('projectId', 'A final assessment subject needs its project');
   exactRef(assessmentRef, 'assessment');
-  const checked = checkV7Final(candidate);
+  const checked = checkFinalBundle(candidate);
   const packet = await prepareDiscoveryFinalSubject(store, project, assessmentRef);
   bindDossier(checked, packet);
   return assemble(project, checked, packet);

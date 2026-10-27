@@ -6,7 +6,7 @@ import { DISCOVERY_FINAL_APPLICATION_KIND, DISCOVERY_FINAL_PAID_RESULT, DISCOVER
   readDiscoveryFinalExecutionAt, type DiscoveryFinalApplication, type DiscoveryFinalExecution,
   type DiscoveryFinalPaidResult } from './discovery-final-execution.js';
 import type { DiscoveryFinalSession } from './discovery-final-session.js';
-import type { V7FinalBundle } from './v7-final-contracts.js';
+import { V7_FINAL_CONTRACT, type V7FinalBundle } from './v7-final-contracts.js';
 import { prepareDiscoveryFinalAssessmentSubject, type DiscoveryFinalAssessmentPacket } from './discovery-final-assessment-subject.js';
 
 /** DR7 7a.4 (codex-omg2 №16021 п.1): the read-only source of the D7 assessment — one exact paid D7 result, proven
@@ -86,6 +86,9 @@ export async function readDiscoveryFinalAssessmentSourceAt(store: Store, project
   valid(same(execution.prepared.value.subject, paid.value.subject) && same(execution.session.value.subject, paid.value.subject),
     'The paid D7 result belongs to another final subject');
   const bundle = paid.value.projection.result.bundle;
+  // 7b.3-class: the paid bundle is of the D7 form version its immutable preparation named before the payment.
+  valid(object(bundle) && bundle.contract === (execution.prepared.value.input.form ?? V7_FINAL_CONTRACT),
+    'The paid D7 bundle is of another form version than its saved preparation');
   const packet = await prepareDiscoveryFinalAssessmentSubject(store, project, paid.value.subject.basis.assessment, bundle);
   valid(same(packet.subject.subject, paid.value.subject) && same(packet.candidate, bundle),
     'The assessment packet is not the one of this paid bundle and its final subject');

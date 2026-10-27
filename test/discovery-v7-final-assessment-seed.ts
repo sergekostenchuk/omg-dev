@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { canonical } from '../src/canonical.js';
+import { V8_FINAL_CONTRACT } from '../src/discovery/v7-final-contracts.js';
 import { reference, type Ref } from '../src/pipeline/contracts.js';
 import { Store } from '../src/storage/store.js';
 import { ProductEngine } from '../src/product/engine.js';
@@ -25,6 +26,8 @@ export interface FinalAssessmentSeedOptions {
   route?: FinalSeedRoute;
   /** Explicit conditions of a conditional paid D7 (7b.3); absent keeps the default evidence-1. */
   conditions?: unknown;
+  /** 7b.3-class: the explicit D7 form version discovery-final/v8; absent keeps discovery-final/v7. */
+  form?: typeof V8_FINAL_CONTRACT;
 }
 const cleanups: (() => void)[] = [];
 process.once('exit', () => { for (const cleanup of cleanups.reverse()) cleanup(); });
@@ -37,8 +40,9 @@ type SeedData = {
 type Snapshot = { root: string; data: SeedData };
 const seeds = new Map<string, Promise<Snapshot>>();
 
-async function build(options: Required<Omit<FinalAssessmentSeedOptions, 'conditions'>> & { conditions?: unknown }): Promise<Snapshot> {
-  const f = await finalPaid(lifetime, options.outcome, options.route, options.conditions);
+async function build(options: Required<Omit<FinalAssessmentSeedOptions, 'conditions' | 'form'>>
+  & { conditions?: unknown; form?: typeof V8_FINAL_CONTRACT }): Promise<Snapshot> {
+  const f = await finalPaid(lifetime, options.outcome, options.route, options.conditions, options.form);
   const packet = await prepareDiscoveryFinalAssessmentSubject(f.store, 'p', f.d6, f.result.value.projection.result.bundle);
   // A real independent reviewer measurement is part of the first caller's
   // work. No consumer or copied world has to calibrate or buy this again.
@@ -50,9 +54,15 @@ async function build(options: Required<Omit<FinalAssessmentSeedOptions, 'conditi
     { prompt: 'Review the complete exact paid final candidate', packetChars: 8_000_000, limitChars: 9_000_000,
       resultLimitChars: 10_000_000, environment: reference(f.environment), role: f.environment.value.reviewer });
   const bases = [{ candidate: '/verdict' }];
+  // 7b.3-class: a classed candidate's answer reviews every owner condition — confirmed when supported, rejected in a return.
+  const conditions = packet.candidate.verdict.conditions as { id: string; kind: string; class?: string }[];
+  const classes = options.form ? conditions.flatMap((condition, index) => condition.kind !== 'owner_choice' ? [] : [{
+    conditionId: condition.id, class: condition.class, judgement: options.verdict === 'supported' ? 'confirmed' : 'rejected',
+    reason: `Reviewed the class against the options of ${condition.id}`, bases: [{ candidate: `/verdict/conditions/${index}` }] }]) : undefined;
   f.reply({ contract: DISCOVERY_FINAL_ASSESSMENT_RESULT, subject: packet.subject, verdict: options.verdict,
     reasons: ['The exact paid final candidate was independently reviewed'], bases,
-    return: options.verdict === 'supported' ? null : { targets: bases, reason: 'The final decision needs another basis', bases } });
+    return: options.verdict === 'supported' ? null : { targets: bases, reason: 'The final decision needs another basis', bases },
+    ...(classes ? { classes } : {}) });
   const paid = await runDiscoveryFinalAssessmentExecution(f.store, 'p', f.paidResult, reference(prepared), { profile: f.profile });
   assert.ok(paid.output && paid.result);
   assert.equal(paid.result.verdict, options.verdict);
@@ -112,14 +122,16 @@ function plant(t: TestContext, seed: Snapshot) {
 export async function finalAssessmentPaid(t: TestContext, options: FinalAssessmentSeedOptions = {}) {
   // One JSON snapshot of explicit conditions before the first await: it keys both caches and builds the paid world.
   // CONDITION-SEED-SNAPSHOT-01: the property is read once into a local value, and only that value is snapshotted.
-  const raw = options.conditions;
+  const raw = options.conditions, form = options.form;
   const conditions = raw === undefined ? undefined : JSON.parse(canonical(raw as never)) as unknown;
+  assert.ok(form === undefined || form === V8_FINAL_CONTRACT, 'an explicit form is discovery-final/v8');
   const selected = { verdict: options.verdict ?? 'supported', outcome: options.outcome ?? 'go', route: options.route ?? 'owner',
-    ...(conditions === undefined ? {} : { conditions }) };
+    ...(conditions === undefined ? {} : { conditions }), ...(form === undefined ? {} : { form }) };
   assert.ok(['supported', 'return'].includes(selected.verdict));
   assert.ok(['go', 'conditional', 'no_go', 'insufficient_evidence'].includes(selected.outcome));
   assert.ok(['owner', 'model', 'partial'].includes(selected.route));
-  const key = `${selected.route}:${selected.outcome}:${selected.verdict}${conditions === undefined ? '' : `:${canonical(conditions as never)}`}`;
+  const key = `${selected.route}:${selected.outcome}:${selected.verdict}${conditions === undefined ? '' : `:${canonical(conditions as never)}`}`
+    + (form === undefined ? '' : `:${form}`);
   let pending = seeds.get(key);
   if (!pending) { pending = build(selected); seeds.set(key, pending); pending.catch(() => seeds.delete(key)); }
   return plant(t, await pending);

@@ -28,7 +28,7 @@ import { DOSSIER_ASSESSMENT_RESULT_CONTRACT, DOSSIER_QUALITY_DIMENSIONS } from '
 import { configureReaderPilot } from '../src/discovery/reader-pilot.js';
 import { prepareDiscoveryFinalSubject, type DiscoveryFinalPacket } from '../src/discovery/discovery-final.js';
 import { DISCOVERY_FINAL_RESULT } from '../src/discovery/discovery-final-result.js';
-import { V7_FINAL_CONTRACT } from '../src/discovery/v7-final-contracts.js';
+import { V7_FINAL_CONTRACT, V8_FINAL_CONTRACT } from '../src/discovery/v7-final-contracts.js';
 import { prepareDiscoveryFinalSession } from '../src/discovery/discovery-final-session.js';
 import { readDiscoveryFinalExecutionAt, runDiscoveryFinalExecution } from '../src/discovery/discovery-final-execution.js';
 import { researchCall } from '../src/discovery/research-protocol.js';
@@ -138,16 +138,17 @@ async function buildDossier(route: FinalSeedRoute) {
 
 /** The paid D7 reply; explicit conditions (7b.3, codex-omg2 №16161) replace the default evidence-1 of a conditional
  * bundle only when given, and are never defaulted when empty, null or malformed. */
-export function finalCandidate(packet: DiscoveryFinalPacket, outcome: FinalOutcome, conditions?: unknown) {
+/** 7b.3-class (codex-omg2 №16183): an explicit form version (discovery-final/v8) only when given; v7 otherwise. */
+export function finalCandidate(packet: DiscoveryFinalPacket, outcome: FinalOutcome, conditions?: unknown, form?: typeof V8_FINAL_CONTRACT) {
   if (conditions !== undefined) assert.equal(outcome, 'conditional', 'explicit conditions belong to a conditional bundle');
   const verdict = { outcome, reason: 'The saved final decision keeps its own reasons', conditions: conditions !== undefined ? conditions
     : outcome === 'conditional' ? [{ id: 'evidence-1', kind: 'evidence', condition: 'A source is available', criterion: 'A signed agreement' }] : [] };
   const bundle = outcome === 'go' || outcome === 'conditional'
-    ? { contract: V7_FINAL_CONTRACT, dossier: packet.dossier.manifest.ref, verdict,
+    ? { contract: form ?? V7_FINAL_CONTRACT, dossier: packet.dossier.manifest.ref, verdict,
       summary: { what: 'Ledger', forWhom: 'Operators', why: 'Traceability', firstResult: 'A first record', successCriterion: 'No missing record', nonGoals: ['Payroll'] },
       projection: { users: ['Operator'], payers: ['Company'], rules: ['Policy'], externalSystems: ['Books'], unresolved: ['Integration'] },
       constitution: { goal: 'Traceability', consumers: ['Operator'], nonGoals: ['Payroll'], successCriterion: 'No missing record' } }
-    : { contract: V7_FINAL_CONTRACT, dossier: packet.dossier.manifest.ref, verdict,
+    : { contract: form ?? V7_FINAL_CONTRACT, dossier: packet.dossier.manifest.ref, verdict,
       summary: { reasons: ['A bounded refusal'], found: ['Evidence'], needed: ['More evidence'] }, projection: null, constitution: null };
   return { contract: DISCOVERY_FINAL_RESULT, subject: structuredClone(packet.subject), bundle };
 }
@@ -207,7 +208,7 @@ function plant<T extends DossierData>(t: TestContext, seed: Snapshot<T>) {
     wires: (): unknown[] => readFileSync(join(root, 'wire.ndjson'), 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line)) };
 }
 
-async function buildPaid(outcome: FinalOutcome, route: FinalSeedRoute, conditions?: unknown): Promise<Snapshot<PaidData>> {
+async function buildPaid(outcome: FinalOutcome, route: FinalSeedRoute, conditions?: unknown, form?: typeof V8_FINAL_CONTRACT): Promise<Snapshot<PaidData>> {
   const f = plant(lifetime, await dossierBaseline(route)), { packet, d6, calibration } = f.data;
   // A different command is deliberately uncalibrated; pay a genuine same-role
   // measurement on this copy rather than borrowing the seed's old command.
@@ -216,8 +217,9 @@ async function buildPaid(outcome: FinalOutcome, route: FinalSeedRoute, condition
     { store: f.store, draftId: calibration.draft.id, questionId: calibration.question.id, purpose: 'assessor' });
   const prepared = await prepareDiscoveryFinalSession(f.store, 'p', packet.subject,
     { prompt: 'Build the exact final Discovery package.', packetChars: 8_000_000, limitChars: 9_000_000,
-      resultLimitChars: 10_000_000, environment: reference(f.environment), role: f.environment.value.implementer });
-  f.reply(finalCandidate(packet, outcome, conditions));
+      resultLimitChars: 10_000_000, environment: reference(f.environment), role: f.environment.value.implementer,
+      ...(form ? { form } : {}) });
+  f.reply(finalCandidate(packet, outcome, conditions, form));
   const paid = await runDiscoveryFinalExecution(f.store, 'p', reference(prepared), { profile: f.profile });
   assert.ok(paid.output && paid.result);
   assert.equal(paid.result.result.bundle.verdict.outcome, outcome);
@@ -230,14 +232,16 @@ async function buildPaid(outcome: FinalOutcome, route: FinalSeedRoute, condition
  * current Environment/profile; historical refs stay byte-exact. Restoring a
  * paid result never dispatches or calibrates a model. First construction is
  * awaited here, so its cost remains inside the calling test/file. */
-export async function finalPaid(t: TestContext, outcome: FinalOutcome = 'go', route: FinalSeedRoute = 'owner', conditions?: unknown) {
+export async function finalPaid(t: TestContext, outcome: FinalOutcome = 'go', route: FinalSeedRoute = 'owner', conditions?: unknown,
+  form?: typeof V8_FINAL_CONTRACT) {
+  assert.ok(form === undefined || form === V8_FINAL_CONTRACT, 'an explicit form is discovery-final/v8');
   assert.ok(['go', 'conditional', 'no_go', 'insufficient_evidence'].includes(outcome));
   assert.ok(['owner', 'model', 'partial'].includes(route));
   // One JSON snapshot of explicit conditions before the first await: it keys the cache and builds the paid world.
   const given = conditions === undefined ? undefined : JSON.parse(canonical(conditions as never)) as unknown;
-  const key = given === undefined ? `${route}:${outcome}` : `${route}:${outcome}:${canonical(given as never)}`;
+  const key = (given === undefined ? `${route}:${outcome}` : `${route}:${outcome}:${canonical(given as never)}`) + (form ? `:${form}` : '');
   let pending = paidSeeds.get(key);
-  if (!pending) { pending = buildPaid(outcome, route, given); paidSeeds.set(key, pending); pending.catch(() => paidSeeds.delete(key)); }
+  if (!pending) { pending = buildPaid(outcome, route, given, form); paidSeeds.set(key, pending); pending.catch(() => paidSeeds.delete(key)); }
   const f = plant(t, await pending), { packet, prepared, execution, paidResult, d6 } = f.data;
   const exact = <T>(ref: Ref): Revision<T> => {
     const row = f.store.get<T>(ref.id, ref.revision);
