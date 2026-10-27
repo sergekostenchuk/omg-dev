@@ -417,6 +417,18 @@ const RECORD_REFERENCE_SEMANTICS: readonly RecordReferenceSemantics[] = [
     ["grounds", "draft"], ["grounds", "paid"], ["grounds", "assessment"]] },
   { kind: "discovery-manifest-successor", contract: "discovery-manifest-successor/v1", data: [], refs: [
     ["predecessor"], ["successor"], ["resolution"]] },
+  // OMG-V7-KEEPER-PREPARED-SESSION (codex-worker2 №16291): the keeper archive names exactly its request parts; the prepared
+  // keeper session names its source, manifest, environment, the containers of its key, request and envelopes, its archive
+  // and parts. The request material and the schema are data, not further references.
+  { kind: "keeper-archive", contract: "keeper-archive/v1", data: [], refs: [["parts", INDEX]] },
+  { kind: "keeper-session", contract: "keeper-session/v1", data: [], refs: [
+    ["input", "source"], ["input", "manifest"], ["input", "environment"],
+    ["request", "key", "artifact", "container"], ["request", "key", "constitution", "container"],
+    ["request", "artifact", "ref"], ["request", "constitution", "ref"],
+    ["packing", "archive"], ["packing", "parts", INDEX],
+    ["packing", "envelopes", INDEX, "packet", "key", "artifact", "container"],
+    ["packing", "envelopes", INDEX, "packet", "key", "constitution", "container"],
+    ["packing", "envelopes", INDEX, "packet", "delivery", "original", "record"]] },
   // DR4-M: structural reference sites only. These records do not prove paid or owner provenance.
   { kind: "discovery-variant-snapshot", contract: "discovery-variant-snapshot/v1", data: [], refs: [
     ["draft"], ["frame"], ["plan"], ["questions", INDEX, "question"], ["questions", INDEX, "progress"],
