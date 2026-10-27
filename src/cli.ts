@@ -4,6 +4,19 @@ import { restoreSnapshot } from "./storage/snapshots.js";
 import { EngineError } from "./errors.js";
 import { readFileSync } from "node:fs";
 import { reference } from "./pipeline/contracts.js";
+import type { OmResult } from "./om/refusal.js";
+
+function closeOwnerSession(store: Store, sessions: { revoke(bearer: unknown): OmResult<unknown> }, bearer: string | null): void {
+  try {
+    if (bearer !== null) {
+      const closed = sessions.revoke(bearer);
+      if (!closed.ok) throw new EngineError(closed.refusal.code, closed.refusal.message, closed.refusal.at);
+    }
+  } catch (error) {
+    if (error instanceof EngineError) throw error;
+    throw new EngineError("owner_session_cleanup_failed", "The owner session could not be closed");
+  } finally { store.close(); }
+}
 
 export async function main(args = process.argv.slice(2)): Promise<void> {
   const [command, database = ".omg/state.sqlite", directory = ".omg/backups"] = args;
@@ -32,6 +45,7 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
     const store = new Store(resolve(database));
     const sessions = command === 'owner-final-acceptance' ? new FinalAcceptanceSessions(store) : new ConditionChoiceSessions(store);
     let bearer: string | null = null;
+    let output: unknown;
     try {
       let input: unknown;
       try { input = JSON.parse(readFileSync(0, 'utf8')); }
@@ -49,7 +63,7 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
         bearer = login.value.bearer;
         const result = await acceptDiscoveryFinal(store, { projectId: request.project, assessment: request.assessment,
           decision: request.decision, reason: request.reason }, sessions.authority(bearer));
-        console.log(JSON.stringify(discoveryDecisionOutput(result)));
+        output = discoveryDecisionOutput(result);
       } else if (command === 'owner-final-condition' && request.type === 'discovery-final-condition' && 'optionId' in request) {
         const accepted = await readAcceptedDiscoveryManifestAt(store, request.project, request.manifest);
         const scope = { projectId: request.project, predecessor: reference(accepted.manifest), bundle: reference(accepted.bundle),
@@ -59,14 +73,14 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
         const login = sessions.exchange({ projectId: request.project, invitation: issued.value.invitation });
         if (!login.ok) throw new EngineError(login.refusal.code, login.refusal.message);
         bearer = login.value.bearer;
-        console.log(JSON.stringify(discoveryConditionOutput(await resolveDiscoveryCondition(store,
+        output = discoveryConditionOutput(await resolveDiscoveryCondition(store,
           { projectId: request.project, manifest: request.manifest, conditionId: request.conditionId,
-            optionId: request.optionId, reason: request.reason }, sessions.authority(bearer)))));
+            optionId: request.optionId, reason: request.reason }, sessions.authority(bearer)));
       } else throw new EngineError('command_invalid', 'The owner door requires its matching scoped command');
     } finally {
-      try { if (bearer && sessions.authority(bearer)) sessions.revoke(bearer); }
-      finally { store.close(); }
+      closeOwnerSession(store, sessions, bearer);
     }
+    console.log(JSON.stringify(output));
     return;
   }
   // H2.0 (№2719): invitation issuance is CLI-only — `serve`, `command` and HTTP can never mint one. The secret reaches
@@ -89,6 +103,7 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
       import("./product/owner-authority.js"), import("./discovery/discovery-decision.js")]);
     const store = new Store(resolve(database)); const sessions = new DiscoveryChoiceSessions(store);
     let bearer: string | null = null;
+    let output: unknown;
     try {
       let request: unknown;
       try { request = JSON.parse(readFileSync(0, "utf8")); }
@@ -103,12 +118,11 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
       const authority = sessions.authority(bearer);
       if (!authority) throw new EngineError("owner_session_missing", "The scoped local session was not established");
       const outcome = answerDiscoveryCondition(store, scoped, authority);
-      console.log(JSON.stringify({ decision: reference(outcome.decision), repeated: outcome.repeated,
-        nextAction: outcome.nextAction }));
+      output = { decision: reference(outcome.decision), repeated: outcome.repeated, nextAction: outcome.nextAction };
     } finally {
-      if (bearer && sessions.authority(bearer)) sessions.revoke(bearer);
-      store.close();
+      closeOwnerSession(store, sessions, bearer);
     }
+    console.log(JSON.stringify(output));
     return;
   }
   // DR1a: the trusted local project-mode command owns the whole scoped invitation/session lifecycle exactly like
@@ -119,6 +133,7 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
       import("./product/owner-authority.js"), import("./product/project-mode.js")]);
     const store = new Store(resolve(database)); const sessions = new ProjectModeSessions(store);
     let bearer: string | null = null;
+    let output: unknown;
     try {
       let request: unknown;
       try { request = JSON.parse(readFileSync(0, "utf8")); }
@@ -133,12 +148,11 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
       const authority = sessions.authority(bearer);
       if (!authority) throw new EngineError("owner_session_missing", "The scoped local session was not established");
       const outcome = setProjectMode(store, scoped, authority);
-      console.log(JSON.stringify({ record: reference(outcome.record), mode: outcome.record.value.mode,
-        repeated: outcome.repeated }));
+      output = { record: reference(outcome.record), mode: outcome.record.value.mode, repeated: outcome.repeated };
     } finally {
-      if (bearer && sessions.authority(bearer)) sessions.revoke(bearer);
-      store.close();
+      closeOwnerSession(store, sessions, bearer);
     }
+    console.log(JSON.stringify(output));
     return;
   }
   // 4O.3: the trusted local variant-choice command owns the whole scoped invitation/session lifecycle exactly like OC1
@@ -150,6 +164,7 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
       import("./discovery/variant-decision.js")]);
     const store = new Store(resolve(database)); const sessions = new VariantChoiceSessions(store);
     let bearer: string | null = null;
+    let output: unknown;
     try {
       let request: unknown;
       try { request = JSON.parse(readFileSync(0, "utf8")); }
@@ -165,12 +180,11 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
       const authority = sessions.authority(bearer);
       if (!authority) throw new EngineError("owner_session_missing", "The scoped local session was not established");
       const outcome = answerVariantChoice(store, scope, authority);
-      console.log(JSON.stringify({ decision: reference(outcome.decision), state: reference(outcome.state),
-        repeated: outcome.repeated }));
+      output = { decision: reference(outcome.decision), state: reference(outcome.state), repeated: outcome.repeated };
     } finally {
-      if (bearer && sessions.authority(bearer)) sessions.revoke(bearer);
-      store.close();
+      closeOwnerSession(store, sessions, bearer);
     }
+    console.log(JSON.stringify(output));
     return;
   }
   if (!["init", "inspect", "backup", "command"].includes(command ?? "")) {
