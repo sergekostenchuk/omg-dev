@@ -20,7 +20,7 @@ import { discoveryFixture, acceptPlan, planQuestion, validPlan, type PlanQuestio
 import { answerDiscoveryFixture } from './product-fixture.js';
 import { readVariantHandoff } from '../src/discovery/discovery-outcome.js';
 import { EngineError } from '../src/errors.js';
-import { canonical } from '../src/canonical.js';
+import { canonical, hashJson } from '../src/canonical.js';
 import { producePartialDossier, readPartialDossier, DOSSIER_MANIFEST_KIND } from '../src/discovery/dossier-manifest.js';
 import type { ClaimAddress } from '../src/discovery/claim-address.js';
 import { readDeepPreparation } from '../src/discovery/deep-research.js';
@@ -228,7 +228,7 @@ async function route(t: test.TestContext, kind: RouteKind) {
     if (kind === 'no_variants') f.configure({none:true});
     if (kind === 'model') f.configure({reject:true});
     if (kind.startsWith('limit')) f.configure({assessorTokens:V7_STAGE_TOKEN_CEILING-1000});
-    const run = kind === 'owner' ? await f.run(1,f.open(),true) : await f.run(kind.startsWith('limit') ? 2 : 3);
+    const run = kind === 'owner' ? await f.run(1,f.open(),true) : await f.run(kind.startsWith('limit') || kind === 'no_variants' ? 2 : 3);
     const handoff = reference(await saved(f,run));
     for (const close of closing) close();
     cached = { base, snapshot: snapshot(base.root), handoff };
@@ -263,7 +263,17 @@ async function withMaterials(t:test.TestContext, limit=false) {
   const run=await f.run(1);restoreWrites();assert.equal(classifications.length,3,JSON.stringify({pauseCode:run.value.pauseCode,error:run.value.error,actions:f.wires().map(w=>w.subject.variantSubject?.kind??(w.subject.assessmentSubject?'assessment':w.subject.question?.id))}));
   if(limit)return {...f,handoff:await saved(f,run),classifications};
   f.configure({none:true});
-  const handoff=await saved(f,await f.run(5));
+  // This fixture tests the D6 receiver. Cut immediately after the ordinary
+  // runner commits that boundary, before its newly connected assessment step.
+  const stopAtD6=onWrites(f.store,(writes,guards,write)=>{
+    const rows=write(writes,guards);
+    if(writes.some(row=>row.kind==='research-run' && (row.value as any).pauseCode==='research_dossier_assessment_unavailable'))
+      throw new Error('fixture committed D6 boundary');
+    return rows;
+  });
+  try { await assert.rejects(()=>f.run(5),/fixture committed D6 boundary/); }
+  finally { stopAtD6(); }
+  const handoff=await saved(f,f.store.get<import('../src/discovery/research-model.js').ResearchRun>(`research-run:${hashJson(['p',f.v.draft.id])}`)!);
   return {...f,handoff,classifications};
 }
 
@@ -457,7 +467,7 @@ test(`6.3-RUNNER-01: ${cold?'cold':'hot'} owner revise exits an unpublished reci
   const existing=f.store.list(DOSSIER_MANIFEST_KIND)[0];
   if(published){
     // Even an explicit new invocation first restores this already-paid saved result.
-    const restored=await f.run(1,store), pause=JSON.parse(restored.value.error!);
+    const restored=await f.run(1,store,true), pause=JSON.parse(restored.value.error!);
     assert.equal(restored.value.pauseCode,'research_dossier_assessment_unavailable');
     assert.deepEqual(pause.dossier,reference(existing!));assert.deepEqual(pause.handoff,reference(f.oldHandoff));
     await inert(f,store,async()=>assert.deepEqual(await f.run(1,store,true),restored));

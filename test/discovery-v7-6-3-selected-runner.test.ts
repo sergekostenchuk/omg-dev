@@ -203,7 +203,7 @@ async function fixed(f:Awaited<ReturnType<typeof ready>>,run:Revision<ResearchRu
   assert.equal(run.value.pauseCode,SELECTED_DOSSIER_PAUSE);
   const saved=JSON.parse(run.value.error!),cold=f.open(),before=history(f.store);
   await inert(f,coldRunner?cold:f.store,async()=>{
-    assert.deepEqual(await f.run(8,coldRunner?cold:f.store),run);
+    assert.deepEqual(await f.run(8,coldRunner?cold:f.store,true),run);
   });
   await inert(f,coldRunner?f.store:cold,async()=>{
     const result=await drive(f,coldRunner?f.store:cold);
@@ -422,7 +422,7 @@ test(`selected runner: two projects ${door} ${cold?'cold':'hot'} cut ${cutAt} ke
     assert.deepEqual(reference(old.handoff),bProof.saved.handoff);assert.deepEqual(old.selected,bProof.proof);
   });
   await inert(f,store,async()=>{
-    assert.deepEqual(await f.run(8,store),run);
+    assert.deepEqual(await f.run(8,store,true),run);
     const repeated=await drive(f,coldStore);
     assert.equal(repeated.reason?.code,SELECTED_DOSSIER_PAUSE);
     assert.deepEqual(repeated.reason?.handoff,saved.handoff);assert.deepEqual(repeated.reason?.selected,saved.selected);

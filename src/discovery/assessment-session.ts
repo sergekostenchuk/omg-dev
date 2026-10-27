@@ -16,7 +16,7 @@ import type { ModelCall } from '../runtime/model-usage.js';
 import { Environments, uniqueTransactionGuards, transactionGuardsCurrent } from '../runtime/environment.js';
 import { prepareModelCallRecovery, readModelCallRecovery } from './model-call-recovery.js';
 import { contextWorkspace, addContextLookup, contextProgress, requireCompleteContextPacket, type ContextWorkspace } from "./context-workspace.js";
-import type { Store, Revision, Write, TransactionGuard } from "../storage/store.js";
+import { checkTransactionGuards, type Store, type Revision, type Write, type TransactionGuard } from "../storage/store.js";
 import type { DiscoveryDraft, Question } from "./discovery.js";
 import type { Environment, RoleBinding } from "../runtime/environment.js";
 import type { ReaderPilot } from "./reader-pilot.js";
@@ -1577,6 +1577,7 @@ export interface DossierAssessmentApplication {
   contract:typeof DOSSIER_APPLICATION; projectId:string; session:Ref; context:Record<string,any>;
   prompt:string; role:RoleBinding; dispatch:Environment; profile:Ref|null; guards:TransactionGuard[];
   state:'prepared'|'running'|'applied'; call:Ref|null; received:Ref|null; after:Ref|null;
+  dispatchGuards?: TransactionGuard[];
 }
 const dossierSessionId=(subject:DossierAssessmentSubject)=>`dossier-session:v1:${hashJson([DOSSIER_SESSION,subject])}`;
 const dossierApplicationId=(session:Ref)=>`dossier-application:v1:${hashJson([session.id,session.revision])}`;
@@ -1642,12 +1643,26 @@ export function readDossierDispatchAdmission(store:Store, applicationRef:Ref) {
   return {application,session,packet,draft,question,environment,profile,context:app.context,
     role:value.role,dispatch:value.dispatch,prompt:value.prompt};
 }
+/** Saved new-send witnesses survive a caller retry without options. Historical proof
+ * checks their form and binding, never their current heads. */
+export function readDossierReservationAt(store: Store, applicationRef: Ref) {
+  const admission = readDossierDispatchAdmission(store, applicationRef), application = admission.application;
+  const running = dossierExact<DossierAssessmentApplication>(store,
+    {id:application.id,revision:2,hash:store.get(application.id,2)?.hash??''},'assessment-application');
+  dossierRequire(object(running.value), 'The dossier reservation must be a record');
+  const additional = Object.hasOwn(running.value, 'dispatchGuards')
+    ? uniqueTransactionGuards(checkTransactionGuards(running.value.dispatchGuards)) : [];
+  dossierRequire(!Object.hasOwn(running.value, 'dispatchGuards') || same(additional, running.value.dispatchGuards),
+    'The dossier reservation lost its normalized dispatch guards');
+  dossierRequire(isRef(running.value.call) && same(running.value, {...application.value,state:'running',call:running.value.call,
+    ...(Object.hasOwn(running.value,'dispatchGuards') ? {dispatchGuards:additional} : {})}),
+    'The dossier reservation did not bind one exact physical call');
+  return {running,guards:uniqueTransactionGuards([...application.value.guards,...additional])};
+}
 async function dossierPhysicalOutcome(store:Store, admission:Awaited<ReturnType<typeof readDossierDispatchAdmission>>, received:Ref) {
   const {session,draft,question,application}=admission;
-  const running=dossierExact<DossierAssessmentApplication>(store,{id:application.id,revision:2,hash:store.get(application.id,2)?.hash??''},'assessment-application');
-  dossierRequire(isRef(running.value.call) && same(running.value,{...application.value,state:'running',call:running.value.call}),
-    'The dossier reservation did not bind one exact physical call');
-  const initial=dossierExact<ModelCall>(store,running.value.call,'model-call');
+  const {running}=readDossierReservationAt(store,reference(application));
+  const initial=dossierExact<ModelCall>(store,running.value.call!,'model-call');
   const outcome=readResearchExecution(store,session.value.projectId,received,session,draft,question,admission.role,session.value.profile);
   requirePhysicalIdentity(initial,outcome.call);
   dossierRequire(outcome.kind==='response','A non-response cannot evaluate a dossier');
@@ -1741,14 +1756,16 @@ export async function proveDossierDispatchAdmission(store:Store,applicationRef:R
 }
 /** One public managed door. Saved positions restore before consulting today's role or profile. */
 export async function runDossierAssessmentSession(store:Store,project:string,subject:unknown,
-  environment?:Revision<Environment>,pilot?:Revision<ReaderPilot>,signal?:AbortSignal,options:{restoreOnly?:boolean;allowance?:number}={}) {
+  environment?:Revision<Environment>,pilot?:Revision<ReaderPilot>,signal?:AbortSignal,options:{restoreOnly?:boolean;allowance?:number;admissionGuards?:TransactionGuard[]}={}) {
+  const {restoreOnly,allowance,admissionGuards:additional}=options;
+  const dispatchGuards=uniqueTransactionGuards(checkTransactionGuards(additional===undefined?[]:additional));
   const packet=await requireDossierAssessmentSubject(store,project,subject),id=dossierSessionId(packet.subject);
-  dossierRequire(options.allowance===undefined || Number.isSafeInteger(options.allowance) && options.allowance>=0,'The dossier allowance must be a nonnegative integer');
+  dossierRequire(allowance===undefined || Number.isSafeInteger(allowance) && allowance>=0,'The dossier allowance must be a nonnegative integer');
   let used=0;
   let session=store.get<DossierAssessmentSession>(id);
-  if(options.restoreOnly) dossierRequire(session,'There is no saved dossier position to restore');
+  if(restoreOnly) dossierRequire(session,'There is no saved dossier position to restore');
   if(!session) {
-    requireCondition(options.allowance!==0,'research_call_allowance','No new dossier call is allowed');
+    requireCondition(allowance!==0,'research_call_allowance','No new dossier call is allowed');
     dossierRequire(environment && object(environment.value) && environment.value.projectId===project,'A new dossier session needs its exact runtime');
     environment=dossierExact<Environment>(store,reference(environment),'environment');
     const draft=store.get<DiscoveryDraft>(packet.basis.draft.ref.id),question=store.get<Question>((packet.basis.plan.value as any).question);
@@ -1774,17 +1791,18 @@ export async function runDossierAssessmentSession(store:Store,project:string,sub
     }
     let application=store.get<DossierAssessmentApplication>(session.value.application);
     if(application) application=dossierExact<DossierAssessmentApplication>(store,reference(application),'assessment-application');
-    if(options.restoreOnly && (!application || application.value.state==='prepared'
+    if(restoreOnly && (!application || application.value.state==='prepared'
       || application.value.state==='running' && application.value.call && store.get<ModelCall>(application.value.call.id)?.value.status==='running'))
       return readDossierAssessmentSessionAt(store,project,reference(session));
     if(!application) {
-      requireCondition(options.allowance===undefined || used<options.allowance,'research_call_allowance','No new dossier call is allowed');
+      requireCondition(allowance===undefined || used<allowance,'research_call_allowance','No new dossier call is allowed');
       const value=session.value,binding=value.binding;
       const draft=dossierExact<DiscoveryDraft>(store,binding.draft,'discovery-draft'),question=dossierExact<Question>(store,binding.question,'question');
       const runtime=dossierExact<Environment>(store,binding.environment,'environment');
       const profile=value.profile?dossierExact<ReaderPilot>(store,value.profile,'reader-pilot'):undefined;
       const effective=new Environments(store).effective(project);
-      const guards=uniqueTransactionGuards([...effective.guards,...effective.admissionGuards,reference(draft),reference(question),
+      const inherited=value.previous?readDossierReservationAt(store,value.previous).guards:[];
+      const guards=uniqueTransactionGuards([...inherited,...dispatchGuards,...effective.guards,...effective.admissionGuards,reference(draft),reference(question),
         reference(runtime),...draft.value.inputs,...(profile?[reference(profile)]:[])]);
       const built=await prepareDossierResearchEnvelope(value.role,value.dispatch,value.prompt,dossierContext(session),
         {store,draftId:draft.id,questionId:question.id,purpose:'dossier-assessor',...(profile?{pilot:profile}:{})},undefined,undefined,true);
@@ -1800,13 +1818,13 @@ export async function runDossierAssessmentSession(store:Store,project:string,sub
     const admission=await proveDossierDispatchAdmission(store,reference(dossierExact<DossierAssessmentApplication>(store,
       {id:application.id,revision:1,hash:store.get(application.id,1)?.hash??''},'assessment-application')));
     if(application.value.state==='prepared') {
-      requireCondition(options.allowance===undefined || used<options.allowance,'research_call_allowance','No new dossier call is allowed');
+      requireCondition(allowance===undefined || used<allowance,'research_call_allowance','No new dossier call is allowed');
       await researchCall(admission.role,admission.dispatch,admission.prompt,admission.context,signal,
         {store,draftId:admission.draft.id,questionId:admission.question.id,purpose:'dossier-assessor',session:reference(session),
           application:reference(application),...(admission.profile?{pilot:admission.profile}:{}),
           prepareCall:call=>({writes:[{id:application!.id,kind:application!.kind,expected:application!.revision,
-            value:{...application!.value,state:'running',call:pendingRef(call)}}],
-            guards:uniqueTransactionGuards([reference(session!),reference(application!),...application!.value.guards])})});
+            value:{...application!.value,state:'running',call:pendingRef(call),...(dispatchGuards.length?{dispatchGuards}: {})}}],
+            guards:uniqueTransactionGuards([reference(session!),reference(application!),...application!.value.guards,...dispatchGuards])})});
       used++;
       continue;
     }
@@ -1815,8 +1833,8 @@ export async function runDossierAssessmentSession(store:Store,project:string,sub
     dossierRequire(head,'The reserved dossier call disappeared');
     const call=dossierExact<ModelCall>(store,reference(head),'model-call');
     if(call.value.status==='running') {
-      requireCondition(options.allowance===undefined || used<options.allowance,'research_call_allowance','No new dossier call is allowed');
-      await resumeDossierResearchCall(store,reference(admission.application),signal);
+      requireCondition(allowance===undefined || used<allowance,'research_call_allowance','No new dossier call is allowed');
+      await resumeDossierResearchCall(store,reference(admission.application),signal,dispatchGuards);
       used++;
       continue;
     }

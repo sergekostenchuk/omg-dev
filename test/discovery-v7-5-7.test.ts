@@ -283,7 +283,7 @@ for (const model of [false, true]) test(`5.7: real ${model ? 'model' : 'owner'} 
   assert.ok(dossier.materials.length >= 3);
   assert.equal(discoveryInspection(f.store, f.v.draft).outcome.state, 'researching');
   const before=history(f.store),cold=f.open();
-  await inert(f,f.store,async()=>assert.deepEqual(await f.run(9,f.store),result));
+  await inert(f,f.store,async()=>assert.deepEqual(await f.run(9,f.store,true),result));
   await inert(f,cold,async()=>{
     assert.deepEqual(await f.run(1,cold,true),result);
     assert.equal((await produceStoppedPartialDossier(cold,'p',details.stop)).repeated,true);
@@ -299,7 +299,7 @@ test('5.7: one stalled cell does not stop another; all applied N limits stop wit
   assert.equal(proof.coverage.missing.length, 2);
   assert.equal(deepCalls(f).length, 6);
   const before=history(f.store);
-  for (const store of [f.store, f.open()]) await inert(f, store, () => f.run(8, store));
+  for (const store of [f.store, f.open()]) await inert(f, store, () => f.run(8, store, true));
   assert.equal(history(f.store),before);
 });
 test('5.7: complete coverage and an unpaid pending frontier are not partial', async t => {
@@ -321,7 +321,7 @@ test('5.7: complete coverage and an unpaid pending frontier are not partial', as
   assert.equal(f.store.list('discovery-dossier-manifest').length,1);
   assert.equal(f.store.list(DEEP_FRONTIER_STOP_KIND).length, 0);
   await inert(f, f.store, () => assert.rejects(() => produceDeepFrontierStop(f.store, 'p', JSON.parse(f.pending.value.error!).handoff), { code: 'discovery_deep_stop_invalid' }));
-  await inert(f,f.store,async()=>assert.deepEqual(await f.run(3,f.store),result));
+  await inert(f,f.store,async()=>assert.deepEqual(await f.run(3,f.store,true),result));
   const cold=f.open();
   await inert(f,cold,async()=>assert.deepEqual(await f.run(1,cold,true),result));
 });
@@ -566,10 +566,10 @@ test('5.7: exhausted stage budget remains terminal after choice, plan and allowa
   assert.equal(paused.value.pauseCode,'research_dossier_assessment_unavailable',paused.value.error!);
   const state=f.store.get<VariantState>(variantStateId('p',f.v.draft.id))!;
   owner(f.store,{...choiceScope(f),operation:'revise',previous:state.value.decision!,expectedSelection:reference(state)});
-  for(const store of [f.store,f.open()])await inert(f,store,async()=>assert.deepEqual(await f.run(100,store),paused));
+  for(const store of [f.store,f.open()])await inert(f,store,async()=>assert.deepEqual(await f.run(100,store,true),paused));
   f.nextEdition();
   for(const store of [f.store,f.open()])await inert(f,store,async()=>{
-    assert.deepEqual(await f.run(100,store),paused);
+    assert.deepEqual(await f.run(100,store,true),paused);
     assert.deepEqual(reference((await readPartialDossier(store,'p',details.dossier)).record),details.dossier);
   });
   assert.equal(deepCalls(f).length,1);

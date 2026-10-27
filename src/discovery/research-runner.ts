@@ -1,3 +1,4 @@
+import type { ModelCall } from '../runtime/model-usage.js';
 import { variantSnapshotReadiness, produceVariantSnapshot, readVariantSnapshot } from "./variant-snapshot.js";
 import { prepareVariantSession, applyVariantSession, readVariantExecutionSession, readVariantGeneration, readVariantModelDecision,
   type ProvenVariantModelDecision, type ProvenVariantGeneration } from "./variant-session.js";
@@ -6,6 +7,7 @@ import { variantStateId, readVariantStateStructural, type VariantHandoff, type V
 import { readVariantOwnerDecision } from "./discovery-decision.js";
 import { publishVariantScope, readCurrentVariantScope } from "./variant-scope.js";
 import { producePartialDossier, produceStoppedPartialDossier, readPartialDossier } from "./dossier-manifest.js";
+import { readRunnerDossierAssessmentAt, runRunnerDossierAssessment } from './dossier-assessment-runner.js';
 import { produceSelectedDossier, readSelectedDossier, SELECTED_DOSSIER_KIND, type SelectedDossier, type ProvenSelectedDossier } from "./selected-dossier.js";
 import { DISCOVERY_DEEP_PREPARATION_CONTRACT, produceDeepPreparation, readDeepPreparation } from "./deep-research.js";
 import { prepareDeepResearch, resumeDeepResearch } from "./deep-research-execution.js";
@@ -104,6 +106,9 @@ const paidTurnId = (run: string, number: number) => `research-turn:v1:${hashJson
 
 export const SELECTED_DOSSIER_PENDING = 'research_selected_dossier_pending';
 export const SELECTED_DOSSIER_PAUSE = 'research_selected_dossier_assessment_unavailable';
+class DossierRunnerSettled extends Error {
+  constructor(readonly run: Revision<ResearchRun>) { super('The exact dossier continuation is saved'); }
+}
 const SELECTED_PAUSE_CONTRACT = 'research-selected-dossier-pause/v1';
 function matchesSelectedRoute(route: VariantHandoff, saved: SelectedDossier | null | undefined): boolean {
   return route.reason === 'choose' && route.next === 'deep' && saved?.projectId === route.projectId
@@ -1943,11 +1948,39 @@ export class Researcher {
       "research_consumer_intent_invalid", "The research run belongs to another draft");
     requireCondition(run?.value.status !== "running" || processStart(run.value.owner.pid) !== run.value.owner.started,
       "research_busy", "This draft already has an active researcher");
+    if (run && (Object.hasOwn(run.value, 'dossierAssessment')
+      || ['research_dossier_ready', 'research_dossier_return'].includes(run.value.pauseCode ?? ''))) {
+      await readRunnerDossierAssessmentAt(this.store, project, reference(run));
+      return run;
+    }
+    // Managed turns may contain both analyst and reviewer calls. D6 must share
+    // the invocation's physical allowance rather than receiving another turn budget.
+    const initialCalls = new Set(this.store.list<ModelCall>('model-call')
+      .filter(call => call.value.projectId === project && call.value.draftId === draftId).map(call => call.id));
+    let dossierOperation = false;
+    const finishDossier = async (restoreOnly = false): Promise<Revision<ResearchRun>> => {
+      requireCondition(run, 'research_dossier_result_invalid', 'The dossier needs its original run');
+      dossierOperation = true;
+      const settled = await runRunnerDossierAssessment(this.store, project, reference(run), {
+        allowance: Math.max(0, limit - Math.max(used, this.store.list<ModelCall>('model-call')
+          .filter(call => call.value.projectId === project && call.value.draftId === draftId && !initialCalls.has(call.id)).length)),
+        restoreOnly: restoreOnly || options.restoreOnly === true || producerContractEra('discovery', options.producerPolicy) !== 7,
+        ...(signal ? { signal } : {}),
+      });
+      if (!settled) { dossierOperation = false; return run; }
+      const code = settled.result.verdict === 'supported' ? 'research_dossier_ready' : 'research_dossier_return';
+      run = this.save(run, { status: 'paused', owner, pauseCode: code,
+        error: canonical({ code, dossier: settled.result.manifest, assessment: settled.result.assessment,
+          return: settled.result.return, next: settled.result.verdict === 'supported' ? 'discovery-final' : 'addressed-research' }),
+        dossierAssessment: settled.result },
+      [reference(settled.origin), settled.result.root, settled.result.manifest, settled.result.assessment]);
+      return run;
+    };
     // The pause carries exact durable addresses. Its historical replay precedes today's
     // selection and cannot activate a new paid step after a mode or plan revision.
     const savedSelected = run && [SELECTED_DOSSIER_PENDING,SELECTED_DOSSIER_PAUSE].includes(run.value.pauseCode ?? '')
       ? await readSelectedResearchPause(this.store,project,draftId,run) : null;
-    if (savedSelected && run!.value.pauseCode === SELECTED_DOSSIER_PAUSE) return run!;
+    if (savedSelected && run!.value.pauseCode === SELECTED_DOSSIER_PAUSE) return finishDossier();
     let savedPartial: { handoff: Ref; [field: string]: unknown } | null = null;
     let pendingHandoff: VariantHandoff | null = null;
     let savedStop: Ref | null = null;
@@ -1996,10 +2029,12 @@ export class Researcher {
           "discovery_dossier_invalid", "The partial result belongs to another handoff or draft");
         // An explicit new invocation may follow a newer real choice/plan. The old
         // dossier is still proved above; the ordinary loop admits the new route.
+        await finishDossier(true);
+        if (run.value.dossierAssessment) return run;
         if (savedStop) {
           requireCondition(dossier.stop && canonical(reference(dossier.stop)) === canonical(savedStop),
             'discovery_deep_stop_invalid', 'The snapshot belongs to another stop');
-          if (!await mayResumeStopped(savedStop)) return run;
+          if (!await mayResumeStopped(savedStop)) return finishDossier();
           const stopped = await readDeepFrontierStop(this.store, project, savedStop);
           if (stopped.record.value.reason === 'budget') {
             // Preserve provenance before clearing the original pause. The first
@@ -2008,7 +2043,7 @@ export class Researcher {
             run = this.save(run, { budgetReentry } as Partial<BudgetReentryRun>,
               [budgetReentry.origin, savedStop, saved.dossier]);
           }
-        } else if (!newPartialRoute(proof.record.value)) return run;
+        } else if (!newPartialRoute(proof.record.value)) return finishDossier();
         savedPartial = null; savedStop = null;
       } else pendingHandoff = proof.record.value;
     }
@@ -2035,7 +2070,7 @@ export class Researcher {
         dossier: reference(dossier.record), completeness: "partial", message: "The partial dossier awaits assessment" });
       run = this.save(run, { status: "paused", owner, pauseCode: "research_dossier_assessment_unavailable", error: message });
       partialPending = false;
-      throw new EngineError("research_dossier_assessment_unavailable", message);
+      throw new DossierRunnerSettled(await finishDossier());
     };
     const receiveStopped = async (stop: Ref, display: object = {}): Promise<never> => {
       const proof = await readDeepFrontierStop(this.store, project, stop);
@@ -2050,7 +2085,7 @@ export class Researcher {
         code: 'research_dossier_assessment_unavailable', message: 'The partial dossier awaits assessment' });
       run = this.save(run, { status: 'paused', owner, pauseCode: 'research_dossier_assessment_unavailable', error: message });
       partialPending = false; deepOperation = false;
-      throw new EngineError('research_dossier_assessment_unavailable', message);
+      throw new DossierRunnerSettled(await finishDossier());
     };
     const receiveSelected = async (handoff: Ref, guards: TransactionGuard[] = []): Promise<never> => {
       selectedPending = true;
@@ -2073,7 +2108,7 @@ export class Researcher {
       run = this.save(run, { status: 'paused', owner, pauseCode: SELECTED_DOSSIER_PAUSE, error: message },
         [handoff,reference(selected.record),reference(selected.manifest)]);
       selectedPending = false; deepOperation = false;
-      throw new EngineError(SELECTED_DOSSIER_PAUSE,message);
+      throw new DossierRunnerSettled(await finishDossier());
     };
     const receiveDeep = async (handoff: Ref, display: object): Promise<void> => {
       deepOperation = true;
@@ -2583,6 +2618,8 @@ export class Researcher {
           options.contextContract && mode !== "planning" ? { contextContract: options.contextContract } : {});
       }
     } catch (error) {
+      if (error instanceof DossierRunnerSettled) return error.run;
+      if (dossierOperation) throw error;
       if (partialPending || selectedPending) throw error;
       if (error instanceof EngineError && error.code === 'discovery_deep_environment_invalid') throw error;
       const current = this.store.get<ResearchRun>(id) ?? run;

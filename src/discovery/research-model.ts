@@ -55,6 +55,12 @@ export interface ResearchRun {
   error: string | null;
   pauseCode?: string | null;
   owner: { pid: number; started: string }; requestChars: number;
+  /** Exact paid D6 continuation; supported is readiness for D7, not acceptance. */
+  dossierAssessment?: ResearchRunDossierAssessment;
+}
+export interface ResearchRunDossierAssessment {
+  contract: 'research-run-dossier-assessment/v1'; origin: Ref; root: Ref; manifest: Ref; assessment: Ref;
+  verdict: 'supported' | 'return'; return: DossierAssessmentResult['return'];
 }
 export interface ResearchTurn {
   run: string; number: number; action: unknown; assessment: Ref | null; observation: unknown; error: string | null;

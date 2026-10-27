@@ -82,7 +82,7 @@ import { expandLayerDelta, type LayerDelta } from './layer-delta.js';
 import { derivePaidReaderResult, readerApplicationAdmission, readReaderResultAt, readSavedReaderBundleResult } from './reader.js';
 import { findAcceptedPaidAnswerChain } from './research-continuation.js';
 import { queueOriginOf, queuedChildReached } from './reading-plan.js';
-import { paidOriginId, paidSessionId, limitedAssessmentRetryScope, assessmentRolePrompt, readAssessmentDispatchAdmission, readDossierDispatchAdmission, DOSSIER_SESSION, readAssessmentApplicationOutcomeAt } from './assessment-session.js';
+import { paidOriginId, paidSessionId, limitedAssessmentRetryScope, assessmentRolePrompt, readAssessmentDispatchAdmission, readDossierDispatchAdmission, readDossierReservationAt, DOSSIER_SESSION, readAssessmentApplicationOutcomeAt } from './assessment-session.js';
 import { readResearchAssessmentAt, assessmentBindingId } from './research-assessment.js';
 import { ATTEMPT_BINDING_CONTRACT, ATTEMPT_BINDING_FIELDS, ATTEMPT_BINDING_KIND, addressedQuestionId, attemptBindingId,
   callAddressesSubject, planSubjectOf, sameSubject, questionDispatchId, type ResearchAttemptBinding, type V7PlanSubject } from './v7-managed-attempt.js';
@@ -3710,11 +3710,11 @@ function researchExecution(store: Store, project: string, callRef: Ref,
   } else if (dossier) {
     requireCondition(isRef(appRef), 'discovery_dossier_session_invalid', 'The dossier call lost its prepared application');
     const admission = readDossierDispatchAdmission(store, appRef!);
-    const claim = store.get<ModelCall>(call.id, 1), running = store.get<Record<string, any>>(appRef!.id, 2);
+    const claim = store.get<ModelCall>(call.id, 1), {running} = readDossierReservationAt(store, appRef!);
     requireCondition(canonical(reference(admission.session)) === canonical(reference(session))
       && canonical(admission.role) === canonical(role) && canonical(admission.profile ? reference(admission.profile) : null) === canonical(profile)
       && claim && running?.kind === 'assessment-application' && hashJson(running.value) === running.hash
-      && canonical(running.value) === canonical({...admission.application.value,state:'running',call:reference(claim)})
+      && canonical(running.value.call) === canonical(reference(claim))
       && canonical(archive.draft) === canonical(binding.draft) && canonical(archive.question) === canonical(binding.question)
       && Object.entries(admission.context).every(([key,value]) => Object.hasOwn(body,key) && canonical(body[key]) === canonical(value))
       && ['dossierSubject','managedDossier','resultCapacity','assessmentDelivery'].every(key =>

@@ -498,23 +498,26 @@ test('budget re-entry: a paid analyst survives an MR working-limit pause until t
 
 test('budget re-entry: no owner increase, new plan/allowance, restoreOnly and zero driver allowances cannot buy research', async t => {
   const f = await stopped(t);
+  // Exact old D6 pauses are inert in restoreOnly. A normal invocation may now
+  // spend the completion reserve on D6, while the ordinary driver and the
+  // re-entry reader below must still reject another research purchase.
   await inert(f, f.store, async () => {
     assert.equal(await readBudgetStopReentry(f.store, 'p', f.v.draft.id, f.details.stop), false);
-    assert.deepEqual(await f.run(20), f.original);
+    assert.deepEqual(await f.run(20, f.store, true), f.original);
     await driver(f); assert.equal(deepCalls(f).length, 1);
   });
   const state = f.store.get<VariantState>(variantStateId('p', f.v.draft.id))!;
   owner(f.store, { ...choiceScope(f), operation: 'revise', previous: state.value.decision!, expectedSelection: reference(state) });
-  await inert(f, f.store, async () => assert.deepEqual(await f.run(20), f.original));
+  await inert(f, f.store, async () => assert.deepEqual(await f.run(20, f.store, true), f.original));
   increase(f);
   await inert(f, f.store, async () => {
     assert.equal(await readBudgetStopReentry(f.store, 'p', f.v.draft.id, f.details.stop), false);
-    assert.deepEqual(await f.run(1), f.original);
+    assert.deepEqual(await f.run(1, f.store, true), f.original);
     assert.equal((await driver(f)).budget.callsMade, 0);
   });
   f.nextEdition();
   await inert(f, f.store, async () => {
-    assert.deepEqual(await f.run(1), f.original);
+    assert.deepEqual(await f.run(1, f.store, true), f.original);
     assert.equal((await driver(f)).budget.callsMade, 0);
     assert.deepEqual(await f.run(1, f.store, true), f.original);
     await driver(f, f.store, 0, 2); await driver(f, f.open(), 1, 0);

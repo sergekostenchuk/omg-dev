@@ -7,7 +7,7 @@ import { requirePacketMaterialDelivery } from './research-delivery.js';
 import { researchCapacityInput, resultCapacityFrom, requireResultCapacity, researchResultEnvelopeLimit } from './early-research-outcome.js';
 import { baselineGuards } from './v7-attempt-assessment.js';
 import { planSubjectOf, sameSubject, type V7PlanSubject } from './v7-managed-attempt.js';
-import { proveDossierDispatchAdmission, assessmentRolePrompt, readAssessmentDispatchAdmission } from './assessment-session.js';
+import { proveDossierDispatchAdmission, readDossierReservationAt, assessmentRolePrompt, readAssessmentDispatchAdmission } from './assessment-session.js';
 import { FINAL_SYNTHESIS_INSTRUCTION } from './synthesis-controls.js';
 
 /** DR3a3-S2 (codex-omg №7690 решение 2): the final synthesis of a v7
@@ -54,9 +54,9 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { runProcess } from "../runtime/process.js";
 import { processStart, evaluateProcessStopWitnesses, isProcessStopRefusal, writeProcessStopWitness } from "../runtime/process-identity.js";
 import type { Environment, RoleBinding } from "../runtime/environment.js";
-import { Environments, resolveRoleMode, uniqueTransactionGuards } from '../runtime/environment.js';
+import { Environments, resolveRoleMode, uniqueTransactionGuards, transactionGuardsCurrent } from '../runtime/environment.js';
 import { EngineError, requireCondition } from "../errors.js";
-import type { Store, Revision, Write, TransactionGuard } from "../storage/store.js";
+import { checkTransactionGuards, type Store, type Revision, type Write, type TransactionGuard } from "../storage/store.js";
 import type { ModelCall } from "../runtime/model-usage.js";
 import { canonical, digest, hashJson } from "../canonical.js";
 import { isRef, reference, type Ref } from "../pipeline/contracts.js";
@@ -354,12 +354,14 @@ function preparedAssessmentCall(reservation: AssessmentReservation | null, call:
       || prepared.writes.length !== 1 || canonical(call) !== original)
       applicationAuditInvalid('The assessment callback must preserve the call and supply its atomic transition and guards');
     const { application, session } = reservation;
+    const extra = reservation.kind === 'dossier' && Object.hasOwn(prepared.writes[0]?.value ?? {}, 'dispatchGuards')
+      ? uniqueTransactionGuards(checkTransactionGuards((prepared.writes[0]!.value as any).dispatchGuards)) : undefined;
     const expected = { id: application.id, kind: application.kind, expected: application.revision,
-      value: { ...application.value, state: 'running', call: { id: call.id, revision: call.expected + 1, hash: hashJson(call.value) } } };
+      value: { ...application.value, ...(extra===undefined?{}:{dispatchGuards:extra}), state: 'running', call: { id: call.id, revision: call.expected + 1, hash: hashJson(call.value) } } };
     if (canonical(prepared.writes[0]) !== canonical(expected))
       applicationAuditInvalid('The reservation must atomically bind this prepared application to this exact pending call');
     const guards = uniqueTransactionGuards(prepared.guards);
-    const required = uniqueTransactionGuards([reference(session), reference(application), ...application.value.guards]);
+    const required = uniqueTransactionGuards([reference(session), reference(application), ...application.value.guards,...(extra??[])]);
     if (!required.every(guard => guards.some(candidate => canonical(candidate) === canonical(guard))))
       applicationAuditInvalid('The reservation cannot omit any original application or session guard');
   } catch (error) {
@@ -1048,18 +1050,19 @@ async function executeResearchPhysicalCall(role:RoleBinding, environment:Environ
         researchControlScope(audit?.store, environment.projectId);
         if (call && audit) {
           let writer = control?.view() ?? audit.store;
-          if (audit.purpose === 'discovery-final' || audit.purpose === 'discovery-final-assessment') {
+          if (audit.purpose === 'dossier-assessor' || audit.purpose === 'discovery-final' || audit.purpose === 'discovery-final-assessment') {
             const at = audit.application;
             requireCondition(isRef(at), 'discovery_final_dispatch_unavailable',
               'The final dispatch needs its exact saved application');
             const application = audit.store.get<Record<string, any>>(at.id, at.revision);
-            const applicationKind = audit.purpose === 'discovery-final-assessment'
-              ? 'discovery-final-assessment-application' : 'discovery-final-application';
+            const applicationKind = audit.purpose === 'dossier-assessor' ? 'assessment-application'
+              : audit.purpose === 'discovery-final-assessment' ? 'discovery-final-assessment-application' : 'discovery-final-application';
             requireCondition(application?.kind === applicationKind && recordValue(application.value)
               && canonical(reference(application)) === canonical(at) && hashJson(application.value) === application.hash
               && Array.isArray(application.value.guards), 'discovery_final_dispatch_unavailable',
             'The final dispatch lost its exact saved application or guards');
-            const guards = uniqueTransactionGuards([reference(application), ...application.value.guards]);
+            const dossier = audit.purpose === 'dossier-assessor' ? readDossierReservationAt(audit.store, at) : null;
+            const guards = uniqueTransactionGuards([reference(dossier?dossier.running:application), ...(dossier?dossier.guards:application.value.guards)]);
             const controlled = writer;
             // The admission may move after reservation or a resumed-claim
             // check. Recheck its saved guards in the authorization CAS, before
@@ -1186,12 +1189,17 @@ async function executeResearchPhysicalCall(role:RoleBinding, environment:Environ
 }
 
 /** Resume only an exact un-authorized reservation of this still-live owner. A different process never inherits it. */
-export async function resumeDossierResearchCall(store:Store,applicationRef:Ref,signal?:AbortSignal) {
+export async function resumeDossierResearchCall(store:Store,applicationRef:Ref,signal?:AbortSignal,admissionGuards:TransactionGuard[]=[]) {
+  const additional=uniqueTransactionGuards(checkTransactionGuards(admissionGuards));
   recoveryDispatchBoundary();
   const admitted=await proveDossierDispatchAdmission(store,applicationRef);
-  const app=store.get<any>(applicationRef.id,2),claim=recordValue(app?.value)&&isRef(app.value.call)?store.get<ModelCall>(app.value.call.id,app.value.call.revision):null;
+  const reserved=readDossierReservationAt(store,applicationRef);
+  requireCondition(additional.every(guard=>reserved.guards.some(saved=>canonical(saved)===canonical(guard))),
+    'discovery_dossier_session_invalid','A claimed dossier cannot discard newly supplied admission grounds');
+  requireCondition(transactionGuardsCurrent(store,reserved.guards),'input_stale',
+    'The claimed dossier lost its saved current admission grounds');
+  const app=reserved.running,claim=recordValue(app?.value)&&isRef(app.value.call)?store.get<ModelCall>(app.value.call.id,app.value.call.revision):null;
   requireCondition(app?.kind==='assessment-application' && recordValue(app.value) && hashJson(app.value)===app.hash && claim && recordValue(claim.value)
-    && canonical(app.value)==canonical({...admitted.application.value,state:'running',call:reference(claim)})
     && canonical(reference(claim))===canonical(app.value.call) && hashJson(claim.value as never)===claim.hash
     && store.get(claim.id) !== null && canonical(reference(store.get(claim.id)!))===canonical(reference(claim))
     && claim.value.status==='running' && executionOf(claim.value)?.phase==='claimed'
