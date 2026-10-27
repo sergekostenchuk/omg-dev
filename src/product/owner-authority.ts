@@ -1792,11 +1792,11 @@ export async function resolveDiscoveryCondition(store: Store, request: unknown, 
       return { choice: 'accept', resolution: structuredClone(proven), edition, resolved: true, unproven: null, route: null,
         conditions: structuredClone(edition.conditions), repeated };
     }
+    // CHOICE-EDITIONS-HISTORY-01: an accepting v1 act of a proven choice is a historical act of the era before positive
+    // resolutions (CONDITION-CLASS saved every owner accept as v1); it keeps its meaning — it resolves nothing.
     const cls = accept ? classOver(base) : null;
     const unproven: ConditionUnresolvedReason | null = !accept ? null
-      : cls === null ? 'condition_class_unproven' : cls === 'boundary' ? 'condition_class_boundary' : cls === 'risk' ? 'condition_class_risk'
-      : (() => { throw new EngineError('discovery_acceptance_invalid', 'An accepting act of a proven choice is saved as a positive resolution',
-        { project: projectId, conditionId: input.conditionId, door: 'owner-final-condition' }); })();
+      : cls === 'boundary' ? 'condition_class_boundary' : cls === 'risk' ? 'condition_class_risk' : 'condition_class_unproven';
     return { choice: accept ? 'accept' : 'decline', resolution: structuredClone(proven), edition: null, resolved: false, unproven,
       route: accept ? { target: 'D7', predecessor: exactRef(proven.value.predecessor), bundle: exactRef(proven.value.bundle),
         paid: exactRef(base.accepted.grounds.paid), assessment: exactRef(base.accepted.grounds.assessment),

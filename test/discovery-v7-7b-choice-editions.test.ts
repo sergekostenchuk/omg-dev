@@ -1,14 +1,18 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
+import { DatabaseSync } from 'node:sqlite';
 import { canonical, hashJson, type Json } from '../src/canonical.js';
 import { EngineError } from '../src/errors.js';
 import { reference, type Ref } from '../src/pipeline/contracts.js';
 import { Store } from '../src/storage/store.js';
 import { readProjectMode } from '../src/product/project-mode.js';
 import { ConditionChoiceSessions, FinalAcceptanceSessions, acceptDiscoveryFinal, issueConditionChoiceInvitation,
-  issueFinalAcceptanceInvitation, resolveDiscoveryCondition } from '../src/product/owner-authority.js';
+  issueFinalAcceptanceInvitation, requireConditionChoiceAuthority, resolveDiscoveryCondition } from '../src/product/owner-authority.js';
+import { uniqueTransactionGuards } from '../src/runtime/environment.js';
 import { discoveryConditionOutput } from '../src/product/engine.js';
-import { CONDITION_RESOLUTION_KIND, MANIFEST_SUCCESSOR_KIND, conditionResolutionId, manifestSuccessorId,
+import { CONDITION_CHOICE_ACTION, CONDITION_RESOLUTION_KIND, MANIFEST_SUCCESSOR_KIND, conditionResolutionId, conditionResolutionWrites,
+  manifestSuccessorId,
   readAcceptedDiscoveryManifestAt, type AcceptedDiscovery } from '../src/discovery/discovery-acceptance.js';
 import { DISCOVERY_MANIFEST_KIND, discoveryManifestId } from '../src/discovery/discovery-manifest.js';
 import { V8_FINAL_CONTRACT } from '../src/discovery/v7-final-contracts.js';
@@ -190,9 +194,59 @@ test('7b.3 choice editions refused: an act as resolution, a moved or malformed r
   assert.equal(f.store.list(CONDITION_RESOLUTION_KIND).length, 2);
 });
 
+/** The whole product history — heads, revisions, events — unchanged by an action, with the calls, the ledger and the wire. */
+function history(store: Store): string {
+  const db = new DatabaseSync(store.path, { readOnly: true });
+  try {
+    const digest = createHash('sha256');
+    for (const query of ['SELECT * FROM heads ORDER BY entity_id', 'SELECT * FROM revisions ORDER BY entity_id,revision',
+      'SELECT * FROM events ORDER BY sequence']) {
+      digest.update(query);
+      for (const row of db.prepare(query).iterate()) for (const [key, value] of Object.entries(row)) {
+        const text = String(value);
+        digest.update(key).update(typeof value).update(`${Buffer.byteLength(text)}:`).update(text);
+      }
+    }
+    return digest.digest('hex');
+  } finally { db.close(); }
+}
+
+test('7b.3 choice editions history: an accepting v1 act of a proven choice saved before editions repeats as that act, hot and cold', async t => {
+  const f = await world(t), first = await accepted(f);
+  // CHOICE-EDITIONS-HISTORY-01: the act exactly as the accepted CONDITION-CLASS producer (bdb0e864) saved it on this
+  // paid v8 bundle — the real scoped owner authority exercised twice, the v1 form, its one write under the same guards.
+  const o = await chooser(f.store, first, 'pick1', 'pick1-yes');
+  const scope = { projectId: 'p', predecessor: reference(first.manifest), bundle: first.manifest.value.bundle, conditionId: 'pick1',
+    optionId: 'pick1-yes', reason: o.request.reason };
+  ok(requireConditionChoiceAuthority(o.authority, { store: f.store, action: CONDITION_CHOICE_ACTION, scope }));
+  const applied = ok(requireConditionChoiceAuthority(o.authority, { store: f.store, action: CONDITION_CHOICE_ACTION, scope }));
+  const option = (CONDITIONS[1] as ReturnType<typeof owner>).options[0]!;
+  const act = { contract: 'discovery-condition-resolution/v1' as const, database: f.store.databaseId, projectId: 'p', predecessor: scope.predecessor,
+    bundle: scope.bundle, conditionId: 'pick1', kind: 'owner_choice' as const, option, scope,
+    authority: { grant: applied.grant, session: applied.session }, at: applied.at };
+  f.store.writeMany(conditionResolutionWrites('p', first, act).writes, uniqueTransactionGuards([reference(f.store.get('project:p')!),
+    applied.session, { id: manifestSuccessorId(scope.predecessor), absent: true }]));
+  // The repeat through the producer is that historical act: it resolves nothing, publishes nothing and pays nothing.
+  for (const store of [f.store, f.open()]) {
+    const before = history(store);
+    const repeated = await quiet(f, store, () => resolveDiscoveryCondition(store, o.request));
+    assert.equal(history(store), before);
+    assert.equal(repeated.repeated, true); assert.equal(repeated.choice, 'accept'); assert.equal(repeated.resolved, false);
+    assert.equal(repeated.edition, null); assert.equal(repeated.unproven, 'condition_class_unproven');
+    assert.equal(repeated.resolution.value.contract, 'discovery-condition-resolution/v1');
+    assert.deepEqual(repeated.route, { target: 'D7', predecessor: reference(first.manifest), bundle: first.manifest.value.bundle,
+      paid: f.paidD7, assessment: f.paidResult, conditionId: 'pick1', optionId: 'pick1-yes' });
+    assert.deepEqual(repeated.conditions, { resolved: [], open: IDS });
+  }
+  assert.equal(f.store.list(MANIFEST_SUCCESSOR_KIND).length, 0); assert.equal(f.store.list(DISCOVERY_MANIFEST_KIND).length, 1);
+});
+
 test('7b.3 choice editions legacy: an accepting choice of a discovery-final/v7 owner condition is an act with condition_class_unproven', async t => {
   const legacy = CONDITIONS.map(({ class: _class, classReason: _reason, ...condition }: any) => condition);
-  const f = await finalAssessmentPaid(t, { outcome: 'conditional', conditions: legacy }), first = await accepted(f);
+  // The machine admission of bypass keeps this test inside its time; the owner still chooses on the edition.
+  const f = await finalAssessmentPaid(t, { outcome: 'conditional', conditions: legacy });
+  modeOf(f.store, 'bypass');
+  const first = await accepted(f);
   const act = (await resolve(f.store, first, 'pick1', 'pick1-yes')).outcome;
   assert.equal(act.resolution.value.contract, 'discovery-condition-resolution/v1'); assert.equal(act.resolved, false);
   assert.equal(act.unproven, 'condition_class_unproven'); assert.equal(act.edition, null);
