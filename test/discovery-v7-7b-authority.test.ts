@@ -8,7 +8,7 @@ import { readProjectMode } from '../src/product/project-mode.js';
 import { FinalAcceptanceSessions, ProjectModeSessions, acceptDiscoveryFinal, issueFinalAcceptanceInvitation,
   issueProjectModeInvitation, requireFinalAcceptanceAuthority } from '../src/product/owner-authority.js';
 import { DISCOVERY_MANIFEST_KIND } from '../src/discovery/discovery-manifest.js';
-import { FINAL_ACCEPTANCE_ACTION, FINAL_ACCEPTANCE_ACT_KIND, provenAcceptanceGrounds, readAcceptedDiscoveryManifestAt,
+import { FINAL_ACCEPTANCE_ACTION, FINAL_ACCEPTANCE_ACT_KIND, readAcceptedDiscoveryManifestAt,
   readFinalAcceptanceSession } from '../src/discovery/discovery-acceptance.js';
 import type { OmResult } from '../src/om/refusal.js';
 import { modeOf } from './discovery-v7-dossier-seed.js';
@@ -33,8 +33,9 @@ async function refused(f: World, store: Store, action: () => Promise<unknown>, c
 const request = (f: World, decision: 'accept' | 'decline' = 'accept') =>
   ({ projectId: 'p', assessment: f.paidResult, decision, reason: decision === 'accept' ? 'The owner accepts' : 'The owner refuses' });
 async function scopeOf(f: World, decision: 'accept' | 'decline' = 'accept') {
-  const grounds = await provenAcceptanceGrounds(f.store, 'p', f.paidResult), mode = readProjectMode(f.store, 'p').ref;
-  return { projectId: 'p', draft: grounds.draft, paid: grounds.paid, assessment: grounds.assessment,
+  // The expected scope comes from the fixture; the invitation and the producer prove the grounds themselves.
+  const mode = readProjectMode(f.store, 'p').ref;
+  return { projectId: 'p', draft: f.packet.final.subject.basis.draft, paid: f.paidD7, assessment: f.paidResult,
     mode: { id: mode.id, revision: mode.revision, hash: mode.hash } as Ref, decision, reason: request(f, decision).reason };
 }
 async function login(f: World, decision: 'accept' | 'decline' = 'accept', store = f.store) {
@@ -46,8 +47,13 @@ async function login(f: World, decision: 'accept' | 'decline' = 'accept', store 
 // The first test of the file pays the first real construction of the shared seed; its own body stays small.
 test('7b authority forms: no value other than a minted acceptance authority decides, and nothing is written', async t => {
   const f = await finalAssessmentPaid(t);
-  for (const fake of [undefined, null, { session: 'x' }, 'owner', true])
-    await refused(f, f.store, () => acceptDiscoveryFinal(f.store, request(f), fake), 'owner_authority_invalid');
+  // The public door refuses a missing authority; the simple forms are refused by the authority check itself.
+  await refused(f, f.store, () => acceptDiscoveryFinal(f.store, request(f), undefined), 'owner_authority_invalid');
+  const scope = await scopeOf(f);
+  for (const fake of [undefined, null, { session: 'x' }, 'owner', true]) {
+    const result = requireFinalAcceptanceAuthority(fake, { store: f.store, action: FINAL_ACCEPTANCE_ACTION, scope });
+    assert.equal(result.ok, false); assert.equal(!result.ok && result.refusal.code, 'owner_authority_invalid');
+  }
 });
 
 test('7b authority: only its own scoped live authority decides; other owner authorities, scopes and Stores refuse without writes', async t => {

@@ -104,7 +104,8 @@ export const acceptedFinalBundleId = (value: AcceptedFinalBundle) =>
 function exactRecord<T>(store: Store, ref: unknown, kind: string, prefix: string, field: string): Revision<T> {
   if (!exactRef(ref) || !ref.id.startsWith(prefix)) acceptanceInvalid(field, `Expected the exact ${field} record`);
   const row = store.get<T>(ref.id, ref.revision);
-  if (!row || row.kind !== kind || row.hash !== ref.hash || row.hash !== hashJson(row.value as never) || !plain(row.value))
+  // ACCEPTANCE-EXACT-REF-01: the answered row is the referenced address itself — its id, revision and hash.
+  if (!row || row.kind !== kind || !same(reference(row), ref) || row.hash !== hashJson(row.value as never) || !plain(row.value))
     acceptanceInvalid(field, `The exact ${field} record is not stored as referenced`, { ref });
   return row;
 }

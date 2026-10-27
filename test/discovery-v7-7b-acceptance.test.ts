@@ -7,8 +7,8 @@ import { Store, type Revision } from '../src/storage/store.js';
 import { readProjectMode } from '../src/product/project-mode.js';
 import { FinalAcceptanceSessions, acceptDiscoveryFinal, issueFinalAcceptanceInvitation } from '../src/product/owner-authority.js';
 import { ACCEPTED_FINAL_BUNDLE_KIND, FINAL_ACCEPTANCE_ACT_KIND, FINAL_MACHINE_ADMISSION_KIND, finalAcceptanceActId,
-  provenAcceptanceGrounds, readAcceptedDiscoveryManifestAt } from '../src/discovery/discovery-acceptance.js';
-import { DISCOVERY_MANIFEST_KIND } from '../src/discovery/discovery-manifest.js';
+  readAcceptedDiscoveryManifestAt } from '../src/discovery/discovery-acceptance.js';
+import { DISCOVERY_MANIFEST_KIND, discoveryManifestId } from '../src/discovery/discovery-manifest.js';
 import type { OmResult } from '../src/om/refusal.js';
 import { modeOf } from './discovery-v7-dossier-seed.js';
 import { finalAssessmentPaid, type FinalAssessmentSeedOptions } from './discovery-v7-final-assessment-seed.js';
@@ -40,8 +40,9 @@ const request = (f: World, decision: 'accept' | 'decline' = 'accept', reason = '
   ({ projectId: 'p', assessment: f.paidResult, decision, reason });
 /** The owner's scoped authority for exactly this decision under the current questions-mode record. */
 async function owner(f: World, decision: 'accept' | 'decline' = 'accept', reason = 'The owner accepts the exact assessed bundle') {
-  const grounds = await provenAcceptanceGrounds(f.store, 'p', f.paidResult), mode = readProjectMode(f.store, 'p');
-  const scope = { projectId: 'p', draft: grounds.draft, paid: grounds.paid, assessment: grounds.assessment,
+  // The expected scope comes from the fixture; the invitation and the producer prove the grounds themselves.
+  const mode = readProjectMode(f.store, 'p');
+  const scope = { projectId: 'p', draft: f.packet.final.subject.basis.draft, paid: f.paidD7, assessment: f.paidResult,
     mode: { id: mode.ref.id, revision: mode.ref.revision, hash: mode.ref.hash }, decision, reason };
   const issued = ok(await issueFinalAcceptanceInvitation(f.store, scope));
   const sessions = new FinalAcceptanceSessions(f.store);
@@ -155,6 +156,17 @@ test('7b acceptance forged and lost grounds: no mode, a foreign project, malform
   forged.scope.decision = 'decline';
   const forgedRow = { ...act, value: forged, hash: hashJson(forged as Json) };
   await refused(f, f.store, () => readAcceptedDiscoveryManifestAt(overlay(f.store, [{ id: act.id, revision: 1, value: forgedRow }]), 'p', manifest));
+  // ACCEPTANCE-EXACT-REF-01: a manifest re-pointed at another revision of its bundle or another id of its act, under a
+  // recomputed identity and hash, while the overlay answers that address with the original row, is no exact record.
+  const saved = accepted.manifest, bundleRef = saved.value.bundle, actRef = saved.value.admission.record;
+  for (const [field, at] of [['bundle', { ...bundleRef, revision: 2 }], ['act', { ...actRef, id: `${actRef.id}x` }]] as const) {
+    const value = structuredClone(saved.value) as any;
+    if (field === 'bundle') value.bundle = at; else value.admission.record = at;
+    const row = { ...saved, id: discoveryManifestId(value), value, hash: hashJson(value as Json) };
+    const original = f.store.get(field === 'bundle' ? bundleRef.id : actRef.id, 1);
+    await refused(f, f.store, () => readAcceptedDiscoveryManifestAt(overlay(f.store, [{ id: row.id, revision: 1, value: row },
+      { id: at.id, revision: at.revision, value: original }]), 'p', reference(row)), 'discovery_acceptance_invalid');
+  }
   // A return assessment rewritten as supported under its own consistent hash is no paid supported assessment.
   const rewritten = structuredClone(back.result.value) as any; rewritten.projection.verdict = 'supported';
   const rewrittenRef = { ...back.paidResult, hash: hashJson(rewritten as Json) };
