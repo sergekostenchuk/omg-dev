@@ -118,19 +118,23 @@ export async function checkDiscoveryFinalAssessmentReply(store: Store, project: 
     projection: DiscoveryFinalAssessmentProjection }> {
   const packet = await requireDiscoveryFinalAssessmentSubject(store, project, subject);
   const input = admission(packet, declaration(packet), envelopeLimitChars);
-  const mandatory = object(saved) && object(saved.mandatory) ? saved.mandatory : null;
+  // FINAL-ASSESSMENT-PACK-01: one plain snapshot of the presented capacity serves the check, the archive read and the
+  // measurement alike — an accessor answering one limit to the check and another to the measurement is never read again.
+  let capacity: unknown;
+  try { capacity = JSON.parse(canonical(saved)); } catch { valid(false, 'The result capacity is not a plain JSON value'); }
+  const mandatory = object(capacity) && object(capacity.mandatory) ? capacity.mandatory : null;
   if (mandatory && Object.hasOwn(mandatory, 'archive')) {
     const prepared = archiveFor(store, packet, input.mandatoryEnvelope);
     valid(same(mandatory.archive, prepared.address), 'The result capacity names another archive or pointer');
     const projection = savedArchiveProjection(store, prepared.address, input.mandatoryEnvelope);
-    requireResearchResultCapacity(saved, { ...input, mandatoryArchive: prepared.address }, (record, pointer) => {
+    requireResearchResultCapacity(capacity, { ...input, mandatoryArchive: prepared.address }, (record, pointer) => {
       valid(same(record, prepared.address.record) && pointer === prepared.address.pointer,
         'The result capacity resolved another archive');
       return projection;
     });
-  } else requireResearchResultCapacity(saved, input);
+  } else requireResearchResultCapacity(capacity, input);
   const projection = projectDiscoveryFinalAssessment({ packet, result: reply });
-  const measurement = measureResearchResult(saved, FORM, projection.result);
+  const measurement = measureResearchResult(capacity, FORM, projection.result);
   if (!measurement.fits) throw new EngineError(RESULT_CAPACITY_REFUSAL,
     'The complete final assessment reply exceeds its admitted serialized envelope', measurement);
   return { kind: FORM, terminal: true, normalized: structuredClone(projection.result), measurement, projection };

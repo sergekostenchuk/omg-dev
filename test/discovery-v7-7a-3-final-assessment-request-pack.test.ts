@@ -536,8 +536,37 @@ test('7a.3 request bounds: the exact wire and the exact reply limit fit, one cha
       refusal(RESULT_CAPACITY_REFUSAL));
     await assert.rejects(() => checkDiscoveryFinalAssessmentReply(negative.store, 'p', packet.subject, limit - 1, exact.capacity, reply),
       refusal(), 'a capacity of another limit is not this admission');
+    // FINAL-ASSESSMENT-PACK-01: a capacity whose limit answers limit−1 to the check and the large limit afterwards is the
+    // same lawful −1 refusal — the check and the measurement read one snapshot.
+    await assert.rejects(() => checkDiscoveryFinalAssessmentReply(negative.store, 'p', packet.subject, limit - 1,
+      shifting(less.capacity, limit - 1, RESULT_LIMIT), reply), refusal(RESULT_CAPACITY_REFUSAL), 'inline shifting limit');
+  });
+  // The archived admission has its own exact bound: it fits, one less refuses, and the shifting limit refuses the same way.
+  let archived = 1_000_000;
+  for (let i = 0; i < 4; i++) {
+    const staged = await stageDiscoveryFinalAssessmentEnvelope(negative.store, 'p', packet.subject, { ...input, resultLimitChars: archived });
+    const required = staged.envelope.capacity.forms[0]!.minimumChars + JSON.stringify(reply).length;
+    if (required === archived) break; archived = required;
+  }
+  const fitting = await prepareDiscoveryFinalAssessmentEnvelope(negative.store, 'p', packet.subject, { ...input, resultLimitChars: archived });
+  const short = await prepareDiscoveryFinalAssessmentEnvelope(negative.store, 'p', packet.subject, { ...input, resultLimitChars: archived - 1 });
+  assert.ok('archive' in fitting.capacity.mandatory && 'archive' in short.capacity.mandatory);
+  await unchanged(negative, negative.store, async () => {
+    assert.ok((await checkDiscoveryFinalAssessmentReply(negative.store, 'p', packet.subject, archived, fitting.capacity, reply)).measurement.fits);
+    await assert.rejects(() => checkDiscoveryFinalAssessmentReply(negative.store, 'p', packet.subject, archived - 1, short.capacity, reply),
+      refusal(RESULT_CAPACITY_REFUSAL));
+    await assert.rejects(() => checkDiscoveryFinalAssessmentReply(negative.store, 'p', packet.subject, archived - 1,
+      shifting(short.capacity, archived - 1, RESULT_LIMIT), reply), refusal(RESULT_CAPACITY_REFUSAL), 'archived shifting limit');
   });
 });
+/** A capacity whose enumerable limit answers `first` on its first read and `later` on every read after it. */
+function shifting(capacity: unknown, first: number, later: number) {
+  const copy = structuredClone(capacity) as Record<string, unknown>;
+  let reads = 0;
+  delete copy.envelopeLimitChars;
+  Object.defineProperty(copy, 'envelopeLimitChars', { enumerable: true, configurable: true, get: () => reads++ === 0 ? first : later });
+  return copy;
+}
 
 test('7a.3 request refusals: foreign role or subject, missing or substituted archive parts, rehashed capacity and a broken reply refuse hot and cold', async () => {
   await ownerWorld(); await partialWorld();
