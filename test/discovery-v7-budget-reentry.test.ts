@@ -341,12 +341,14 @@ async function oldSnapshot(f: Stopped, store = f.store) {
   assert.equal(history(store), before); assert.deepEqual(f.wires(), wire);
 }
 function assertAdvanced(f: Stopped, paid: number) {
-  assert.equal(deepCalls(f).length, paid + 1);
-  assert.equal(deepCalls(f).at(-1).subject.deepCell.subject.planQuestionId, 'q-two');
+  const calls = deepCalls(f);
+  assert.equal(calls.length, paid + 1);
+  assert.equal(calls.at(-1).subject.deepCell.subject.planQuestionId, 'q-two');
   const frontier = deepPlanSelection(f.store, 'p', f.scope);
   const first = frontier.progress.find(row => row.question === 'q-one')!;
   const second = frontier.progress.find(row => row.question === 'q-two')!;
   assert.ok(first.state); assert.ok(second.state);
+  return frontier;
 }
 for (const door of ['researcher', 'driver'] as const) test(`budget re-entry: ${door} uses the proved later owner increase; paid progress and old snapshot survive hot/cold`, async t => {
   const f = await stopped(t), before = readEffectiveStageBudget(f.store, 'p').segment!;
@@ -364,8 +366,7 @@ for (const door of ['researcher', 'driver'] as const) test(`budget re-entry: ${d
     const result = await driver(f, store); assert.equal(result.end, 'stage_paused');
     assert.equal(result.budget.turnsUsed, 1); assert.equal(result.budget.callsMade, 2); assert.equal(result.budget.callsRemaining, 0);
   } else await f.run(1, store);
-  assertAdvanced(f, paid);
-  const progress = deepPlanSelection(f.store, 'p', f.scope).progress;
+  const progress = assertAdvanced(f, paid).progress;
   assert.deepEqual(progress.find(row => row.question === 'q-one'), oldProgress.find(row => row.question === 'q-one'));
   assert.equal(progress.find(row => row.question === 'q-two')!.summary!.count,
     oldProgress.find(row => row.question === 'q-two')!.summary!.count + 1);
@@ -457,12 +458,13 @@ test('budget re-entry: a paid analyst survives an MR working-limit pause until t
   const first = await driver(f);
   const paused = f.store.get<ResearchRun>(f.original.id)!;
   const usage = budgetUsage(f.store, raised.segment);
+  const afterAnalyst = deepCalls(f);
   assert.equal(first.budget.callsMade, 1);
-  assert.equal(deepCalls(f).length, before + 1);
+  assert.equal(afterAnalyst.length, before + 1);
   assert.equal(assessments().length, beforeAssessments);
   assert.equal(paused.value.pauseCode, 'discovery_budget_reserve');
   assert.equal(JSON.parse(paused.value.error!).details.cause, 'budget_question_limit');
-  const paidDeep = deepCalls(f).at(-1), paid = money(f.store), wire = f.wires();
+  const paidDeep = afterAnalyst.at(-1), paid = money(f.store), wire = f.wires();
   const analyst = deepIntents(f.store).find(row => row.value.kind === 'analyst'
     && row.value.cursor.subject?.planQuestionId === 'q-two')!;
   assert.ok(analyst); assert.equal(analyst.value.state, 'applied');
@@ -482,10 +484,11 @@ test('budget re-entry: a paid analyst survives an MR working-limit pause until t
       options: [{ method: 'Reuse the exact paid analyst', saved: 0, decision: 'accept', quality: 'Keep the full paid answer', preserved: ['q-two'] }],
       obligations: ['q-two'], forecast: 'The measured reviewer requires 2.2M reserve', basis: [f.details.stop] }, 24_000_000);
   const resumed = await driver(f, f.open(), 1, 1);
+  const afterReviewer = deepCalls(f);
   assert.equal(resumed.budget.callsMade, 1, JSON.stringify(resumed.reason));
   assert.equal(assessments().length, beforeAssessments + 1);
-  assert.equal(deepCalls(f).length, before + 1);
-  assert.deepEqual(deepCalls(f).at(-1), paidDeep);
+  assert.equal(afterReviewer.length, before + 1);
+  assert.deepEqual(afterReviewer.at(-1), paidDeep);
   assert.deepEqual(f.store.get<ResearchConsumerIntent>(analyst.id), analyst);
   assert.deepEqual(f.store.list<ModelCall>('model-call').filter(row => row.value.consumerIntent?.id === analyst.id), analystCalls);
   assert.deepEqual(f.wires().slice(0, wire.length), wire);
@@ -623,15 +626,17 @@ test('budget re-entry: an ordinary v7 forecast refusal does not use the stopped-
 test('budget re-entry: one-call invocations recover the same paid deep step without paying for it again', async t => {
   const f = await stopped(t); increase(f);
   const first = await driver(f, f.store, 1, 1);
-  assert.equal(first.budget.callsMade, 1); assert.equal(deepCalls(f).length, 2);
+  const firstDeep = deepCalls(f);
+  assert.equal(first.budget.callsMade, 1); assert.equal(firstDeep.length, 2);
   const intents = deepIntents(f.store).filter(row => row.value.kind === 'analyst'
     && row.value.cursor.subject?.planQuestionId === 'q-two');
   assert.equal(intents.length, 1); const intent = intents[0]!;
   const call = f.store.list<ModelCall>('model-call').find(row => row.value.consumerIntent?.id === intent.id);
-  assert.ok(call); const deep = deepCalls(f).at(-1);
+  assert.ok(call); const deep = firstDeep.at(-1);
   const second = await driver(f, f.open(), 1, 1);
-  assert.equal(second.budget.callsMade, 1); assert.equal(deepCalls(f).length, 2);
-  assert.deepEqual(deepCalls(f).at(-1), deep);
+  const recoveredDeep = deepCalls(f);
+  assert.equal(second.budget.callsMade, 1); assert.equal(recoveredDeep.length, 2);
+  assert.deepEqual(recoveredDeep.at(-1), deep);
   const recovered = f.store.get<ResearchConsumerIntent>(intent.id)!;
   assert.ok(recovered); assert.deepEqual(recovered.value.cursor, intent.value.cursor);
   assert.equal(f.store.list<ModelCall>('model-call').filter(row => row.value.consumerIntent?.id === intent.id).length, 1);
