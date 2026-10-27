@@ -27,6 +27,7 @@ import { publishVariantScope } from '../src/discovery/variant-scope.js';
 import { ProjectModeSessions, VariantChoiceSessions, issueProjectModeInvitation, issueVariantChoiceInvitation } from '../src/product/owner-authority.js';
 import { setProjectMode } from '../src/product/project-mode.js';
 import { researchSetup, produce, rand, validPlan, type PlanQuestion } from './discovery-v7-fixture.js';
+import { storeUnchanged, storeRefused } from './store-unchanged.js';
 import type { OmResult } from '../src/om/refusal.js';
 import { DISCOVERY_DEEP_PREPARATION_CONTRACT, produceDeepPreparation, type DeepPreparation } from '../src/discovery/deep-research.js';
 import { DISCOVERY_COVERAGE_CELL_CONTRACT } from '../src/discovery/coverage.js';
@@ -202,11 +203,27 @@ const all = (store: Store) => {
     revisions: db.prepare('SELECT * FROM revisions ORDER BY entity_id,revision').all(), events:db.prepare('SELECT * FROM events ORDER BY sequence').all() } as never); }
   finally { db.close(); }
 };
+/** The per-action part of a read-only window: the real Store's own stamp is
+ * compared through the accepted storeUnchanged/storeRefused — its own commits
+ * plus SQLite data_version, so a write by any connection is seen and a write
+ * followed by a refusal is no silent pass — while the paid calls, the budget
+ * ledger and the wire keep their per-window comparison. The full
+ * heads/revisions/events dump is compared once per class in fixed(), not once
+ * per window. */
 async function unchanged<T>(f: Paid, store: Store, action: () => Promise<T>, refuses = false): Promise<T | undefined> {
-  const before = all(store), calls = money(store), wires = f.wires();
+  const calls = money(store), wires = f.wires();
   let result: T | undefined;
-  if (refuses) await assert.rejects(action, error => error instanceof EngineError);
-  else result = await action();
+  if (refuses) await storeRefused(store, action);
+  else result = await storeUnchanged(store, action);
+  assert.deepEqual(money(store), calls); assert.deepEqual(f.wires(), wires);
+  return result;
+}
+/** One byte fixed point per class of read-only window: the complete
+ * heads/revisions/events dump plus calls/ledger/wire is compared around the
+ * block, while every action inside keeps its own stamp window — a write
+ * anywhere is caught once per class, not once per window. */
+async function fixed<T>(f: Paid, store: Store, block: () => Promise<T>): Promise<T> {
+  const before = all(store), calls = money(store), wires = f.wires(), result = await block();
   assert.equal(all(store), before); assert.deepEqual(money(store), calls); assert.deepEqual(f.wires(), wires);
   return result;
 }
@@ -411,7 +428,7 @@ const refusal = (code?: string) => (error: unknown) => error instanceof EngineEr
 
 const events = (store: Store, from: number) => store.eventsPage(from, store.lastEvent(), 1000);
 /** Prepare once on a fresh subject: the archive, its parts and the session appear in one write, nothing is paid or sent. */
-async function prepareSession(f: Paid, packet: DiscoveryFinalAssessmentPacket, input = assessmentInput(f)) {
+async function prepareSession(f: Paid, packet: DiscoveryFinalAssessmentPacket, input = assessmentInput(f), pin = false) {
   const before = f.store.lastEvent(), calls = money(f.store), wire = f.wires();
   const session = await prepareDiscoveryFinalAssessmentSession(f.store, 'p', packet.subject, input);
   const written = events(f.store, before);
@@ -431,9 +448,13 @@ async function prepareSession(f: Paid, packet: DiscoveryFinalAssessmentPacket, i
     assert.equal(Object.hasOwn(value, key), false, `a prepared session carries no ${key}`);
   const archive = f.store.get<any>(value.archive.id, value.archive.revision)!;
   assert.deepEqual(readArchiveBody(f.store, archive).body.request.packet, packet, 'the archive keeps the whole proven request');
-  // Repeat and exact read write nothing and pay nothing.
-  assert.deepEqual(await unchanged(f, f.store, () => prepareDiscoveryFinalAssessmentSession(f.store, 'p', packet.subject, input)), session);
-  assert.deepEqual(await unchanged(f, f.store, () => readDiscoveryFinalAssessmentSessionAt(f.store, 'p', reference(session))), session);
+  // Repeat and exact read write nothing and pay nothing; the pinned call keeps
+  // the class's byte fixed point while the stamp windows prove each action.
+  const tail = async () => {
+    assert.deepEqual(await unchanged(f, f.store, () => prepareDiscoveryFinalAssessmentSession(f.store, 'p', packet.subject, input)), session);
+    assert.deepEqual(await unchanged(f, f.store, () => readDiscoveryFinalAssessmentSessionAt(f.store, 'p', reference(session))), session);
+  };
+  if (pin) await fixed(f, f.store, tail); else await tail();
   return { session, input };
 }
 
@@ -442,7 +463,7 @@ test('7a.3 session owner: the four candidate forms each save one immutable prepa
   const manifest = ownerFinal.dossier.manifest.ref, ids = new Set<string>();
   for (const outcome of ['go', 'conditional', 'no_go', 'insufficient_evidence'] as const) {
     const packet = await prepareDiscoveryFinalAssessmentSubject(owner.store, 'p', reference(ownerD6), candidate(manifest, outcome));
-    const { session } = await prepareSession(owner, packet);
+    const { session } = await prepareSession(owner, packet, undefined, outcome === 'go');
     assert.equal(session.value.subject.candidate.verdict.outcome, outcome);
     ids.add(session.id);
   }
@@ -455,7 +476,7 @@ test('7a.3 session model: a cold Store after late heads reads and repeats the ex
   const packet = await prepareDiscoveryFinalAssessmentSubject(model.store, 'p', reference(modelD6), candidate(final.dossier.manifest.ref, 'conditional'));
   const { session, input } = await prepareSession(model, packet), kept = structuredClone(session);
   const cold = model.open();
-  await unchanged(model, cold, async () => {
+  await fixed(model, cold, async () => {
     assert.deepEqual(await readDiscoveryFinalAssessmentSessionAt(cold, 'p', reference(session)), kept);
     assert.deepEqual(await prepareDiscoveryFinalAssessmentSession(cold, 'p', packet.subject, input), kept);
   });
@@ -502,7 +523,7 @@ test('7a.3 session refusals: a distorted subject, environment, role, limit, save
   let reads = 0;
   const shifting = { ...input };
   Object.defineProperty(shifting, 'limitChars', { enumerable: true, get: () => reads++ === 0 ? input.limitChars : 1 });
-  await unchanged(negative, negative.store, async () => {
+  await fixed(negative, negative.store, async () => {
     const altered = structuredClone(packet.subject) as any; altered.candidate.verdict.reason = 'A recomputed candidate';
     for (const subject of [altered, foreign.subject, { ...packet.subject, projectId: 'other' }, null])
       await assert.rejects(() => prepareDiscoveryFinalAssessmentSession(negative.store, 'p', subject, input), refusal(), 'subject');
@@ -559,7 +580,7 @@ test('7a.3 session race: a second Store committing the same preparation first le
   const written = events(negative.store, before);
   assert.ok(written.every(event => negative.store.history(event.id).length === 1), 'every archive, part and session row has one revision');
   assert.equal(written.filter(event => event.kind === DISCOVERY_FINAL_ASSESSMENT_SESSION_KIND).length, 1);
-  await unchanged(negative, other, async () => assert.deepEqual(await prepareDiscoveryFinalAssessmentSession(other, 'p', packet.subject, input), winner));
+  await fixed(negative, other, async () => assert.deepEqual(await prepareDiscoveryFinalAssessmentSession(other, 'p', packet.subject, input), winner));
   other.close();
 });
 
