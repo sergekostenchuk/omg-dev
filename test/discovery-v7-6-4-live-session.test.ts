@@ -9,6 +9,7 @@ import { canonical, hashJson, type Json } from '../src/canonical.js';
 import { reference, type Ref } from '../src/pipeline/contracts.js';
 import { EngineError } from '../src/errors.js';
 import { Store } from '../src/storage/store.js';
+import { provenStore, storeView } from '../src/storage/store-view.js';
 import { uniqueTransactionGuards } from '../src/runtime/environment.js';
 import { processStart } from '../src/runtime/process-identity.js';
 import type { DiscoveryDraft, Question } from '../src/discovery/discovery.js';
@@ -333,12 +334,17 @@ console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,u
   return terminal;
 }
 function view(store:Store,write:(writes:any[],guards:any[],invoke:()=>any)=>any) {
-  const bound=new Map<PropertyKey,unknown>();
-  return new Proxy(store,{get(target,key){
-    if(key==='writeMany')return (writes:any[],guards:any[]=[])=>write(writes,guards,()=>target.writeMany(writes,guards));
-    if(!bound.has(key)){const value=Reflect.get(target,key);bound.set(key,typeof value==='function'?value.bind(target):value);}
-    return bound.get(key);
+  const wrapped=storeView(store,{write:(writes,guards)=>{
+    let invoked=false;
+    const result=write(writes,guards,()=>{
+      assert.equal(invoked,false,'A cut must not repeat its original write');
+      invoked=true;return store.writeMany(writes,guards);
+    });
+    assert.equal(invoked,true,'A cut must invoke its original write');
+    return result;
   }});
+  assert.equal(provenStore(wrapped),store,'Write-only cuts retain the real Store reads');
+  return wrapped;
 }
 function mask(store:Store,ref:Ref,value:unknown=null) {
   const get=store.get.bind(store),bound=new Map<PropertyKey,unknown>();
