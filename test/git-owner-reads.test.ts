@@ -315,7 +315,13 @@ test('GITSRC4 M8 writers keep gates and exact parents while selection uses a bou
   await t.test('one writer uses one ancestry query, absent paths use none, failures remain failures', sub => {
     const log = trace(sub), proof = readWriter(f.store, 'p', repository, ref, path);
     assert.equal(proof.commit, writer.value.commit);
-    assert.equal(log.count(['merge-base', '--is-ancestor', writer.value.commit!, repository.head]), 1);
+    // OMG-NATIVE-WRITERS-HOTSPOT-SPEED: a commit is its own ancestor, so an equal head asks no ancestor query (the exact commit is
+    // still proved by the bounded rev-list read; test/native-writers-speed.test.ts pins that), and an unequal head keeps its single query.
+    assert.equal(repository.head, writer.value.commit, 'this slice head is the writer commit itself');
+    assert.equal(log.count(['merge-base', '--is-ancestor', writer.value.commit!, repository.head]), 0);
+    const later = { ...repository, head: original[1]!.value.commit! };
+    assert.equal(readWriter(f.store, 'p', later, ref, path).commit, writer.value.commit);
+    assert.equal(log.count(['merge-base', '--is-ancestor', writer.value.commit!, later.head]), 1, 'an unequal head still asks the ancestor query');
     assert.equal(log.calls.filter(args => args[0] === 'rev-list' && args.length !== 5).length, 0, 'no full-history walk for a single writer');
     const count = log.calls.length;
     assert.equal(selectWriter(f.store, 'p', repository, [ref], 'not-owned.txt'), null);
