@@ -43,6 +43,13 @@ async function login(f: World, decision: 'accept' | 'decline' = 'accept', store 
   return { scope, sessions, bearer: opened.bearer, session: opened.session, authority: sessions.authority(opened.bearer)! };
 }
 
+// The first test of the file pays the first real construction of the shared seed; its own body stays small.
+test('7b authority forms: no value other than a minted acceptance authority decides, and nothing is written', async t => {
+  const f = await finalAssessmentPaid(t);
+  for (const fake of [undefined, null, { session: 'x' }, 'owner', true])
+    await refused(f, f.store, () => acceptDiscoveryFinal(f.store, request(f), fake), 'owner_authority_invalid');
+});
+
 test('7b authority: only its own scoped live authority decides; other owner authorities, scopes and Stores refuse without writes', async t => {
   const f = await finalAssessmentPaid(t);
   // Another owner action: a project-mode authority cannot decide on the final bundle.
@@ -50,8 +57,6 @@ test('7b authority: only its own scoped live authority decides; other owner auth
   const modeInvite = ok(issueProjectModeInvitation(f.store, { project: 'p', mode: 'questions', previous: reference(readProjectMode(f.store, 'p').record) }));
   const modeLogin = ok(modeSessions.exchange({ project: 'p', invitation: modeInvite.invitation }));
   await refused(f, f.store, () => acceptDiscoveryFinal(f.store, request(f), modeSessions.authority(modeLogin.bearer)), 'owner_authority_foreign');
-  for (const fake of [undefined, null, { session: 'x' }, 'owner', true])
-    await refused(f, f.store, () => acceptDiscoveryFinal(f.store, request(f), fake), 'owner_authority_invalid');
   // A decline authority does not accept, an accept authority does not decline, and the authority is bound to its Store.
   const decline = await login(f, 'decline');
   await refused(f, f.store, () => acceptDiscoveryFinal(f.store, request(f, 'accept'), decline.authority), 'owner_authority_foreign');

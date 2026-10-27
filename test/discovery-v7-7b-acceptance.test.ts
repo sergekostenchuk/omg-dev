@@ -65,6 +65,14 @@ const absent = (store: Store, ref: Ref) => overlay(store, [{ id: ref.id, revisio
 const newEvents = (store: Store, from: number) => store.eventsPage(from, store.lastEvent(), 1000);
 async function world(t: test.TestContext, options: FinalAssessmentSeedOptions = {}) { return finalAssessmentPaid(t, options); }
 
+// The first test of the file pays the first real construction of the shared seed; its own body stays small.
+test('7b acceptance questions: without its owner authority a paid supported assessment is not accepted and nothing is written', async t => {
+  const f = await world(t);
+  assert.equal(readProjectMode(f.store, 'p').mode, 'questions');
+  await refused(f, f.store, () => acceptDiscoveryFinal(f.store, request(f)), 'owner_authority_invalid');
+  assert.equal(f.store.list(DISCOVERY_MANIFEST_KIND).length, 0);
+});
+
 test('7b acceptance owner: accept publishes the act, the saved whole bundle and the manifest in one write, read back exactly', async t => {
   const f = await world(t), o = await owner(f), before = f.store.lastEvent(), calls = money(f.store), sent = wire(f);
   const outcome = await acceptDiscoveryFinal(f.store, o.request, o.authority);
@@ -137,7 +145,6 @@ test('7b acceptance forged and lost grounds: no mode, a foreign project, malform
   for (const bad of [null, {}, { ...request(f), extra: 1 }, { ...request(f), assessment: f.paidD7 }, { ...request(f), assessment: { ...f.paidResult, hash: '0'.repeat(64) } },
     { ...request(f), decision: 'maybe' }, { ...request(f), reason: ' ' }])
     await refused(f, f.store, () => acceptDiscoveryFinal(f.store, bad));
-  await refused(f, f.store, () => acceptDiscoveryFinal(f.store, request(f)), 'owner_authority_invalid');
   // Lost grounds of a saved acceptance and a forged supported/act are never an accepted Discovery.
   const o = await owner(f), accepted = (await acceptDiscoveryFinal(f.store, o.request, o.authority)).accepted!;
   const manifest = reference(accepted.manifest);
