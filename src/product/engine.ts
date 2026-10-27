@@ -54,12 +54,31 @@ import { EarlyStageDriver } from "./early-stage-driver.js";
 import { modelUsage } from "../runtime/model-usage.js";
 import { configureReaderPilot, assertPilotBoundary } from "../discovery/reader-pilot.js";
 import { configureSavedSynthesis, configureV7SavedSynthesis } from "../discovery/saved-synthesis.js";
-import { OwnerSessions, issueOwnerInvitation, type OwnerAuthority } from "./owner-authority.js";
+import { OwnerSessions, issueOwnerInvitation, type OwnerAuthority, acceptDiscoveryFinal, resolveDiscoveryCondition,
+  type DiscoveryAcceptanceOutcome, type ConditionResolutionOutcome } from "./owner-authority.js";
+import { readAcceptedDiscoveryManifestAt, type AcceptedDiscovery } from '../discovery/discovery-acceptance.js';
 import { listOwnerQuestions, writeOwnerResult, type OwnerReaders } from "../om/owner-result.js";
 import { readOmInput } from "../om/input.js";
 import { readRoutes } from "../om/routes.js";
 import { RunControlGate, type RunControlHold } from "../om/run-control.js";
 import { renderStageSummary, stageSummary } from "./stage-summary.js";
+
+/** Display only the proven bundle, without interpreting acceptance as a go or
+ * open conditions as permission for a later stage. No session credential is exposed. */
+export function acceptedDiscoveryOutput(accepted: AcceptedDiscovery) {
+  const bundle = accepted.bundle.value.bundle;
+  return { manifest: reference(accepted.manifest), bundle: reference(accepted.bundle), value: bundle,
+    outcome: bundle.verdict.outcome, conditions: bundle.verdict.conditions,
+    unresolved: accepted.conditions.open.length > 0, conditionStatus: accepted.conditions };
+}
+export function discoveryDecisionOutput(result: DiscoveryAcceptanceOutcome) {
+  return { decision: result.decision, act: result.act ? reference(result.act) : null,
+    accepted: result.accepted ? acceptedDiscoveryOutput(result.accepted) : null, repeated: result.repeated };
+}
+export function discoveryConditionOutput(result: ConditionResolutionOutcome) {
+  return { choice: result.choice, act: reference(result.resolution), edition: result.edition,
+    resolved: result.resolved, unresolved: !result.resolved, reason: result.unproven, route: result.route, repeated: result.repeated };
+}
 
 export type { Project, StageContent } from "./stage-checks.js";
 /** H2.0: the om readers the owner producer shares with the G4b gate — handed in so om/owner-result stays off the ring. */
@@ -255,6 +274,15 @@ export class ProductEngine {
   execute(input: unknown): unknown {
     const command = parseCommand(input);
     switch (command.type) {
+      case 'discovery-final-decision':
+        return acceptDiscoveryFinal(this.store, { projectId: command.project, assessment: command.assessment,
+          decision: command.decision, reason: command.reason }).then(discoveryDecisionOutput);
+      case 'discovery-final-accepted':
+        return readAcceptedDiscoveryManifestAt(this.store, command.project, command.manifest).then(acceptedDiscoveryOutput);
+      case 'discovery-final-condition':
+        return resolveDiscoveryCondition(this.store, { projectId: command.project, manifest: command.manifest,
+          conditionId: command.conditionId, ...('optionId' in command ? { optionId: command.optionId } : { claims: command.claims }),
+          reason: command.reason }).then(discoveryConditionOutput);
       case 'recover-research-response': this.#project(command.project); return recoverResearchResponse(this.store, this.environments, command.project, command.call, command.session, this.actor);
       case 'declare-adapter-lineage': this.#project(command.project); return declareAdapterLineage(this.store, command.project, command, this.actor);
       case 'observe-runtime': this.#project(command.project); return observeRuntime(this.store,command.project,command);

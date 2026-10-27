@@ -21,6 +21,54 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
   if (command === "restore") {
     console.log(JSON.stringify(restoreSnapshot(directory, database))); return;
   }
+  // Only these local owner doors mint scoped authority. JSON commands and
+  // HTTP can name a decision, but cannot supply or mint its authority.
+  if (command === 'owner-final-acceptance' || command === 'owner-final-condition') {
+    const { parseCommand } = await import('./product/commands.js');
+    const { FinalAcceptanceSessions, issueFinalAcceptanceInvitation, acceptDiscoveryFinal,
+      ConditionChoiceSessions, issueConditionChoiceInvitation, resolveDiscoveryCondition } = await import('./product/owner-authority.js');
+    const { provenAcceptanceGrounds, provenAcceptanceMode, readAcceptedDiscoveryManifestAt } = await import('./discovery/discovery-acceptance.js');
+    const { discoveryDecisionOutput, discoveryConditionOutput } = await import('./product/engine.js');
+    const store = new Store(resolve(database));
+    const sessions = command === 'owner-final-acceptance' ? new FinalAcceptanceSessions(store) : new ConditionChoiceSessions(store);
+    let bearer: string | null = null;
+    try {
+      let input: unknown;
+      try { input = JSON.parse(readFileSync(0, 'utf8')); }
+      catch { throw new EngineError('command_invalid', 'The owner door requires valid JSON'); }
+      const request = parseCommand(input);
+      if (command === 'owner-final-acceptance' && request.type === 'discovery-final-decision') {
+        const grounds = await provenAcceptanceGrounds(store, request.project, request.assessment);
+        const mode = provenAcceptanceMode(store, request.project);
+        const scope = { projectId: request.project, draft: grounds.draft, paid: grounds.paid, assessment: grounds.assessment,
+          mode: mode.ref, decision: request.decision, reason: request.reason };
+        const issued = await issueFinalAcceptanceInvitation(store, scope);
+        if (!issued.ok) throw new EngineError(issued.refusal.code, issued.refusal.message);
+        const login = sessions.exchange({ projectId: request.project, invitation: issued.value.invitation });
+        if (!login.ok) throw new EngineError(login.refusal.code, login.refusal.message);
+        bearer = login.value.bearer;
+        const result = await acceptDiscoveryFinal(store, { projectId: request.project, assessment: request.assessment,
+          decision: request.decision, reason: request.reason }, sessions.authority(bearer));
+        console.log(JSON.stringify(discoveryDecisionOutput(result)));
+      } else if (command === 'owner-final-condition' && request.type === 'discovery-final-condition' && 'optionId' in request) {
+        const accepted = await readAcceptedDiscoveryManifestAt(store, request.project, request.manifest);
+        const scope = { projectId: request.project, predecessor: reference(accepted.manifest), bundle: reference(accepted.bundle),
+          conditionId: request.conditionId, optionId: request.optionId, reason: request.reason };
+        const issued = await issueConditionChoiceInvitation(store, scope);
+        if (!issued.ok) throw new EngineError(issued.refusal.code, issued.refusal.message);
+        const login = sessions.exchange({ projectId: request.project, invitation: issued.value.invitation });
+        if (!login.ok) throw new EngineError(login.refusal.code, login.refusal.message);
+        bearer = login.value.bearer;
+        console.log(JSON.stringify(discoveryConditionOutput(await resolveDiscoveryCondition(store,
+          { projectId: request.project, manifest: request.manifest, conditionId: request.conditionId,
+            optionId: request.optionId, reason: request.reason }, sessions.authority(bearer)))));
+      } else throw new EngineError('command_invalid', 'The owner door requires its matching scoped command');
+    } finally {
+      try { if (bearer && sessions.authority(bearer)) sessions.revoke(bearer); }
+      finally { store.close(); }
+    }
+    return;
+  }
   // H2.0 (№2719): invitation issuance is CLI-only — `serve`, `command` and HTTP can never mint one. The secret reaches
   // the owner's terminal exactly once; the Store keeps only its hash inside the grant.
   if (command === "owner-invite") {
@@ -126,7 +174,7 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
     return;
   }
   if (!["init", "inspect", "backup", "command"].includes(command ?? "")) {
-    throw new EngineError("invalid_command", "Usage: npm start -- init|inspect|backup|restore|owner-invite|owner-discovery-choice|owner-project-mode|owner-variant-choice|command [database] [backup-directory]; choice/mode/variant-choice/command read JSON from stdin; probe --help");
+    throw new EngineError("invalid_command", "Usage: npm start -- init|inspect|backup|restore|owner-invite|owner-discovery-choice|owner-project-mode|owner-variant-choice|owner-final-acceptance|owner-final-condition|command [database] [backup-directory]; owner doors and command read JSON from stdin; probe --help");
   }
   const store = new Store(resolve(database));
   try {

@@ -11,8 +11,13 @@ import { readerPilotSchema, type ReaderPilotSettings } from "../discovery/reader
 import type { ContextRecoverySelector } from '../discovery/context-recovery.js';
 import type { AdapterLineageDeclaration } from '../adapters/adapter-lineage.js';
 import type { EarlyStageInstruction } from './early-stage-driver.js';
+import type { ClaimAddress } from '../discovery/claim-address.js';
 
 export type ProductCommand =
+  | { type: 'discovery-final-decision'; project: string; assessment: Ref; decision: 'accept' | 'decline'; reason: string }
+  | { type: 'discovery-final-accepted'; project: string; manifest: Ref }
+  | { type: 'discovery-final-condition'; project: string; manifest: Ref; conditionId: string; optionId: string; reason: string }
+  | { type: 'discovery-final-condition'; project: string; manifest: Ref; conditionId: string; claims: ClaimAddress[]; reason: string }
   | {type:'recover-research-response';project:string;call:Ref;session:Ref}
   | ({type:'declare-adapter-lineage';project:string} & AdapterLineageDeclaration)
   | {type:'observe-runtime';project:string;scope:Ref;obligation:string;key:string}
@@ -123,6 +128,11 @@ const reviseEarlyStageInput = command("revise-early-stage-input", { project, exp
 const stageSummary = command("stage-summary", { project, stage });
 stageSummary.properties['draftId'] = string;
 const schema = { oneOf: [
+  command('discovery-final-decision', { project, assessment: ref, decision: { enum: ['accept', 'decline'] }, reason: text }),
+  command('discovery-final-accepted', { project, manifest: ref }),
+  command('discovery-final-condition', { project, manifest: ref, conditionId: text, optionId: text, reason: text }),
+  command('discovery-final-condition', { project, manifest: ref, conditionId: text, reason: text,
+    claims: { type: 'array', minItems: 1, items: object({ project, container: ref, containerKind: text, pointer: string, claimId: text }) } }),
   omStart, omContinue, command("om-state", { project }), command("environment-readiness", { project }), command("om-spend", { project }), command("om-stop", { project }), command("om-fsck", { project }),
   command("om-decisions", { project }),
   // RL3 (№4205): the owner's explicit reopening of a completed pass's accepted L3 by the AT1 door.
