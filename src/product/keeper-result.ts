@@ -23,9 +23,8 @@ export interface KeeperResult {
   contract: typeof KEEPER_RESULT_CONTRACT; key: KeeperCheckKey;
   outcome: 'conforms' | 'reject'; reason: string | null; remarks: KeeperRemark[];
 }
-export interface KeeperResultInput {
-  key: KeeperCheckKey; artifact: KeeperMaterial; constitution: KeeperMaterial; result: KeeperResult;
-}
+export interface KeeperPair { key: KeeperCheckKey; artifact: KeeperMaterial; constitution: KeeperMaterial }
+export interface KeeperResultInput extends KeeperPair { result: KeeperResult }
 export interface KeeperResultProjection extends KeeperResultInput { checkId: string; resultId: string }
 
 function invalid(field: string, reason: string): never {
@@ -85,6 +84,22 @@ function decodedKey(value: unknown, at: string): KeeperCheckKey {
   }
 }
 
+/** One structural snapshot of the exact pair and both complete containers.
+ * This checks hashes and selected pointers, not accepted or paid origins. */
+export function decodeKeeperPair(input: unknown): KeeperPair {
+  let snapshot: unknown;
+  try { snapshot = JSON.parse(canonical(input)) as unknown; }
+  catch { invalid('input', 'Expected one complete JSON snapshot'); }
+  shape(snapshot, ['key', 'artifact', 'constitution'], 'input');
+  const key = decodedKey(snapshot.key, 'key');
+  const artifact = material(snapshot.artifact, key.artifact.container, 'artifact');
+  const constitution = material(snapshot.constitution, key.constitution.container, 'constitution');
+  resolve(artifact.value, key.artifact.pointer, 'key.artifact.pointer');
+  const constitutionRoot = resolve(constitution.value, key.constitution.pointer, 'key.constitution.pointer');
+  if (!object(constitutionRoot)) invalid('key.constitution.pointer', 'The selected constitution must be an object');
+  return { key, artifact, constitution };
+}
+
 /** Decode one immutable JSON snapshot of the input. The two supplied values
  * are complete containers, not just the selected subtrees. `key` is the exact
  * structural pair, and `result.key` must identify that same pair and version.
@@ -96,12 +111,10 @@ export function decodeKeeperResult(input: unknown): KeeperResultInput {
   try { snapshot = JSON.parse(canonical(input)) as unknown; }
   catch { invalid('input', 'Expected one complete JSON snapshot'); }
   shape(snapshot, ['key', 'artifact', 'constitution', 'result'], 'input');
-  const key = decodedKey(snapshot.key, 'key');
-  const artifact = material(snapshot.artifact, key.artifact.container, 'artifact');
-  const constitution = material(snapshot.constitution, key.constitution.container, 'constitution');
+  const { key, artifact, constitution } = decodeKeeperPair({ key: snapshot.key,
+    artifact: snapshot.artifact, constitution: snapshot.constitution });
   const artifactRoot = resolve(artifact.value, key.artifact.pointer, 'key.artifact.pointer');
   const constitutionRoot = resolve(constitution.value, key.constitution.pointer, 'key.constitution.pointer');
-  if (!object(constitutionRoot)) invalid('key.constitution.pointer', 'The selected constitution must be an object');
 
   shape(snapshot.result, ['contract', 'key', 'outcome', 'reason', 'remarks'], 'result');
   const result = snapshot.result;
