@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { canonical } from '../src/canonical.js';
 import type { TestContext } from 'node:test';
 import { chmodSync, cpSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -135,9 +136,12 @@ async function buildDossier(route: FinalSeedRoute) {
   return { ...f, d6, packet, profile };
 }
 
-export function finalCandidate(packet: DiscoveryFinalPacket, outcome: FinalOutcome) {
-  const verdict = { outcome, reason: 'The saved final decision keeps its own reasons', conditions: outcome === 'conditional'
-    ? [{ id: 'evidence-1', kind: 'evidence', condition: 'A source is available', criterion: 'A signed agreement' }] : [] };
+/** The paid D7 reply; explicit conditions (7b.3, codex-omg2 №16161) replace the default evidence-1 of a conditional
+ * bundle only when given, and are never defaulted when empty, null or malformed. */
+export function finalCandidate(packet: DiscoveryFinalPacket, outcome: FinalOutcome, conditions?: unknown) {
+  if (conditions !== undefined) assert.equal(outcome, 'conditional', 'explicit conditions belong to a conditional bundle');
+  const verdict = { outcome, reason: 'The saved final decision keeps its own reasons', conditions: conditions !== undefined ? conditions
+    : outcome === 'conditional' ? [{ id: 'evidence-1', kind: 'evidence', condition: 'A source is available', criterion: 'A signed agreement' }] : [] };
   const bundle = outcome === 'go' || outcome === 'conditional'
     ? { contract: V7_FINAL_CONTRACT, dossier: packet.dossier.manifest.ref, verdict,
       summary: { what: 'Ledger', forWhom: 'Operators', why: 'Traceability', firstResult: 'A first record', successCriterion: 'No missing record', nonGoals: ['Payroll'] },
@@ -203,7 +207,7 @@ function plant<T extends DossierData>(t: TestContext, seed: Snapshot<T>) {
     wires: (): unknown[] => readFileSync(join(root, 'wire.ndjson'), 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line)) };
 }
 
-async function buildPaid(outcome: FinalOutcome, route: FinalSeedRoute): Promise<Snapshot<PaidData>> {
+async function buildPaid(outcome: FinalOutcome, route: FinalSeedRoute, conditions?: unknown): Promise<Snapshot<PaidData>> {
   const f = plant(lifetime, await dossierBaseline(route)), { packet, d6, calibration } = f.data;
   // A different command is deliberately uncalibrated; pay a genuine same-role
   // measurement on this copy rather than borrowing the seed's old command.
@@ -213,7 +217,7 @@ async function buildPaid(outcome: FinalOutcome, route: FinalSeedRoute): Promise<
   const prepared = await prepareDiscoveryFinalSession(f.store, 'p', packet.subject,
     { prompt: 'Build the exact final Discovery package.', packetChars: 8_000_000, limitChars: 9_000_000,
       resultLimitChars: 10_000_000, environment: reference(f.environment), role: f.environment.value.implementer });
-  f.reply(finalCandidate(packet, outcome));
+  f.reply(finalCandidate(packet, outcome, conditions));
   const paid = await runDiscoveryFinalExecution(f.store, 'p', reference(prepared), { profile: f.profile });
   assert.ok(paid.output && paid.result);
   assert.equal(paid.result.result.bundle.verdict.outcome, outcome);
@@ -226,12 +230,14 @@ async function buildPaid(outcome: FinalOutcome, route: FinalSeedRoute): Promise<
  * current Environment/profile; historical refs stay byte-exact. Restoring a
  * paid result never dispatches or calibrates a model. First construction is
  * awaited here, so its cost remains inside the calling test/file. */
-export async function finalPaid(t: TestContext, outcome: FinalOutcome = 'go', route: FinalSeedRoute = 'owner') {
+export async function finalPaid(t: TestContext, outcome: FinalOutcome = 'go', route: FinalSeedRoute = 'owner', conditions?: unknown) {
   assert.ok(['go', 'conditional', 'no_go', 'insufficient_evidence'].includes(outcome));
   assert.ok(['owner', 'model', 'partial'].includes(route));
-  const key = `${route}:${outcome}`;
+  // One JSON snapshot of explicit conditions before the first await: it keys the cache and builds the paid world.
+  const given = conditions === undefined ? undefined : JSON.parse(canonical(conditions as never)) as unknown;
+  const key = given === undefined ? `${route}:${outcome}` : `${route}:${outcome}:${canonical(given as never)}`;
   let pending = paidSeeds.get(key);
-  if (!pending) { pending = buildPaid(outcome, route); paidSeeds.set(key, pending); pending.catch(() => paidSeeds.delete(key)); }
+  if (!pending) { pending = buildPaid(outcome, route, given); paidSeeds.set(key, pending); pending.catch(() => paidSeeds.delete(key)); }
   const f = plant(t, await pending), { packet, prepared, execution, paidResult, d6 } = f.data;
   const exact = <T>(ref: Ref): Revision<T> => {
     const row = f.store.get<T>(ref.id, ref.revision);

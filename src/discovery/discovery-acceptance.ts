@@ -91,7 +91,7 @@ export function requireFinalAcceptanceScope(value: unknown): FinalAcceptanceScop
     reason: value.reason as string };
 }
 export function finalAcceptanceSessionId(grant: Ref): string {
-  return `${FINAL_ACCEPTANCE_SESSION_PREFIX}${hashJson(exact(grant) as never)}`;
+  return sessionIdOf(FINAL_ACCEPTANCE_SESSION_PREFIX, grant);
 }
 /** One decision per paid assessment: its act or its machine admission has one address. */
 export const finalAcceptanceActId = (projectId: string, assessment: Ref) =>
@@ -109,45 +109,82 @@ function exactRecord<T>(store: Store, ref: unknown, kind: string, prefix: string
     acceptanceInvalid(field, `The exact ${field} record is not stored as referenced`, { ref });
   return row;
 }
-/** Historical proof of one exact v6 grant: its complete closed provenance. */
-export function readFinalAcceptanceGrant(store: Store, ref: unknown): Revision<FinalAcceptanceSessionGrant> {
-  const row = exactRecord<FinalAcceptanceSessionGrant>(store, ref, FINAL_ACCEPTANCE_GRANT_KIND, FINAL_ACCEPTANCE_GRANT_PREFIX, 'grant');
+/** The saved provenance of one kind of scoped owner session: its record kinds, contracts, prefixes, lifetimes and scope. */
+interface OwnerSessionSpec<S> {
+  label: string; action: string; grantContract: string; sessionContract: string; grantPrefix: string; sessionPrefix: string;
+  grantLifetime: number; sessionLifetime: number; scope: (value: unknown) => S;
+}
+const sessionIdOf = (prefix: string, grant: Ref) => `${prefix}${hashJson(exact(grant) as never)}`;
+/** Historical proof of one exact grant: its complete closed provenance. */
+function readScopedGrant<G extends { scope: S; issuedAt: number; expiresAt: number }, S>(store: Store, ref: unknown,
+  spec: OwnerSessionSpec<S>): Revision<G> {
+  const row = exactRecord<G>(store, ref, FINAL_ACCEPTANCE_GRANT_KIND, spec.grantPrefix, 'grant');
   const value = row.value as unknown as Record<string, unknown>;
   if (row.revision !== 1 || !exactKeys(value, ['contract', 'id', 'database', 'action', 'method', 'scope', 'issuedAt', 'expiresAt', 'proof'])
-    || value.contract !== FINAL_ACCEPTANCE_GRANT_CONTRACT || value.database !== store.databaseId || !text(value.id)
-    || row.id !== `${FINAL_ACCEPTANCE_GRANT_PREFIX}${value.id}` || value.action !== FINAL_ACCEPTANCE_ACTION
+    || value.contract !== spec.grantContract || value.database !== store.databaseId || !text(value.id)
+    || row.id !== `${spec.grantPrefix}${value.id}` || value.action !== spec.action
     || value.method !== FINAL_ACCEPTANCE_PAIRING_METHOD || !Number.isSafeInteger(value.issuedAt) || !Number.isSafeInteger(value.expiresAt)
-    || (value.expiresAt as number) - (value.issuedAt as number) !== FINAL_ACCEPTANCE_GRANT_LIFETIME_MS
+    || (value.expiresAt as number) - (value.issuedAt as number) !== spec.grantLifetime
     || typeof value.proof !== 'string' || !/^[a-f0-9]{64}$/.test(value.proof))
-    acceptanceInvalid('grant', 'An acceptance invitation keeps its complete v6 provenance', { ref: reference(row) });
-  requireFinalAcceptanceScope(value.scope);
+    acceptanceInvalid('grant', `An ${spec.label} invitation keeps its complete provenance`, { ref: reference(row) });
+  spec.scope(value.scope);
   return row;
 }
-/** Historical proof of one exact v6 session revision, open or closed. */
-export function readFinalAcceptanceSession(store: Store, ref: unknown): Revision<FinalAcceptanceSession> {
-  const row = exactRecord<FinalAcceptanceSession>(store, ref, FINAL_ACCEPTANCE_SESSION_KIND, FINAL_ACCEPTANCE_SESSION_PREFIX, 'session');
+/** Historical proof of one exact session revision, open or closed. */
+function readScopedSession<V extends { scope: S; grant: Ref; openedAt: number; expiresAt: number; state: 'open' | 'closed' },
+  S>(store: Store, ref: unknown, spec: OwnerSessionSpec<S>): Revision<V> {
+  const row = exactRecord<V>(store, ref, FINAL_ACCEPTANCE_SESSION_KIND, spec.sessionPrefix, 'session');
   const value = row.value as unknown as Record<string, unknown>;
   if (!exactKeys(value, ['contract', 'grant', 'database', 'action', 'method', 'scope', 'session', 'openedAt', 'expiresAt', 'state'], ['closedAt'])
-    || value.contract !== FINAL_ACCEPTANCE_SESSION_CONTRACT || !exactRef(value.grant) || row.id !== finalAcceptanceSessionId(value.grant)
-    || value.database !== store.databaseId || value.action !== FINAL_ACCEPTANCE_ACTION || value.method !== FINAL_ACCEPTANCE_PAIRING_METHOD
+    || value.contract !== spec.sessionContract || !exactRef(value.grant) || row.id !== sessionIdOf(spec.sessionPrefix, value.grant)
+    || value.database !== store.databaseId || value.action !== spec.action || value.method !== FINAL_ACCEPTANCE_PAIRING_METHOD
     || !text(value.session) || !Number.isSafeInteger(value.openedAt) || !Number.isSafeInteger(value.expiresAt)
-    || (value.expiresAt as number) - (value.openedAt as number) !== FINAL_ACCEPTANCE_SESSION_LIFETIME_MS
+    || (value.expiresAt as number) - (value.openedAt as number) !== spec.sessionLifetime
     || (value.state !== 'open' && value.state !== 'closed') || (value.state === 'closed') !== Object.hasOwn(value, 'closedAt')
     || (value.state === 'closed' && !Number.isSafeInteger(value.closedAt))
     || (value.state === 'open' && row.revision !== 1) || (value.state === 'closed' && row.revision !== 2))
-    acceptanceInvalid('session', 'An acceptance owner session keeps its complete v6 provenance', { ref: reference(row) });
-  const scope = requireFinalAcceptanceScope(value.scope), grant = readFinalAcceptanceGrant(store, value.grant);
+    acceptanceInvalid('session', `An ${spec.label} owner session keeps its complete provenance`, { ref: reference(row) });
+  const scope = spec.scope(value.scope), grant = readScopedGrant<{ scope: S; issuedAt: number; expiresAt: number }, S>(store, value.grant, spec);
   if (!same(grant.value.scope, scope) || (value.openedAt as number) < grant.value.issuedAt || (value.openedAt as number) >= grant.value.expiresAt)
-    acceptanceInvalid('session', 'An acceptance session descends from its exact scoped grant inside its saved window', { ref: reference(row) });
+    acceptanceInvalid('session', `An ${spec.label} session descends from its exact scoped grant inside its saved window`, { ref: reference(row) });
   if (value.state === 'closed') {
-    const first = store.get<FinalAcceptanceSession>(row.id, 1);
+    const first = store.get<V>(row.id, 1);
     if (!first) acceptanceInvalid('session', 'The exact open revision of a revoked session is absent', { ref: reference(row) });
-    const opened = readFinalAcceptanceSession(store, reference(first!));
+    const opened = readScopedSession<V, S>(store, reference(first!), spec);
     const { closedAt, ...rest } = value;
     if (!same({ ...rest, state: 'open' }, opened.value) || (closedAt as number) < (value.openedAt as number))
       acceptanceInvalid('session', 'Revocation changes only the state and closedAt of the exact open session', { ref: reference(row) });
   }
   return row;
+}
+/** The saved act of one scoped owner session: authorized by its exact open session and grant, inside the session window. */
+function requireActSession<S>(store: Store, authority: unknown, scope: S, at: number, spec: OwnerSessionSpec<S>, ref: Ref): void {
+  if (!plain(authority) || !exactKeys(authority, ['grant', 'session']))
+    acceptanceInvalid('session', `The ${spec.label} act names its exact grant and session`, { ref });
+  const session = readScopedSession<{ scope: S; grant: Ref; openedAt: number; expiresAt: number; state: 'open' | 'closed' }, S>(store, authority.session, spec);
+  const grant = readScopedGrant<{ scope: S; issuedAt: number; expiresAt: number }, S>(store, authority.grant, spec);
+  if (session.value.state !== 'open' || !same(session.value.grant, reference(grant)) || !same(session.value.scope, scope)
+    || session.value.openedAt > at || at >= session.value.expiresAt)
+    acceptanceInvalid('session', `The ${spec.label} act was authorized by its exact saved open session`, { ref });
+}
+const FINAL_ACCEPTANCE_SPEC: OwnerSessionSpec<FinalAcceptanceScope> = { label: 'acceptance', action: FINAL_ACCEPTANCE_ACTION,
+  grantContract: FINAL_ACCEPTANCE_GRANT_CONTRACT, sessionContract: FINAL_ACCEPTANCE_SESSION_CONTRACT,
+  grantPrefix: FINAL_ACCEPTANCE_GRANT_PREFIX, sessionPrefix: FINAL_ACCEPTANCE_SESSION_PREFIX,
+  grantLifetime: FINAL_ACCEPTANCE_GRANT_LIFETIME_MS, sessionLifetime: FINAL_ACCEPTANCE_SESSION_LIFETIME_MS, scope: requireFinalAcceptanceScope };
+/** The one first revision of a record addressed by its canonical id, not by a caller Ref. */
+function soleRecord<T>(store: Store, id: string, kind: string, field: string): Revision<T> {
+  const row = store.get<T>(id, 1);
+  if (!row || row.id !== id || row.revision !== 1 || row.kind !== kind || row.hash !== hashJson(row.value as never) || !plain(row.value))
+    acceptanceInvalid(field, `The ${field} record is not stored at its canonical address`, { id });
+  return row;
+}
+/** Historical proof of one exact v6 grant: its complete closed provenance. */
+export function readFinalAcceptanceGrant(store: Store, ref: unknown): Revision<FinalAcceptanceSessionGrant> {
+  return readScopedGrant<FinalAcceptanceSessionGrant, FinalAcceptanceScope>(store, ref, FINAL_ACCEPTANCE_SPEC);
+}
+/** Historical proof of one exact v6 session revision, open or closed. */
+export function readFinalAcceptanceSession(store: Store, ref: unknown): Revision<FinalAcceptanceSession> {
+  return readScopedSession<FinalAcceptanceSession, FinalAcceptanceScope>(store, ref, FINAL_ACCEPTANCE_SPEC);
 }
 
 /** The proven grounds of one acceptance: a really paid assessment with the verdict supported, over the exact paid D7
@@ -211,11 +248,7 @@ export function proveFinalAcceptanceAct(store: Store, project: string, ref: Ref,
     acceptanceInvalid('scope', 'The owner act names another draft, paid D7 or assessment', { ref });
   const mode = provenAcceptanceMode(store, project, scope.mode);
   if (mode.mode !== 'questions') acceptanceInvalid('mode', 'An owner act is made under its exact questions-mode record', { ref });
-  const authority = value.authority as Record<string, unknown>;
-  const session = readFinalAcceptanceSession(store, authority.session), grant = readFinalAcceptanceGrant(store, authority.grant);
-  if (session.value.state !== 'open' || !same(session.value.grant, reference(grant)) || !same(session.value.scope, scope)
-    || session.value.openedAt > (value.at as number) || (value.at as number) >= session.value.expiresAt)
-    acceptanceInvalid('session', 'The owner act was authorized by its exact saved open acceptance session', { ref });
+  requireActSession(store, value.authority, scope, value.at as number, FINAL_ACCEPTANCE_SPEC, ref);
   return row;
 }
 /** The saved machine admission, proved from the exact bypass-mode record it names. */
@@ -239,13 +272,79 @@ export interface AcceptedDiscovery {
   bundle: Revision<AcceptedFinalBundle>;
   admission: { kind: 'owner'; record: Revision<FinalAcceptanceAct> } | { kind: 'machine'; record: Revision<FinalMachineAdmission> };
   grounds: DiscoveryAcceptanceGrounds;
+  /** DR7 7b.3: the proven resolution records of this edition, in their order, and the conditions of the bundle they leave
+   * open. A first acceptance resolves nothing; only a proven accepting owner choice resolves its condition. */
+  resolutions: Revision<ConditionResolution>[];
+  conditions: { resolved: string[]; open: string[] };
 }
 /** The historical reader of an accepted manifest: the structural record, then the paid supported assessment, the saved
- * whole bundle and the admission are proven again from their exact Refs; late heads and a cold Store change nothing. */
+ * whole bundle and the admission are proven again from their exact Refs; late heads and a cold Store change nothing.
+ * A later edition (7b.3) proves its previous edition by this same reader, keeps its draft, bundle, assessment and
+ * admission, and adds exactly one proven resolution, named by the one successor record of that previous edition. */
 export async function readAcceptedDiscoveryManifestAt(store: Store, project: string, at: unknown): Promise<AcceptedDiscovery> {
-  const ref = acceptanceSnapshot(at, 'manifest') as Ref;
+  return readAcceptedEdition(store, project, acceptanceSnapshot(at, 'manifest'), new Set());
+}
+async function readAcceptedEdition(store: Store, project: string, at: unknown, seen: Set<string>): Promise<AcceptedDiscovery> {
+  const ref = at as Ref;
   const structural = readDiscoveryManifestStructural(store, project, ref), manifest = structural.record;
-  if (manifest.value.previous !== null || manifest.value.resolutions.length !== 0)
+  // An edition met again on its own chain is a cycle, never a history.
+  if (seen.has(manifest.id)) acceptanceInvalid('previous', 'The chain of editions returns to an edition already read', { ref });
+  seen.add(manifest.id);
+  if (manifest.value.previous === null) return readFirstAcceptance(store, project, manifest);
+  // The edition is checked against its predecessor's exact saved records before that predecessor is proven again, so a
+  // forged or lost ground is refused without the paid proof; the proven predecessor must then be that same view.
+  const light = readEditionView(store, project, manifest.value.previous);
+  const resolution = checkEdition(store, project, manifest, light);
+  const prior = await readAcceptedEdition(store, project, manifest.value.previous, seen);
+  if (!same(prior.manifest, light.manifest) || !same(prior.bundle, light.bundle) || !same(prior.resolutions, light.resolutions))
+    acceptanceInvalid('previous', 'The proven previous edition is not the one its saved records name', { ref });
+  return assembleEdition(manifest, prior, resolution);
+}
+/** What a resolution is proven against: an edition, its saved bundle and the resolutions it already carries. */
+export interface EditionView { manifest: Revision<DiscoveryManifest>; bundle: Revision<AcceptedFinalBundle>; resolutions: Revision<ConditionResolution>[] }
+/** The exact saved records of an edition, read without proving the paid assessment. */
+export function readEditionView(store: Store, project: string, ref: Ref): EditionView {
+  const manifest = readDiscoveryManifestStructural(store, project, ref).record;
+  return { manifest, bundle: exactRecord<AcceptedFinalBundle>(store, manifest.value.bundle, ACCEPTED_FINAL_BUNDLE_KIND, `${ACCEPTED_FINAL_BUNDLE_KIND}:`, 'bundle'),
+    resolutions: manifest.value.resolutions.map(item =>
+      exactRecord<ConditionResolution>(store, item, CONDITION_RESOLUTION_KIND, `${CONDITION_RESOLUTION_KIND}:`, 'resolution')) };
+}
+/** A later edition over its predecessor: named with its added resolution by the one successor record of that predecessor,
+ * keeping its accepted bodies, adding exactly one resolution, which is a proven accepting owner choice made on it. */
+function checkEdition(store: Store, project: string, manifest: Revision<DiscoveryManifest>, predecessor: EditionView): Revision<ConditionResolution> {
+  const ref = reference(manifest), previous = manifest.value.previous!, value = manifest.value, kept = predecessor.manifest.value;
+  if (!same(previous, reference(predecessor.manifest))) acceptanceInvalid('previous', 'The edition names another previous edition', { ref });
+  if (value.resolutions.length === 0)
+    acceptanceInvalid('manifest', 'A later edition adds a proven resolution to its previous edition', { ref });
+  const added = value.resolutions[value.resolutions.length - 1]!;
+  const successor = soleRecord<ManifestSuccessor>(store, manifestSuccessorId(previous), MANIFEST_SUCCESSOR_KIND, 'successor');
+  if (!exactKeys(successor.value as unknown as Record<string, unknown>, ['contract', 'projectId', 'predecessor', 'successor', 'resolution'])
+    || successor.value.contract !== MANIFEST_SUCCESSOR_CONTRACT || successor.value.projectId !== project
+    || !same(successor.value.predecessor, previous) || !same(successor.value.successor, ref) || !same(successor.value.resolution, added))
+    acceptanceInvalid('successor', 'The previous edition names this edition and its resolution as its one successor', { ref });
+  if (!same(value.draft, kept.draft) || !same(value.bundle, kept.bundle) || !same(value.assessment, kept.assessment)
+    || !same(value.admission, kept.admission) || !same(value.resolutions.slice(0, -1), kept.resolutions)
+    || value.resolutions.length !== kept.resolutions.length + 1)
+    acceptanceInvalid('manifest', 'A later edition keeps the accepted bodies and adds exactly one resolution to its previous edition', { ref });
+  const resolution = proveConditionResolution(store, project, added, predecessor);
+  if (resolution.value.option.choice !== 'accept')
+    acceptanceInvalid('resolution', 'A declining owner choice fulfils no condition and is no resolution of an edition', { ref: added });
+  return resolution;
+}
+function assembleEdition(manifest: Revision<DiscoveryManifest>, prior: AcceptedDiscovery, resolution: Revision<ConditionResolution>): AcceptedDiscovery {
+  const resolutions = [...prior.resolutions, resolution];
+  return structuredClone({ verification: 'accepted', manifest, bundle: prior.bundle, admission: prior.admission, grounds: prior.grounds,
+    resolutions, conditions: conditionsOf(prior.bundle.value.bundle, resolutions) });
+}
+/** The next edition over an already proven predecessor: the same checks as the historical reader, without proving the
+ * predecessor's paid grounds again. */
+export function extendAcceptedEdition(store: Store, project: string, prior: AcceptedDiscovery, at: Ref): AcceptedDiscovery {
+  const manifest = readDiscoveryManifestStructural(store, project, exact(at)).record;
+  if (manifest.value.previous === null) acceptanceInvalid('previous', 'A first acceptance extends no edition', { ref: at });
+  return assembleEdition(manifest, prior, checkEdition(store, project, manifest, prior));
+}
+async function readFirstAcceptance(store: Store, project: string, manifest: Revision<DiscoveryManifest>): Promise<AcceptedDiscovery> {
+  if (manifest.value.resolutions.length !== 0)
     acceptanceInvalid('manifest', 'A first acceptance has no previous manifest and no resolutions');
   // The saved records are read exactly before the paid assessment is proven again, so a lost or substituted record is
   // refused before that proof; every relation between them is still checked against the proven grounds below.
@@ -267,5 +366,134 @@ export async function readAcceptedDiscoveryManifestAt(store: Store, project: str
     : { kind: 'machine' as const, record: proveFinalMachineAdmission(store, project, manifest.value.admission.record, grounds) };
   if (admission.kind === 'owner' && admission.record.value.scope.decision !== 'accept')
     acceptanceInvalid('act', 'A declining owner act publishes no accepted manifest');
-  return structuredClone({ verification: 'accepted', manifest, bundle, admission, grounds });
+  return structuredClone({ verification: 'accepted', manifest, bundle, admission, grounds, resolutions: [],
+    conditions: conditionsOf(grounds.bundle, []) });
+}
+
+/* DR7 7b.3 (codex-omg2 №16156 п.1): the proven resolution of the conditions of one accepted conditional bundle. A
+ * resolution never rewrites the accepted bodies: the code publishes a new immutable edition of the manifest whose previous
+ * is the proven predecessor and whose resolutions add one proven record for one condition of exactly this bundle. An
+ * owner_choice is resolved only by the owner's separate scoped choice of an offered option, with its saved consequences;
+ * the acceptance authority, a v6 authority and bypass mode do not stand for it, and a declining choice is saved as the
+ * owner's act but fulfils nothing. Each edition has one successor record, so the editions of a bundle form one line. */
+export const CONDITION_CHOICE_ACTION = 'discovery-final-condition-choice' as const;
+export const CONDITION_CHOICE_GRANT_CONTRACT = 'owner-session-grant/v7' as const;
+export const CONDITION_CHOICE_SESSION_CONTRACT = 'owner-session/v7' as const;
+export const CONDITION_CHOICE_GRANT_PREFIX = 'owner-final-condition-grant:';
+export const CONDITION_CHOICE_SESSION_PREFIX = 'owner-final-condition-session:';
+export const CONDITION_CHOICE_GRANT_LIFETIME_MS = 10 * 60_000;
+export const CONDITION_CHOICE_SESSION_LIFETIME_MS = 30 * 60_000;
+export const CONDITION_RESOLUTION_KIND = 'discovery-condition-resolution' as const;
+export const CONDITION_RESOLUTION_CONTRACT = 'discovery-condition-resolution/v1' as const;
+export const MANIFEST_SUCCESSOR_KIND = 'discovery-manifest-successor' as const;
+export const MANIFEST_SUCCESSOR_CONTRACT = 'discovery-manifest-successor/v1' as const;
+
+/** One exact owner choice: the project, the exact edition it is made on and its saved bundle, the condition of that
+ * bundle, the offered option and the owner's reason. */
+export interface ConditionChoiceScope { projectId: string; predecessor: Ref; bundle: Ref; conditionId: string; optionId: string; reason: string }
+export interface ConditionChoiceGrant {
+  contract: typeof CONDITION_CHOICE_GRANT_CONTRACT; id: string; database: string; action: typeof CONDITION_CHOICE_ACTION;
+  method: typeof FINAL_ACCEPTANCE_PAIRING_METHOD; scope: ConditionChoiceScope; issuedAt: number; expiresAt: number; proof: string;
+}
+export interface ConditionChoiceSession {
+  contract: typeof CONDITION_CHOICE_SESSION_CONTRACT; grant: Ref; database: string; action: typeof CONDITION_CHOICE_ACTION;
+  method: typeof FINAL_ACCEPTANCE_PAIRING_METHOD; scope: ConditionChoiceScope; session: string; openedAt: number; expiresAt: number;
+  state: 'open' | 'closed'; closedAt?: number;
+}
+export interface ConditionOption { optionId: string; label: string; consequences: string[]; choice: 'accept' | 'decline' }
+/** The saved owner choice on one condition of one saved bundle: the offered option verbatim, with its consequences. */
+export interface ConditionResolution {
+  contract: typeof CONDITION_RESOLUTION_CONTRACT; database: string; projectId: string; predecessor: Ref; bundle: Ref; conditionId: string;
+  kind: 'owner_choice'; option: ConditionOption; scope: ConditionChoiceScope; authority: { grant: Ref; session: Ref }; at: number;
+}
+/** The one successor of an edition: the next edition and the resolution it adds. */
+export interface ManifestSuccessor {
+  contract: typeof MANIFEST_SUCCESSOR_CONTRACT; projectId: string; predecessor: Ref; successor: Ref; resolution: Ref;
+}
+
+export function requireConditionChoiceScope(value: unknown): ConditionChoiceScope {
+  if (!plain(value) || !exactKeys(value, ['projectId', 'predecessor', 'bundle', 'conditionId', 'optionId', 'reason'])
+    || !text(value.projectId) || !exactRef(value.predecessor) || !exactRef(value.bundle) || !text(value.conditionId) || !text(value.optionId)
+    || !text(value.reason))
+    acceptanceInvalid('scope', 'An owner choice names the project, the exact edition and bundle, the condition, the offered option and a reason only',
+      {}, 'discovery_condition_resolution_invalid');
+  return { projectId: value.projectId as string, predecessor: exact(value.predecessor as Ref), bundle: exact(value.bundle as Ref),
+    conditionId: value.conditionId as string, optionId: value.optionId as string, reason: value.reason as string };
+}
+const CONDITION_CHOICE_SPEC: OwnerSessionSpec<ConditionChoiceScope> = { label: 'owner choice', action: CONDITION_CHOICE_ACTION,
+  grantContract: CONDITION_CHOICE_GRANT_CONTRACT, sessionContract: CONDITION_CHOICE_SESSION_CONTRACT,
+  grantPrefix: CONDITION_CHOICE_GRANT_PREFIX, sessionPrefix: CONDITION_CHOICE_SESSION_PREFIX,
+  grantLifetime: CONDITION_CHOICE_GRANT_LIFETIME_MS, sessionLifetime: CONDITION_CHOICE_SESSION_LIFETIME_MS, scope: requireConditionChoiceScope };
+export const conditionChoiceSessionId = (grant: Ref) => sessionIdOf(CONDITION_CHOICE_SESSION_PREFIX, grant);
+export function readConditionChoiceGrant(store: Store, ref: unknown): Revision<ConditionChoiceGrant> {
+  return readScopedGrant<ConditionChoiceGrant, ConditionChoiceScope>(store, ref, CONDITION_CHOICE_SPEC);
+}
+export function readConditionChoiceSession(store: Store, ref: unknown): Revision<ConditionChoiceSession> {
+  return readScopedSession<ConditionChoiceSession, ConditionChoiceScope>(store, ref, CONDITION_CHOICE_SPEC);
+}
+/** One resolution per condition of one saved bundle, and one successor per edition. */
+export const conditionResolutionId = (projectId: string, bundle: Ref, conditionId: string) =>
+  `${CONDITION_RESOLUTION_KIND}:${projectId}:${hashJson({ bundle: exact(bundle), conditionId } as never)}`;
+export const manifestSuccessorId = (predecessor: Ref) => `${MANIFEST_SUCCESSOR_KIND}:${hashJson(exact(predecessor) as never)}`;
+
+/** The conditions of the bundle the resolutions fulfil and those still open, in the bundle's order. */
+function conditionsOf(bundle: V7FinalBundle, resolutions: Revision<ConditionResolution>[]): { resolved: string[]; open: string[] } {
+  const ids = bundle.verdict.conditions.map(condition => (condition as { id: string }).id);
+  const done = new Set(resolutions.map(row => row.value.conditionId));
+  return { resolved: ids.filter(id => done.has(id)), open: ids.filter(id => !done.has(id)) };
+}
+/** The owner_choice condition of the accepted bundle and its offered option; an evidence condition is not an owner choice. */
+export function offeredConditionOption(accepted: EditionView, conditionId: string, optionId: string):
+  { condition: Record<string, unknown>; option: ConditionOption } {
+  const conditions = (accepted.bundle.value as { bundle?: { verdict?: { conditions?: unknown } } }).bundle?.verdict?.conditions;
+  if (!Array.isArray(conditions)) acceptanceInvalid('bundle', 'The saved bundle keeps its verdict conditions', {}, 'discovery_condition_resolution_invalid');
+  const condition = (conditions as unknown[]).find(item => plain(item) && item.id === conditionId) as Record<string, unknown> | undefined;
+  if (!condition) acceptanceInvalid('conditionId', 'The condition is not one of this accepted bundle', {}, 'discovery_condition_resolution_invalid');
+  if (condition!.kind === 'evidence')
+    acceptanceInvalid('conditionId', 'An evidence condition is fulfilled by proven material, never by an owner choice', {}, 'discovery_condition_evidence_unproven');
+  if (condition!.kind !== 'owner_choice' || !Array.isArray(condition!.options))
+    acceptanceInvalid('conditionId', 'Only an offered owner condition is resolved by the owner', {}, 'discovery_condition_resolution_invalid');
+  const option = (condition!.options as unknown[]).find(item => plain(item) && item.optionId === optionId);
+  if (!option) acceptanceInvalid('optionId', 'The owner chooses one option the condition offers', {}, 'discovery_condition_resolution_invalid');
+  return { condition: condition!, option: structuredClone(option) as ConditionOption };
+}
+/** The writes of one owner choice: the resolution alone for a declining option; for an accepting one also the next
+ * edition and the successor record of its predecessor. */
+export function conditionResolutionWrites(project: string, accepted: AcceptedDiscovery, resolution: ConditionResolution):
+  { writes: Write[]; edition: { id: string; revision: 1; value: DiscoveryManifest } | null } {
+  const record = { id: conditionResolutionId(project, accepted.manifest.value.bundle, resolution.conditionId), revision: 1,
+    hash: hashJson(resolution as unknown as Json) };
+  const writes: Write[] = [{ id: record.id, kind: CONDITION_RESOLUTION_KIND, expected: 0, value: resolution }];
+  if (resolution.option.choice !== 'accept') return { writes, edition: null };
+  const predecessor = exact(reference(accepted.manifest));
+  const value: DiscoveryManifest = { ...structuredClone(accepted.manifest.value), previous: predecessor,
+    resolutions: [...accepted.manifest.value.resolutions.map(exact), record] };
+  const id = discoveryManifestId(value), successor: ManifestSuccessor = { contract: MANIFEST_SUCCESSOR_CONTRACT, projectId: project,
+    predecessor, successor: { id, revision: 1, hash: hashJson(value as unknown as Json) }, resolution: record };
+  writes.push({ id, kind: DISCOVERY_MANIFEST_KIND, expected: 0, value },
+    { id: manifestSuccessorId(predecessor), kind: MANIFEST_SUCCESSOR_KIND, expected: 0, value: successor });
+  return { writes, edition: { id, revision: 1, value } };
+}
+/** The saved owner choice, proved from its own grounds over the proven predecessor edition: this bundle, an offered
+ * option of a condition not yet resolved, the exact scope and the exact open session and grant inside their windows. */
+export function proveConditionResolution(store: Store, project: string, ref: unknown, predecessor: EditionView): Revision<ConditionResolution> {
+  const row = exactRecord<ConditionResolution>(store, ref, CONDITION_RESOLUTION_KIND, `${CONDITION_RESOLUTION_KIND}:`, 'resolution');
+  const value = row.value as unknown as Record<string, unknown>, at = reference(row);
+  if (row.revision !== 1 || !exactKeys(value, ['contract', 'database', 'projectId', 'predecessor', 'bundle', 'conditionId', 'kind', 'option', 'scope',
+    'authority', 'at']) || value.contract !== CONDITION_RESOLUTION_CONTRACT || value.database !== store.databaseId || value.projectId !== project
+    || value.kind !== 'owner_choice' || !exactRef(value.predecessor) || !same(value.predecessor, reference(predecessor.manifest))
+    || !exactRef(value.bundle) || !same(value.bundle, predecessor.manifest.value.bundle) || !text(value.conditionId)
+    || row.id !== conditionResolutionId(project, value.bundle, value.conditionId) || !Number.isSafeInteger(value.at))
+    acceptanceInvalid('resolution', 'An owner choice keeps its complete v1 provenance on this exact bundle', { ref: at });
+  const scope = requireConditionChoiceScope(value.scope);
+  if (scope.projectId !== project || !same(scope.predecessor, value.predecessor) || !same(scope.bundle, value.bundle)
+    || scope.conditionId !== value.conditionId)
+    acceptanceInvalid('scope', 'The owner choice was made on its exact predecessor edition, bundle and condition', { ref: at });
+  if (predecessor.resolutions.some(item => item.value.conditionId === scope.conditionId))
+    acceptanceInvalid('resolution', 'A condition is resolved once', { ref: at });
+  const offered = offeredConditionOption(predecessor, scope.conditionId, scope.optionId);
+  if (!same(value.option, offered.option))
+    acceptanceInvalid('option', 'The saved option is the offered one verbatim, with its consequences', { ref: at });
+  requireActSession(store, value.authority, scope, value.at as number, CONDITION_CHOICE_SPEC, at);
+  return row;
 }

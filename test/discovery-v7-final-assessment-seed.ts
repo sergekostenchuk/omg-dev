@@ -4,6 +4,7 @@ import { chmodSync, cpSync, mkdtempSync, readFileSync, rmSync, writeFileSync } f
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
+import { canonical } from '../src/canonical.js';
 import { reference, type Ref } from '../src/pipeline/contracts.js';
 import { Store } from '../src/storage/store.js';
 import { ProductEngine } from '../src/product/engine.js';
@@ -22,6 +23,8 @@ export interface FinalAssessmentSeedOptions {
   verdict?: 'supported' | 'return';
   outcome?: FinalOutcome;
   route?: FinalSeedRoute;
+  /** Explicit conditions of a conditional paid D7 (7b.3); absent keeps the default evidence-1. */
+  conditions?: unknown;
 }
 const cleanups: (() => void)[] = [];
 process.once('exit', () => { for (const cleanup of cleanups.reverse()) cleanup(); });
@@ -34,8 +37,8 @@ type SeedData = {
 type Snapshot = { root: string; data: SeedData };
 const seeds = new Map<string, Promise<Snapshot>>();
 
-async function build(options: Required<FinalAssessmentSeedOptions>): Promise<Snapshot> {
-  const f = await finalPaid(lifetime, options.outcome, options.route);
+async function build(options: Required<Omit<FinalAssessmentSeedOptions, 'conditions'>> & { conditions?: unknown }): Promise<Snapshot> {
+  const f = await finalPaid(lifetime, options.outcome, options.route, options.conditions);
   const packet = await prepareDiscoveryFinalAssessmentSubject(f.store, 'p', f.d6, f.result.value.projection.result.bundle);
   // A real independent reviewer measurement is part of the first caller's
   // work. No consumer or copied world has to calibrate or buy this again.
@@ -107,11 +110,14 @@ function plant(t: TestContext, seed: Snapshot) {
 /** A lazily paid D7 assessment, built in the first consumer's test. Copies
  * preserve exact paid history while isolating database, values and runtime. */
 export async function finalAssessmentPaid(t: TestContext, options: FinalAssessmentSeedOptions = {}) {
-  const selected = { verdict: options.verdict ?? 'supported', outcome: options.outcome ?? 'go', route: options.route ?? 'owner' };
+  // One JSON snapshot of explicit conditions before the first await: it keys both caches and builds the paid world.
+  const conditions = options.conditions === undefined ? undefined : JSON.parse(canonical(options.conditions as never)) as unknown;
+  const selected = { verdict: options.verdict ?? 'supported', outcome: options.outcome ?? 'go', route: options.route ?? 'owner',
+    ...(conditions === undefined ? {} : { conditions }) };
   assert.ok(['supported', 'return'].includes(selected.verdict));
   assert.ok(['go', 'conditional', 'no_go', 'insufficient_evidence'].includes(selected.outcome));
   assert.ok(['owner', 'model', 'partial'].includes(selected.route));
-  const key = `${selected.route}:${selected.outcome}:${selected.verdict}`;
+  const key = `${selected.route}:${selected.outcome}:${selected.verdict}${conditions === undefined ? '' : `:${canonical(conditions as never)}`}`;
   let pending = seeds.get(key);
   if (!pending) { pending = build(selected); seeds.set(key, pending); pending.catch(() => seeds.delete(key)); }
   return plant(t, await pending);

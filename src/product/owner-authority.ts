@@ -23,8 +23,14 @@ import { FINAL_ACCEPTANCE_ACTION, FINAL_ACCEPTANCE_ACT_CONTRACT, FINAL_ACCEPTANC
   finalMachineAdmissionId, proveFinalAcceptanceAct, proveFinalMachineAdmission, provenAcceptanceGrounds, provenAcceptanceMode,
   readAcceptedDiscoveryManifestAt, readFinalAcceptanceGrant, readFinalAcceptanceSession, requireFinalAcceptanceScope,
   type AcceptedDiscovery, type DiscoveryAcceptanceGrounds, type FinalAcceptanceAct, type FinalAcceptanceScope,
-  type FinalAcceptanceSession, type FinalAcceptanceSessionGrant, type FinalMachineAdmission } from "../discovery/discovery-acceptance.js";
+  type FinalAcceptanceSession, type FinalAcceptanceSessionGrant, type FinalMachineAdmission,
+  CONDITION_CHOICE_ACTION, CONDITION_CHOICE_GRANT_CONTRACT, CONDITION_CHOICE_GRANT_LIFETIME_MS, CONDITION_CHOICE_GRANT_PREFIX,
+  CONDITION_CHOICE_SESSION_CONTRACT, CONDITION_CHOICE_SESSION_LIFETIME_MS, CONDITION_RESOLUTION_CONTRACT, conditionChoiceSessionId,
+  conditionResolutionId, conditionResolutionWrites, extendAcceptedEdition, manifestSuccessorId, readEditionView, type EditionView, offeredConditionOption, proveConditionResolution,
+  readConditionChoiceGrant, readConditionChoiceSession, requireConditionChoiceScope, type ConditionChoiceGrant,
+  type ConditionChoiceScope, type ConditionChoiceSession, type ConditionResolution, type ManifestSuccessor } from "../discovery/discovery-acceptance.js";
 import { delivered, isPlainObject, isText, refused, type OmResult, type Refusal, type Sealed } from "../om/refusal.js";
+import { proveClaimAddress, type ClaimAddress } from "../discovery/claim-address.js";
 
 /**
  * H2.0 (№1353, вариант Б; договор №2719): owner authority — the separately authenticated path that alone may produce
@@ -1346,7 +1352,7 @@ const FINAL_ACCEPTANCE_EXERCISE = FinalAcceptanceAuthority.prototype.exercise;
 export function requireFinalAcceptanceAuthority(candidate: unknown,
   request: { store: Store; action: string; scope: FinalAcceptanceScope }): OmResult<Sealed<{ session: Ref; grant: Ref; at: number }>> {
   if (candidate instanceof OwnerAuthority || candidate instanceof DiscoveryChoiceAuthority || candidate instanceof ProjectModeAuthority
-    || candidate instanceof VariantChoiceAuthority || candidate instanceof StageBudgetAuthority)
+    || candidate instanceof VariantChoiceAuthority || candidate instanceof StageBudgetAuthority || candidate instanceof ConditionChoiceAuthority)
     return refused('owner_authority_foreign', 'Another owner authority cannot decide on the final Discovery bundle',
       { unit: 'DR7b', target: 'authority', field: 'action' }, 'owner');
   if (!(candidate instanceof FinalAcceptanceAuthority) || !FINAL_ACCEPTANCE_AUTHORITIES.has(candidate))
@@ -1519,4 +1525,283 @@ export async function acceptDiscoveryFinal(store: Store, request: unknown, autho
   const declined = await saved(false);
   if (!declined) throw new EngineError('owner_authority_internal', 'The declining act was not saved');
   return declined;
+}
+
+// DR7 7b.3 (codex-omg2 №16156 п.1): the owner's separate choice on one owner_choice condition of an accepted bundle and the
+// atomic publication of the next manifest edition. The saved forms and their proofs live in discovery-acceptance.ts. Only a
+// minted condition-choice authority bound to this exact edition, condition and option writes; the acceptance authority,
+// the v6 authorities and bypass mode never stand for it. A declining choice saves the owner's act and publishes nothing.
+function denyChoice(code: OwnerAuthorityRefusalCode, target: string, field: string, message: string): never {
+  deny(code as DiscoveryChoiceAuthorityRefusalCode, target, field, message, 'DR7b3');
+}
+function choiceScopeOf(value: unknown, code: OwnerAuthorityRefusalCode): ConditionChoiceScope {
+  try { return requireConditionChoiceScope(value); }
+  catch (error) {
+    if (error instanceof EngineError) denyChoice(code, 'owner-final-condition', 'scope', error.message);
+    throw error;
+  }
+}
+/** The proven predecessor edition a choice is made on: an accepted edition without a successor, whose bundle offers this
+ * option on a condition not yet resolved. */
+async function choiceScopeGrounds(store: Store, scope: ConditionChoiceScope): Promise<AcceptedDiscovery> {
+  let accepted: AcceptedDiscovery;
+  try {
+    accepted = await readAcceptedDiscoveryManifestAt(store, scope.projectId, scope.predecessor);
+    offeredConditionOption(accepted, scope.conditionId, scope.optionId);
+    if (!sameScope(accepted.manifest.value.bundle, scope.bundle))
+      throw new EngineError('discovery_condition_resolution_invalid', 'The scope names another bundle than its predecessor edition');
+  } catch (error) {
+    if (!(error instanceof EngineError)) throw error;
+    return take(refused(error.code, error.message, { unit: 'DR7b3', target: scope.projectId, field: 'scope', ref: scope.predecessor }, 'owner'));
+  }
+  if (store.get(conditionResolutionId(scope.projectId, accepted.manifest.value.bundle, scope.conditionId)))
+    take(refused('discovery_condition_resolution_stale', 'The owner has already chosen on this condition',
+      { unit: 'DR7b3', target: scope.projectId, field: 'conditionId' }, 'owner'));
+  if (store.get(manifestSuccessorId(scope.predecessor)))
+    take(refused('discovery_condition_resolution_stale', 'The edition already has a successor; a choice is made on the latest edition',
+      { unit: 'DR7b3', target: scope.projectId, field: 'predecessor', ref: scope.predecessor }, 'owner'));
+  return accepted;
+}
+
+/** The trusted CLI's one-use invitation for one exact owner choice on one condition of an accepted edition. */
+export async function issueConditionChoiceInvitation(store: Store, request: unknown):
+  Promise<OmResult<Sealed<{ invitation: string; grant: Ref; expiresAt: number }>>> {
+  return runAsync(async () => {
+    requireCondition(store instanceof Store, 'owner_invitation_invalid', 'An owner choice invitation needs a Store');
+    const scope = choiceScopeOf(acceptanceSnapshot(request, 'scope'), 'owner_invitation_invalid');
+    const project = store.get(`project:${scope.projectId}`);
+    if (!project) denyChoice('owner_project_missing', scope.projectId, 'projectId', 'An owner choice invitation is issued for an existing project only');
+    await choiceScopeGrounds(store, scope);
+    const secret = randomBytes(32).toString('hex'), id = randomBytes(16).toString('hex'), issuedAt = Date.now();
+    const grant: ConditionChoiceGrant = { contract: CONDITION_CHOICE_GRANT_CONTRACT, id, database: store.databaseId,
+      action: CONDITION_CHOICE_ACTION, method: FINAL_ACCEPTANCE_PAIRING_METHOD, scope, issuedAt,
+      expiresAt: issuedAt + CONDITION_CHOICE_GRANT_LIFETIME_MS, proof: digest(secret) };
+    const written = take(writeGuarded<ConditionChoiceGrant>(store, { unit: 'DR7b3', target: `${CONDITION_CHOICE_GRANT_PREFIX}${id}`,
+      writes: [{ id: `${CONDITION_CHOICE_GRANT_PREFIX}${id}`, kind: FINAL_ACCEPTANCE_GRANT_KIND, expected: 0, value: grant }],
+      guards: [exactRef(reference(project!)), scope.predecessor] }));
+    return { invitation: `${id}.${secret}`, grant: exactRef(reference(written[0]!)), expiresAt: grant.expiresAt };
+  });
+}
+
+const CONDITION_CHOICE_MINT = Symbol('condition-choice-authority-mint');
+const CONDITION_CHOICE_AUTHORITIES = new WeakSet<ConditionChoiceAuthority>();
+export class ConditionChoiceAuthority {
+  readonly #sessions: ConditionChoiceSessions; readonly #store: Store; readonly #digest: string;
+  readonly #sessionId: string; readonly #session: Ref; readonly #scope: ConditionChoiceScope;
+  constructor(token: symbol, sessions: ConditionChoiceSessions, store: Store, bearerDigest: string, session: Ref, scope: ConditionChoiceScope) {
+    requireCondition(token === CONDITION_CHOICE_MINT, 'owner_authority_invalid', 'Owner choice authority is minted by its scoped session exchange only');
+    this.#sessions = sessions; this.#store = store; this.#digest = bearerDigest;
+    this.#session = exactRef(session); this.#sessionId = this.#session.id; this.#scope = structuredClone(scope);
+    CONDITION_CHOICE_AUTHORITIES.add(this);
+  }
+  exercise(request: { store: Store; action: string; scope: ConditionChoiceScope }): OmResult<Sealed<{ session: Ref; grant: Ref; at: number }>> {
+    return run(() => {
+      if (!CONDITION_CHOICE_AUTHORITIES.has(this)) denyChoice('owner_authority_invalid', 'authority', 'authority',
+        'Owner choice authority is an object of the closed scoped registry');
+      if (!shape(request) || request.store !== this.#store || request.action !== CONDITION_CHOICE_ACTION || !sameScope(request.scope, this.#scope))
+        denyChoice('owner_authority_foreign', this.#sessionId, 'scope', 'Owner choice authority is bound to one Store and one exact choice');
+      const found = this.#store.get<ConditionChoiceSession>(this.#sessionId);
+      if (!found) denyChoice('owner_session_missing', this.#sessionId, 'session', 'The owner choice session record is absent');
+      let session: Revision<ConditionChoiceSession>;
+      try { session = readConditionChoiceSession(this.#store, reference(found!)); }
+      catch (error) { if (error instanceof EngineError) denyChoice('owner_session_state_invalid', this.#sessionId, 'session', error.message); throw error; }
+      if (session!.value.state !== 'open') denyChoice('owner_session_revoked', this.#sessionId, 'session', 'The owner choice session is revoked');
+      if (!sameScope(reference(session!), this.#session))
+        denyChoice('owner_authority_foreign', this.#sessionId, 'session', 'The original owner choice session cannot be substituted');
+      if (this.#sessions.sessionOf(this.#digest) !== this.#sessionId)
+        denyChoice('owner_session_missing', this.#sessionId, 'session', 'The owner choice session is not live in this process');
+      const now = Date.now();
+      if (now < session!.value.openedAt || session!.value.expiresAt <= now)
+        denyChoice('owner_session_expired', this.#sessionId, 'session', 'The owner choice session is outside its live window');
+      if (session!.value.database !== this.#store.databaseId || !sameScope(session!.value.scope, this.#scope))
+        denyChoice('owner_authority_foreign', this.#sessionId, 'scope', 'The owner choice session is bound to another database or choice');
+      return { session: exactRef(reference(session!)), grant: exactRef(session!.value.grant), at: now };
+    });
+  }
+}
+const CONDITION_CHOICE_EXERCISE = ConditionChoiceAuthority.prototype.exercise;
+export function requireConditionChoiceAuthority(candidate: unknown,
+  request: { store: Store; action: string; scope: ConditionChoiceScope }): OmResult<Sealed<{ session: Ref; grant: Ref; at: number }>> {
+  if (candidate instanceof OwnerAuthority || candidate instanceof DiscoveryChoiceAuthority || candidate instanceof ProjectModeAuthority
+    || candidate instanceof VariantChoiceAuthority || candidate instanceof StageBudgetAuthority || candidate instanceof FinalAcceptanceAuthority)
+    return refused('owner_authority_foreign', 'Another owner authority cannot choose on a condition of the final Discovery bundle',
+      { unit: 'DR7b3', target: 'authority', field: 'action' }, 'owner');
+  if (!(candidate instanceof ConditionChoiceAuthority) || !CONDITION_CHOICE_AUTHORITIES.has(candidate))
+    return refused('owner_authority_invalid', 'Use the trusted owner choice door for this exact condition',
+      { unit: 'DR7b3', target: 'authority', field: 'authority' }, 'owner');
+  return CONDITION_CHOICE_EXERCISE.call(candidate, request);
+}
+export class ConditionChoiceSessions {
+  readonly #store: Store;
+  readonly #live = new Map<string, { session: string; authority: ConditionChoiceAuthority }>();
+  constructor(store: Store) {
+    requireCondition(store instanceof Store, 'owner_invitation_invalid', 'The owner choice session registry needs a Store');
+    this.#store = store;
+  }
+  sessionOf(bearerDigest: string): string | null { return this.#live.get(bearerDigest)?.session ?? null; }
+  exchange(request: unknown): OmResult<Sealed<{ bearer: string; session: Ref; expiresAt: number }>> {
+    return run(() => {
+      if (!shape(request) || !isText(request.projectId) || !isText(request.invitation)
+        || Object.keys(request).some(key => !['projectId', 'invitation'].includes(key)))
+        denyChoice('owner_invitation_invalid', 'final-condition-session', 'request', 'An owner choice exchange names projectId and invitation only');
+      const project = request.projectId as string, parts = (request.invitation as string).split('.');
+      if (parts.length !== 2 || !/^[a-f0-9]{32}$/.test(parts[0]!) || !/^[a-f0-9]{64}$/.test(parts[1]!))
+        denyChoice('owner_invitation_invalid', project, 'invitation', 'An invitation is <grant-id>.<secret>');
+      const found = this.#store.get<ConditionChoiceGrant>(`${CONDITION_CHOICE_GRANT_PREFIX}${parts[0]}`);
+      if (!found) denyChoice('owner_invitation_invalid', project, 'invitation', 'Unknown owner choice invitation');
+      let grant: Revision<ConditionChoiceGrant>;
+      try { grant = readConditionChoiceGrant(this.#store, reference(found!)); }
+      catch (error) { if (error instanceof EngineError) denyChoice('owner_invitation_invalid', project, 'invitation', error.message); throw error; }
+      if (!timingSafeEqual(Buffer.from(digest(parts[1]!), 'hex'), Buffer.from(grant!.value.proof, 'hex')))
+        denyChoice('owner_invitation_invalid', project, 'invitation', 'The invitation secret does not verify');
+      if (grant!.value.database !== this.#store.databaseId || grant!.value.scope.projectId !== project || grant!.value.action !== CONDITION_CHOICE_ACTION)
+        denyChoice('owner_invitation_foreign', project, 'invitation', 'The invitation belongs to another database, project or action');
+      const now = Date.now();
+      if (now < grant!.value.issuedAt) denyChoice('owner_invitation_invalid', project, 'invitation', 'The owner choice invitation is not yet issued');
+      if (grant!.value.expiresAt <= now) denyChoice('owner_invitation_expired', project, 'invitation', 'The owner choice invitation has expired');
+      const grantRef = exactRef(reference(grant!)), sessionId = conditionChoiceSessionId(grantRef);
+      if (this.#store.get(sessionId)) denyChoice('owner_invitation_spent', project, 'invitation', 'The owner choice invitation is already exchanged');
+      const session: ConditionChoiceSession = { contract: CONDITION_CHOICE_SESSION_CONTRACT, grant: grantRef, database: grant!.value.database,
+        action: CONDITION_CHOICE_ACTION, method: FINAL_ACCEPTANCE_PAIRING_METHOD, scope: grant!.value.scope,
+        session: randomBytes(16).toString('hex'), openedAt: now, expiresAt: now + CONDITION_CHOICE_SESSION_LIFETIME_MS, state: 'open' };
+      const written = take(writeGuarded<ConditionChoiceSession>(this.#store, { unit: 'DR7b3', target: sessionId,
+        writes: [{ id: sessionId, kind: FINAL_ACCEPTANCE_SESSION_KIND, expected: 0, value: session }], guards: [grantRef] }));
+      const bearer = randomBytes(32).toString('hex'), key = digest(bearer), opened = exactRef(reference(written[0]!));
+      this.#live.set(key, { session: sessionId,
+        authority: new ConditionChoiceAuthority(CONDITION_CHOICE_MINT, this, this.#store, key, opened, grant!.value.scope) });
+      return { bearer, session: opened, expiresAt: session.expiresAt };
+    });
+  }
+  authority(bearer: unknown): ConditionChoiceAuthority | null {
+    return typeof bearer === 'string' && /^[a-f0-9]{64}$/.test(bearer) ? this.#live.get(digest(bearer))?.authority ?? null : null;
+  }
+  revoke(bearer: unknown): OmResult<Sealed<{ session: Ref }>> {
+    return run(() => {
+      const key = typeof bearer === 'string' ? digest(bearer) : null, live = key ? this.#live.get(key) : undefined;
+      if (!live) denyChoice('owner_session_missing', 'final-condition-session', 'bearer', 'No live owner choice session carries this bearer');
+      this.#live.delete(key!);
+      const head = this.#store.get<ConditionChoiceSession>(live!.session);
+      if (!head) denyChoice('owner_session_missing', live!.session, 'session', 'The owner choice session record is absent');
+      if (head!.value.state === 'closed') return { session: exactRef(reference(head!)) };
+      const closed: ConditionChoiceSession = { ...head!.value, state: 'closed', closedAt: Math.max(Date.now(), head!.value.openedAt) };
+      const written = take(writeGuarded<ConditionChoiceSession>(this.#store, { unit: 'DR7b3', target: head!.id,
+        writes: [{ id: head!.id, kind: FINAL_ACCEPTANCE_SESSION_KIND, expected: head!.revision, value: closed }],
+        guards: [exactRef(reference(head!))] }));
+      return { session: exactRef(reference(written[0]!)) };
+    });
+  }
+}
+
+export interface ConditionResolutionOutcome {
+  choice: 'accept' | 'decline';
+  /** The saved owner choice, proven on its predecessor edition. */
+  resolution: Revision<ConditionResolution>;
+  /** The proven next edition; null for a declining choice, which fulfils nothing and publishes no edition. */
+  edition: AcceptedDiscovery | null;
+  repeated: boolean;
+}
+type ChoiceRequest = { projectId: string; manifest: Ref; conditionId: string; reason: string }
+  & ({ optionId: string; claims?: undefined } | { claims: ClaimAddress[]; optionId?: undefined });
+function choiceRequest(value: unknown): ChoiceRequest {
+  const input = acceptanceSnapshot(value, 'request');
+  const keys = shape(input) ? Object.keys(input).sort().join(',') : '';
+  if (!shape(input) || !['conditionId,manifest,optionId,projectId,reason', 'claims,conditionId,manifest,projectId,reason'].includes(keys)
+    || !isText(input.projectId) || !isRef(input.manifest) || !shape(input.manifest) || Object.keys(input.manifest).sort().join(',') !== 'hash,id,revision'
+    || !isText(input.conditionId) || !isText(input.reason) || !(input.reason as string).trim()
+    || (Object.hasOwn(input, 'optionId') ? !isText(input.optionId) : !Array.isArray(input.claims) || input.claims.length === 0))
+    throw new EngineError('discovery_condition_resolution_invalid',
+      'A resolution names projectId, the exact accepted edition, the condition, the offered option or the claims, and a reason only',
+      { door: 'owner-final-condition' });
+  const base = { projectId: input.projectId as string, manifest: exactRef(input.manifest as Ref), conditionId: input.conditionId as string,
+    reason: input.reason as string };
+  return Object.hasOwn(input, 'optionId') ? { ...base, optionId: input.optionId as string } : { ...base, claims: input.claims as ClaimAddress[] };
+}
+/** An evidence condition with accepted claims: every claim is proven accepted in this project, and still the condition stays
+ * open — an accepted claim is no proof that it meets the criterion of this exact bundle; that is the paid conformance
+ * assessment of 7b.3e (codex-omg2 №16160). Nothing is written. */
+function refuseEvidence(store: Store, accepted: EditionView, input: ChoiceRequest & { claims: ClaimAddress[] }): never {
+  const conditions = (accepted.bundle.value as { bundle?: { verdict?: { conditions?: unknown } } }).bundle?.verdict?.conditions;
+  const condition = Array.isArray(conditions) ? conditions.find(item => shape(item) && item.id === input.conditionId) : undefined;
+  if (!condition) throw new EngineError('discovery_condition_resolution_invalid', 'The condition is not one of this accepted bundle',
+    { conditionId: input.conditionId, door: 'owner-final-condition' });
+  if ((condition as { kind?: unknown }).kind !== 'evidence')
+    throw new EngineError('discovery_condition_resolution_invalid', 'Claims address an evidence condition; an owner condition is chosen by the owner',
+      { conditionId: input.conditionId, door: 'owner-final-condition' });
+  for (const [index, claim] of input.claims.entries()) {
+    if (!shape(claim) || claim.project !== input.projectId)
+      throw new EngineError('discovery_condition_resolution_invalid', 'A claim address names a claim of this project',
+        { conditionId: input.conditionId, claim: index, door: 'owner-final-condition' });
+    proveClaimAddress(store, claim);
+  }
+  throw new EngineError('discovery_condition_evidence_unproven',
+    'Accepted claims do not prove the criterion of this condition; the paid conformance assessment decides it',
+    { conditionId: input.conditionId, claims: input.claims.length, door: 'owner-final-condition' });
+}
+/**
+ * DR7 7b.3: the single producer of an owner choice on one condition of an accepted bundle. Only a minted condition-choice
+ * authority bound to this exact edition, condition and option may write. An accepting option publishes atomically the
+ * resolution, the next edition and the successor record of its predecessor; a declining one saves the resolution alone.
+ * Every write stands under the CAS of its new addresses and the guards of the project and the exact open session; a choice
+ * already saved on this condition is returned proven again, and an edition that already has a successor is stale.
+ */
+export async function resolveDiscoveryCondition(store: Store, request: unknown, authority?: unknown): Promise<ConditionResolutionOutcome> {
+  requireCondition(store instanceof Store, 'discovery_condition_resolution_invalid', 'An owner choice needs a Store');
+  const input = choiceRequest(request), projectId = input.projectId;
+  const project = store.get(`project:${projectId}`);
+  if (!project) throw new EngineError('owner_project_missing', 'An owner choice addresses an existing project only',
+    { project: projectId, door: 'owner-final-condition' });
+  // The condition, the option and the evidence refusal are read from the exact saved records of the edition before its
+  // paid grounds are proven again; a choice is written only over the proven predecessor below.
+  const view = readEditionView(store, projectId, input.manifest);
+  if (input.claims) return refuseEvidence(store, view, input);
+  offeredConditionOption(view, input.conditionId, input.optionId);
+  const predecessor = await readAcceptedDiscoveryManifestAt(store, projectId, input.manifest);
+  const offered = offeredConditionOption(predecessor, input.conditionId, input.optionId);
+  const resolutionId = conditionResolutionId(projectId, predecessor.manifest.value.bundle, input.conditionId);
+  const saved = async (repeated: boolean): Promise<ConditionResolutionOutcome | null> => {
+    const row = store.get<ConditionResolution>(resolutionId, 1);
+    if (!row) return null;
+    // The saved choice is proven on the edition it names, which is this predecessor or one of its proven ancestors.
+    let base = predecessor;
+    while (!sameScope(reference(base.manifest), row.value.scope?.predecessor) && base.manifest.value.previous)
+      base = await readAcceptedDiscoveryManifestAt(store, projectId, base.manifest.value.previous);
+    const proven = proveConditionResolution(store, projectId, reference(row), base);
+    // Only a compatible saved choice is this result; another option is an explicit conflict, never the old choice as success.
+    if (proven.value.option.optionId !== input.optionId)
+      throw new EngineError('discovery_condition_resolution_conflict', 'The owner has already chosen another option on this condition',
+        { project: projectId, conditionId: input.conditionId, chosen: proven.value.option.optionId, door: 'owner-final-condition' });
+    if (proven.value.option.choice !== 'accept') return { choice: 'decline', resolution: structuredClone(proven), edition: null, repeated };
+    const successor = store.get<ManifestSuccessor>(manifestSuccessorId(proven.value.scope.predecessor), 1);
+    if (!successor) throw new EngineError('owner_authority_internal', 'An accepting owner choice is saved without its edition');
+    const edition = extendAcceptedEdition(store, projectId, base, successor.value.successor);
+    return { choice: 'accept', resolution: structuredClone(proven), edition, repeated };
+  };
+  const before = await saved(true);
+  if (before) return before;
+  const stale = () => new EngineError('discovery_condition_resolution_stale',
+    'The edition gained a successor or the owner session moved before the choice was written', { project: projectId, door: 'owner-final-condition' });
+  if (store.get(manifestSuccessorId(input.manifest))) throw stale();
+  const scope: ConditionChoiceScope = { projectId, predecessor: exactRef(reference(predecessor.manifest)),
+    bundle: exactRef(predecessor.manifest.value.bundle), conditionId: input.conditionId, optionId: input.optionId, reason: input.reason };
+  const admitted = requireConditionChoiceAuthority(authority, { store, action: CONDITION_CHOICE_ACTION, scope });
+  if (!admitted.ok) return acceptanceFailure(admitted);
+  // The second exercise closes the check-to-write window; the pinned open session revision is a transaction guard.
+  const applied = requireConditionChoiceAuthority(authority, { store, action: CONDITION_CHOICE_ACTION, scope });
+  if (!applied.ok) return acceptanceFailure(applied);
+  const resolution: ConditionResolution = { contract: CONDITION_RESOLUTION_CONTRACT, database: store.databaseId, projectId,
+    predecessor: scope.predecessor, bundle: scope.bundle, conditionId: input.conditionId, kind: 'owner_choice', option: offered.option,
+    scope, authority: { grant: applied.value.grant, session: applied.value.session }, at: applied.value.at };
+  const published = conditionResolutionWrites(projectId, predecessor, resolution);
+  try { store.writeMany(published.writes, uniqueTransactionGuards([reference(project), applied.value.session])); }
+  catch (error) {
+    if (error instanceof EngineError && ['revision_conflict', 'input_stale'].includes(error.code)) {
+      const winner = await saved(true);
+      if (winner) return winner;
+      throw stale();
+    }
+    throw error;
+  }
+  const outcome = await saved(false);
+  if (!outcome) throw new EngineError('owner_authority_internal', 'The owner choice was not saved');
+  return outcome;
 }
