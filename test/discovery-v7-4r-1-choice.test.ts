@@ -281,7 +281,8 @@ test('4R.1 choice: a real model -> owner override -> owner revise stays current 
   const model = f.store.list<VariantModelDecision>('discovery-variant-model-decision')[0]!, proof = readVariantModelDecision(f.store, 'p', reference(model));
   const override: VariantChoiceScope = { ...choiceScope(f, 'reject_all'), operation: 'override', previous: reference(model), expectedSelection: proof.state! };
   const act = owner(f.store, override), sent = f.wires(), paid = money(f.store);
-  const rejected = await f.run(1, f.open()); assert.equal(JSON.parse(rejected.value.error!).scope, null);
+  // Restore the owner rejection and its D6 publication; a new D6 assessment is a separate paid step.
+  const rejected = await f.run(1, f.open(), true); assert.equal(JSON.parse(rejected.value.error!).scope, null);
   assert.deepEqual(JSON.parse(rejected.value.error!).decision, reference(act.decision));
   const revise: VariantChoiceScope = { ...choiceScope(f), operation: 'revise', previous: reference(act.decision), expectedSelection: reference(act.state) };
   const last = owner(f.store, revise); f.mode('questions');

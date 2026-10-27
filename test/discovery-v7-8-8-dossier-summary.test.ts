@@ -734,7 +734,8 @@ test('8.8 dossier summary: owner choice stopped by the paid budget keeps its mis
     for (const store of [f.store, f.open()]) await still(f, store, async () => {
       assert.deepEqual(await summarize(store, root), summary);
       assert.equal(renderStageSummary(await summarize(store, root)), text);
-      assert.deepEqual(await f.run(9, store), result);
+      // Recover the historical stop after the new plan; do not admit a new D6 assessment on that old plan.
+      assert.deepEqual(await f.run(9, store, true), result);
     });
   });
 });

@@ -250,7 +250,8 @@ for(const model of [false,true])test(`5.6: real ${model?'model':'owner'} choose 
   assert.equal(discoveryInspection(f.store,f.store.get<DiscoveryDraft>(f.v.draft.id)!).outcome.state,'researching');
   await inert(f,f.store,async()=>assert.deepEqual(await f.run(3,f.store,true),final));
   const cold=f.open();
-  await inert(f,cold,async()=>assert.deepEqual(await f.run(3,cold),final));
+  // The saved selected D6 is a fixed point in restore mode; ordinary run may now buy its assessment.
+  await inert(f,cold,async()=>assert.deepEqual(await f.run(3,cold,true),final));
 });
 
 for(const mode of ['common','insufficient'] as const)test(`5.6: applied ${mode} material stays in the exact missing frontier`,async t=>{
@@ -310,7 +311,8 @@ test('5.6: N and exact run cursor survive restart and an environment revision; s
   assert.equal(stop.record.value.reason,'stall');assert.deepEqual(stop.coverage.missing,frontier.coverage.missing);
   assert.deepEqual(reference(dossier.stop!),details.stop);assert.deepEqual(reference(dossier.handoff),details.handoff);
   assert.equal(dossier.record.value.completeness,'partial');
-  for(const store of [f.store,f.open()])await inert(f,store,async()=>assert.deepEqual(await f.run(5,store),run));
+  // Historical stalled partial recovery does not authorize the newly connected D6 assessment.
+  for(const store of [f.store,f.open()])await inert(f,store,async()=>assert.deepEqual(await f.run(5,store,true),run));
 });
 
 test('5.6: restoreOnly, default policy and zero allowance cannot buy or prepare the missing cell',async t=>{
@@ -333,7 +335,8 @@ test('5.6: real paid budget stays exhausted across restart and keeps the exact m
   assert.equal(stop.coverage.missing[0]!.cell.subject.planQuestionId,'q-two');
   assert.deepEqual(reference(dossier.stop!),details.stop);assert.deepEqual(reference(dossier.handoff),details.handoff);
   assert.equal(dossier.record.value.completeness,'partial');
-  for(const store of [f.store,f.open()])await inert(f,store,async()=>assert.deepEqual(await f.run(5,store),result));
+  // Research allowance exhaustion preserves this stop; D6 completion has its own forecast and is not requested here.
+  for(const store of [f.store,f.open()])await inert(f,store,async()=>assert.deepEqual(await f.run(5,store,true),result));
 });
 
 test('5.6: a real new scope with the same cell has its own preparation and paid identity',async t=>{
@@ -405,7 +408,7 @@ test(`5.6-01: ${cold?'cold':'hot'} prepared cut at deep position ${position} res
   if(position===2){
     await inert(f,store,async()=>assert.deepEqual(await f.run(2,store,true),result));
     const again=f.open();
-    await inert(f,again,async()=>assert.deepEqual(await f.run(2,again),result));
+    await inert(f,again,async()=>assert.deepEqual(await f.run(2,again,true),result));
   }else for(const again of [store,f.open()])await inert(f,again,async()=>{
     assert.deepEqual(await f.run(2,again,true),result);
   });
