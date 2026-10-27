@@ -15,6 +15,9 @@ export interface StageArtifact {
   proofs: Ref[];
   closure?: StageClosure;
 }
+/** A stage's historical proof is reconstructed from the saved contract and exact grounds, independently of current admission. */
+export interface AcceptedStageArtifact { artifact: Revision<StageArtifact>; grounds: Ref[] }
+export type StageHistoryReader = (artifact: Revision<StageArtifact>) => Promise<Ref[]>;
 export interface GateContext {
   projectId: string;
   content: Json;

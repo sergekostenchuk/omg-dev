@@ -12,7 +12,7 @@ import { conceptApplicationFindings, preparationFindings, specificationApplicati
 import { discoveryBasisCatalogue } from '../discovery/discovery-outcome.js';
 import { buildL1 } from "../graph/builder.js";
 import { projectGraph } from "../graph/project.js";
-import { isRef, reference, stageId, STAGE_CLOSURE_CONTRACT, type Ref, type StageArtifact } from "../pipeline/contracts.js";
+import { isRef, reference, stageId, STAGE_CLOSURE_CONTRACT, uniqueRefs, type AcceptedStageArtifact, type Ref, type StageArtifact } from "../pipeline/contracts.js";
 import { readLegacyOperation, StageChecks } from "../product/stage-checks.js";
 import { Store, type Revision, type TransactionGuard, type Write } from "../storage/store.js";
 import { historicalProof, historicalTrace, pendingSnapshotView, withHistoricalReads } from "../history/proofs.js";
@@ -361,16 +361,18 @@ function requireInputRequest(store: Store, request: InputRequest): void {
 
 // An accepted historical snapshot is checked against its saved proof closure. A later source revision or file edit
 // is not a reason to rerun old acceptance against today's evidence or to substitute a current draft for its source.
-function loadSources(store: Store, request: InputRequest): InputResult<Sealed<InputStages>> {
+function loadSources(store: Store, request: InputRequest, prefix: readonly UpstreamStage[] = INPUT_STAGES): InputResult<Sealed<InputStages>> {
   const stages = new Map<UpstreamStage, Revision<StageArtifact>>();
-  for (const stage of INPUT_STAGES) {
+  for (const stage of prefix) {
     const result = readRecord<StageArtifact>(store, request.stages[stage], { unit: "G1", target: stageId(request.project, stage),
       id: stageId(request.project, stage), kind: "stage" });
     if (!result.ok) return transfer("refs", result);
+    if (canonical(reference(result.value)) !== canonical(request.stages[stage]) || hashJson(result.value.value) !== result.value.hash)
+      return refuse('stage_not_accepted', 'The stage row differs from its exact saved reference', at(stageId(request.project, stage), 'record', request.stages[stage]), 'producer');
     stages.set(stage, result.value as Revision<StageArtifact>);
   }
   const sources: Partial<InputStages> = {};
-  for (const [index, stage] of INPUT_STAGES.entries()) {
+  for (const [index, stage] of prefix.entries()) {
     const record = stages.get(stage)!;
     const bad = (field: string, message: string): never => {
       raise("stage_not_accepted", message, at(record.id, field, reference(record)));
@@ -392,7 +394,7 @@ function loadSources(store: Store, request: InputRequest): InputResult<Sealed<In
       const proofs = new Map<string, Revision<Row>>();
       for (const ref of value.proofs) {
         const found = store.get<Row>(ref.id, ref.revision);
-        check(found && found.hash === ref.hash, "proofs", `Exact proof is unavailable: ${ref.id}`);
+        check(found && canonical(reference(found)) === canonical(ref) && hashJson(found.value) === ref.hash, "proofs", `Exact proof is unavailable: ${ref.id}`);
         const prior = proofs.get(ref.id);
         check(!prior || canonical(reference(prior)) === canonical(ref), "proofs", "Proofs cannot claim two versions of one source");
         proofs.set(ref.id, found);
@@ -522,13 +524,13 @@ function loadSources(store: Store, request: InputRequest): InputResult<Sealed<In
     }
   }
   const result = sources as InputStages;
-  const behaviors = result.specification.fields['behavior'], features = result.features.fields['features'];
+  const behaviors = result.specification?.fields['behavior'], features = result.features?.fields['features'];
   if (Array.isArray(behaviors) && Array.isArray(features)) {
     const covered = new Set(features.flatMap((feature: unknown) => object(feature) && Array.isArray(feature.requirements) ? feature.requirements : []));
     if (covered.size !== behaviors.length || [...covered].some(value => !Number.isSafeInteger(value) || Number(value) < 0 || Number(value) >= behaviors.length))
       return refuse("stage_not_accepted", "Prepared features must cover every specified behavior", at(result.features.ref.id, "features.requirements", result.features.ref), "producer");
   }
-  if (isBasisApplicationEra(result.concept.contractVersion)) {
+  if (result.concept && isBasisApplicationEra(result.concept.contractVersion)) {
     try {
       const catalogue = discoveryBasisCatalogue({ ref: result.discovery.ref, fields: result.discovery.fields });
       const applications = conceptApplicationFindings(result.concept.fields['conceptSections'] ?? null, catalogue);
@@ -541,7 +543,7 @@ function loadSources(store: Store, request: InputRequest): InputResult<Sealed<In
         at(result.discovery.ref.id, 'content.fields', result.discovery.ref), 'producer');
     }
   }
-  if (isBasisApplicationEra(result.specification.contractVersion)) {
+  if (result.specification && isBasisApplicationEra(result.specification.contractVersion)) {
     try {
       const catalogue = discoveryBasisCatalogue({ ref: result.discovery.ref, fields: result.discovery.fields });
       const applications = specificationApplicationFindings(result.specification.fields['behaviorContracts'] ?? null,
@@ -555,15 +557,47 @@ function loadSources(store: Store, request: InputRequest): InputResult<Sealed<In
         at(result.discovery.ref.id, 'content.fields', result.discovery.ref), 'producer');
     }
   }
-  const outcomes = (result['operation-map'].fields['mapDesign'] as Row)?.artifacts;
-  if (Array.isArray(outcomes)) for (const stage of INPUT_STAGES) {
+  const outcomes = (result['operation-map']?.fields['mapDesign'] as Row)?.artifacts;
+  if (Array.isArray(outcomes) || prefix.length < INPUT_STAGES.length) for (const stage of prefix) {
     if (isLegacyEra(contractEraOf(result[stage]))) continue;
     const findings = preparationFindings(stage, result[stage].fields, name => result[name as UpstreamStage]?.fields ?? null,
-      outcomes.map((artifact: Row) => artifact.id));
+      Array.isArray(outcomes) ? outcomes.map((artifact: Row) => artifact.id) : []);
     if (findings.length) return refuse("stage_not_accepted", findings[0]!.message,
       at(result[stage].ref.id, findings[0]!.field ?? findings[0]!.target, result[stage].ref), "producer");
   }
   return delivered(result);
+}
+
+/** The same historical upstream proof used by the complete OM input, limited to the selected stage's own exact
+ * predecessor chain. No future stage or live file is required; a caller cannot supply a shortened proof inventory. */
+export function readAcceptedUpstreamStageAt(store: Store, project: string, stage: UpstreamStage, at: unknown): AcceptedStageArtifact {
+  let input: { project: string; stage: UpstreamStage; at: Ref };
+  try { input = JSON.parse(canonical({ project, stage, at })); }
+  catch { throw new EngineError('stage_history_invalid', 'Expected an exact JSON upstream stage request'); }
+  const last = INPUT_STAGES.indexOf(input.stage);
+  if (last < 0 || typeof input.project !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/.test(input.project)
+    || !isRef(input.at) || Object.keys(input.at).sort().join(',') !== 'hash,id,revision')
+    throw new EngineError('stage_history_invalid', 'Expected project, upstream stage and a closed exact Ref');
+  const prefix = INPUT_STAGES.slice(0, last + 1), refs = {} as InputRequest['stages'];
+  const rows: Revision<StageArtifact>[] = [];
+  let next: Ref = input.at;
+  for (let i = last; i >= 0; i--) {
+    const current = prefix[i]!, expectedId = stageId(input.project, current);
+    const checked = readRecord<StageArtifact>(store, next, { unit: 'stage-history', target: expectedId, id: expectedId, kind: 'stage' });
+    if (!checked.ok) throw new EngineError('stage_history_invalid', checked.refusal.message, checked.refusal.at);
+    const row = checked.value as Revision<StageArtifact>;
+    if (canonical(reference(row)) !== canonical(next) || hashJson(row.value) !== next.hash
+      || row.value?.projectId !== input.project || row.value.stage !== current || row.value.status !== 'accepted'
+      || !Array.isArray(row.value.inputs) || row.value.inputs.length !== (i === 0 ? 0 : 1)
+      || (i > 0 && !isRef(row.value.inputs[0])))
+      throw new EngineError('stage_history_invalid', 'The saved accepted stage has a foreign, missing or mixed predecessor', { ref: next });
+    refs[current] = next; rows.push(row);
+    if (i > 0) next = row.value.inputs[0]!;
+  }
+  const proven = loadSources(store, { project: input.project, stages: refs, expected: 0 }, prefix);
+  if (!proven.ok) throw new EngineError('stage_history_invalid', proven.refusal.message, proven.refusal.at);
+  const artifact = rows[0]!;
+  return structuredClone({ artifact, grounds: uniqueRefs(rows.flatMap(row => [reference(row), ...row.value.proofs])) });
 }
 
 function deriveInputRecord(store: Store, request: InputRequest): InputResult<Sealed<OmInputRecord>> {

@@ -61,6 +61,14 @@ export class StageChecks {
       "graph-projection": graphProjectionHandler,
       ...REFINEMENT_EXTERNAL_CHECKS,
       ...EXECUTION_EXTERNAL_CHECKS,
+    }, async artifact => {
+      if (!UPSTREAM_STAGES.includes(artifact.value.stage as UpstreamStage))
+        throw new EngineError('stage_history_unsupported', 'This stage has no connected historical acceptance proof', { ref: reference(artifact) });
+      // input.ts also consumes StageChecks for current admission. Load its existing historical proof only on demand,
+      // after both modules are initialized; the common prefix/full-input validator remains a single implementation.
+      const { readAcceptedUpstreamStageAt } = await import('../om/input.js');
+      return readAcceptedUpstreamStageAt(this.store, artifact.value.projectId,
+        artifact.value.stage as UpstreamStage, reference(artifact)).grounds;
     });
     this.environments = new Environments(store);
     this.refinement = new Refinement(store, this.discovery, this.graphs, this.environments, this.pipeline);

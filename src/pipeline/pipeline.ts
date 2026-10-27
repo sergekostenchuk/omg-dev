@@ -6,7 +6,9 @@ import { uniqueTransactionGuards, transactionGuardsCurrent } from "../runtime/en
 import { sourceIsCurrent, withSourceMemo, type Source } from "../evidence/evidence.js";
 import { STAGES, predecessor, reference, stageId, isRef, uniqueRefs, STAGE_CLOSURE_CONTRACT,
   type Stage, type StageArtifact, type StageClosure, type StageExternalCheck, type ExternalCheckHandler,
-  type ExternalCheckHandlers, type StageProjection, type StageValidators, type Finding, type Ref } from "./contracts.js";
+  type ExternalCheckHandlers, type StageProjection, type StageValidators, type Finding, type Ref,
+  type AcceptedStageArtifact, type StageHistoryReader } from "./contracts.js";
+export type { AcceptedStageArtifact } from './contracts.js';
 
 interface PreparedStage { write: Write & { value: StageArtifact }; guards: TransactionGuard[] }
 
@@ -60,7 +62,7 @@ export class Pipeline {
   /** The admission the stage's own validator issued in one full inspection, apart from the predecessor's. */
   #ownAdmission = new WeakMap<StageProjection, TransactionGuard[]>();
   constructor(private readonly store: Store, private readonly validators: StageValidators,
-    externalChecks?: ExternalCheckHandlers) {
+    externalChecks?: ExternalCheckHandlers, private readonly historyReader?: StageHistoryReader) {
     requireCondition(STAGES.every(stage => typeof validators[stage] === "function"),
       "stage_contract_missing", "Every stage needs its own executable validation contract");
     // G1 (№6210): the caller's handlers merge over the defaults — a handler passed for a kind
@@ -78,6 +80,23 @@ export class Pipeline {
   }
   #requireStage(stage: Stage): void {
     requireCondition(STAGES.includes(stage), "unknown_stage", "Unknown pipeline stage");
+  }
+  /** One exact historical acceptance. The registered stage contract proves saved grounds; current heads/closure guards
+   * are not acceptance evidence, and an unconnected historical contract refuses rather than trusting status. */
+  async readAcceptedStageArtifactAt(projectId: string, stage: Stage, at: unknown): Promise<AcceptedStageArtifact> {
+    this.#requireProject(projectId); this.#requireStage(stage);
+    let ref: Ref;
+    try { ref = JSON.parse(canonical(at)) as Ref; }
+    catch { throw new EngineError('stage_history_invalid', 'Expected an exact JSON stage Ref'); }
+    requireCondition(isRef(ref) && Object.keys(ref).sort().join(',') === 'hash,id,revision'
+      && ref.id === stageId(projectId, stage), 'stage_history_invalid', 'Expected the exact stage Ref for this project and stage');
+    const artifact = this.store.get<StageArtifact>(ref.id, ref.revision);
+    requireCondition(artifact !== null && artifact.kind === 'stage' && canonical(reference(artifact)) === canonical(ref)
+      && hashJson(artifact.value) === ref.hash && artifact.value?.projectId === projectId && artifact.value.stage === stage
+      && artifact.value.status === 'accepted', 'stage_history_invalid', 'The exact accepted stage container is absent or foreign');
+    requireCondition(this.historyReader !== undefined, 'stage_history_unsupported', 'This pipeline has no historical acceptance contract');
+    const grounds = await this.historyReader(artifact);
+    return structuredClone({ artifact, grounds: uniqueRefs(grounds) });
   }
   draft(projectId: string, stage: Stage, content: Json, expected: number, admissionGuards: TransactionGuard[] = []): Revision<StageArtifact> {
     const prepared = this.#prepareDraft(projectId, stage, content, expected, admissionGuards);
