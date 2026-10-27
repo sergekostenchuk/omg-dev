@@ -61,10 +61,14 @@ function requireGateShape(writer: WriterSource, environment: Environment): void 
 
 function writerReachable(repository: Repository, commit: string): boolean {
   if (!commitName(commit)) return false;
-  if (!gitIsAncestor(repository.root, commit, repository.head)) return false;
   // merge-base peels annotated tags; the former rev-list membership required the commit OID itself.
   // This bounded read proves commit identity; commitOrigin separately reads its actual parent object.
-  return git(repository.root, ['rev-list', '--parents', '-n', '1', commit]).split(' ')[0] === commit;
+  const identity = () => git(repository.root, ['rev-list', '--parents', '-n', '1', commit]).split(' ')[0] === commit;
+  // A commit is its own ancestor, so the head itself needs no ancestor query once this read proves the exact commit;
+  // any other answer (an annotated tag, a tree, a blob) takes the ordinary path below and keeps its ordinary outcome.
+  if (commit === repository.head && identity()) return true;
+  if (!gitIsAncestor(repository.root, commit, repository.head)) return false;
+  return identity();
 }
 
 /** Check one immutable writer against a supplied repository slice; never select a current head. */
