@@ -1,10 +1,8 @@
 import { readPartialDossier } from "../discovery/dossier-manifest.js";
-import { readBudgetReentryContinuation, readBudgetStopReentry, readSelectedResearchPause, SELECTED_DOSSIER_PENDING, SELECTED_DOSSIER_PAUSE } from "../discovery/research-runner.js";
-import { withResearchRunControl } from '../discovery/research-protocol.js';
+import { readSelectedResearchPause, SELECTED_DOSSIER_PENDING, SELECTED_DOSSIER_PAUSE, type BudgetReentry } from "../discovery/research-runner.js";
 import { readVariantHandoff, discoveryInspection } from '../discovery/discovery-outcome.js';
 import { canonical, digest, type Json } from "../canonical.js";
 import { Discovery } from "../discovery/discovery.js";
-import type { ProducerPolicy } from "../discovery/requirements.js";
 import {
   executionAdmission, isCurrentEra, listDrafts, orderedQuestions, readAnswer, readDraft,
   readQuestion, readStageArtifact, readResearchRun, type Decision, type DiscoveryDraft, type Fact, type ResearchRun,
@@ -73,11 +71,7 @@ const refusalReason = (value: Refusal): EarlyStageReason =>
   reason(value.code, value.at.target, value.message, value.at.field);
 
 export class EarlyStageDriver {
-  private readonly producerPolicy: ProducerPolicy | undefined;
-  constructor(private readonly engine: ProductEngine, producerPolicy?: ProducerPolicy) {
-    // Trusted embedding configuration, never a request or an owner-budget field.
-    this.producerPolicy = producerPolicy === undefined ? undefined : Object.freeze({ ...producerPolicy });
-  }
+  constructor(private readonly engine: ProductEngine, private readonly budgetReentry?: BudgetReentry) {}
 
   reviseInput(project: string, expected: number, instruction: EarlyStageInstruction): EarlyStageInputRevision {
     this.#prepareInstruction(project, instruction);
@@ -146,10 +140,9 @@ export class EarlyStageDriver {
           // Prove the historical result above before considering new work. The
           // same read-only budget check is used by Researcher; only normal driver
           // control/admission and transport reservation may perform the re-entry.
-          const saved = JSON.parse(restored.value.error ?? 'null');
           const reenter = restored.value.pauseCode === 'research_dossier_assessment_unavailable'
-            && this.producerPolicy?.discovery === 7 && maxTurns > 0 && maxCalls > 0 && isRef(saved?.stop)
-            && await readBudgetStopReentry(this.engine.store, project, draft.id, saved.stop);
+            && this.budgetReentry && maxTurns > 0 && maxCalls > 0
+            && await this.budgetReentry.eligible(this.engine.store, project, draft, restored);
           if (!reenter) return this.#result(project, early.end, early.stage, early.draft, early.candidates, early.stageResult,
             early.reason, 0, maxTurns, maxCalls, 0, null);
         }
@@ -463,49 +456,32 @@ export class EarlyStageDriver {
       }
       let stageResult: StageResearchResult;
       try {
-        // This opt-in is limited to an existing proved budget stop. A policy by
-        // itself must never enable arbitrary v7 generation through this driver.
+        // Discovery owns the optional configuration and proves the stopped
+        // route again under this execution's original hold.
         const prior = readResearchRun(this.engine.store, request.project, draft.id);
-        if (this.producerPolicy?.discovery === 7 && request.maxCalls > 0 && current.stage === 'discovery'
-          && isCurrentEra('discovery', draft.value.contractVersion, this.producerPolicy) && prior) {
-          // Re-read and prove after acquiring the execution hold: entry's read
-          // is not authority over a later head, handoff or budget chain.
-          let eligible: boolean;
-          if (prior.value.pauseCode === 'research_dossier_assessment_unavailable') {
-            await this.#stageOutcome(request.project, 'discovery', reference(draft), {
-              status: 'paused', stage: current.artifact ? reference(current.artifact) : null,
-              research: reference(prior), feedback: null, findings: [], turnsUsed: 0 });
-            const saved = JSON.parse(prior.value.error ?? 'null');
-            eligible = isRef(saved?.stop)
-              && await readBudgetStopReentry(this.engine.store, request.project, draft.id, saved.stop);
-          } else eligible = await readBudgetReentryContinuation(this.engine.store, request.project, draft.id, prior);
-          admitRunControl(this.engine.store, request.project, execution.hold);
-          if (eligible) {
-            const policy = this.producerPolicy;
-            requireCondition(executionAdmission(this.engine.store, draft, 'new-research', policy).admitted,
-              'research_contract_upgrade_required', 'Budget re-entry requires the exact admitted current draft');
-            let restored: Revision<ResearchRun>;
-            let unpaidPause: { code: string; target: string; message: string } | null = null;
-            try {
-              restored = await withResearchRunControl(this.engine.store, request.project, execution.hold,
-                () => this.engine.researcher.run(request.project, draft.id, request.maxTurns - turnsUsed,
-                  undefined, { producerPolicy: policy }));
-            } catch (error) {
-              // The transport reports a typed refusal if control moved at its
-              // reservation. Preserve the driver's original control outcome.
-              admitRunControl(this.engine.store, request.project, execution.hold);
-              if (!(error instanceof EngineError) || !['budget_estimate_missing', 'discovery_budget_reserve',
-                'discovery_budget_overrun', 'research_call_allowance'].includes(error.code)) throw error;
-              const paused = readResearchRun(this.engine.store, request.project, draft.id);
-              requireCondition(paused?.value.status === 'paused', 'research_consumer_intent_invalid',
-                'An unpaid budget or allowance refusal must preserve its research pause');
-              restored = paused;
-              unpaidPause = { code: error.code, target: draft.id, message: error.message };
-            } finally {
-              const latest = readResearchRun(this.engine.store, request.project, draft.id);
-              turnsUsed += Math.max(0, (latest?.value.turns ?? prior.value.turns) - prior.value.turns);
-            }
+        if (this.budgetReentry && request.maxCalls > 0 && current.stage === 'discovery' && prior) {
+          let restored: Revision<ResearchRun> | null = null;
+          let unpaidPause: { code: string; target: string; message: string } | null = null;
+          try {
+            restored = await this.budgetReentry.resume(this.engine.researcher, request.project, draft.id,
+              request.maxTurns - turnsUsed, execution.hold);
+          } catch (error) {
+            // The transport reports a typed refusal if control moved at its
+            // reservation. Preserve the driver's original control outcome.
             admitRunControl(this.engine.store, request.project, execution.hold);
+            if (!(error instanceof EngineError) || !['budget_estimate_missing', 'discovery_budget_reserve',
+              'discovery_budget_overrun', 'research_call_allowance'].includes(error.code)) throw error;
+            const paused = readResearchRun(this.engine.store, request.project, draft.id);
+            requireCondition(paused?.value.status === 'paused', 'research_consumer_intent_invalid',
+              'An unpaid budget or allowance refusal must preserve its research pause');
+            restored = paused;
+            unpaidPause = { code: error.code, target: draft.id, message: error.message };
+          } finally {
+            const latest = readResearchRun(this.engine.store, request.project, draft.id);
+            turnsUsed += Math.max(0, (latest?.value.turns ?? prior.value.turns) - prior.value.turns);
+          }
+          admitRunControl(this.engine.store, request.project, execution.hold);
+          if (restored) {
             const pause = unpaidPause ?? (restored.value.pauseCode ? { code: restored.value.pauseCode, target: draft.id,
               message: restored.value.error ?? 'Research is paused' } : null);
             const outcome = await this.#stageOutcome(request.project, 'discovery', reference(draft), {
@@ -731,11 +707,15 @@ export class EarlyStageDriver {
       try { saved = JSON.parse(run?.value.error ?? 'null'); } catch { /* A diagnostic pause carries no authority. */ }
       const address: unknown = saved?.handoff;
       const partial = run?.value.pauseCode === 'research_dossier_assessment_unavailable';
-      if (partial || run?.value.pauseCode === 'research_partial_dossier_pending'
-        || run?.value.pauseCode === 'research_variant_handoff_unavailable')
+      // A current budget/forecast refusal takes precedence over a historical
+      // deep-frontier pause. Otherwise expose only the proved exact handoff.
+      const pending = run?.value.pauseCode === 'research_deep_frontier_pending'
+        && (!finding || finding.code === 'research_deep_frontier_pending');
+      const handoffPause = partial || pending || run?.value.pauseCode === 'research_partial_dossier_pending'
+        || run?.value.pauseCode === 'research_variant_handoff_unavailable';
+      if (handoffPause)
         requireCondition(isRef(address), 'discovery_variant_handoff_invalid', 'The saved handoff pause lost its exact address');
-      if (isRef(address) && (partial || run?.value.pauseCode === 'research_partial_dossier_pending'
-        || run?.value.pauseCode === 'research_variant_handoff_unavailable')) {
+      if (handoffPause && isRef(address)) {
         const handoff = (await readVariantHandoff(this.engine.store, project, address)).record;
         requireCondition(partial ? handoff.value.draft.id === draft.id : canonical(handoff.value.draft) === canonical(draft),
           'discovery_variant_handoff_invalid', 'The stage paused on another draft handoff');

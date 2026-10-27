@@ -23,7 +23,8 @@ import { isResearchPreview } from './research-preview.js';
 import { stageNeighbors, usesStageNeighbors, STAGE_NEIGHBOR_CONTEXT, STAGE_NEIGHBOR_INSTRUCTION } from './stage-neighbors.js';
 import { earlyResearchStage, earlyResearchFailure, earlyResearchCorrection, deliveredConceptSections, RESULT_CAPACITY_REFUSAL,
   requireEscalationReply, EARLY_RESEARCH_OUTCOME } from './early-research-outcome.js';
-import { producerContractEra, type ProducerPolicy, type UpstreamStage } from './requirements.js';
+import { NEXT_CONTRACT_ERA, producerContractEra, type ProducerPolicy, type UpstreamStage } from './requirements.js';
+import { executionAdmission } from './projection-reader.js';
 import { discoveryContext, discoveryInspection, discoveryTraversal, publishVariantHandoff, readVariantHandoff, readDeepFrontierStop, produceDeepFrontierStop, type DiscoveryOutcome } from './discovery-outcome.js';
 import { savedSynthesisMaterials, savedV7SynthesisMaterials } from "./saved-synthesis.js";
 import { readResearchContext, researchContextReadEra } from "./research-limits.js";
@@ -35,7 +36,8 @@ import { canonical, hashJson, type Json } from "../canonical.js";
 import { EngineError, requireCondition } from "../errors.js";
 import { Discovery, type Decision, type DiscoveryDraft, type Question } from "./discovery.js";
 import type { PaidDiscoveryAttemptsAssessment, V7AttemptPacket, EarlyUnknown, ResearchAction, ResearchAssessment, ResearchRun, ResearchTurn } from "./research-model.js";
-import { researchAction, researchCall, prepareResearchEnvelope } from "./research-protocol.js";
+import { researchAction, researchCall, prepareResearchEnvelope, withResearchRunControl } from "./research-protocol.js";
+import { admitRunControl, type RunControlHold } from '../om/run-control.js';
 import { turnAction, projectPaidTurnAdmission, projectPaidOwnerReview, projectPaidPause,
   projectResearchTurnRevision, projectSourceReadingTurn, projectPaidLocalRefusal, projectRepeatedContextRead,
   projectAddressedWorkspace, ACTION_RESPONSE_REFUSAL_CODES, webResearchCapability, admittedResearchAction,
@@ -166,17 +168,17 @@ export async function readSelectedResearchPause(store: Store, project: string, d
  * working group limit or spends the completion reserve. */
 export async function readBudgetStopReentry(store: Store, project: string, draftId: string, stop: Ref): Promise<boolean> {
   const old = await readDeepFrontierStop(store, project, stop);
-  return budgetStopReentryEligible(store, project, draftId, old);
+  return budgetStopReentryEligible(store, project, draftId, old.record);
 }
 
 function budgetStopReentryEligible(store: Store, project: string, draftId: string,
-  old: Awaited<ReturnType<typeof readDeepFrontierStop>>): boolean {
-  requireCondition(old.record.value.draft.id === draftId, 'discovery_deep_stop_invalid',
+  old: Awaited<ReturnType<typeof readDeepFrontierStop>>['record']): boolean {
+  requireCondition(old.value.draft.id === draftId, 'discovery_deep_stop_invalid',
     'Budget re-entry requires the stop of this exact draft');
-  if (old.record.value.reason !== 'budget') return false;
+  if (old.value.reason !== 'budget') return false;
   const effective = readEffectiveStageBudget(store, project), segment = effective.segment;
   const previous = store.get<import('../runtime/research-budget.js').BudgetSegment>(
-    old.record.value.budget.segment.id, old.record.value.budget.segment.revision)!;
+    old.value.budget.segment.id, old.value.budget.segment.revision)!;
   // The common reader proves every owner act. Comparing with the stop's exact
   // saved segment excludes increases that were already exhausted at that stop.
   if (!segment || segment.id !== previous.id || segment.revision <= previous.revision
@@ -187,12 +189,12 @@ function budgetStopReentryEligible(store: Store, project: string, draftId: strin
   // A later increase admits only the stopped plan and choice, not whatever
   // other v7 route may have become current since that historical stop.
   const plan = currentPlan(store, project);
-  if (plan.draft.id !== draftId || canonical(plan.planAnswer) !== canonical(old.record.value.plan)) return false;
+  if (plan.draft.id !== draftId || canonical(plan.planAnswer) !== canonical(old.value.plan)) return false;
   const state = store.get<VariantState>(variantStateId(project, draftId));
-  if (!state || canonical(state.value.set) !== canonical(old.record.value.set)
-    || canonical(state.value.decision) !== canonical(old.record.value.decision)) return false;
+  if (!state || canonical(state.value.set) !== canonical(old.value.set)
+    || canonical(state.value.decision) !== canonical(old.value.decision)) return false;
   const selected = readCurrentVariantScope(store, project, reference(plan.draft));
-  if (canonical(reference(selected.scope)) !== canonical(old.record.value.scope)) return false;
+  if (canonical(reference(selected.scope)) !== canonical(old.value.scope)) return false;
   const usage = budgetUsage(store, segment);
   if (usage.reserved || usage.measured >= effective.limit - effective.completionReserve) return false;
   const group = usage.groups[DISCOVERY_V7_STAGE_BUDGET_KEY];
@@ -246,7 +248,59 @@ async function readBudgetReentryOrigin(store: Store, project: string, draftId: s
 export async function readBudgetReentryContinuation(store: Store, project: string, draftId: string,
   run: Revision<ResearchRun>): Promise<boolean> {
   const stopped = await readBudgetReentryOrigin(store, project, draftId, run);
-  return stopped !== null && budgetStopReentryEligible(store, project, draftId, stopped);
+  return stopped !== null && budgetStopReentryEligible(store, project, draftId, stopped.record);
+}
+
+async function budgetReentryAdmission(store: Store, project: string, draft: Revision<DiscoveryDraft>,
+  run: Revision<ResearchRun>, policy: ProducerPolicy | undefined): Promise<boolean> {
+  // The explicit trusted configuration and era selection belong to Discovery;
+  // neither a request field nor the default producer policy grants this path.
+  if (policy?.discovery !== NEXT_CONTRACT_ERA || draft.value.stage !== 'discovery'
+    || draft.value.projectId !== project || draft.value.contractVersion !== producerContractEra('discovery', policy)) return false;
+  const head = store.get<ResearchRun>(run.id);
+  requireCondition(run.kind === 'research-run' && run.id === `research-run:${hashJson([project, draft.id])}`
+    && run.value.projectId === project && run.value.draftId === draft.id && head
+    && canonical(reference(head)) === canonical(reference(run)) && hashJson(run.value) === run.hash,
+    'discovery_deep_stop_invalid', 'Budget re-entry requires the exact current research run');
+  if (run.value.status !== 'paused') return false;
+  if (run.value.pauseCode !== 'research_dossier_assessment_unavailable')
+    return readBudgetReentryContinuation(store, project, draft.id, run);
+  let saved: any;
+  try { saved = JSON.parse(run.value.error ?? 'null'); } catch { /* Refuse below. */ }
+  // Partial dossiers can also be produced without a deep budget stop. They
+  // remain recoverable, but are not authority to start paid work.
+  if (!isRef(saved?.stop)) return false;
+  requireCondition(isRef(saved?.handoff) && isRef(saved?.dossier)
+    && !Object.hasOwn(saved, 'selected'), 'discovery_deep_stop_invalid', 'The partial pause lost its exact budget-stop basis');
+  const dossier = await readPartialDossier(store, project, saved.dossier);
+  // A stopped partial dossier already proves its exact stop through the shared
+  // historical reader; do not derive the same proof a second time here.
+  const stop = dossier.stop;
+  requireCondition(stop && stop.value.run.id === run.id && stop.value.draft.id === draft.id
+    && canonical(stop.value.handoff) === canonical(saved.handoff)
+    && canonical(reference(stop)) === canonical(saved.stop)
+    && canonical(reference(dossier.handoff)) === canonical(saved.handoff)
+    && canonical(dossier.record.value.draft) === canonical(stop.value.draft),
+    'discovery_deep_stop_invalid', 'The partial pause belongs to another exact budget stop');
+  return budgetStopReentryEligible(store, project, draft.id, stop);
+}
+
+/** Trusted embedding configuration for this one stopped route. Its policy is
+ * snapshotted here, inside Discovery, and never comes from an early-stage
+ * request, model output or budget increase. It grants no general v7 work. */
+export class BudgetReentry {
+  readonly #policy: ProducerPolicy | undefined;
+  constructor(policy?: ProducerPolicy) {
+    this.#policy = policy === undefined ? undefined : Object.freeze({ ...policy });
+    Object.freeze(this);
+  }
+  eligible(store: Store, project: string, draft: Revision<DiscoveryDraft>, run: Revision<ResearchRun>): Promise<boolean> {
+    return budgetReentryAdmission(store, project, draft, run, this.#policy);
+  }
+  resume(researcher: Researcher, project: string, draftId: string, limit: number,
+    hold: RunControlHold): Promise<Revision<ResearchRun> | null> {
+    return researcher.resumeBudgetReentry(project, draftId, limit, hold, this.#policy);
+  }
 }
 
 /** dispatchMode with the X50 proviso: a failed planned child guards the
@@ -276,6 +330,22 @@ function dispatchModeAfterRecovery(turns: Revision<ResearchTurn>[], question: Re
 
 export class Researcher {
   constructor(private readonly store: Store, private readonly discovery: Discovery, private readonly environments: Environments) {}
+  /** Re-read the exact route after the Driver has acquired control. This is
+   * still just the ordinary Researcher under its invocation-scoped hold; the
+   * common admission, reservation and CAS remain the authority to send. */
+  async resumeBudgetReentry(project: string, draftId: string, limit: number, hold: RunControlHold,
+    policy?: ProducerPolicy): Promise<Revision<ResearchRun> | null> {
+    if (!policy) return null;
+    const draft = this.store.get<DiscoveryDraft>(draftId);
+    const run = this.store.get<ResearchRun>(`research-run:${hashJson([project, draftId])}`);
+    if (!draft || draft.kind !== 'discovery-draft' || !run
+      || !await budgetReentryAdmission(this.store, project, draft, run, policy)) return null;
+    admitRunControl(this.store, project, hold);
+    requireCondition(executionAdmission(this.store, draft, 'new-research', policy).admitted,
+      'research_contract_upgrade_required', 'Budget re-entry requires the exact admitted current draft');
+    return withResearchRunControl(this.store, project, hold,
+      () => this.run(project, draftId, limit, undefined, { producerPolicy: policy }));
+  }
   async run(project: string, draftId: string, limit: number, signal?: AbortSignal,
     options: { restoreOnly?: boolean; producerPolicy?: ProducerPolicy;
       /** DRS1a2: trusted opt-in of the compact analyst storage on the v7 path. */

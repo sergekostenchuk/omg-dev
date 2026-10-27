@@ -11,7 +11,7 @@ import { EarlyStageDriver } from '../src/product/early-stage-driver.js';
 import { stopRun, acquireRunExecution, releaseRunExecution, readRunControl } from '../src/om/run-control.js';
 import { ProductEngine } from '../src/product/engine.js';
 import { EngineError } from '../src/errors.js';
-import { Researcher, readBudgetStopReentry } from '../src/discovery/research-runner.js';
+import { BudgetReentry, Researcher, readBudgetStopReentry } from '../src/discovery/research-runner.js';
 import { prepareResearchEnvelope, researchCall, resumeDossierResearchCall, withResearchRunControl } from '../src/discovery/research-protocol.js';
 import { prepareDossierAssessmentSubject } from '../src/discovery/dossier-assessment.js';
 import { runDossierAssessmentSession } from '../src/discovery/assessment-session.js';
@@ -278,13 +278,15 @@ function increase(f: Stopped, limit = 24_000_000, store = f.store) {
   return raised;
 }
 function driver(f: Stopped, store = f.store, maxTurns = 1, maxCalls = 2) {
-  return new EarlyStageDriver(new ProductEngine(store), { discovery: 7 }).run({ project: 'p', draftId: f.v.draft.id, maxTurns, maxCalls });
+  return new EarlyStageDriver(new ProductEngine(store), new BudgetReentry({ discovery: 7 }))
+    .run({ project: 'p', draftId: f.v.draft.id, maxTurns, maxCalls });
 }
 async function forecastRefusal(f: Stopped, door: 'driver' | 'researcher', code: string, store = f.store) {
   if (door === 'driver') {
     const result = await driver(f, store);
     assert.equal(result.reason?.code, code, JSON.stringify(result.reason));
     assert.equal(result.reason?.target, f.v.draft.id); assert.equal(result.budget.callsMade, 0);
+    assert.equal(result.reason?.handoff, undefined); assert.equal(result.reason?.next, undefined);
     return result.reason!.message;
   }
   let message: string | undefined;
@@ -640,7 +642,7 @@ test('budget re-entry: one-call invocations recover the same paid deep step with
 test('budget re-entry: only the immutable constructor policy opts in; a request policy cannot enable the default driver', async t => {
   const f = await stopped(t); increase(f);
   const request = { project: 'p', draftId: f.v.draft.id, maxTurns: 1, maxCalls: 2, producerPolicy: { discovery: 7 } };
-  const disabled = { discovery: 6 }, configured = new EarlyStageDriver(new ProductEngine(f.store), disabled);
+  const disabled = { discovery: 6 }, configured = new EarlyStageDriver(new ProductEngine(f.store), new BudgetReentry(disabled));
   disabled.discovery = 7;
   await inert(f, f.store, async () => {
     const plain = await new ProductEngine(f.store).earlyStages.run(request);
@@ -648,7 +650,7 @@ test('budget re-entry: only the immutable constructor policy opts in; a request 
     assert.equal(plain.budget.callsMade, 0);
     assert.equal((await configured.run(request)).budget.callsMade, 0);
   });
-  const enabled = { discovery: 7 }, admitted = new EarlyStageDriver(new ProductEngine(f.store), enabled);
+  const enabled = { discovery: 7 }, admitted = new EarlyStageDriver(new ProductEngine(f.store), new BudgetReentry(enabled));
   enabled.discovery = 6;
   const outcome = await admitted.run({ project: 'p', draftId: f.v.draft.id, maxTurns: 1, maxCalls: 2 });
   assert.equal(outcome.budget.turnsUsed, 1); assert.equal(outcome.budget.callsMade, 2);
@@ -713,10 +715,39 @@ test('budget re-entry: a second Store releasing the hold during preparation cann
 
 test('budget re-entry: the explicit constructor policy alone cannot start arbitrary v7 work', async t => {
   const f = await ready(t), paid = money(f.store), wire = f.wires();
-  const result = await new EarlyStageDriver(new ProductEngine(f.store), { discovery: 7 })
+  const handoff = JSON.parse(f.pending.value.error!).handoff;
+  const result = await new EarlyStageDriver(new ProductEngine(f.store), new BudgetReentry({ discovery: 7 }))
     .run({ project: 'p', draftId: f.v.draft.id, maxTurns: 5, maxCalls: 10 });
   assert.equal(result.budget.callsMade, 0); assert.equal(result.budget.turnsUsed, 0);
+  assert.deepEqual(result.reason?.handoff, handoff);
+  assert.equal(result.reason?.next, 'deep'); assert.equal(result.reason?.target, 'deep');
+  assert.equal(result.stageResult?.discovery?.state, 'researching');
+  const cold = await new EarlyStageDriver(new ProductEngine(f.open()))
+    .run({ project: 'p', draftId: f.v.draft.id, maxTurns: 5, maxCalls: 10 });
+  assert.deepEqual(cold.reason?.handoff, handoff);
+  assert.equal(cold.reason?.next, 'deep'); assert.equal(cold.reason?.target, 'deep');
+  assert.equal(cold.stageResult?.discovery?.state, 'researching');
+  assert.equal(cold.budget.callsMade, 0); assert.equal(cold.budget.turnsUsed, 0);
   assert.deepEqual(money(f.store), paid); assert.deepEqual(f.wires(), wire);
+
+  // A genuine negative partial dossier has no deep stop. The opt-in must leave
+  // this historical result alone rather than treating it as a budget re-entry.
+  const negative = bind(t, await build()); negative.configure({ none: true });
+  const partial = await negative.run(3);
+  assert.equal(partial.value.pauseCode, 'research_dossier_assessment_unavailable');
+  const saved = JSON.parse(partial.value.error!);
+  assert.equal(saved.stop, undefined);
+  const optIn = new BudgetReentry({ discovery: 7 });
+  await inert(negative, negative.store, async () => {
+    const currentDraft = negative.store.get<DiscoveryDraft>(negative.v.draft.id)!;
+    assert.equal(await optIn.eligible(negative.store, 'p', currentDraft, partial), false);
+    const restored = await new EarlyStageDriver(new ProductEngine(negative.store), optIn)
+      .run({ project: 'p', draftId: negative.v.draft.id, maxTurns: 5, maxCalls: 10 });
+    assert.deepEqual(restored.reason?.handoff, saved.handoff);
+    assert.deepEqual(restored.reason?.dossier, saved.dossier);
+    assert.equal(restored.reason?.completeness, 'partial');
+    assert.equal(restored.budget.callsMade, 0); assert.equal(restored.budget.turnsUsed, 0);
+  });
 });
 
 test('budget re-entry: control scope binds Store/project, snapshots the hold, rejects nesting and expires without leaking', async t => {
