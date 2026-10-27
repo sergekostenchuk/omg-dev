@@ -4,6 +4,7 @@ import { cpSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { storeUnchanged, storeRefused } from './store-unchanged.js';
+import { storeView } from '../src/storage/store-view.js';
 import { DatabaseSync } from 'node:sqlite';
 import { canonical, hashJson, type Json } from '../src/canonical.js';
 import { reference, type Ref } from '../src/pipeline/contracts.js';
@@ -276,7 +277,7 @@ function revise(f: Selected, store = f.store) {
 
 import { DOSSIER_ASSESSMENT_RESULT_CONTRACT, DOSSIER_QUALITY_DIMENSIONS,
   type DossierAssessmentPacket, type DossierAssessmentResult } from '../src/discovery/research-model.js';
-import type { Revision } from '../src/storage/store.js';
+import type { Revision, TransactionGuard, Write } from '../src/storage/store.js';
 function replyFor(packet: DossierAssessmentPacket, verdict: 'supported' | 'return' = 'supported'): DossierAssessmentResult {
   const bases = [{ record: packet.manifest.ref }];
   return { contract: DOSSIER_ASSESSMENT_RESULT_CONTRACT, subject: structuredClone(packet.subject), verdict,
@@ -329,12 +330,23 @@ console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,u
   return terminal;
 }
 function view(store:Store,write:(writes:any[],guards:any[],invoke:()=>any)=>any) {
-  const bound=new Map<PropertyKey,unknown>();
-  return new Proxy(store,{get(target,key){
-    if(key==='writeMany')return (writes:any[],guards:any[]=[])=>write(writes,guards,()=>target.writeMany(writes,guards));
-    if(!bound.has(key)){const value=Reflect.get(target,key);bound.set(key,typeof value==='function'?value.bind(target):value);}
-    return bound.get(key);
-  }});
+  return storeView(store,{write:(writes,guards)=>write(writes,guards,()=>store.writeMany(writes,guards))});
+}
+// The assessDossier path reads Store indices outside the narrow storeView surface, so the write-only view cannot
+// carry it. The cut intercepts only this connection's writeMany at the prototype — every read and every other
+// Store's commit keep the original method, and the tested call sees the real target.
+function interceptWrites(t:test.TestContext,target:Store,
+  action:(writes:any[],guards:any[],invoke:()=>Revision<unknown>[])=>Revision<unknown>[]) {
+  const original=Store.prototype.writeMany;
+  const method=t.mock.method(Store.prototype,'writeMany',function(this:Store,writes:Write[],guards:TransactionGuard[]=[]):Revision<unknown>[] {
+    let committed=false;
+    const commit=()=>{if(committed)throw new Error('write intercept allows one original commit');committed=true;return original.call(this,writes,guards);};
+    return (this===target?action(writes,guards,commit):commit()) as Revision<unknown>[];
+  });
+  let restored=false;
+  const restore=()=>{if(!restored){restored=true;method.mock.restore();}};
+  t.after(restore);
+  return restore;
 }
 function mask(store:Store,ref:Ref,value:unknown=null) {
   const get=store.get.bind(store),bound=new Map<PropertyKey,unknown>();
@@ -394,11 +406,13 @@ for(const model of [false,true])test('D6 publication: real '+(model?'model':'own
   const packet=await prepareDossierAssessmentSubject(f.store,'p',reference(produceSelectedDossier(f.store,'p',f.input).record));
   liveAdapter(f,packet,'supported',false);const pilot=wideDelivery(f);
   let cut=false;
-  const interrupted=view(f.store,(writes,_guards,invoke)=>{
+  const restore=interceptWrites(t,f.store,(writes,_guards,invoke)=>{
     const hit=!cut&&writes.some(write=>write.kind==='assessment-session'&&write.value.contract==='dossier-session/v1'&&write.value.result);
     const rows=invoke();if(hit){cut=true;throw new Error('terminal-cut');}return rows;
   });
-  await assert.rejects(()=>assessDossier(interrupted,'p',packet.subject,f.environment,pilot),/terminal-cut/);assert.ok(cut);
+  try{await assert.rejects(()=>assessDossier(f.store,'p',packet.subject,f.environment,pilot),/terminal-cut/);}
+  finally{restore();}
+  assert.ok(cut);
   assert.equal(f.store.list(DOSSIER_ASSESSMENT_KIND).length,0);
   const terminal=f.store.list<DossierAssessmentSession>('assessment-session').find(s=>s.value.contract==='dossier-session/v1'&&s.value.subject.identity===packet.subject.identity)!;
   assert.ok(terminal.value.result);
@@ -434,11 +448,13 @@ for(const model of [false,true])test('D6 publication: real '+(model?'model':'own
 test('D6 publication: nonempty partial, committed-publication cut and competing Stores have a free fixed point',async t=>{
   const f=await partial(t);liveAdapter(f,f.packet,'return',false);
   let cut=false;
-  const interrupted=view(f.store,(writes,_guards,invoke)=>{
+  const restore=interceptWrites(t,f.store,(writes,_guards,invoke)=>{
     const hit=!cut&&writes.some(write=>write.kind===DOSSIER_ASSESSMENT_KIND);
     const rows=invoke();if(hit){cut=true;throw new Error('publication-cut');}return rows;
   });
-  await assert.rejects(()=>assessDossier(interrupted,'p',f.packet.subject,f.environment),/publication-cut/);assert.ok(cut);
+  try{await assert.rejects(()=>assessDossier(f.store,'p',f.packet.subject,f.environment),/publication-cut/);}
+  finally{restore();}
+  assert.ok(cut);
   const published=f.store.list<PaidDossierAssessment>(DOSSIER_ASSESSMENT_KIND)[0]!;
   assert.equal(published.value.result.completeness,'partial');assert.equal(published.value.result.result.verdict,'return');
   assert.ok(published.value.result.packet.materials.length);assert.deepEqual(published.value.result.packet.manifest.value.reasons,f.packet.manifest.value.reasons);
