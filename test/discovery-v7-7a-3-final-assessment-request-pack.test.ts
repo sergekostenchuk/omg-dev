@@ -57,6 +57,7 @@ import { prepareDiscoveryFinalAssessmentTransport, checkDiscoveryFinalAssessment
 import { DISCOVERY_FINAL_ASSESSMENT_ENVELOPE, prepareDiscoveryFinalAssessmentEnvelope, requireDiscoveryFinalAssessmentEnvelope,
   stageDiscoveryFinalAssessmentEnvelope, type DiscoveryFinalAssessmentEnvelopeInput } from '../src/discovery/discovery-final-assessment-packing.js';
 import { readArchiveBody } from '../src/discovery/request-parts.js';
+import { storeRefused, storeUnchanged } from './store-unchanged.js';
 import { RESULT_CAPACITY_REFUSAL } from '../src/discovery/early-research-outcome.js';
 
 // DR7 7a.3 (codex-omg2 №15531): the complete request to the D7 assessor, its physical envelope through the common
@@ -205,12 +206,24 @@ const all = (store: Store) => {
     revisions: db.prepare('SELECT * FROM revisions ORDER BY entity_id,revision').all(), events:db.prepare('SELECT * FROM events ORDER BY sequence').all() } as never); }
   finally { db.close(); }
 };
-async function unchanged<T>(f: Paid, store: Store, action: () => Promise<T>, refuses = false): Promise<T | undefined> {
+/** The byte fixed point: the whole product history of the file before and after one awaited action — kept once per
+ * scenario class, beside the cheap stamp windows below. */
+async function fixedPoint<T>(f: Paid, store: Store, action: () => Promise<T>, refuses = false): Promise<T | undefined> {
   const before = all(store), calls = money(store), wires = f.wires();
   let result: T | undefined;
   if (refuses) await assert.rejects(action, error => error instanceof EngineError);
   else result = await action();
   assert.equal(all(store), before); assert.deepEqual(money(store), calls); assert.deepEqual(f.wires(), wires);
+  return result;
+}
+/** A no-write window on the genuine open Store through its change stamp (also proved after a refusal), with the
+ * model calls, the ledger and the wire compared as before. */
+async function unchanged<T>(f: Paid, store: Store, action: () => Promise<T>, refuses = false): Promise<T | undefined> {
+  const calls = money(store), wires = f.wires();
+  let result: T | undefined;
+  if (refuses) await storeRefused(store, action);
+  else result = await storeUnchanged(store, action);
+  assert.deepEqual(money(store), calls); assert.deepEqual(f.wires(), wires);
   return result;
 }
 async function setup(t: test.TestContext, model = false) {
@@ -424,7 +437,7 @@ function assessmentInput(f: Paid, packetChars = 24_000): DiscoveryFinalAssessmen
 const refusal = (code?: string) => (error: unknown) => error instanceof EngineError && (!code || error.code === code);
 /** Prepare the envelope once: only the archive and its parts are written, nothing is paid or sent; the archive keeps
  * the whole request, the wire carries the assessor role, the prompt, the schema and the result capacity. */
-async function prepared(f: Paid, packet: DiscoveryFinalAssessmentPacket, input = assessmentInput(f)) {
+async function prepared(f: Paid, packet: DiscoveryFinalAssessmentPacket, input = assessmentInput(f), full = false) {
   const before = f.store.lastEvent(), calls = money(f.store), wire = f.wires();
   const envelope = await prepareDiscoveryFinalAssessmentEnvelope(f.store, 'p', packet.subject, input);
   const events = f.store.eventsPage(before, f.store.lastEvent(), 1000);
@@ -447,7 +460,7 @@ async function prepared(f: Paid, packet: DiscoveryFinalAssessmentPacket, input =
   assert.deepEqual(original.subject, packet.subject); assert.deepEqual(original.schema, envelope.packet.schema);
   for (const key of ['paid', 'accepted', 'session', 'result']) assert.equal(Object.hasOwn(envelope, key), false);
   // A repeat writes nothing more and reads the same exact addresses.
-  assert.deepEqual(await unchanged(f, f.store, () => prepareDiscoveryFinalAssessmentEnvelope(f.store, 'p', packet.subject, input)), envelope);
+  assert.deepEqual(await (full ? fixedPoint : unchanged)(f, f.store, () => prepareDiscoveryFinalAssessmentEnvelope(f.store, 'p', packet.subject, input)), envelope);
   return { envelope, input, original, archive };
 }
 
@@ -459,7 +472,7 @@ test('7a.3 request owner: four lawful candidates prepare the whole request once 
     const { envelope } = await prepared(owner, packet);
     for (const verdict of ['supported', 'return'] as const) {
       const reply = answer(packet, verdict, [{ candidate: '/summary' }, { record: ownerFinal.subject.basis.response }]);
-      const checked = (await unchanged(owner, owner.store, () =>
+      const checked = (await (outcome === 'go' && verdict === 'supported' ? fixedPoint : unchanged)(owner, owner.store, () =>
         checkDiscoveryFinalAssessmentReply(owner.store, 'p', packet.subject, RESULT_LIMIT, envelope.capacity, reply)))!;
       assert.deepEqual(checked.projection, projectDiscoveryFinalAssessment({ packet, result: reply }), 'the one RESULT projector decides the reply');
       assert.deepEqual(checked.normalized, reply); assert.equal(checked.terminal, true); assert.ok(checked.measurement.fits);
@@ -475,7 +488,7 @@ test('7a.3 request model: a cold Store after late heads proves the same envelope
   const { envelope, input } = await prepared(model, packet), reply = answer(packet, 'supported');
   const kept = structuredClone(envelope);
   const cold = model.open();
-  await unchanged(model, cold, async () => {
+  await fixedPoint(model, cold, async () => {
     assert.deepEqual(await requireDiscoveryFinalAssessmentEnvelope(cold, 'p', packet.subject, input, envelope), envelope);
     assert.deepEqual(await prepareDiscoveryFinalAssessmentEnvelope(cold, 'p', packet.subject, input), envelope);
     const checked = await checkDiscoveryFinalAssessmentReply(cold, 'p', packet.subject, RESULT_LIMIT, envelope.capacity, reply);
@@ -490,7 +503,7 @@ test('7a.3 request model: a cold Store after late heads proves the same envelope
 test('7a.3 request partial: a large request is sent as positive addressed fragments with exact child pages of the whole archive', async () => {
   await partialWorld();
   const packet = await prepareDiscoveryFinalAssessmentSubject(negative.store, 'p', reference(partialD6), candidate(partialFinal.dossier.manifest.ref, 'no_go'));
-  const { envelope, original, archive } = await prepared(negative, packet, assessmentInput(negative, 24_000));
+  const { envelope, original, archive } = await prepared(negative, packet, assessmentInput(negative, 24_000), true);
   const whole = JSON.stringify(original).length;
   assert.ok(whole > 24_000, `the proven request (${whole}) exceeds the packet share`);
   assert.ok(Array.isArray(archive.value.parts) && archive.value.parts.length >= 1, 'the archive keeps its exact child parts');
@@ -512,7 +525,7 @@ test('7a.3 request bounds: the exact wire and the exact reply limit fit, one cha
   await partialWorld();
   const packet = await prepareDiscoveryFinalAssessmentSubject(negative.store, 'p', reference(partialD6), candidate(partialFinal.dossier.manifest.ref, 'go'));
   const input = { ...assessmentInput(negative), resultLimitChars: RESULT_LIMIT - 1 };
-  await unchanged(negative, negative.store, async () => {
+  await fixedPoint(negative, negative.store, async () => {
     const staged = await stageDiscoveryFinalAssessmentEnvelope(negative.store, 'p', packet.subject, input);
     assert.ok(staged.writes.some(write => write.kind === 'research-context'), 'a fresh archive is only staged');
     const length = staged.envelope.input.length;
@@ -594,7 +607,7 @@ test('7a.3 request refusals: foreign role or subject, missing or substituted arc
         refusal(), JSON.stringify(Object.keys(broken)));
   });
   const coldStore = negative.open();
-  for (const store of [negative.store, coldStore]) await unchanged(negative, store, async () => {
+  for (const store of [negative.store, coldStore]) await (store === coldStore ? fixedPoint : unchanged)(negative, store, async () => {
     // The transport's own archive and part, hot and cold; the shared D6 grounds once, on the hot Store (the subject
     // and RESULT files hold their other doors).
     const grounds = store === negative.store ? [partialFinal.subject.basis.brief.source, partialFinal.subject.basis.assessment,
@@ -630,7 +643,7 @@ test('7a.3 request rich: both sides of every contradiction, rejected and unasses
   assert.ok(dossier.unknowns.length);
   const relation = dossier.contradictions[0]!;
   const reply = answer(packet, 'return', [{ contradiction: relation.contradiction.id }, { claim: relation.sides[1].address }]);
-  const checked = await unchanged(owner, owner.store, () =>
+  const checked = await fixedPoint(owner, owner.store, () =>
     checkDiscoveryFinalAssessmentReply(owner.store, 'p', packet.subject, RESULT_LIMIT, envelope.capacity, reply));
   assert.deepEqual(checked!.normalized, reply);
 });
