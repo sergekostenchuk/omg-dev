@@ -402,9 +402,10 @@ export function researchCapacityProjection(saved: ResearchResultCapacity, store?
     'research_capacity_invalid', 'The result admission lost its archive');
   const actionMode = saved.actionMode;
   const { record, pointer, hash } = archive;
-  const projection = actionMode === 'final-result-preflight'
+  const finalArchive = actionMode === 'final-result-preflight' || actionMode === 'final-assessment-preflight';
+  const projection = finalArchive
     ? readFinalCapacityProjection(store, record, pointer) : readCapacityProjection(store, record, pointer);
-  if (actionMode === 'final-result-preflight') requireCondition(hashJson(projection) === hash,
+  if (finalArchive) requireCondition(hashJson(projection) === hash,
     'research_capacity_invalid', 'The final admission archive does not match its declared hash');
   return projection;
 }
@@ -436,6 +437,8 @@ export function researchResultFailure(saved: unknown, payload: unknown): EngineE
   const response = payload as Record<string, any> | null;
   const kind = capacity.actionMode === 'final-result-preflight'
     ? response?.contract === 'discovery-final-result/v1' ? 'discovery_final' : response?.action
+    : capacity.actionMode === 'final-assessment-preflight'
+    ? response?.contract === 'discovery-final-assessment-result/v1' ? 'discovery_final_assessment' : response?.action
     : capacity.actionMode === 'dossier-result-preflight'
     ? response?.contract === DOSSIER_ASSESSMENT_RESULT_CONTRACT && ['supported','return'].includes(response?.verdict)
       ? `dossier_${response!.verdict}` : response?.action

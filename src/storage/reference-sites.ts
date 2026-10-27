@@ -111,6 +111,9 @@ const finalSubjectRefs = (prefix: readonly PathPatternSegment[]): PathPattern[] 
     .map(key => [...prefix, 'basis', key]),
   ...['question', 'fact', 'acceptance', 'source'].map(key => [...prefix, 'basis', 'brief', key]),
 ];
+const finalAssessmentSubjectRefs = (prefix: readonly PathPatternSegment[]): PathPattern[] => [
+  [...prefix, 'candidate', 'dossier'], ...finalSubjectRefs([...prefix, 'subject']),
+];
 const contextData = (prefix: readonly PathPatternSegment[]): PathPattern[] => [
   ...contextBodyData(prefix), ...capacityData([...prefix, 'resultCapacity'])
 ];
@@ -345,6 +348,21 @@ const RECORD_REFERENCE_SEMANTICS: readonly RecordReferenceSemantics[] = [
     ["context", "contextWorkspace", INDEX, "record"]] },
   { kind: "discovery-final-paid-result", contract: "discovery-final-paid-result/v1", data: [], refs: [
     ["prepared"], ...finalSubjectRefs(["subject"]), ["session"], ["application"], ["call"], ["request"], ["response"]] },
+  // Final assessment binds a paid D7 source and the whole candidate, but
+  // conditional user payload and projected packet are data, not new anchors.
+  { kind: "discovery-final-assessment-execution", contract: "discovery-final-assessment-execution/v1", data: [], refs: [
+    ["source"], ["prepared"], ...finalAssessmentSubjectRefs(["subject"]), ["binding", "draft"], ["binding", "question"],
+    ["binding", "environment"], ["binding", "inputs", INDEX], ["profile"], ["previous"], ["result"],
+    ["workspace", "entries", INDEX, "result", "record"], ["workspace", "deliveryCoverage", INDEX, "record"]] },
+  { kind: "discovery-final-assessment-application", contract: "discovery-final-assessment-application/v1", data: [], refs: [
+    ["session"], ["profile"], ["guards", INDEX], ["call"], ["received"], ["after"],
+    ["context", "finalContinuation", "source"], ["context", "finalContinuation", "prepared"],
+    ["context", "finalContinuation", "execution"], ...finalAssessmentSubjectRefs(["context", "finalContinuation", "subject"]),
+    ["context", "resultCapacity", "mandatory", "archive", "record"], ["context", "contextWorkspace", INDEX, "record"]] },
+  { kind: "discovery-final-assessment-paid-result", contract: "discovery-final-assessment-paid-result/v1", data: [], refs: [
+    ["source"], ["prepared"], ...finalAssessmentSubjectRefs(["subject"]), ["session"], ["application"], ["call"], ["request"], ["response"]] },
+  { kind: "model-call", contract: null, data: [["finalContinuation", "subject", "candidate", "verdict", "conditions"]] },
+  { kind: "continuation-state", contract: null, data: [["finalContinuation", "subject", "candidate", "verdict", "conditions"]] },
   // DR6 6.1/6.2: the structural dossier snapshot declares its exact references only — the draft, the accepted frame
   // and plan answers, the grounds of each partial reason, every claim container of the axes, unknowns and
   // contradiction sides, the assessment of each side and the grounds of each resolution.

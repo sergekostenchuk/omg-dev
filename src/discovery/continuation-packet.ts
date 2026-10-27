@@ -607,10 +607,19 @@ export interface FinalContinuation {
   prepared: Ref;
   execution: Ref;
 }
-interface ContinuationState { finalContinuation?: FinalContinuation; dossier?: DossierContinuation; projectId: string; question: string; purpose: string; actor: string; activeCall: string; attempts: number; subject?: V7PlanSubject; assessmentKey?: string; variantSubject?: VariantSubject; draft?: Ref; questionRef?: Ref; deepPreparation?: Ref }
+/** The independent assessment has its own continuation namespace and binds
+ * both the prepared assessment and the exact paid final it evaluates. */
+export interface FinalAssessmentContinuation {
+  subject: import('./discovery-final-assessment-subject.js').DiscoveryFinalAssessmentSubject;
+  source: Ref;
+  prepared: Ref;
+  execution: Ref;
+}
+type FinalResearchContinuation = FinalContinuation | FinalAssessmentContinuation;
+interface ContinuationState { finalContinuation?: FinalResearchContinuation; dossier?: DossierContinuation; projectId: string; question: string; purpose: string; actor: string; activeCall: string; attempts: number; subject?: V7PlanSubject; assessmentKey?: string; variantSubject?: VariantSubject; draft?: Ref; questionRef?: Ref; deepPreparation?: Ref }
 export interface ContinuationPacketState {
   dossier?: DossierContinuation;
-  finalContinuation?: FinalContinuation;
+  finalContinuation?: FinalResearchContinuation;
   initial: boolean; state: Revision<ContinuationState> | null; id: string; priorCalls: number;
   basis: Ref | null; latest: Ref | null; callGuards: ReadGuard[]; attempts: number;
   projectId: string; question: Revision<Question>; draft: Revision<DiscoveryDraft>; purpose: string; actor: string; subject: V7PlanSubject | null; assessmentSubject: AssessmentTransportSubject | null; variantSubject?: VariantSubject | null; deepPreparation?: Ref | null;
@@ -622,8 +631,8 @@ export function continuationState(store: Store, projectId: string, draftId: stri
 export function continuationState(store: Store, projectId: string, draftId: string, questionId: string, purpose: string,
   actor: string, subject: V7PlanSubject | null, assessmentSubject: AssessmentTransportSubject | null,
   variantSubject: VariantSubject | null, deepPreparation?: Ref | null, dossier?: DossierContinuation,
-  finalContinuation?: FinalContinuation): ContinuationPacketState;
-export function continuationState(store: Store, projectId: string, draftId: string, questionId: string, purpose: string, actor: string, subject: V7PlanSubject | null = null, assessmentSubject: AssessmentTransportSubject | null = null, variantSubject: VariantSubject | null = null, deepPreparation: Ref | null = null, dossier?: DossierContinuation, finalContinuation?: FinalContinuation): ContinuationPacketState {
+  finalContinuation?: FinalResearchContinuation): ContinuationPacketState;
+export function continuationState(store: Store, projectId: string, draftId: string, questionId: string, purpose: string, actor: string, subject: V7PlanSubject | null = null, assessmentSubject: AssessmentTransportSubject | null = null, variantSubject: VariantSubject | null = null, deepPreparation: Ref | null = null, dossier?: DossierContinuation, finalContinuation?: FinalResearchContinuation): ContinuationPacketState {
   const draft=store.get<DiscoveryDraft>(draftId),question=store.get<Question>(questionId);
   requireCondition(draft?.kind==='discovery-draft' && question?.kind==='question' && draft.value.projectId===projectId
     && question.value.projectId===projectId && question.value.draftId===draftId && draft.value.questions.includes(questionId),
@@ -632,14 +641,18 @@ export function continuationState(store: Store, projectId: string, draftId: stri
   if (variantSubject) variantTransportGuards(projectId, draftId, variantSubject);
   const deep = deepTransportSubject(purpose, deepPreparation, subject, variantSubject, assessmentSubject);
   const assessmentKey = assessmentSubjectKey(assessmentSubject);
-  if (finalContinuation) requireCondition(purpose==='discovery-final' && !dossier && !subject && !assessmentSubject && !variantSubject && !deep
-    && finalContinuation.subject?.contract==='discovery-final-subject/v1' && finalContinuation.subject.projectId===projectId
+  if (finalContinuation) requireCondition(!dossier && !subject && !assessmentSubject && !variantSubject && !deep
+    && finalContinuation.subject?.projectId===projectId
     && isRef(finalContinuation.prepared) && isRef(finalContinuation.execution) && finalContinuation.execution.revision===1
-    && Object.keys(finalContinuation).sort().join(',')==='execution,prepared,subject',
+    && (purpose==='discovery-final' && finalContinuation.subject.contract==='discovery-final-subject/v1'
+      && Object.keys(finalContinuation).sort().join(',')==='execution,prepared,subject'
+      || purpose==='discovery-final-assessment' && finalContinuation.subject.contract==='discovery-final-assessment-subject/v1'
+      && 'source' in finalContinuation && isRef(finalContinuation.source)
+      && Object.keys(finalContinuation).sort().join(',')==='execution,prepared,source,subject'),
   'continuation_foreign','A final continuation needs its own exact immutable subject and origin');
-  requireCondition(purpose!=='discovery-final' || finalContinuation, 'continuation_foreign',
+  requireCondition(!['discovery-final', 'discovery-final-assessment'].includes(purpose) || finalContinuation, 'continuation_foreign',
     'A final call needs its own continuation identity');
-  const id=`continuation-state:${hashJson(finalContinuation ? ['discovery-final/v1',projectId,finalContinuation,actor] : dossier ? ['dossier/v1',projectId,dossier,actor] : variantSubject ? ['variant/v1',projectId,reference(draft),reference(question),variantSubject,purpose,actor] : assessmentSubject ? [projectId,assessmentSubject,purpose,actor] : subject ? (deep ? [projectId,subject,purpose,actor,'deep/v1',deep] : [projectId,subject,purpose,actor]) : [projectId,questionId,purpose,actor])}`;
+  const id=`continuation-state:${hashJson(finalContinuation ? [purpose === 'discovery-final' ? 'discovery-final/v1' : 'discovery-final-assessment/v1',projectId,finalContinuation,actor] : dossier ? ['dossier/v1',projectId,dossier,actor] : variantSubject ? ['variant/v1',projectId,reference(draft),reference(question),variantSubject,purpose,actor] : assessmentSubject ? [projectId,assessmentSubject,purpose,actor] : subject ? (deep ? [projectId,subject,purpose,actor,'deep/v1',deep] : [projectId,subject,purpose,actor]) : [projectId,questionId,purpose,actor])}`;
   const state=store.get<ContinuationState>(id);
   const calls=(deep ? deepIdentityCalls(store,deep,purpose,actor) : store.list<ModelCall>('model-call')).filter(c=>
     (!finalContinuation || c.value !== null && typeof c.value === 'object' && !Array.isArray(c.value)) && c.value.projectId===projectId
