@@ -1,6 +1,9 @@
-import test from 'node:test';
+import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
-import { writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { storeUnchanged } from './store-unchanged.js';
 import { DatabaseSync } from 'node:sqlite';
 import { canonical, hashJson, type Json } from '../src/canonical.js';
 import { reference, type Ref } from '../src/pipeline/contracts.js';
@@ -168,15 +171,46 @@ import { prepareResearchConsumerApplication, deepResearchApplication, readResear
 import type { Write, TransactionGuard } from '../src/storage/store.js';
 const all = (store: Store) => canonical(store.list().flatMap(row => store.history(row.id)));
 const end = { type: 'impossible', code: 'source_unavailable', evidence: [], text: 'No accessible source for this exact cell' };
-async function ready(t: test.TestContext, model = false) {
-  const f = await paid(t);
+/** The real paid line, the real owner or model choice, its scope and the deep preparation — built once per class by
+ * the producers themselves, in a root of its own that lives for the file. */
+async function readyIn(model: boolean) {
+  const f = await paid(lifetime);
   let scope: ReturnType<typeof publishVariantScope>['scope'];
   if (model) { const choice = await modelChoose(f); scope = publishVariantScope(f.store, 'p', reference(choice)).scope; }
   else scope = selected(f).published;
   const preparation = produceDeepPreparation(f.store, 'p', inputFor(f, scope)).record;
   f.reply({ action: 'answer', question: 'q-industry', value: end, citations: [] });
   const input = { projectId: 'p', deepPreparation: reference(preparation), environment: f.environment };
-  return { ...f, get store() { return interceptions.get(f.store) ?? f.store; }, scopeRecord: scope, preparation, input };
+  return { f, scope, preparation, input };
+}
+// Each test starts from its own exact copy of its class's world: the world's connection is closed, its files are
+// snapshotted once, and before every test they are restored in place (saved records name the root: workspace, adapter,
+// settings and wire) under a fresh Store of that test, closed when the test ends. Tests of a file run one after another.
+const WORLD_FILES = ['state.sqlite', 'state.sqlite-wal', 'state.sqlite-shm', 'reply.json', 'wire.ndjson'];
+const disposals: (() => void)[] = [];
+after(() => { for (const dispose of disposals.splice(0).reverse()) dispose(); });
+const lifetime = { after: (dispose: () => void) => { disposals.push(dispose); } } as unknown as test.TestContext;
+const worlds = new Map<boolean, { made: Awaited<ReturnType<typeof readyIn>>; snapshot: string }>();
+async function ready(t: test.TestContext, model = false) {
+  let world = worlds.get(model);
+  if (!world) {
+    const made = await readyIn(model);
+    made.f.store.close();
+    const snapshot = mkdtempSync(join(tmpdir(), 'omg-5-5-world-'));
+    disposals.push(() => rmSync(snapshot, { recursive: true, force: true }));
+    for (const file of WORLD_FILES) if (existsSync(join(made.f.root, file))) copyFileSync(join(made.f.root, file), join(snapshot, file));
+    world = { made, snapshot }; worlds.set(model, world);
+  }
+  const { made: { f: base, scope, preparation, input }, snapshot } = world;
+  for (const file of WORLD_FILES) {
+    rmSync(join(base.root, file), { force: true });
+    if (existsSync(join(snapshot, file))) copyFileSync(join(snapshot, file), join(base.root, file));
+  }
+  const own = new Store(base.path); t.after(() => own.close());
+  const f = { ...base, engine: new ProductEngine(own), discovery: new Discovery(own),
+    open: () => { const opened = new Store(base.path); t.after(() => opened.close()); return opened; } };
+  return { ...f, get store() { return interceptions.get(own) ?? own; }, scopeRecord: structuredClone(scope),
+    preparation: structuredClone(preparation), input: structuredClone(input) };
 }
 type Ready = Awaited<ReturnType<typeof ready>>;
 const interceptions = new WeakMap<Store, Store>();
@@ -711,18 +745,24 @@ test('5.345-01 a proven reject_all supersedes unpaid deep without inventing a sc
 
 test('5.345-01 current-choice proof refuses missing state, decision, grant, session, set and member', async t => {
   const f = await ready(t), old = prepareDeepResearch(f.store, linkedInput(f)), act = revisedChoice(f);
-  const before = all(f.store), account = money(f.store), sent = f.wires().length;
+  const account = money(f.store), sent = f.wires().length;
   const cold = new Store(f.store.path); t.after(() => cold.close());
   const missing = [
     { id: variantStateId('p', f.draft.id), headOnly: true },
     { id: act.decision.id }, { id: act.decision.value.authority.grant.id },
     { id: act.decision.value.authority.session.id }, { id: f.scopeRecord.value.set.id }, { id: f.scopeRecord.value.member.id },
   ];
-  for (const store of [f.store, cold]) for (const absent of missing) {
+  // The masked overlay changes the reads and stays one; the genuine Store under it proves no write by its change stamp
+  // around every window, and one full before/after pair of its whole history stands for each of the hot and cold Stores.
+  for (const store of [f.store, cold]) for (const [index, absent] of missing.entries()) {
     const view = storeView(store, { get: (id, revision) => id === absent.id && (!absent.headOnly || revision === undefined) ? null : undefined,
       write: () => { throw new Error('A read-only proof attempted a write'); } });
-    assert.throws(() => staleUnpaidDeepAdmission(view, old), EngineError, absent.id);
-    assert.throws(() => readCurrentVariantChoice(view, 'p', reference(f.v.draft)), EngineError, absent.id);
-    assert.equal(all(store), before); assert.deepEqual(money(store), account); assert.equal(f.wires().length, sent);
+    const before = index === 0 ? all(store) : null;
+    await storeUnchanged(store, () => {
+      assert.throws(() => staleUnpaidDeepAdmission(view, old), EngineError, absent.id);
+      assert.throws(() => readCurrentVariantChoice(view, 'p', reference(f.v.draft)), EngineError, absent.id);
+    });
+    if (before !== null) assert.equal(all(store), before);
+    assert.deepEqual(money(store), account); assert.equal(f.wires().length, sent);
   }
 });
