@@ -6,7 +6,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
-import { canonical, hashJson, type Json } from "../src/canonical.js";
+import { canonical, canonicalSorted, hashJson, type Json } from "../src/canonical.js";
 import { EngineError } from "../src/errors.js";
 import { UPSTREAM_STAGES, type UpstreamStage } from "../src/discovery/requirements.js";
 import type { Question } from "../src/discovery/discovery.js";
@@ -17,23 +17,33 @@ import { reference, type Ref } from "../src/pipeline/contracts.js";
 import { ProductEngine } from "../src/product/engine.js";
 import { Store, type Revision, type Write } from "../src/storage/store.js";
 import { type OmResult, type Refusal } from "../src/om/refusal.js";
-import { beginAttempt, completeAttempt, openSeries, prepareSeriesAdmission, readCompletionBinding, resumeSeries, seriesId, stopReviewNamespace, STOP_REVIEW_KIND,
-  type AttemptGoal, type RepairSeries, type MechanismAdmission } from "../src/om/series.js";
-import { closeAttempt, openAttempt, prepareManagedClaim, type OriginHold } from "../src/om/repeat-gate.js";
+import { beginAttempt, completeAttempt, completionWorkId, openSeries, prepareSeriesAdmission, readCompletionBinding, resumeSeries, seriesId, stopReviewNamespace, STOP_REVIEW_KIND,
+  type AnyRepairSeries, type AttemptGoal, type RepairSeries, type MechanismAdmission, type CompletionWork } from "../src/om/series.js";
+import { closeAttempt, openAttempt, prepareManagedClaim, readOriginHoldAt, readStopContext,
+  type MechanismOriginHold, type OriginHold } from "../src/om/repeat-gate.js";
 import { startRun } from "../src/om/run.js";
-import { recordRefusal, unitRefusalNamespace, UNIT_REFUSAL_KIND } from "../src/om/refusal-journal.js";
+import { journalId, readJournal, recordRefusal, unitRefusalNamespace, UNIT_REFUSAL_KIND,
+  type RefusalJournal, type UnitRefusalRecord } from "../src/om/refusal-journal.js";
 import { writeOmInput } from "../src/om/input.js";
 import { inputDecisionWrite, writeAddressing } from "../src/om/addressing.js";
 import { writeHorizon } from "../src/om/horizon.js";
-import { writeGaps, type GapReadRequest, type GapRequest } from "../src/om/gaps.js";
+import { writeGaps, type GapReadRequest, type GapRecord, type GapRequest } from "../src/om/gaps.js";
 import { writeRoutes, type RoutesRecord } from "../src/om/routes.js";
 import { prepareQuestionTasks, writeQuestionPacket, type QuestionPacketRequest } from "../src/om/question-packet.js";
-import { gapLineKey, gapLineExpectedResult, writeGapLines } from "../src/om/gap-lines.js";
+import { gapLineKey, gapLineExpectedResult, gapLinesId, writeGapLines, type GapLinesRecord } from "../src/om/gap-lines.js";
+import { writeWorksFrame } from "../src/om/works-frame.js";
+import { writeNeighbors } from "../src/om/neighbors.js";
+import { writeAtomicGate } from "../src/om/atomic-gate.js";
+import { settleCandidate } from "../src/om/frame-accept.js";
+import { resolveSnapshot } from "../src/om/impact.js";
+import type { LayerProposal, ProposalRequest } from "../src/om/frame-proposals.js";
+import type { FrameRequest } from "../src/om/frame-obligations.js";
 import { writeOmObligations, normalizeOwnerGapAssignment, OM_OWNER_ASSIGNMENT_CONTRACT, OM_OWNER_ASSIGNMENT_KIND } from "../src/om/obligations.js";
 import { mc1FieldSpec, writeMc1Question, writeAcceptedAnswer, type AnswerQuestionContract } from "../src/om/accepted-answer.js";
 import { confirmResults } from "../src/om/achievements.js";
 import { writeGuarded } from "../src/om/refs.js";
-import { runModelTransport, runModelCall, readModelTransport, readModelCallPhysical, type ModelTransportRequest, type ModelCallRequest } from "../src/om/model-call.js";
+import { runModelTransport, runModelCall, readModelTransport, readModelCallPhysical, readCompletionWorkAt, readManagedModelDiagnostic,
+  type ModelTransportRequest, type ModelCallRequest } from "../src/om/model-call.js";
 import { readAssessmentIntentAt, writeAssessmentIntent } from "../src/om/assessment.js";
 import { spendReport, readSpendReport, SPEND_PURPOSE_SET_V2, type SpendSnapshot } from "../src/om/spend-report.js";
 import { Environments } from "../src/runtime/environment.js";
@@ -47,7 +57,7 @@ import {
 } from "../src/om/call-record.js";
 import { gardenGraph, prepareNativeLayers } from "./om-fixture.js";
 import { managedBlock, managedUsage } from "./om-managed-block.js";
-import { defectedWork, regatedHold, runFixture } from "./om-run-fixture.js";
+import { defectedWork, project, regatedHold, runFixture } from "./om-run-fixture.js";
 import { preparedFeatures } from "./product-fixture.js";
 import { preparedField } from "./preparation-fixture.js";
 
@@ -75,47 +85,6 @@ function deeplyFrozen(value: unknown): boolean {
     || Object.isFrozen(value) && Object.values(value as Record<string, unknown>).every(deeplyFrozen);
 }
 
-interface Fixture {
-  readonly path: string;
-  readonly store: Store;
-  readonly series: Revision<RepairSeries>;
-  readonly adapter: Ref;
-  readonly config: Ref;
-  readonly goal: AttemptGoal;
-}
-
-function fixture(t: test.TestContext): Fixture {
-  const root = mkdtempSync(join(tmpdir(), "omg-om-spend-"));
-  const path = join(root, "state.sqlite");
-  const store = new Store(path);
-  t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
-  const adapter = reference(store.write({
-    id: `adapter:${PROJECT}`, kind: "dispatch-adapter", expected: 0,
-    value: { projectId: PROJECT, protocol: "codex-stdio", status: "configured-not-accepted" },
-  }));
-  const config = reference(store.write({
-    id: `config:${PROJECT}`, kind: "dispatch-config", expected: 0,
-    value: { projectId: PROJECT, model: "fixture", transport: "stdio", status: "configured-not-accepted" },
-  }));
-  deliveredOf(openSeries(store, {
-    project: PROJECT, block: BLOCK, line: 1, slice: "slice:cart@1", predecessor: null, basis: null,
-  }));
-  const goal: AttemptGoal = {
-    key: "gap:cart:price", questions: ["which operation owns the price?"], result: "an accepted price producer",
-  };
-  const series = deliveredOf(beginAttempt(store, { project: PROJECT, block: BLOCK, line: 1, attempt: 1, goal }));
-  return { path, store, series, adapter, config, goal };
-}
-
-function request(f: Fixture, call: string): RecordCallRequest {
-  return {
-    call, purpose: "model-research", basis: null, block: BLOCK,
-    gaps: [{ id: "gap:price", goal: "price contract", field: "contract", consumer: BLOCK }],
-    series: reference(f.series), attempt: 1, goal: f.goal,
-    dispatch: { adapter: f.adapter, config: f.config }, packet: { question: "who produces the price?" },
-  };
-}
-
 function rewriteLedger(f: { readonly store: Store }, value: unknown): Ref {
   const current = f.store.get(callLedgerId(PROJECT));
   return reference(f.store.write({
@@ -131,6 +100,16 @@ class ExactOnlyStore extends Store {
   }
   override list<T = Json>(_kind?: string): Revision<T>[] {
     assert.fail("historical read enumerated current records");
+  }
+}
+
+/** The same exact-read store with a write guard: a lawful historical read changes nothing. */
+class FrozenExactStore extends ExactOnlyStore {
+  override write<T = Json>(input: Write): Revision<T> {
+    assert.fail(`a lawful historical read must not write ${input.id}`);
+  }
+  override writeMany<T = Json>(inputs: Write[]): Revision<T>[] {
+    assert.fail(`a lawful historical read must not write ${inputs.map(input => input.id).join(", ")}`);
   }
 }
 
@@ -448,79 +427,265 @@ test("E6 ledger: invalid reader arguments and undeclared historical contexts are
   refusedWith(readCallLedgerAt(f.store, PROJECT, ref, [unused]), "ledger_invalid");
 });
 
-function mechanismOriginFixture(t: test.TestContext) {
-  const f = fixture(t), engine = new ProductEngine(f.store);
-  const owner = { kind: "mechanism", mechanism: "M5:addressing" } as const;
-  const { level: _level, ...l1 } = projectGraph(gardenGraph("cross", PROJECT), 1);
-  preparedFeatures(engine, PROJECT, l1 as Graph, field => {
-    const value = preparedField(PROJECT, field);
-    if (field === "preparation") (value as Record<string, Json>).unknowns = [{
-      id: "encoding", question: "Which output encoding is supported?", consumer: `${PROJECT}-consume-block`,
-      moment: "om-pass", blocksCurrentStage: false, resolution: "Address this question before research",
-    }];
-    return value;
-  });
-  const stages = Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(f.store.get(`stage:${PROJECT}:${stage}`)!)])) as Record<UpstreamStage, Ref>;
-  const input = deliveredOf(writeOmInput(f.store, { project: PROJECT, expected: 0, stages }));
-  const graph = reference(f.store.get(`graph:${PROJECT}`)!);
-  const horizon = deliveredOf(writeHorizon(f.store, { project: PROJECT, input: reference(input), graph, refinement: null, available: {},
-    choice: { choiceVersion: "spend-origin", features: [{ outcome: `${PROJECT}-result` }], excluded: [] } }));
-  const sources: GapRequest = { project: PROJECT, input: reference(input), graph, horizon: reference(horizon.gate),
-    operations: { proposals: [], frame: { project: PROJECT, level: 2, graph, horizon: reference(horizon.gate), layer: null, frame: null, upper: null } },
-    works: { state: "upper-not-accepted", layer: reference(f.store.get(`graph-layer:${PROJECT}:2`)!) } };
-  const gaps = deliveredOf(writeGaps(f.store, sources));
-  const scope = { sources: structuredClone(gaps.sources) as GapRequest, records: gaps.records.map(reference) };
-  const routes = deliveredOf(writeRoutes(f.store, { project: PROJECT, gaps: scope, tasks: [], catalog: { paths: [], records: [] }, previous: null }));
-  const batch = routes.value.batches.find(item => item.task === "input-field"
-    && item.items.some(member => member.target === "discovery:encoding") && item.items.every(member => member.consumers.length === 0));
-  assert.ok(batch);
-  const admission: MechanismAdmission = { gaps: scope, routes: reference(routes), batch: batch.id };
-  const address = { project: PROJECT, owner, line: 1 };
-  deliveredOf(openSeries(f.store, { ...address, scope, predecessor: null, basis: null }));
-  const goal = { key: "address-encoding", ...deliveredOf(prepareSeriesAdmission(f.store, address, admission)).goal };
-  const running = deliveredOf(beginAttempt(f.store, { ...address, attempt: 1, goal, admission }));
-  function appendRefusal(suffix: string) {
-    const source = f.store.write({ id: `${unitRefusalNamespace(PROJECT)}spend-${suffix}`, kind: UNIT_REFUSAL_KIND, expected: 0,
-      value: { gate: "G3", refusals: [{ code: `graph_invalid:${suffix}`, goal: goal.key,
-        remedy: "identify the producer or the defective derivation",
-        origin: { name: "artifact_missing", stage: "layer-check", subject: "artifact:cart", sources: [] } }] } });
-    return deliveredOf(recordRefusal(f.store, { project: PROJECT, source: reference(source) }));
+/** The one M5 mechanism address of the run fixture's project. */
+const M5 = { project, owner: { kind: "mechanism", mechanism: "M5:addressing" } as const, line: 1 };
+/* The mechanism-origin world, built on the fixture's real accepted state — "encoding" stays unaddressed, the
+ * level-2 and level-3 frames stand accepted, and the repository is real — by the engine's own writers, nothing
+ * hand-made. A works proposal that declares its nodes removed while keeping only read access to their code is
+ * carried as a real candidate to the true G5: settleCandidate writes the actual diagnostic and journals its rows,
+ * and because the accepted base and the rejected proposal both hold the work the finding names, no row of the
+ * origin table places it — the weighing stands unknown. The mechanism's managed lifecycle then runs on the derived
+ * routes — owner series, the prepared admission, the issued packet, the paid call ending in the real
+ * cannot_answer — and its explicit G7 close claims the unplaced row: the gate's own weighing raises THIS attempt's
+ * hold on it. The later journal head is another settled rejection of the same kind — a real producer's newer
+ * revision, after the analysis already settled on the older one. The paid preparation is accounted by the ledger
+ * itself, never derived from the report under test. */
+async function mechanismOriginFixture(t: test.TestContext) {
+  const { owner, project } = M5;
+  const f = runFixture(t, ["encoding"], "executed"), store = f.store, request = f.request();
+  const input = reference(store.get(`om-input:${project}`)!);
+  const graph = reference(store.get(`graph:${project}`)!);
+  const environment = reference(store.get(`environment:${project}`)!);
+  const layer2 = reference(store.get(`graph-layer:${project}:2`)!), layer3 = reference(store.get(`graph-layer:${project}:3`)!);
+  const frame2 = reference(store.get(`om-frame:${project}:2`)!), frame3 = reference(store.get(`om-frame:${project}:3`)!);
+  const horizon = deliveredOf(writeHorizon(store, { project, input, graph, refinement: layer2, available: {},
+    choice: { choiceVersion: "spend-origin", features: [{ outcome: `${project}-result` }], excluded: [] } }));
+  const h = reference(horizon.gate);
+  // The accepted-world frame requests — the same shape the door itself derives after the level-3 acceptance.
+  const worksFrame = (): FrameRequest => ({ project, level: 3, graph, horizon: h, layer: layer3, frame: frame3,
+    upper: { horizon: h, frame: frame2 }, workZoneContract: "accepted-l2-v1" });
+  const operationsFrame = (): FrameRequest => ({ project, level: 2, graph, horizon: h, layer: layer2, frame: frame2, upper: null });
+  const scopeOf = (works: ProposalRequest): GapRequest =>
+    ({ project, input, graph, horizon: h, operations: { frame: operationsFrame(), proposals: [] }, works });
+  const accepted3 = store.list<LayerProposal>("layer-proposal").filter(record => record.value.level === 3).at(-1)!;
+  assert.ok(accepted3, "the executed world keeps its accepted level-3 proposal");
+
+  // A real failed works cycle on the accepted base: the defected proposal meets the true G5, and settleCandidate
+  // writes the actual diagnostic and journals its rows — the base and the rejected proposal both hold the work the
+  // finding names, so no rule of the origin table places it: claimed, the row weighs unknown.
+  const failCandidate = (suffix: string) => {
+    const defected = structuredClone(accepted3.value);
+    defected.base = { graph, frame: frame3 };
+    defected.status = "proposed";
+    delete defected.verdict;
+    for (const node of defected.nodes) if (node.code) node.code = node.code.map(item => ({ ...item, access: "read" }));
+    for (const fill of defected.fills) if (fill.codeRef) fill.codeRef = { ...fill.codeRef, access: "read" };
+    // The accepted frame's slots are occupied: every re-stated fill is an explicit replacement of the accepted
+    // endpoint it succeeds, and the proposal says the works it redefines are removed — the defected copy is real.
+    defected.replaces = defected.fills.map(fill => ({ obligation: fill.obligation,
+      base: { node: fill.node, graph }, with: { node: fill.node, port: fill.port ?? null },
+      basis: "spend-origin: the re-issued work carries read-only write scope" }));
+    defected.removes = [...new Set([...defected.removes, ...defected.nodes.map(node => node.id)])];
+    const proposal = reference(store.write({ id: `om-proposal:${project}:${suffix}`,
+      kind: "layer-proposal", expected: 0, value: defected }));
+    const works = { frame: worksFrame(), proposals: [proposal] };
+    const derived = deliveredOf(writeGaps(store, scopeOf(works)));
+    const read = { sources: structuredClone(derived.sources) as GapRequest, records: canonicalSorted(derived.records.map(reference)) };
+    const previous = store.get<GapLinesRecord>(gapLinesId(project));
+    const lines = deliveredOf(writeGapLines(store, { project, previous: previous ? reference(previous) : null,
+      pass: (previous?.value.request.pass ?? 0) + 1, gaps: read, closures: [] }));
+    const handoff = deliveredOf(writeOmObligations(store, { project, gaps: read, lines: reference(lines), assignments: [] }));
+    const candidate = deliveredOf(writeWorksFrame(store, { ...works, works: { contract: "works-frame/v1",
+      producer: reference(handoff.producer), ledger: reference(handoff.record), bindings: [] } }));
+    assert.equal(candidate.state, "candidate");
+    const neighbors = deliveredOf(writeNeighbors(store, { project, candidate: reference(candidate.record) }));
+    const gate = deliveredOf(writeAtomicGate(store, { project, candidate: reference(candidate.record),
+      neighbors: reference(neighbors), environment, gaps: read, results: [], sources: [],
+      snapshot: resolveSnapshot(join(f.root, "repo")) }));
+    assert.ok(!gate.value.result.passed, "the defected proposal meets a real G5 refusal");
+    const journalBefore = new Set((store.get<RefusalJournal>(journalId(project))?.value.rows ?? []).map(row => row.id));
+    const settled = deliveredOf(settleCandidate(store, { project, level: 3, candidate: reference(candidate.record),
+      outcome: { ...gate.value.result, codes: [...gate.value.result.codes], basis: reference(gate) } }));
+    assert.equal(settled.state, "rejected");
+    // Exactly this candidate's rows: the delta its settlement journaled, not every G5 row the journal holds.
+    const rows = deliveredOf(readJournal(store, { project })).value.rows
+      .filter(row => row.gate === "G5" && !journalBefore.has(row.id));
+    assert.ok(rows.length >= 1, "the refused candidate's own diagnostic journals its own G5 rows");
+    return rows;
+  };
+
+  const g5rows = failCandidate("defected");
+  for (const row of g5rows) {
+    const source = store.get<UnitRefusalRecord>(row.source.id, row.source.revision);
+    assert.ok(source && source.value.gate === "G5", "each candidate row links its own exact G5 refusal record");
   }
-  const journal = appendRefusal("held"), row = journal.value.rows[journal.value.rows.length - 1]!;
-  const closed = deliveredOf(closeAttempt(f.store, { ...address, attempt: 1,
-    outcome: { reason: "refused", accepting: [], cancelling: [], refusals: [{ row: row.id, name: row.code, goal: row.goal }] } }));
-  assert.equal(closed.holds.length, 1);
-  const hold = closed.holds[0]!, series = f.store.get(running.id)!;
+
+  // The mechanism's managed lifecycle on the derived routes — owner series line 1, the prepared admission, the
+  // issued packet and the paid call whose real cannot_answer completes its work as refused.
+  const derived = deliveredOf(writeGaps(store, scopeOf({ frame: worksFrame(), proposals: [] })));
+  const scope = { sources: structuredClone(derived.sources) as GapRequest, records: canonicalSorted(derived.records.map(reference)) };
+  const routes4 = deliveredOf(writeRoutes(store, { project, gaps: scope, tasks: [], catalog: { paths: [], records: [] }, previous: null }));
+  const batch4 = routes4.value.batches.find(batch => batch.model === "MC2" && batch.task === "input-field"
+    && batch.items.every(item => item.consumers.length === 0))!;
+  assert.ok(batch4, "the open encoding question is routed to the mechanism on the current routes");
+  const ownerAddress = { project, owner, line: 1 };
+  const admission: MechanismAdmission = { gaps: { sources: structuredClone(scope.sources) as GapRequest,
+    records: [...scope.records] }, routes: reference(routes4), batch: batch4.id };
+  deliveredOf(openSeries(store, { ...ownerAddress, scope: admission.gaps, predecessor: null, basis: null }));
+  const proof = deliveredOf(prepareSeriesAdmission(store, ownerAddress, admission));
+  const goal: AttemptGoal = { key: "address-missing-fields", ...proof.goal };
+  const series = deliveredOf(openAttempt(store, { ...ownerAddress, attempt: 1, goal, admission,
+    completion: { routes: reference(routes4), batches: [batch4.id] } })) as Revision<AnyRepairSeries>;
+  const binding = deliveredOf(readCompletionBinding(store, project, reference(series), 1));
+  assert.ok(binding, "the managed opening binds its own exact completion owner");
+  assert.deepEqual(binding.value.series, reference(series));
+  assert.equal(binding.value.attempt, 1);
+  assert.deepEqual(binding.value.owner, owner);
+  assert.deepEqual(binding.value.goal, goal);
+  assert.deepEqual(binding.value.plan, { routes: reference(routes4), batches: [batch4.id] });
+  const packet = deliveredOf(writeQuestionPacket(store, { project, routes: reference(routes4), batch: batch4.id,
+    environment, attempt: { series: reference(series), ordinal: 1 }, previous: [] })).record;
+  assert.equal(packet.value.state, "ready", "E2 issues the ready packet of this exact attempt");
+  assert.equal(packet.value.request.batch, batch4.id);
+  assert.deepEqual(packet.value.request.routes, reference(routes4), "the packet names the full exact routes reference");
+  assert.deepEqual(packet.value.request.attempt?.series, reference(series), "the packet names the full exact series reference");
+  assert.equal(packet.value.request.attempt?.ordinal, 1);
+  const inputHead = reference(store.get(`om-input:${project}`)!);
+  f.push({ research: { protocol: "$answerProtocol", requestId: "$requestId", action: "cannot_answer",
+    questionIds: batch4.items.map(item => item.gap),
+    reason: "The delivered material does not answer the encoding question" }, usage: actualUsage });
+  const e4 = deliveredOf(await runModelCall(store, { project, packet: reference(packet),
+    dispatch: request.dispatch, role: "implementer" }));
+  assert.equal(e4.outcome?.kind, "no-result", "the paid E4 ends refused through the real answer form");
+  assert.deepEqual(e4.packet, reference(packet), "the paid E4 is the exchange of this exact packet");
+  assert.ok(e4.call, "the paid E4 keeps its own call record");
+  assert.equal(e4.record.value.om.application, "applied", "the paid E4 exchange is applied to its exact call record");
+  assert.deepEqual(e4.record.value.om.call, e4.call, "the call record names its own full call reference");
+  assert.ok(e4.record.value.om.exchange, "the applied call keeps its exact exchange record");
+  assert.deepEqual(e4.record.value.om.request.packet, reference(packet), "the call request names the full exact packet");
+  const physical = deliveredOf(readModelCallPhysical(store, { project, record: reference(e4.record) }));
+  assert.deepEqual(physical.call, e4.call, "the physical exchange names the same full call reference");
+  assert.deepEqual(physical.packet, reference(packet), "the physical exchange names the same full packet reference");
+  assert.ok(physical.transport, "the applied E4 keeps its transport exchange");
+  assert.deepEqual(e4.record.value.usage, actualUsage, "the paid preparatory call carries its measured usage");
+  assert.ok(e4.diagnostic, "the refused E4 keeps its own diagnostic");
+  const e4diagnostic = store.get<UnitRefusalRecord>(e4.diagnostic.id, e4.diagnostic.revision)!;
+  assert.equal(e4diagnostic.value.gate, "E4", "the saved diagnostic is the E4's own unit refusal");
+  const e4proof = deliveredOf(readManagedModelDiagnostic(store, binding, e4.diagnostic!));
+  assert.equal(e4proof.reason, "refused", "the E4 diagnostic's own derived reason is refused");
+  const e4origin = e4diagnostic.value.refusals[0]!.origin;
+  const e4packetSource = e4origin.sources.find(source => source.role === "packet")!;
+  const e4callSource = e4origin.sources.find(source => source.role === "call")!;
+  assert.deepEqual(e4packetSource.ref, reference(packet), "the E4 diagnostic names the full exact packet reference");
+  assert.deepEqual(e4callSource.ref, e4.call, "the E4 diagnostic names the full exact call reference");
+  assert.deepEqual(reference(store.get(`om-input:${project}`)!), inputHead,
+    "the paid refused E4 leaves the admitted input untouched");
+
+  // The paid E4's own saved diagnostic is journalled too — a second real refusal row of this project's own journal.
+  deliveredOf(recordRefusal(store, { project, source: e4.diagnostic! }));
+  const rows = deliveredOf(readJournal(store, { project })).value.rows.filter(item => item.source.id === e4.diagnostic!.id);
+  assert.ok(rows.length >= 1, "the refused paid E4 journals its diagnostic as rows");
+
+  // The mechanism attempt's explicit G7 claims its own paid row and the unplaced works row: the gate's own weighing
+  // raises this attempt's hold on it, and the origin analysis is recorded and settled on that exact journal head.
+  const claim = deliveredOf(prepareManagedClaim(store, { ...ownerAddress, attempt: 1,
+    outcome: { reason: "refused", accepting: [], cancelling: [],
+      refusals: [...rows.slice(0, 1), ...g5rows].map(item => ({ row: item.id, name: item.code, goal: item.goal })) } }));
+  assert.equal(claim.outcome.reason, "refused", "the gate derives the refused reason from the weighed rows");
+  const claimedRows = new Set(claim.outcome.refusals.map(item => item.row));
+  for (const row of [...rows, ...g5rows])
+    assert.ok(claimedRows.has(row.id), "the managed claim keeps every required E4 and candidate row");
+  // The same M5 series is re-read at its own head immediately before the close: its own attempt 1 is still open.
+  const preCloseHead = store.get<AnyRepairSeries>(series.id)!;
+  assert.equal(preCloseHead.value.attempts.length, 1, "the own series holds only this exact attempt");
+  assert.equal(preCloseHead.value.attempts[0]!.ordinal, 1);
+  assert.equal(preCloseHead.value.attempts[0]!.outcome, null, "attempt 1 stays open on its own series until the G7 close");
+  // Before the close the factual work record already reads the complete composition of the own paid batch.
+  const workHead = store.get<CompletionWork>(completionWorkId(project, binding.id))!;
+  const composition = deliveredOf(readCompletionWorkAt(store, project, reference(workHead)));
+  assert.equal(composition.complete, true, "the own paid batch is complete in the factual work composition before G7");
+  const closed = deliveredOf(closeAttempt(store, { ...ownerAddress, attempt: 1, outcome: claim.outcome }));
+  assert.equal(closed.attempt, 1, "the explicit G7 completes this exact attempt");
+  // The gate's own routing of the claimed rows: each own G5 row weighs unknown by the origin table itself,
+  // and the refused paid E4 is a proposal row — a source of the stop, never a substitute for the unknown one.
+  for (const row of g5rows) {
+    const routed = closed.routed.find(item => item.row === row.id);
+    assert.ok(routed, "G7 itself routes the own candidate row");
+    assert.equal(routed!.class, "unknown", "the own G5 row weighs unknown by the gate's own table");
+  }
+  const e4routed = closed.routed.find(item => item.row === rows[0]!.id);
+  assert.equal(e4routed?.class, "proposal", "the refused paid E4 is a proposal row, not a substitute for unknown");
+  // The closure is proved by the completion reader on the factual post-close work record, not by a flag.
+  const closedWorkHead = store.get<CompletionWork>(completionWorkId(project, binding.id))!;
+  assert.ok(closedWorkHead.value.closed, "the factual work record carries its own close");
+  const closedComposition = deliveredOf(readCompletionWorkAt(store, project, reference(closedWorkHead)));
+  assert.ok(closedComposition.work.value.closed, "the completion reader returns the closed registry");
+  assert.equal(closedComposition.complete, true, "the closed registry still holds the complete own composition");
+  // The hold is this series' fact for its own unplaced row — the candidate's row, not any row the journal holds.
+  const head = reference(store.get<RefusalJournal>(journalId(project))!);
+  const held = closed.holds.map(item => deliveredOf(readOriginHoldAt(store, project, item, head)));
+  const own = held.filter(item => g5rows.some(row => row.id === item.value.row));
+  assert.ok(own.length >= 1, "the unplaced candidate row stands as this attempt's hold");
+  const heldRecord = own[0]!, hold = reference(heldRecord);
+  assert.equal(heldRecord.value.attempt, 1);
+  const seriesAtHold = reference(store.get<AnyRepairSeries>(series.id)!);
+  assert.deepEqual(heldRecord.value.series, seriesAtHold, "the hold names the full exact M5 series revision that recorded its refusal");
+  assert.deepEqual((heldRecord.value as MechanismOriginHold).owner, owner);
+  assert.equal(heldRecord.value.lift, null, "the hold stands while its origin is not established");
+  const context = deliveredOf(readStopContext(store, { project, owner, line: 1 })).context;
+  const contextHold = context.holds.find(item => item.hold.id === hold.id)!;
+  assert.ok(contextHold, "the standing-hold context names the same hold");
+  assert.equal(contextHold.attempt, 1);
+  const heldRow = g5rows.find(row => row.id === heldRecord.value.row)!;
+  assert.deepEqual(contextHold.origin, heldRow.origin, "the hold's context carries the row's own weighed origin");
+  const obstacle = context.repeated.find(item => item.row === heldRow.id);
+  assert.ok(obstacle, "the stop context counts the own row among this series' obstacles");
+  assert.equal(obstacle!.class, "unknown", "the context's own weighing of the own row is unknown");
+  assert.equal(obstacle!.times, 1, "the tally counts exactly this one attempt running into the row");
+  const closedSeries = reference(store.get<AnyRepairSeries>(series.id)!);
   const analysisGoal = { key: "analyse-encoding-origin", questions: ["What caused this unanswered encoding question?"],
     result: "A checked origin for the saved refusal" };
   const analysis: MechanismRecordCallRequest = {
     call: "mechanism-origin", purpose: "origin-analysis", basis: { kind: "origin-hold", hold }, owner, admission,
     gaps: [{ id: hold.id, goal: analysisGoal.key, field: "origin", consumer: owner }],
-    series: reference(series), attempt: 1, goal: analysisGoal,
-    dispatch: { adapter: f.adapter, config: f.config }, packet: { question: "What caused this saved refusal?" },
+    series: closedSeries, attempt: 1, goal: analysisGoal,
+    dispatch: request.dispatch, packet: { question: "What caused this saved refusal?" },
   };
-  const recorded = deliveredOf(recordCall(f.store, PROJECT, analysis));
-  const settled = deliveredOf(settleCall(f.store, reference(recorded.call), actualUsage, "succeeded"));
-  return { ...f, recorded, settled, journal: reference(f.store.get(journal.id)!), appendRefusal, gaps, gapScope: scope };
+  const recorded = deliveredOf(recordCall(store, project, analysis));
+  const settled = deliveredOf(settleCall(store, reference(recorded.call), actualUsage, "succeeded"));
+  const journal = reference(store.get<RefusalJournal>(journalId(project))!);
+  const gapRecords = { records: admission.gaps.records.map(ref => store.get<GapRecord>(ref.id, ref.revision)!) };
+  // The later journal head is a real producer's too: another defected proposal on the same accepted base meets the
+  // true G5 and its settled rejection journals its own rows — a new revision of the same real journal, reached
+  // after the analysis was already settled on the older head.
+  async function laterJournal() {
+    failCandidate("defected-again");
+    return reference(store.get<RefusalJournal>(journalId(project))!);
+  }
+  return { get store() { return store; }, path: f.database, recorded, settled, journal, laterJournal, hold, e4,
+    series: closedSeries, admission, goal: analysisGoal, dispatch: request.dispatch, gaps: gapRecords,
+    gapScope: { sources: structuredClone(admission.gaps.sources) as GapRequest, records: [...admission.gaps.records] } };
 }
 
-test("E6 ledger: mechanism origin analysis reads its exact journal after later journal heads and restart", t => {
-  const f = mechanismOriginFixture(t);
+test("E6 ledger: mechanism origin analysis reads its exact journal after later journal heads and restart", async t => {
+  const f = await mechanismOriginFixture(t);
+  // The paid preparatory call and its expense — the refused E4 exchange of the managed attempt.
+  assert.equal(f.e4.outcome?.kind, "no-result");
+  assert.deepEqual(f.e4.record.value.usage, actualUsage, "the preparatory E4 call is paid at its measured usage");
+  assert.ok(f.e4.call && f.e4.diagnostic);
+  // Both exact revisions of the origin analysis exist — the recorded opening and the settled head.
+  assert.ok(f.settled.call.revision > f.recorded.call.revision, "the settled call is a later revision of the recorded one");
   const currentHistory = [{ call: reference(f.settled.call), journal: f.journal }];
-  assert.deepEqual(deliveredOf(readCallLedger(f.store, PROJECT, currentHistory)), f.settled.ledger);
-  const laterJournal = f.appendRefusal("later");
+  assert.deepEqual(deliveredOf(readCallLedger(f.store, M5.project, currentHistory)), f.settled.ledger);
+  const laterJournal = await f.laterJournal();
   assert.ok(laterJournal.revision > f.journal.revision);
   f.store.close();
-  const reopened = new ExactOnlyStore(f.path);
+  const reopened = new FrozenExactStore(f.path);
   try {
     const admissionHistory = [{ call: reference(f.recorded.call), journal: f.journal }];
-    assert.deepEqual(deliveredOf(readCallLedgerAt(reopened, PROJECT, reference(f.recorded.ledger), admissionHistory)), f.recorded.ledger);
-    assert.deepEqual(deliveredOf(readCallLedgerAt(reopened, PROJECT, reference(f.settled.ledger), currentHistory)), f.settled.ledger);
-    refusedWith(readCallLedgerAt(reopened, PROJECT, reference(f.recorded.ledger)), "ledger_invalid");
+    assert.deepEqual(deliveredOf(readCallLedgerAt(reopened, M5.project, reference(f.recorded.ledger), admissionHistory)), f.recorded.ledger);
+    assert.deepEqual(deliveredOf(readCallLedgerAt(reopened, M5.project, reference(f.settled.ledger), currentHistory)), f.settled.ledger);
+    // A lawful historical read writes nothing and a repeat reads the same ledgers.
+    assert.deepEqual(deliveredOf(readCallLedgerAt(reopened, M5.project, reference(f.settled.ledger), currentHistory)), f.settled.ledger);
+    assert.deepEqual(reopened.get(f.recorded.call.id, f.recorded.call.revision)!.value, f.recorded.call.value,
+      "the recorded revision of the origin analysis is read exactly");
+    assert.deepEqual(reopened.get(f.settled.call.id, f.settled.call.revision)!.value, f.settled.call.value,
+      "the settled revision of the origin analysis is read exactly");
+    refusedWith(readCallLedgerAt(reopened, M5.project, reference(f.recorded.ledger)), "ledger_invalid");
     for (const journal of [
       { ...f.journal, hash: "0".repeat(64) }, { ...f.journal, revision: 50 }, { ...f.journal, id: "om-refusal-journal:other" },
     ]) {
-      refusedWith(readCallLedgerAt(reopened, PROJECT, reference(f.recorded.ledger), [{ call: reference(f.recorded.call), journal }]),
+      refusedWith(readCallLedgerAt(reopened, M5.project, reference(f.recorded.ledger), [{ call: reference(f.recorded.call), journal }]),
         ["ledger_invalid", "call_record_invalid"]);
     }
   } finally { reopened.close(); }
@@ -732,20 +897,25 @@ test("E6 report: a valid D1 set unrelated to the call is refused instead of prod
   assert.equal(refusal.at.field, "gaps");
 });
 
-test("E6 report: a named missing or incorrect D1 source is a refusal rather than unknown significance", { todo: "NR1 №3646: согласованная перезапись цепочки до новейшей записи — om-fsck её не видит; решение позже" }, t => {
-  const f = mechanismOriginFixture(t);
-  const selected = f.gaps.records.find(record => record.value.gap.code === "obligation_open" && record.value.gap.consumers.length > 0)!;
+test("E6 report: a named missing or incorrect D1 source is a refusal rather than unknown significance", { todo: "NR1 №3646: согласованная перезапись цепочки до новейшей записи — om-fsck её не видит; решение позже" }, async t => {
+  // The carrier is the block-level call the question belongs to: a stop analysis of the paid stop, and the D1 set
+  // is the exact one its plan stood on. A mechanism origin-analysis is not the subject this negative checks.
+  const f = await spendStop(t), gapScope = planD1(f);
+  const selected = gapScope.records.map(ref => f.store.get<D1Gap>(ref.id, ref.revision)!)
+    .find(record => record.value.gap.code === "obligation_open" && record.value.gap.consumers.length > 0)!;
   assert.ok(selected);
   const gap = selected.value.gap;
-  const recorded = deliveredOf(recordCall(f.store, PROJECT, { ...request(f, "exact-d1"),
+  const recorded = deliveredOf(recordCall(f.store, PROJECT, { ...analysisRequest(f, "exact-d1"),
     gaps: [{ id: gap.target, goal: gap.target, field: gap.field, consumer: gap.consumers[0]! }] }));
+  const whole = spendReport(f.store, { project: PROJECT,
+    significance: [{ call: reference(recorded.call), gaps: gapScope, obligations: null }] });
+  assert.ok(whole.ok, "the intact named source is the lawful control for the same declared question");
   for (const changed of [
-    { ...f.gapScope, records: f.gapScope.records.filter(ref => ref.id !== selected.id) },
-    { ...f.gapScope, records: f.gapScope.records.map(ref => ref.id === selected.id ? { ...ref, hash: "0".repeat(64) } : ref) },
-    { ...f.gapScope, sources: { ...f.gapScope.sources, input: { ...f.gapScope.sources.input, revision: 99 } } },
+    { ...gapScope, records: gapScope.records.filter(ref => ref.id !== selected.id) },
+    { ...gapScope, records: gapScope.records.map(ref => ref.id === selected.id ? { ...ref, hash: "0".repeat(64) } : ref) },
+    { ...gapScope, sources: { ...gapScope.sources, input: { ...gapScope.sources.input, revision: 99 } } },
   ]) {
     const result = spendReport(f.store, { project: PROJECT,
-      histories: [{ call: reference(f.settled.call), journal: f.journal }],
       significance: [{ call: reference(recorded.call), gaps: changed, obligations: null }] });
     assert.equal(result.ok, false);
     if (!result.ok) { assert.ok(result.refusal.code); assert.ok(result.refusal.at.target); }
