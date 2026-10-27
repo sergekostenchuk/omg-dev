@@ -406,12 +406,10 @@ const RECORD_REFERENCE_SEMANTICS: readonly RecordReferenceSemantics[] = [
   { kind: "discovery-final-machine-admission", contract: "discovery-final-machine-admission/v1", data: [], refs: [
     ["draft"], ["paid"], ["assessment"], ["mode"]] },
   { kind: "discovery-final-bundle", contract: "discovery-final-bundle/v1", data: [["bundle"]], refs: [["paid"]] },
-  // DR7 7b.3: the owner choice on one condition of a saved bundle and the one successor of a manifest edition. The option
-  // texts are data; the choice names its bundle, its predecessor edition and its authority records.
+  // DR7 7b.3: the owner act on one condition of a saved bundle. The option texts are data; the act names its edition,
+  // its bundle and its authority records.
   { kind: "discovery-condition-resolution", contract: "discovery-condition-resolution/v1", data: [], refs: [
-    ["bundle"], ["scope", "predecessor"], ["authority", "grant"], ["authority", "session"]] },
-  { kind: "discovery-manifest-successor", contract: "discovery-manifest-successor/v1", data: [], refs: [
-    ["predecessor"], ["successor"], ["resolution"]] },
+    ["predecessor"], ["bundle"], ["scope", "predecessor"], ["scope", "bundle"], ["authority", "grant"], ["authority", "session"]] },
   // DR4-M: structural reference sites only. These records do not prove paid or owner provenance.
   { kind: "discovery-variant-snapshot", contract: "discovery-variant-snapshot/v1", data: [], refs: [
     ["draft"], ["frame"], ["plan"], ["questions", INDEX, "question"], ["questions", INDEX, "progress"],

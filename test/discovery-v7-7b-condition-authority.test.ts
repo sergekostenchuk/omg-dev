@@ -100,36 +100,35 @@ test('7b.3 authority: only its own scoped live authority chooses; the acceptance
     const result = await issueConditionChoiceInvitation(f.store, bad);
     assert.equal(result.ok, false); assert.equal(!result.ok && result.refusal.code, code, canonical(bad as never));
   }
-  const edition = (await resolveDiscoveryCondition(f.store, request, narrow.authority)).edition!;
-  for (const stale of [scopeOf(first, 'owner-2', 'carry'), scopeOf(edition, 'owner-1', 'refuse')]) {
-    const result = await issueConditionChoiceInvitation(f.store, stale);
-    assert.equal(!result.ok && result.refusal.code, 'discovery_condition_resolution_stale');
-  }
+  assert.equal((await resolveDiscoveryCondition(f.store, request, narrow.authority)).unproven, 'condition_class_unproven');
+  const again = await issueConditionChoiceInvitation(f.store, scopeOf(first, 'owner-1', 'refuse'));
+  assert.equal(!again.ok && again.refusal.code, 'discovery_condition_resolution_stale', 'the owner has already acted on this condition');
 });
 
-test('7b.3 authority bypass: a machine admission does not replace the owner choice; the owner still chooses on its edition', async t => {
+test('7b.3 authority bypass: a machine admission does not replace the owner choice; the owner still acts on its edition', async t => {
   const f = await world(t);
   modeOf(f.store, 'bypass');
   const { first } = await accepted(f);
   assert.equal(first.admission.kind, 'machine');
   await refused(f, f.store, () => resolveDiscoveryCondition(f.store, choice(first, 'owner-1', 'narrow')), 'owner_authority_invalid');
   const o = await chooser(f.store, first, 'owner-1', 'narrow');
-  const edition = (await resolveDiscoveryCondition(f.store, o.request, o.authority)).edition!;
-  assert.equal(edition.admission.kind, 'machine'); assert.deepEqual(edition.conditions.resolved, ['owner-1']);
+  const outcome = await resolveDiscoveryCondition(f.store, o.request, o.authority);
+  assert.equal(outcome.choice, 'accept'); assert.equal(outcome.edition, null); assert.equal(outcome.unproven, 'condition_class_unproven');
+  assert.deepEqual((await readAcceptedDiscoveryManifestAt(f.store, 'p', reference(first.manifest))).conditions.resolved, []);
 });
 
-test('7b.3 authority revocation and window: a revoked session no longer chooses, its saved choice stays provable cold, and a revocation before the commit writes nothing', async t => {
+test('7b.3 authority revocation and window: a revoked session no longer acts, its saved act stays provable cold, and a revocation before the commit writes nothing', async t => {
   const f = await world(t), { first } = await accepted(f), previous = Store.prototype.writeMany;
   const revoked = await chooser(f.store, first, 'owner-1', 'narrow');
   ok(revoked.sessions.revoke(revoked.bearer));
   await refused(f, f.store, () => resolveDiscoveryCondition(f.store, revoked.request, revoked.authority), 'owner_session_revoked');
   const o = await chooser(f.store, first, 'owner-1', 'narrow');
-  const edition = (await resolveDiscoveryCondition(f.store, o.request, o.authority)).edition!;
+  const act = (await resolveDiscoveryCondition(f.store, o.request, o.authority)).resolution;
   ok(o.sessions.revoke(o.bearer));
   const cold = f.open();
-  assert.deepEqual(await readAcceptedDiscoveryManifestAt(cold, 'p', reference(edition.manifest)), edition, 'the choice stays proven after revocation');
+  assert.deepEqual((await resolveDiscoveryCondition(cold, o.request)).resolution, act, 'the act stays proven after revocation');
   // The session is revoked between the authority check and the commit: the guarded write refuses and writes nothing.
-  const w = await chooser(f.store, edition, 'owner-2', 'carry');
+  const w = await chooser(f.store, first, 'owner-2', 'carry');
   let moved = false;
   Store.prototype.writeMany = function (this: Store, writes, guards) {
     if (this === f.store && !moved && writes.some(item => item.kind === CONDITION_RESOLUTION_KIND)) { moved = true; ok(w.sessions.revoke(w.bearer)); }
@@ -140,6 +139,6 @@ test('7b.3 authority revocation and window: a revoked session no longer chooses,
       (error: unknown) => error instanceof EngineError && error.code === 'discovery_condition_resolution_stale');
   } finally { Store.prototype.writeMany = previous; }
   assert.equal(moved, true);
-  assert.equal(f.store.list(CONDITION_RESOLUTION_KIND).length, 1, 'no second choice');
-  assert.equal(f.store.list(MANIFEST_SUCCESSOR_KIND).length, 1, 'no second successor');
+  assert.equal(f.store.list(CONDITION_RESOLUTION_KIND).length, 1, 'no second act');
+  assert.equal(f.store.list(MANIFEST_SUCCESSOR_KIND).length, 0, 'no successor');
 });

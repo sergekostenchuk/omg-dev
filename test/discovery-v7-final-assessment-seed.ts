@@ -111,7 +111,9 @@ function plant(t: TestContext, seed: Snapshot) {
  * preserve exact paid history while isolating database, values and runtime. */
 export async function finalAssessmentPaid(t: TestContext, options: FinalAssessmentSeedOptions = {}) {
   // One JSON snapshot of explicit conditions before the first await: it keys both caches and builds the paid world.
-  const conditions = options.conditions === undefined ? undefined : JSON.parse(canonical(options.conditions as never)) as unknown;
+  // CONDITION-SEED-SNAPSHOT-01: the property is read once into a local value, and only that value is snapshotted.
+  const raw = options.conditions;
+  const conditions = raw === undefined ? undefined : JSON.parse(canonical(raw as never)) as unknown;
   const selected = { verdict: options.verdict ?? 'supported', outcome: options.outcome ?? 'go', route: options.route ?? 'owner',
     ...(conditions === undefined ? {} : { conditions }) };
   assert.ok(['supported', 'return'].includes(selected.verdict));

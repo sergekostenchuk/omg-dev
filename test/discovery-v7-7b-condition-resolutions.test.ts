@@ -59,6 +59,16 @@ function overlay(store: Store, rows: { id: string; revision: number; value: unkn
     return bound.get(key);
   } });
 }
+/** The same overlay on the genuine Store itself: its prototype read answers some exact revisions differently while the
+ * action runs, so the proof cache of the genuine Store stays in use. */
+async function masked<T>(store: Store, rows: { id: string; revision: number; value: unknown }[], action: () => Promise<T>): Promise<T> {
+  const get = Store.prototype.get;
+  Store.prototype.get = function (this: Store, id: string, revision?: number) {
+    const found = this === store ? rows.find(row => row.id === id && (revision === undefined || row.revision === revision)) : undefined;
+    return found ? found.value : get.call(this, id, revision);
+  } as typeof get;
+  try { return await action(); } finally { Store.prototype.get = get; }
+}
 /** The real conditional world, accepted by the owner in questions mode. */
 async function accepted(t: test.TestContext): Promise<{ f: World; first: AcceptedDiscovery }> {
   const f = await finalAssessmentPaid(t, { outcome: 'conditional', conditions: CONDITIONS });
@@ -84,12 +94,16 @@ async function chooser(store: Store, edition: AcceptedDiscovery, conditionId: st
 
 // The first test pays the first real construction of the conditional seed; its own body stays small.
 test('7b.3 forms: the seed carries the given conditions read once; malformed or unknown requests refuse before any proof', async t => {
-  // The caller's array is snapshotted before the first await: a later mutation never reaches the paid world.
-  const given = structuredClone(CONDITIONS), f = await finalAssessmentPaid(t, { outcome: 'conditional', conditions: given });
-  given[1]!.options![0]!.consequences[0] = 'mutated';
+  // CONDITION-SEED-SNAPSHOT-01: the caller's array is snapshotted before the first await — a mutation right after the
+  // call, while the paid world is still being built, never reaches it — and the property is read exactly once.
+  const given = structuredClone(CONDITIONS), pending = finalAssessmentPaid(t, { outcome: 'conditional', conditions: given });
+  given[1]!.options![0]!.consequences[0] = 'mutated during the preparation';
+  const f = await pending;
   assert.deepEqual(f.packet.candidate.verdict.conditions, CONDITIONS, 'the paid assessment reviewed exactly these conditions');
-  assert.equal((await finalAssessmentPaid(t, { outcome: 'conditional', conditions: CONDITIONS })).paidResult.hash, f.paidResult.hash,
-    'the same conditions share one paid baseline');
+  let reads = 0;
+  const once = { outcome: 'conditional' as const, get conditions() { reads++; if (reads > 1) throw new Error('read twice'); return CONDITIONS; } };
+  assert.equal((await finalAssessmentPaid(t, once)).paidResult.hash, f.paidResult.hash, 'the same conditions share one paid baseline');
+  assert.equal(reads, 1, 'the conditions are read once');
   const manifest = { id: 'discovery-manifest:p:x', revision: 1, hash: '0'.repeat(64) };
   const base = { projectId: 'p', manifest, conditionId: 'owner-1', optionId: 'narrow', reason: 'The owner chooses' };
   for (const bad of [null, {}, { ...base, extra: 1 }, { ...base, reason: ' ' }, { ...base, optionId: '' },
@@ -117,67 +131,49 @@ test('7b.3 evidence: a real accepted claim is no proof of the criterion; the evi
     await refused(f, f.store, () => resolveDiscoveryCondition(f.store, choice(first, conditionId!, optionId!)), 'discovery_condition_resolution_invalid');
 });
 
-test('7b.3 owner accept: the resolution, the next edition and the successor are one write; the accepted bodies stay', async t => {
+test('7b.3 owner accept: the act is saved alone; the condition stays open with condition_class_unproven and the address of a new D7', async t => {
   const { f, first } = await accepted(t);
   const o = await chooser(f.store, first, 'owner-1', 'narrow'), from = f.store.lastEvent();
   const outcome = await resolveDiscoveryCondition(f.store, o.request, o.authority);
   assert.equal(outcome.choice, 'accept'); assert.equal(outcome.repeated, false);
-  const edition = outcome.edition!, resolution = outcome.resolution;
-  // Exactly the three new records, in one write.
-  const events = f.store.eventsPage(from, f.store.lastEvent(), 1000).map(event => event.id).sort();
-  assert.deepEqual(events, [edition.manifest.id, manifestSuccessorId(reference(first.manifest)),
-    conditionResolutionId('p', first.manifest.value.bundle, 'owner-1')].sort());
-  assert.deepEqual(edition.manifest.value.previous, reference(first.manifest));
-  assert.deepEqual(edition.manifest.value.resolutions, [reference(resolution)]);
-  for (const key of ['draft', 'bundle', 'assessment', 'admission'] as const)
-    assert.deepEqual(edition.manifest.value[key], first.manifest.value[key], `the accepted ${key} is kept`);
-  assert.deepEqual(edition.bundle, first.bundle); assert.deepEqual(edition.admission, first.admission);
-  assert.deepEqual(edition.conditions, { resolved: ['owner-1'], open: ['evidence-1', 'owner-2'] });
-  assert.equal(edition.bundle.value.bundle.verdict.outcome, 'conditional', 'conditional is never replaced by go');
-  assert.deepEqual(resolution.value.option, CONDITIONS[1]!.options![0], 'the offered option verbatim, with its consequences');
-  assert.deepEqual(resolution.value.predecessor, reference(first.manifest));
-  // A repeat, a cold Store and the historical predecessor read the same.
+  assert.equal(outcome.edition, null); assert.equal(outcome.resolved, false); assert.equal(outcome.unproven, 'condition_class_unproven');
+  assert.deepEqual(outcome.route, { target: 'D7', predecessor: reference(first.manifest), bundle: first.manifest.value.bundle,
+    paid: f.paidD7, assessment: f.paidResult, conditionId: 'owner-1', optionId: 'narrow' });
+  const id = conditionResolutionId('p', first.manifest.value.bundle, 'owner-1');
+  assert.deepEqual(f.store.eventsPage(from, f.store.lastEvent(), 1000).map(event => event.id), [id], 'the act is the one write');
+  assert.deepEqual(outcome.resolution.value.option, CONDITIONS[1]!.options![0], 'the offered option verbatim, with its consequences');
+  assert.deepEqual(outcome.resolution.value.predecessor, reference(first.manifest));
+  assert.equal(f.store.get(manifestSuccessorId(reference(first.manifest))), null, 'no successor');
+  assert.equal(f.store.list(DISCOVERY_MANIFEST_KIND).length, 1, 'no edition');
+  assert.deepEqual(await readAcceptedDiscoveryManifestAt(f.store, 'p', reference(first.manifest)), first, 'every condition stays open');
+  // A repeat and a cold Store return the same proven act; the other owner condition is chosen on the same edition.
   const again = await quiet(f, f.store, () => resolveDiscoveryCondition(f.store, o.request, o.authority));
-  assert.equal(again.repeated, true); assert.deepEqual(again.edition, edition);
+  assert.equal(again.repeated, true); assert.deepEqual(again.resolution, outcome.resolution);
   const cold = f.open();
-  assert.deepEqual(await quiet(f, cold, () => readAcceptedDiscoveryManifestAt(cold, 'p', reference(edition.manifest))), edition);
-  assert.deepEqual(await readAcceptedDiscoveryManifestAt(f.store, 'p', reference(first.manifest)), first, 'the predecessor stays historical');
-  // The other owner condition is chosen on the latest edition; the edition chain grows by one proven resolution.
-  const second = await chooser(f.store, edition, 'owner-2', 'carry');
-  const next = (await resolveDiscoveryCondition(f.store, second.request, second.authority)).edition!;
-  assert.deepEqual(next.manifest.value.previous, reference(edition.manifest));
-  assert.equal(next.resolutions.length, 2); assert.deepEqual(next.conditions, { resolved: ['owner-1', 'owner-2'], open: ['evidence-1'] });
+  assert.deepEqual((await quiet(f, cold, () => resolveDiscoveryCondition(cold, o.request))).resolution, outcome.resolution);
+  const second = await chooser(f.store, first, 'owner-2', 'carry');
+  assert.equal((await resolveDiscoveryCondition(f.store, second.request, second.authority)).unproven, 'condition_class_unproven');
 });
 
-test('7b.3 owner decline: the saved refusal fulfils nothing, publishes no edition, and an opposite repeat is a conflict', async t => {
+test('7b.3 owner decline: the refusal is saved alone, an opposite repeat is a conflict, and a malformed saved act is a typed refusal', async t => {
   const { f, first } = await accepted(t);
   const o = await chooser(f.store, first, 'owner-1', 'refuse');
   const outcome = await resolveDiscoveryCondition(f.store, o.request, o.authority);
   assert.equal(outcome.choice, 'decline'); assert.equal(outcome.edition, null);
+  assert.equal(outcome.unproven, null); assert.equal(outcome.route, null);
   assert.deepEqual(outcome.resolution.value.option, CONDITIONS[1]!.options![1]);
   assert.equal(f.store.get(manifestSuccessorId(reference(first.manifest))), null, 'no successor');
-  assert.equal(f.store.list(DISCOVERY_MANIFEST_KIND).length, 1, 'no new edition');
-  assert.deepEqual((await readAcceptedDiscoveryManifestAt(f.store, 'p', reference(first.manifest))).conditions.open, ['evidence-1', 'owner-1', 'owner-2']);
   const again = await quiet(f, f.store, () => resolveDiscoveryCondition(f.store, o.request, o.authority));
   assert.equal(again.choice, 'decline'); assert.equal(again.repeated, true);
-  // The opposite choice is an explicit conflict, never the old decline as a success, and never a rewrite of it.
+  // The opposite choice is an explicit conflict, never the old refusal as a success, and never a rewrite of it.
   await refused(f, f.store, () => resolveDiscoveryCondition(f.store, choice(first, 'owner-1', 'narrow')), 'discovery_condition_resolution_conflict');
-  // A decline placed into an edition under recomputed identities is no resolution of the edition.
-  const forged = edition(first, outcome.resolution);
-  await refused(f, f.store, () => readAcceptedDiscoveryManifestAt(overlay(f.store, forged.rows), 'p', forged.ref), 'discovery_acceptance_invalid');
+  // CONDITION-SAVED-SHAPE-01: a saved act whose value is no record, under a consistent hash, is typed on the public repeat.
+  const id = conditionResolutionId('p', first.manifest.value.bundle, 'owner-1');
+  for (const value of [null, 'x', []])
+    await refused(f, f.store, () => masked(f.store, [{ id, revision: 1,
+      value: { id, revision: 1, kind: CONDITION_RESOLUTION_KIND, hash: hashJson(value as Json), value } }], () => resolveDiscoveryCondition(f.store, o.request)),
+    'discovery_acceptance_invalid');
 });
-
-/** An edition over a predecessor adding one resolution Ref, with its successor record, under recomputed identities. */
-function edition(predecessor: AcceptedDiscovery, resolution: Revision<unknown> | Ref, changes: (value: any) => void = () => {}) {
-  const added = 'value' in resolution ? reference(resolution as Revision<unknown>) : resolution;
-  const value = structuredClone(predecessor.manifest.value) as any;
-  value.previous = reference(predecessor.manifest); value.resolutions = [...value.resolutions, added]; changes(value);
-  const ref = { id: discoveryManifestId(value), revision: 1, hash: hashJson(value as Json) };
-  const successor = { contract: 'discovery-manifest-successor/v1', projectId: 'p', predecessor: value.previous, successor: ref, resolution: added };
-  const row = (id: string, kind: string, body: unknown) => ({ id, revision: 1, value: { id, revision: 1, kind, hash: hashJson(body as Json), value: body } });
-  return { ref, value, rows: [row(ref.id, DISCOVERY_MANIFEST_KIND, value),
-    row(manifestSuccessorId(value.previous), MANIFEST_SUCCESSOR_KIND, successor)] };
-}
 
 type Held = { writes: Parameters<Store['writeMany']>[0]; guards: Parameters<Store['writeMany']>[1] };
 const isChoice = (writes: readonly { kind: string }[]) => writes.some(w => w.kind === CONDITION_RESOLUTION_KIND);
@@ -194,38 +190,32 @@ async function held(other: Store, on: AcceptedDiscovery, conditionId: string, op
   return captured!;
 }
 
-test('7b.3 forged editions: a substituted, rehashed, re-pointed or lost ground of an edition is refused without writes', async t => {
+/** An edition over a predecessor naming one more resolution Ref, under recomputed identities. */
+function edition(predecessor: AcceptedDiscovery, resolution: Ref) {
+  const value = structuredClone(predecessor.manifest.value) as any;
+  value.previous = reference(predecessor.manifest); value.resolutions = [...value.resolutions, resolution];
+  const ref = { id: discoveryManifestId(value), revision: 1, hash: hashJson(value as Json) };
+  return { ref, rows: [{ id: ref.id, revision: 1, value: { id: ref.id, revision: 1, kind: DISCOVERY_MANIFEST_KIND, hash: ref.hash, value } }] };
+}
+
+test('7b.3 forged acts and editions: no edition resolves a condition, and a rewritten, moved or re-pointed act is refused without writes', async t => {
   const { f, first } = await accepted(t);
-  // A real owner-2 choice on the same predecessor, prepared before owner-1 is resolved and held back.
-  const fork = await held(f.open(), first, 'owner-2', 'carry');
   const o = await chooser(f.store, first, 'owner-1', 'narrow');
-  const real = (await resolveDiscoveryCondition(f.store, o.request, o.authority)).edition!, resolution = real.resolutions[0]!;
-  const read = (store: Store, ref: Ref) => () => readAcceptedDiscoveryManifestAt(store, 'p', ref);
-  // ACCEPTANCE-EXACT-REF-01: the edition names revision 2 of its resolution and the overlay answers with the saved row.
-  const moved = { ...reference(resolution), revision: 2 }, shifted = edition(first, moved);
-  await refused(f, f.store, read(overlay(f.store, [...shifted.rows, { id: moved.id, revision: 2, value: resolution }]), shifted.ref), 'discovery_acceptance_invalid');
-  // The saved option rewritten (its consequences) under a consistent hash is not the offered option.
-  const rewritten = structuredClone(resolution) as any; rewritten.value.option.consequences = ['Everything ships at once'];
-  rewritten.hash = hashJson(rewritten.value as Json);
-  const rehashed = edition(first, reference(rewritten));
-  await refused(f, f.store, read(overlay(f.store, [...rehashed.rows, { id: rewritten.id, revision: 1, value: rewritten }]), rehashed.ref), 'discovery_acceptance_invalid');
-  // An edition that changes an accepted body, adds the same resolution again, or is not named by the successor record.
-  const draft = edition(first, resolution, value => { value.draft = value.assessment; });
-  await refused(f, f.store, read(overlay(f.store, draft.rows), draft.ref), 'discovery_acceptance_invalid');
-  const twice = edition(real, resolution);
-  await refused(f, f.store, read(overlay(f.store, twice.rows), twice.ref), 'discovery_manifest_invalid');
-  // A second edition on the same predecessor, with its real resolution and manifest planted but not named by the one
-  // successor record: the one-line limit holds on reading, not only on writing.
-  const planted = fork.writes.filter(w => w.kind !== MANIFEST_SUCCESSOR_KIND), forkManifest = planted.find(w => w.kind === DISCOVERY_MANIFEST_KIND)!;
-  const forkRef = { id: forkManifest.id, revision: 1, hash: hashJson(forkManifest.value as Json) };
-  await refused(f, f.store, read(overlay(f.store, planted.map(w => ({ id: w.id, revision: 1,
-    value: { id: w.id, revision: 1, kind: w.kind, hash: hashJson(w.value as Json), value: w.value } }))), forkRef), 'discovery_acceptance_invalid');
-  // Lost grounds of the real edition: the successor record, the resolution, the predecessor manifest.
-  for (const lost of [{ id: manifestSuccessorId(reference(first.manifest)), revision: 1 }, reference(resolution), reference(first.manifest)])
-    await refused(f, f.store, read(overlay(f.store, [{ id: lost.id, revision: lost.revision, value: null }]), reference(real.manifest)));
+  const act = (await resolveDiscoveryCondition(f.store, o.request, o.authority)).resolution;
+  // A later edition naming the real accepting act as its resolution: the class of the choice is unproven.
+  const planted = edition(first, reference(act));
+  await refused(f, f.store, () => readAcceptedDiscoveryManifestAt(overlay(f.store, planted.rows), 'p', planted.ref), 'discovery_condition_class_unproven');
+  // The saved act at its canonical address: its option rewritten, its predecessor re-pointed under a consistent hash, or
+  // another revision answered — each is a typed refusal on the public repeat.
+  const rewritten = structuredClone(act) as any; rewritten.value.option.consequences = ['Everything ships at once'];
+  const repointed = structuredClone(act) as any; repointed.value.predecessor = repointed.value.bundle;
+  for (const row of [rewritten, repointed]) row.hash = hashJson(row.value as Json);
+  for (const row of [rewritten, repointed, { ...structuredClone(act), revision: 2 }])
+    await refused(f, f.store, () => masked(f.store, [{ id: act.id, revision: 1, value: row }], () => resolveDiscoveryCondition(f.store, o.request)),
+      'discovery_acceptance_invalid');
 });
 
-test('7b.3 atomicity and races: a failed write leaves no half edition; on one predecessor the same choice has one winner and another condition is stale', async t => {
+test('7b.3 atomicity and races: a failed write leaves no act; on one edition the same choice has one winner and the opposite is a conflict', async t => {
   const { f, first } = await accepted(t), previous = Store.prototype.writeMany;
   const a = await chooser(f.store, first, 'owner-1', 'narrow');
   Store.prototype.writeMany = function (this: Store, writes, guards) {
@@ -234,9 +224,8 @@ test('7b.3 atomicity and races: a failed write leaves no half edition; on one pr
   } as typeof previous;
   try { await refused(f, f.store, () => resolveDiscoveryCondition(f.store, a.request, a.authority), 'injected_write_failure'); }
   finally { Store.prototype.writeMany = previous; }
-  for (const kind of [CONDITION_RESOLUTION_KIND, MANIFEST_SUCCESSOR_KIND]) assert.equal(f.store.list(kind).length, 0, kind);
-  assert.equal(f.store.list(DISCOVERY_MANIFEST_KIND).length, 1);
-  // A second Store prepares its own real choice on the same predecessor; its writes are held and committed first.
+  assert.equal(f.store.list(CONDITION_RESOLUTION_KIND).length, 0);
+  // A second Store prepares its own real act on the same edition; its write is held and committed first.
   const other = f.open();
   async function race(winner: Held, action: () => Promise<unknown>) {
     let raced = false;
@@ -246,16 +235,21 @@ test('7b.3 atomicity and races: a failed write leaves no half edition; on one pr
     } as typeof previous;
     try { return await action(); } finally { Store.prototype.writeMany = previous; assert.equal(raced, true); }
   }
-  // Another condition committed first on the same predecessor: this choice is stale and writes nothing.
-  const otherCondition = await held(other, first, 'owner-2', 'carry');
-  await race(otherCondition, () => assert.rejects(() => resolveDiscoveryCondition(f.store, a.request, a.authority),
-    (error: unknown) => error instanceof EngineError && error.code === 'discovery_condition_resolution_stale'));
-  assert.equal(f.store.get(conditionResolutionId('p', first.manifest.value.bundle, 'owner-1')), null, 'the stale choice wrote nothing');
-  const winner = await readAcceptedDiscoveryManifestAt(f.store, 'p', reference(f.store.get<any>(manifestSuccessorId(reference(first.manifest)))!.value.successor));
-  assert.deepEqual(winner.conditions.resolved, ['owner-2']);
-  // On the winner's edition the same choice raced by the second Store has one proven winner.
-  const c = await chooser(f.store, winner, 'owner-1', 'narrow'), sameChoice = await held(other, winner, 'owner-1', 'narrow');
-  const outcome = await race(sameChoice, () => resolveDiscoveryCondition(f.store, c.request, c.authority)) as Awaited<ReturnType<typeof resolveDiscoveryCondition>>;
-  assert.equal(outcome.repeated, true); assert.deepEqual(outcome.edition!.conditions.resolved, ['owner-1', 'owner-2']);
-  assert.equal(f.store.list(CONDITION_RESOLUTION_KIND).length, 2);
+  const same = await race(await held(other, first, 'owner-1', 'narrow'), () => resolveDiscoveryCondition(f.store, a.request, a.authority)) as
+    Awaited<ReturnType<typeof resolveDiscoveryCondition>>;
+  assert.equal(same.repeated, true); assert.equal(f.store.list(CONDITION_RESOLUTION_KIND).length, 1);
+  const b = await chooser(f.store, first, 'owner-2', 'carry');
+  await race(await held(other, first, 'owner-2', 'stop'), () => assert.rejects(() => resolveDiscoveryCondition(f.store, b.request, b.authority),
+    (error: unknown) => error instanceof EngineError && error.code === 'discovery_condition_resolution_conflict'));
+  const kept = f.store.get<any>(conditionResolutionId('p', first.manifest.value.bundle, 'owner-2'))!;
+  assert.equal(kept.value.option.optionId, 'stop', 'the winner is kept');
+  assert.equal(f.store.list(MANIFEST_SUCCESSOR_KIND).length, 0);
+});
+
+test('7b.3 seed cache: other conditions get their own paid baseline, never the one of the shared conditions', async t => {
+  const other = CONDITIONS.slice(0, 2), shared = await finalAssessmentPaid(t, { outcome: 'conditional', conditions: CONDITIONS });
+  const own = await finalAssessmentPaid(t, { outcome: 'conditional', conditions: other });
+  assert.deepEqual(own.packet.candidate.verdict.conditions, other);
+  assert.notEqual(own.paidResult.hash, shared.paidResult.hash);
+  assert.notEqual(own.paidD7.hash, shared.paidD7.hash, 'a separate paid D7 as well');
 });
