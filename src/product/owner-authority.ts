@@ -16,6 +16,14 @@ import { STAGE_BUDGET_ACTION, STAGE_BUDGET_PAIRING_METHOD, STAGE_BUDGET_GRANT_CO
   type StageBudgetSessionGrant } from "../discovery/stage-token-budget.js";
 import type { BudgetSegment } from "../runtime/research-budget.js";
 import { uniqueTransactionGuards } from "../runtime/environment.js";
+import { FINAL_ACCEPTANCE_ACTION, FINAL_ACCEPTANCE_ACT_CONTRACT, FINAL_ACCEPTANCE_ACT_KIND, FINAL_ACCEPTANCE_GRANT_CONTRACT,
+  FINAL_ACCEPTANCE_GRANT_KIND, FINAL_ACCEPTANCE_GRANT_LIFETIME_MS, FINAL_ACCEPTANCE_GRANT_PREFIX, FINAL_ACCEPTANCE_PAIRING_METHOD,
+  FINAL_ACCEPTANCE_SESSION_CONTRACT, FINAL_ACCEPTANCE_SESSION_KIND, FINAL_ACCEPTANCE_SESSION_LIFETIME_MS,
+  FINAL_MACHINE_ADMISSION_CONTRACT, acceptanceSnapshot, acceptanceWrites, finalAcceptanceActId, finalAcceptanceSessionId,
+  finalMachineAdmissionId, proveFinalAcceptanceAct, proveFinalMachineAdmission, provenAcceptanceGrounds, provenAcceptanceMode,
+  readAcceptedDiscoveryManifestAt, readFinalAcceptanceGrant, readFinalAcceptanceSession, requireFinalAcceptanceScope,
+  type AcceptedDiscovery, type DiscoveryAcceptanceGrounds, type FinalAcceptanceAct, type FinalAcceptanceScope,
+  type FinalAcceptanceSession, type FinalAcceptanceSessionGrant, type FinalMachineAdmission } from "../discovery/discovery-acceptance.js";
 import { delivered, isPlainObject, isText, refused, type OmResult, type Refusal, type Sealed } from "../om/refusal.js";
 
 /**
@@ -1233,4 +1241,282 @@ export function increaseStageBudget(store: Store, request: unknown, authority: u
     }
     throw error;
   }
+}
+
+
+// ---- DR7 7b.1+7b.2 (codex-omg2 №16106 п.1): the owner decision on one exact assessed D7 bundle --------------------------
+// One exact capability for one decision: database (the grant's), project, the D7 draft, the paid D7, its paid supported
+// assessment, the questions-mode record and accept or decline. Its saved forms and historical proofs live in
+// discovery-acceptance.ts; the unforgeable authority, the session registry and the single producer live here. No other owner
+// authority, actor string, owner flag or model reply authorizes it, and in bypass mode only the proven saved policy does.
+function denyAcceptance(code: OwnerAuthorityRefusalCode, target: string, field: string, message: string): never {
+  deny(code as DiscoveryChoiceAuthorityRefusalCode, target, field, message, 'DR7b');
+}
+function acceptanceScopeOf(value: unknown, code: OwnerAuthorityRefusalCode): FinalAcceptanceScope {
+  try { return requireFinalAcceptanceScope(value); }
+  catch (error) {
+    if (error instanceof EngineError) denyAcceptance(code, 'owner-final-acceptance', 'scope', error.message);
+    throw error;
+  }
+}
+async function runAsync<T>(action: () => Promise<T>): Promise<OmResult<Sealed<T>>> {
+  try { return delivered(await action()); }
+  catch (error) { if (error instanceof AuthorityFailure) return { ok: false, refusal: error.refusal }; throw error; }
+}
+/** The proven grounds a scope must name exactly: the paid supported assessment, its paid D7 and draft, and the current
+ * questions-mode record of the project. */
+async function acceptanceScopeGrounds(store: Store, scope: FinalAcceptanceScope): Promise<DiscoveryAcceptanceGrounds> {
+  let grounds: DiscoveryAcceptanceGrounds;
+  try { grounds = await provenAcceptanceGrounds(store, scope.projectId, scope.assessment); }
+  catch (error) {
+    if (!(error instanceof EngineError)) throw error;
+    return take(refused(error.code, error.message, { unit: 'DR7b', target: scope.projectId, field: 'assessment', ref: scope.assessment }, 'owner'));
+  }
+  if (!sameScope(grounds.paid, scope.paid) || !sameScope(grounds.draft, scope.draft))
+    denyAcceptance('owner_invitation_invalid', scope.projectId, 'scope', 'The scope names another paid D7 or draft than its assessment');
+  let mode: ReturnType<typeof provenAcceptanceMode>;
+  try { mode = provenAcceptanceMode(store, scope.projectId); }
+  catch (error) {
+    if (!(error instanceof EngineError)) throw error;
+    return take(refused(error.code, error.message, { unit: 'DR7b', target: scope.projectId, field: 'mode' }, 'owner'));
+  }
+  if (mode.mode !== 'questions' || !sameScope(exactRef(mode.ref), scope.mode))
+    take(refused('discovery_acceptance_mode_mismatch', 'An owner decision is scoped to the current questions-mode record',
+      { unit: 'DR7b', target: scope.projectId, field: 'mode', ref: scope.mode }, 'owner'));
+  return grounds;
+}
+
+/** The trusted CLI's one-use invitation for one exact owner decision on a paid supported assessment. */
+export async function issueFinalAcceptanceInvitation(store: Store, request: unknown):
+  Promise<OmResult<Sealed<{ invitation: string; grant: Ref; expiresAt: number }>>> {
+  return runAsync(async () => {
+    requireCondition(store instanceof Store, 'owner_invitation_invalid', 'An acceptance invitation needs a Store');
+    const scope = acceptanceScopeOf(acceptanceSnapshot(request, 'scope'), 'owner_invitation_invalid');
+    const project = store.get(`project:${scope.projectId}`);
+    if (!project) denyAcceptance('owner_project_missing', scope.projectId, 'projectId', 'An acceptance invitation is issued for an existing project only');
+    await acceptanceScopeGrounds(store, scope);
+    const secret = randomBytes(32).toString('hex'), id = randomBytes(16).toString('hex'), issuedAt = Date.now();
+    const grant: FinalAcceptanceSessionGrant = { contract: FINAL_ACCEPTANCE_GRANT_CONTRACT, id, database: store.databaseId,
+      action: FINAL_ACCEPTANCE_ACTION, method: FINAL_ACCEPTANCE_PAIRING_METHOD, scope, issuedAt,
+      expiresAt: issuedAt + FINAL_ACCEPTANCE_GRANT_LIFETIME_MS, proof: digest(secret) };
+    const written = take(writeGuarded<FinalAcceptanceSessionGrant>(store, { unit: 'DR7b', target: `${FINAL_ACCEPTANCE_GRANT_PREFIX}${id}`,
+      writes: [{ id: `${FINAL_ACCEPTANCE_GRANT_PREFIX}${id}`, kind: FINAL_ACCEPTANCE_GRANT_KIND, expected: 0, value: grant }],
+      guards: [exactRef(reference(project!)), scope.mode] }));
+    return { invitation: `${id}.${secret}`, grant: exactRef(reference(written[0]!)), expiresAt: grant.expiresAt };
+  });
+}
+
+const FINAL_ACCEPTANCE_MINT = Symbol('final-acceptance-authority-mint');
+const FINAL_ACCEPTANCE_AUTHORITIES = new WeakSet<FinalAcceptanceAuthority>();
+export class FinalAcceptanceAuthority {
+  readonly #sessions: FinalAcceptanceSessions; readonly #store: Store; readonly #digest: string;
+  readonly #sessionId: string; readonly #session: Ref; readonly #scope: FinalAcceptanceScope;
+  constructor(token: symbol, sessions: FinalAcceptanceSessions, store: Store, bearerDigest: string, session: Ref, scope: FinalAcceptanceScope) {
+    requireCondition(token === FINAL_ACCEPTANCE_MINT, 'owner_authority_invalid', 'Acceptance authority is minted by its scoped session exchange only');
+    this.#sessions = sessions; this.#store = store; this.#digest = bearerDigest;
+    this.#session = exactRef(session); this.#sessionId = this.#session.id; this.#scope = structuredClone(scope);
+    FINAL_ACCEPTANCE_AUTHORITIES.add(this);
+  }
+  exercise(request: { store: Store; action: string; scope: FinalAcceptanceScope }): OmResult<Sealed<{ session: Ref; grant: Ref; at: number }>> {
+    return run(() => {
+      if (!FINAL_ACCEPTANCE_AUTHORITIES.has(this)) denyAcceptance('owner_authority_invalid', 'authority', 'authority',
+        'Acceptance authority is an object of the closed scoped registry');
+      if (!shape(request) || request.store !== this.#store || request.action !== FINAL_ACCEPTANCE_ACTION || !sameScope(request.scope, this.#scope))
+        denyAcceptance('owner_authority_foreign', this.#sessionId, 'scope', 'Acceptance authority is bound to one Store and one exact decision');
+      const found = this.#store.get<FinalAcceptanceSession>(this.#sessionId);
+      if (!found) denyAcceptance('owner_session_missing', this.#sessionId, 'session', 'The acceptance owner session record is absent');
+      let session: Revision<FinalAcceptanceSession>;
+      try { session = readFinalAcceptanceSession(this.#store, reference(found!)); }
+      catch (error) { if (error instanceof EngineError) denyAcceptance('owner_session_state_invalid', this.#sessionId, 'session', error.message); throw error; }
+      if (session!.value.state !== 'open') denyAcceptance('owner_session_revoked', this.#sessionId, 'session', 'The acceptance owner session is revoked');
+      if (!sameScope(reference(session!), this.#session))
+        denyAcceptance('owner_authority_foreign', this.#sessionId, 'session', 'The original acceptance session cannot be substituted');
+      if (this.#sessions.sessionOf(this.#digest) !== this.#sessionId)
+        denyAcceptance('owner_session_missing', this.#sessionId, 'session', 'The acceptance owner session is not live in this process');
+      const now = Date.now();
+      if (now < session!.value.openedAt || session!.value.expiresAt <= now)
+        denyAcceptance('owner_session_expired', this.#sessionId, 'session', 'The acceptance owner session is outside its live window');
+      if (session!.value.database !== this.#store.databaseId || !sameScope(session!.value.scope, this.#scope))
+        denyAcceptance('owner_authority_foreign', this.#sessionId, 'scope', 'The acceptance owner session is bound to another database or decision');
+      return { session: exactRef(reference(session!)), grant: exactRef(session!.value.grant), at: now };
+    });
+  }
+}
+const FINAL_ACCEPTANCE_EXERCISE = FinalAcceptanceAuthority.prototype.exercise;
+export function requireFinalAcceptanceAuthority(candidate: unknown,
+  request: { store: Store; action: string; scope: FinalAcceptanceScope }): OmResult<Sealed<{ session: Ref; grant: Ref; at: number }>> {
+  if (candidate instanceof OwnerAuthority || candidate instanceof DiscoveryChoiceAuthority || candidate instanceof ProjectModeAuthority
+    || candidate instanceof VariantChoiceAuthority || candidate instanceof StageBudgetAuthority)
+    return refused('owner_authority_foreign', 'Another owner authority cannot decide on the final Discovery bundle',
+      { unit: 'DR7b', target: 'authority', field: 'action' }, 'owner');
+  if (!(candidate instanceof FinalAcceptanceAuthority) || !FINAL_ACCEPTANCE_AUTHORITIES.has(candidate))
+    return refused('owner_authority_invalid', 'Use the trusted owner acceptance door for this exact decision',
+      { unit: 'DR7b', target: 'authority', field: 'authority' }, 'owner');
+  return FINAL_ACCEPTANCE_EXERCISE.call(candidate, request);
+}
+export class FinalAcceptanceSessions {
+  readonly #store: Store;
+  readonly #live = new Map<string, { session: string; authority: FinalAcceptanceAuthority }>();
+  constructor(store: Store) {
+    requireCondition(store instanceof Store, 'owner_invitation_invalid', 'The acceptance session registry needs a Store');
+    this.#store = store;
+  }
+  sessionOf(bearerDigest: string): string | null { return this.#live.get(bearerDigest)?.session ?? null; }
+  exchange(request: unknown): OmResult<Sealed<{ bearer: string; session: Ref; expiresAt: number }>> {
+    return run(() => {
+      if (!shape(request) || !isText(request.projectId) || !isText(request.invitation)
+        || Object.keys(request).some(key => !['projectId', 'invitation'].includes(key)))
+        denyAcceptance('owner_invitation_invalid', 'final-acceptance-session', 'request', 'An acceptance exchange names projectId and invitation only');
+      const project = request.projectId as string, parts = (request.invitation as string).split('.');
+      if (parts.length !== 2 || !/^[a-f0-9]{32}$/.test(parts[0]!) || !/^[a-f0-9]{64}$/.test(parts[1]!))
+        denyAcceptance('owner_invitation_invalid', project, 'invitation', 'An invitation is <grant-id>.<secret>');
+      const found = this.#store.get<FinalAcceptanceSessionGrant>(`${FINAL_ACCEPTANCE_GRANT_PREFIX}${parts[0]}`);
+      if (!found) denyAcceptance('owner_invitation_invalid', project, 'invitation', 'Unknown acceptance invitation');
+      let grant: Revision<FinalAcceptanceSessionGrant>;
+      try { grant = readFinalAcceptanceGrant(this.#store, reference(found!)); }
+      catch (error) { if (error instanceof EngineError) denyAcceptance('owner_invitation_invalid', project, 'invitation', error.message); throw error; }
+      if (!timingSafeEqual(Buffer.from(digest(parts[1]!), 'hex'), Buffer.from(grant!.value.proof, 'hex')))
+        denyAcceptance('owner_invitation_invalid', project, 'invitation', 'The invitation secret does not verify');
+      if (grant!.value.database !== this.#store.databaseId || grant!.value.scope.projectId !== project || grant!.value.action !== FINAL_ACCEPTANCE_ACTION)
+        denyAcceptance('owner_invitation_foreign', project, 'invitation', 'The invitation belongs to another database, project or action');
+      const now = Date.now();
+      if (now < grant!.value.issuedAt) denyAcceptance('owner_invitation_invalid', project, 'invitation', 'The acceptance invitation is not yet issued');
+      if (grant!.value.expiresAt <= now) denyAcceptance('owner_invitation_expired', project, 'invitation', 'The acceptance invitation has expired');
+      const grantRef = exactRef(reference(grant!)), sessionId = finalAcceptanceSessionId(grantRef);
+      if (this.#store.get(sessionId)) denyAcceptance('owner_invitation_spent', project, 'invitation', 'The acceptance invitation is already exchanged');
+      const session: FinalAcceptanceSession = { contract: FINAL_ACCEPTANCE_SESSION_CONTRACT, grant: grantRef, database: grant!.value.database,
+        action: FINAL_ACCEPTANCE_ACTION, method: FINAL_ACCEPTANCE_PAIRING_METHOD, scope: grant!.value.scope,
+        session: randomBytes(16).toString('hex'), openedAt: now, expiresAt: now + FINAL_ACCEPTANCE_SESSION_LIFETIME_MS, state: 'open' };
+      const written = take(writeGuarded<FinalAcceptanceSession>(this.#store, { unit: 'DR7b', target: sessionId,
+        writes: [{ id: sessionId, kind: FINAL_ACCEPTANCE_SESSION_KIND, expected: 0, value: session }], guards: [grantRef] }));
+      const bearer = randomBytes(32).toString('hex'), key = digest(bearer), opened = exactRef(reference(written[0]!));
+      this.#live.set(key, { session: sessionId,
+        authority: new FinalAcceptanceAuthority(FINAL_ACCEPTANCE_MINT, this, this.#store, key, opened, grant!.value.scope) });
+      return { bearer, session: opened, expiresAt: session.expiresAt };
+    });
+  }
+  authority(bearer: unknown): FinalAcceptanceAuthority | null {
+    return typeof bearer === 'string' && /^[a-f0-9]{64}$/.test(bearer) ? this.#live.get(digest(bearer))?.authority ?? null : null;
+  }
+  revoke(bearer: unknown): OmResult<Sealed<{ session: Ref }>> {
+    return run(() => {
+      const key = typeof bearer === 'string' ? digest(bearer) : null, live = key ? this.#live.get(key) : undefined;
+      if (!live) denyAcceptance('owner_session_missing', 'final-acceptance-session', 'bearer', 'No live acceptance session carries this bearer');
+      this.#live.delete(key!);
+      const head = this.#store.get<FinalAcceptanceSession>(live!.session);
+      if (!head) denyAcceptance('owner_session_missing', live!.session, 'session', 'The acceptance session record is absent');
+      if (head!.value.state === 'closed') return { session: exactRef(reference(head!)) };
+      const closed: FinalAcceptanceSession = { ...head!.value, state: 'closed', closedAt: Math.max(Date.now(), head!.value.openedAt) };
+      const written = take(writeGuarded<FinalAcceptanceSession>(this.#store, { unit: 'DR7b', target: head!.id,
+        writes: [{ id: head!.id, kind: FINAL_ACCEPTANCE_SESSION_KIND, expected: head!.revision, value: closed }],
+        guards: [exactRef(reference(head!))] }));
+      return { session: exactRef(reference(written[0]!)) };
+    });
+  }
+}
+
+export interface DiscoveryAcceptanceOutcome {
+  decision: 'accept' | 'decline';
+  /** The proven accepted Discovery; null for a declining owner act, which publishes no accepted manifest. */
+  accepted: AcceptedDiscovery | null;
+  act: Revision<FinalAcceptanceAct> | null;
+  repeated: boolean;
+}
+function acceptanceFailure(result: OmResult<unknown>): never {
+  if (result.ok) throw new EngineError('owner_authority_internal', 'Authority refusal unexpectedly delivered a value');
+  throw new EngineError(result.refusal.code, result.refusal.message, { ...result.refusal.at, door: 'owner-final-acceptance' });
+}
+function acceptanceRequest(value: unknown): { projectId: string; assessment: Ref; decision: 'accept' | 'decline'; reason: string } {
+  const input = acceptanceSnapshot(value, 'request');
+  if (!shape(input) || Object.keys(input).sort().join(',') !== 'assessment,decision,projectId,reason' || !isText(input.projectId)
+    || !isRef(input.assessment) || !shape(input.assessment) || Object.keys(input.assessment).sort().join(',') !== 'hash,id,revision'
+    || (input.decision !== 'accept' && input.decision !== 'decline') || !isText(input.reason) || !(input.reason as string).trim())
+    throw new EngineError('discovery_acceptance_invalid', 'An acceptance request names projectId, the exact paid assessment, accept or decline and a reason only',
+      { door: 'owner-final-acceptance' });
+  return { projectId: input.projectId as string, assessment: exactRef(input.assessment as Ref), decision: input.decision as 'accept' | 'decline',
+    reason: input.reason as string };
+}
+/**
+ * DR7 7b.1+7b.2: the single producer of a decision on one exact paid supported assessment. In questions mode only a minted
+ * acceptance authority bound to this exact decision may write; accept publishes atomically the act, the saved whole bundle
+ * and the manifest, decline writes the act alone. In bypass mode the code writes the machine admission from the proven
+ * bypass record, the bundle and the manifest. Every write stands under the CAS of its new addresses and the guards of the
+ * project, the current mode head and the exact open session; a decision already saved for this assessment is returned
+ * proven again. Any refusal writes nothing.
+ */
+export async function acceptDiscoveryFinal(store: Store, request: unknown, authority?: unknown): Promise<DiscoveryAcceptanceOutcome> {
+  requireCondition(store instanceof Store, 'discovery_acceptance_invalid', 'An acceptance needs a Store');
+  const input = acceptanceRequest(request), projectId = input.projectId;
+  const project = store.get(`project:${projectId}`);
+  if (!project) throw new EngineError('owner_project_missing', 'An acceptance addresses an existing project only',
+    { project: projectId, door: 'owner-final-acceptance' });
+  // The current mode is proven first: a project without one has no acceptance, before any paid ground is proven again.
+  const mode = provenAcceptanceMode(store, projectId);
+  const grounds = await provenAcceptanceGrounds(store, projectId, input.assessment);
+  const saved = async (repeated: boolean): Promise<DiscoveryAcceptanceOutcome | null> => {
+    const act = store.get<FinalAcceptanceAct>(finalAcceptanceActId(projectId, grounds.assessment), 1);
+    if (act) {
+      const proven = proveFinalAcceptanceAct(store, projectId, reference(act), grounds);
+      if (proven.value.scope.decision === 'decline') return { decision: 'decline', accepted: null, act: structuredClone(proven), repeated };
+      const manifest = acceptanceWrites(projectId, grounds, { kind: 'owner', act: proven.value }).manifest;
+      const accepted = await readAcceptedDiscoveryManifestAt(store, projectId, { id: manifest.id, revision: 1, hash: hashJson(manifest.value as never) });
+      return { decision: 'accept', accepted, act: structuredClone(proven), repeated };
+    }
+    const admission = store.get<FinalMachineAdmission>(finalMachineAdmissionId(projectId, grounds.assessment), 1);
+    if (admission) {
+      const proven = proveFinalMachineAdmission(store, projectId, reference(admission), grounds);
+      const manifest = acceptanceWrites(projectId, grounds, { kind: 'machine', admission: proven.value }).manifest;
+      const accepted = await readAcceptedDiscoveryManifestAt(store, projectId, { id: manifest.id, revision: 1, hash: hashJson(manifest.value as never) });
+      return { decision: 'accept', accepted, act: null, repeated };
+    }
+    return null;
+  };
+  const before = await saved(true);
+  if (before) return before;
+  let writes, guards, manifestRef: Ref | null = null;
+  if (mode.mode === 'questions') {
+    const scope: FinalAcceptanceScope = { projectId, draft: grounds.draft, paid: grounds.paid, assessment: grounds.assessment,
+      mode: exactRef(mode.ref), decision: input.decision, reason: input.reason };
+    const admitted = requireFinalAcceptanceAuthority(authority, { store, action: FINAL_ACCEPTANCE_ACTION, scope });
+    if (!admitted.ok) return acceptanceFailure(admitted);
+    // The second exercise closes the check-to-write window; the pinned open session revision is a transaction guard.
+    const applied = requireFinalAcceptanceAuthority(authority, { store, action: FINAL_ACCEPTANCE_ACTION, scope });
+    if (!applied.ok) return acceptanceFailure(applied);
+    const act: FinalAcceptanceAct = { contract: FINAL_ACCEPTANCE_ACT_CONTRACT, database: store.databaseId, projectId, scope,
+      authority: { grant: applied.value.grant, session: applied.value.session }, at: applied.value.at };
+    if (input.decision === 'decline')
+      writes = [{ id: finalAcceptanceActId(projectId, grounds.assessment), kind: FINAL_ACCEPTANCE_ACT_KIND, expected: 0, value: act }];
+    else { const published = acceptanceWrites(projectId, grounds, { kind: 'owner', act }); writes = published.writes;
+      manifestRef = { id: published.manifest.id, revision: 1, hash: hashJson(published.manifest.value as never) }; }
+    guards = uniqueTransactionGuards([reference(project), exactRef(mode.ref), applied.value.session]);
+  } else {
+    if (authority !== undefined)
+      throw new EngineError('discovery_acceptance_mode_mismatch', 'In bypass mode the saved project policy admits the bundle; an owner authority is not used',
+        { project: projectId, door: 'owner-final-acceptance' });
+    if (input.decision !== 'accept')
+      throw new EngineError('discovery_acceptance_mode_mismatch', 'A machine admission only accepts; a refusal is an owner decision in questions mode',
+        { project: projectId, door: 'owner-final-acceptance' });
+    const admission: FinalMachineAdmission = { contract: FINAL_MACHINE_ADMISSION_CONTRACT, database: store.databaseId, projectId,
+      draft: grounds.draft, paid: grounds.paid, assessment: grounds.assessment, mode: exactRef(mode.ref), policy: 'bypass' };
+    const published = acceptanceWrites(projectId, grounds, { kind: 'machine', admission });
+    writes = published.writes; manifestRef = { id: published.manifest.id, revision: 1, hash: hashJson(published.manifest.value as never) };
+    guards = uniqueTransactionGuards([reference(project), exactRef(mode.ref)]);
+  }
+  try { store.writeMany(writes, guards); }
+  catch (error) {
+    if (error instanceof EngineError && ['revision_conflict', 'input_stale'].includes(error.code)) {
+      const winner = await saved(true);
+      if (winner) return winner;
+      throw new EngineError('discovery_acceptance_stale', 'The mode, the owner session or the decision moved before the acceptance was written',
+        { project: projectId, door: 'owner-final-acceptance' });
+    }
+    throw error;
+  }
+  if (manifestRef) {
+    const accepted = await readAcceptedDiscoveryManifestAt(store, projectId, manifestRef);
+    return { decision: 'accept', accepted, act: accepted.admission.kind === 'owner' ? accepted.admission.record : null, repeated: false };
+  }
+  const declined = await saved(false);
+  if (!declined) throw new EngineError('owner_authority_internal', 'The declining act was not saved');
+  return declined;
 }

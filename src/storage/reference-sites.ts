@@ -399,6 +399,13 @@ const RECORD_REFERENCE_SEMANTICS: readonly RecordReferenceSemantics[] = [
   // previous manifest and condition resolution records; the admission kind is data and proves no authority.
   { kind: "discovery-manifest", contract: "discovery-manifest/v7", data: [], refs: [
     ["draft"], ["bundle"], ["assessment"], ["admission", "record"], ["previous"], ["resolutions", INDEX]] },
+  // DR7 7b.1+7b.2: the owner act, the machine admission and the saved whole bundle of one accepted D7. The bundle body and
+  // the scope texts are data; the act names its exact draft, paid D7, assessment, mode record and authority records.
+  { kind: "discovery-final-acceptance-act", contract: "discovery-final-acceptance-act/v1", data: [], refs: [
+    ["scope", "draft"], ["scope", "paid"], ["scope", "assessment"], ["scope", "mode"], ["authority", "grant"], ["authority", "session"]] },
+  { kind: "discovery-final-machine-admission", contract: "discovery-final-machine-admission/v1", data: [], refs: [
+    ["draft"], ["paid"], ["assessment"], ["mode"]] },
+  { kind: "discovery-final-bundle", contract: "discovery-final-bundle/v1", data: [["bundle"]], refs: [["paid"]] },
   // DR4-M: structural reference sites only. These records do not prove paid or owner provenance.
   { kind: "discovery-variant-snapshot", contract: "discovery-variant-snapshot/v1", data: [], refs: [
     ["draft"], ["frame"], ["plan"], ["questions", INDEX, "question"], ["questions", INDEX, "progress"],
