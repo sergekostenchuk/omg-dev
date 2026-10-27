@@ -1,14 +1,14 @@
 import { canonical, hashJson } from '../canonical.js';
 import { EngineError, requireCondition } from '../errors.js';
-import { reference, type Ref } from '../pipeline/contracts.js';
+import type { Ref } from '../pipeline/contracts.js';
 import type { Store, TransactionGuard, Write } from '../storage/store.js';
 import { DISCOVERY_FINAL_PACKET, requireDiscoveryFinalPacket, requireDiscoveryFinalSubject,
   type DiscoveryFinalPacket, type DiscoveryFinalSubject } from './discovery-final.js';
 import { V7_FINAL_SCHEMA, checkV7Final, type V7FinalBundle } from './v7-final-contracts.js';
 import { buildResearchResultCapacity, requireResearchResultCapacity, measureResearchResult,
   type ResearchResultCapacity, type ResearchResultCapacityInput } from './research-delivery.js';
-import { RESULT_CAPACITY_REFUSAL } from './early-research-outcome.js';
-import { prepareArchiveParts, readArchiveBody } from './request-parts.js';
+import { RESULT_CAPACITY_REFUSAL, readFinalCapacityProjection } from './early-research-outcome.js';
+import { prepareArchiveParts } from './request-parts.js';
 
 /** A structural D7 reply, not a payment, publication or acceptance. */
 export const DISCOVERY_FINAL_RESULT = 'discovery-final-result/v1' as const;
@@ -80,15 +80,10 @@ function archiveFor(store: Store, packet: DiscoveryFinalPacket, minimum: Record<
 
 function savedArchiveProjection(store: Store, address: { record: Ref; pointer: string; hash: string },
   minimum: Record<string, unknown>): Record<string, unknown> {
-  const row = store.get(address.record.id, address.record.revision);
-  valid(row?.kind === 'research-context' && row.revision === 1
-    && same(reference(row), address.record) && hashJson(row.value as never) === address.record.hash,
-  'The exact final result archive is missing or changed');
-  const body = readArchiveBody(store, row).body;
-  valid(address.pointer === '/body/request' && same(body.request, minimum)
-    && hashJson(body.request) === address.hash,
+  const projection = readFinalCapacityProjection(store, address.record, address.pointer);
+  valid(same(projection, minimum) && hashJson(projection) === address.hash,
   'The saved final result minimum differs from the proven packet and schema');
-  return body.request;
+  return projection;
 }
 
 /** Pure projection of a candidate over its supplied packet. It does not prove
@@ -140,29 +135,69 @@ export async function prepareDiscoveryFinalResultTransport(store: Store, project
   return { contract: DISCOVERY_FINAL_RESULT, subject: structuredClone(packet.subject), packet, schema, capacity };
 }
 
+/** Re-prove a saved final admission without trusting a caller-supplied archive
+ * resolver or a structurally plausible D6 packet. The same paid D6 reader,
+ * declaration and capacity builder used by the producer own this proof. */
+export async function requireDiscoveryFinalResultCapacity(store: Store, project: string,
+  subject: unknown, limit: number, saved: unknown): Promise<DiscoveryFinalResultTransport> {
+  let subjectSnapshot: unknown, capacitySnapshot: unknown;
+  try { subjectSnapshot = JSON.parse(canonical(subject)); }
+  catch { throw new EngineError('discovery_final_subject_invalid', 'The final subject must be a stable data value'); }
+  try { capacitySnapshot = JSON.parse(canonical(saved)); }
+  catch { throw new EngineError('research_capacity_invalid', 'The result admission must be a stable data value'); }
+  const proven = await prepareDiscoveryFinalResultTransport(store, project, subjectSnapshot, limit, { archive: 'staged' });
+  valid(proven.archive && 'archive' in proven.capacity.mandatory,
+    'The final result admission lost its exact archive');
+  const address = proven.capacity.mandatory.archive;
+  const input = admission(proven.packet, proven.schema, limit);
+  const projection = savedArchiveProjection(store, address, input.mandatoryEnvelope);
+  const bindings = { projectId: proven.subject.projectId, finalSubject: proven.subject };
+  requireResearchResultCapacity(capacitySnapshot, { ...input, bindings, mandatoryArchive: address }, (record, pointer) => {
+    valid(same(record, address.record) && pointer === address.pointer,
+      'The result admission resolved another archive');
+    return projection;
+  });
+  return proven;
+}
+
 /** Re-prove the entire supplied packet once, rederive its exact admission using
  * the caller's independently known limit, then measure the complete serialized
  * reply. No session or model call is created. */
 export async function checkDiscoveryFinalResearchReply(store: Store, project: string,
   packetInput: unknown, envelopeLimitChars: number, saved: unknown, reply: unknown) {
-  const packet = await requireDiscoveryFinalPacket(store, project, packetInput);
+  let packetSnapshot: unknown;
+  try { packetSnapshot = JSON.parse(canonical(packetInput)); }
+  catch { throw new EngineError('discovery_final_subject_invalid', 'The final packet must be a stable data value'); }
+  // Capacity is caller input at this public door. Snapshot it once so that
+  // the checked declaration and the later measurement cannot observe
+  // different values from an accessor or other mutable object.
+  let capacity: unknown;
+  try { capacity = JSON.parse(canonical(saved)); }
+  catch { throw new EngineError('research_capacity_invalid', 'The result admission must be a stable data value'); }
+  // Preserve the projector's plain-object requirement, then capture all
+  // nested JSON values once without normalizing a foreign prototype.
+  valid(object(reply), 'The final reply must be a plain object');
+  let replySnapshot: unknown;
+  try { replySnapshot = JSON.parse(canonical(reply)); }
+  catch { throw new EngineError('discovery_final_result_invalid', 'The final reply must be a stable data value'); }
+  const packet = await requireDiscoveryFinalPacket(store, project, packetSnapshot);
   const schema = declaration(packet);
   const input = admission(packet, schema, envelopeLimitChars);
-  const mandatory = object(saved) && object(saved.mandatory) ? saved.mandatory : null;
+  const mandatory = object(capacity) && object(capacity.mandatory) ? capacity.mandatory : null;
   if (mandatory && Object.hasOwn(mandatory, 'archive')) {
     const prepared = archiveFor(store, packet, input.mandatoryEnvelope);
     valid(same(mandatory.archive, prepared.address), 'The result capacity names another archive or pointer');
     const projection = savedArchiveProjection(store, prepared.address, input.mandatoryEnvelope);
     const bindings = { projectId: packet.subject.projectId, finalSubject: packet.subject };
-    requireResearchResultCapacity(saved, { ...input, bindings, mandatoryArchive: prepared.address },
+    requireResearchResultCapacity(capacity, { ...input, bindings, mandatoryArchive: prepared.address },
       (record, pointer) => {
         valid(same(record, prepared.address.record) && pointer === prepared.address.pointer,
           'The result capacity resolved another archive');
         return projection;
       });
-  } else requireResearchResultCapacity(saved, input);
-  const projection = projectDiscoveryFinal(packet, reply);
-  const measurement = measureResearchResult(saved, FORM, projection.result);
+  } else requireResearchResultCapacity(capacity, input);
+  const projection = projectDiscoveryFinal(packet, replySnapshot);
+  const measurement = measureResearchResult(capacity as ResearchResultCapacity, FORM, projection.result);
   if (!measurement.fits) throw new EngineError(RESULT_CAPACITY_REFUSAL,
     'The complete final reply exceeds its admitted serialized envelope', measurement);
   return { kind: FORM, terminal: true, normalized: projection.result, measurement, projection };

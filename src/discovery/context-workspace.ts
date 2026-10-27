@@ -1,7 +1,7 @@
 import { hashJson, canonical } from '../canonical.js';
 import { isRef, type Ref } from '../pipeline/contracts.js';
 import { EngineError, requireCondition } from '../errors.js';
-import { planResearchDelivery, requireResearchDelivery, type ResearchDelivery,
+import { planResearchContextDelivery, requireResearchContextDelivery, type ResearchDelivery,
   type ResearchMaterialAddress } from './research-delivery.js';
 
 export interface ContextLookup { record: Ref; pointer: string; value: unknown; page?: {offset:number;end:number;total:number;unit:string;next:number|null;encoding?:'canonical-json'} }
@@ -277,7 +277,7 @@ export function requireContextDelivery(expected: ContextLookup[], packet: Record
     const original = expected.find(item => contextLookupKey(item) === fragment?.original?.key);
     requireCondition(original && !keys.includes(fragment.original.key),
       'research_context_undelivered', 'The partial delivery has no unique saved original');
-    requireResearchDelivery(deliveryOriginal(original, fragment), contextLookupKey(original), fragment);
+    requireResearchContextDelivery(deliveryOriginal(original, fragment), contextLookupKey(original), fragment);
   }
   const newest = expected.at(-1);
   requireCondition(!newest||keys.includes(contextLookupKey(newest))
@@ -354,12 +354,12 @@ export function packContextWorkspace(packet: Record<string, any>, maxChars: numb
         && canonical(chosen).length + JSON.stringify(candidate).length <= contextChars;
     };
     let fragment = deliveryLimitChars > 0
-      ? planResearchDelivery(newest, key, maxChars, deliveryLimitChars, fits) : null;
+      ? planResearchContextDelivery(newest, key, maxChars, deliveryLimitChars, fits) : null;
     if (fragment?.encoding === 'json-string-fragment' && Array.isArray(newest.value)
       && newest.value.length > 0) {
       const item = { record: newest.record,
         pointer: `${newest.pointer}/${newest.page?.offset ?? 0}`, value: newest.value[0] };
-      fragment = planResearchDelivery(item, key, maxChars, deliveryLimitChars, fits);
+      fragment = planResearchContextDelivery(item, key, maxChars, deliveryLimitChars, fits);
     }
     if (fragment) packet.contextDelivery = [fragment]; else delete packet.contextDelivery;
     requireCondition(fragment, 'research_context_capacity',

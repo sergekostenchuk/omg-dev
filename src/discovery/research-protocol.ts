@@ -78,6 +78,9 @@ import { REQUEST_MANIFEST_CONTRACT, prepareRequestPartsAndManifest, partitionRes
 
 import { isDiscoveryV7Draft } from './v7-contracts.js';
 import { stageBudgetPlan, DISCOVERY_V7_STAGE_BUDGET_KEY } from './stage-token-budget.js';
+import { currentDiscoveryFinalGuards, prepareDiscoveryFinalContextPacker,
+  readDiscoveryFinalDispatchAdmission } from './discovery-final-execution.js';
+import { pendingOverlay, storeView } from '../storage/store-view.js';
 
 export { researchAction } from './research-consumer-transition.js';
 
@@ -126,6 +129,9 @@ export interface ResearchCallAudit {
   store: Store; draftId: string; purpose: string; questionId?: string; pilot?: Revision<ReaderPilot>;
   session?: Ref; onContext?: (context: Record<string, any>) => void;
   application?: Ref; prepareCall?: (call: Write) => { writes: Write[]; guards: TransactionGuard[] };
+  /** Final's immutable prepared application and, for its first step, origin
+   * are staged into the same transaction as its physical claim. */
+  finalPending?: { session?: Write; application: Write };
   consumerIntent?: Ref;
   /** Trusted caller dependencies for a new physical send only. They augment
    * the reservation, never the saved intent, wire or a paid replay. */
@@ -139,6 +145,10 @@ export interface ResearchCallAudit {
 }
 type AssessmentReservation = { kind: 'replay-only' } | {
   kind: 'application' | 'dossier'; session: Revision<RecoverableContextSession>; application: Revision<Record<string, any>>;
+} | {
+  kind: 'final'; session: Revision<RecoverableContextSession>; application: Revision<Record<string, any>>;
+  admission: Awaited<ReturnType<typeof readDiscoveryFinalDispatchAdmission>>;
+  writes: Write[]; guards: TransactionGuard[];
 };
 const recordValue = (value: unknown): value is Record<string, any> => value !== null && typeof value === 'object' && !Array.isArray(value);
 function applicationAuditInvalid(message: string): never {
@@ -163,6 +173,44 @@ async function dossierAssessmentReservation(audit: ResearchCallAudit | undefined
   requireCondition([...current.guards,...current.admissionGuards].every(guard=>admission.application.value.guards.some(saved=>canonical(saved)===canonical(guard))),
     'discovery_dossier_session_invalid','The new dossier send lost its mandatory current runtime guards');
   return {kind:'dossier',session:admission.session,application:admission.application};
+}
+/** A prepared D7 packet is not permission to spend: only its separate saved
+ * application and current exact guards can reserve a physical call. */
+async function finalReservation(audit: ResearchCallAudit | undefined, role: RoleBinding,
+  environment: Environment, prompt: string, context: unknown): Promise<AssessmentReservation> {
+  requireCondition(audit && audit.purpose === 'discovery-final' && isRef(audit.session)
+    && isRef(audit.application) && !audit.prepareCall && recordValue(audit.finalPending)
+    && !audit.consumerIntent && !audit.previewIntent,
+  'discovery_final_dispatch_unavailable', 'A final call requires its own exact session and application');
+  const pending = audit.finalPending;
+  const writes = [...(pending.session ? [pending.session] : []), pending.application];
+  requireCondition(writes.every(write => recordValue(write) && typeof write.id === 'string'
+    && typeof write.kind === 'string' && write.expected === 0 && recordValue(write.value)
+    && !audit.store.get(write.id)) && pending.application.kind === 'discovery-final-application'
+    && (!pending.session || pending.session.kind === 'discovery-final-execution')
+    && new Set(writes.map(write => write.id)).size === writes.length,
+  'discovery_final_dispatch_unavailable', 'The final claim needs fresh exact staged records');
+  const rows = writes.map(write => ({ id: write.id, kind: write.kind, revision: 1,
+    hash: hashJson(write.value as never), value: write.value }));
+  // The common pending layer owns frozen snapshots and traces every read back
+  // to its genuine source; an arbitrary Proxy would lose that proof chain.
+  const view = pendingOverlay(audit.store, rows);
+  const admission = await readDiscoveryFinalDispatchAdmission(view, audit.application);
+  const current = currentDiscoveryFinalGuards(audit.store, environment.projectId, admission);
+  requireCondition(canonical(reference(admission.session)) === canonical(audit.session)
+    && canonical(reference(admission.application)) === canonical(audit.application)
+    && canonical(pending.application.value) === canonical(admission.application.value)
+    && (!pending.session || canonical(pending.session.value) === canonical(admission.session.value))
+    && canonical(admission.context) === canonical(context) && canonical(admission.role) === canonical(role)
+    && canonical(admission.dispatch) === canonical(environment) && admission.prompt === prompt
+    && admission.draft.id === audit.draftId && admission.question.id === audit.questionId
+    && canonical(admission.session.value.profile) === canonical(audit.pilot ? reference(audit.pilot) : null)
+    && current.every(guard => admission.application.value.guards.some(saved => canonical(saved) === canonical(guard))),
+  'discovery_final_dispatch_unavailable', 'The final call differs from its current proved admission');
+  const guards: TransactionGuard[] = [pending.session ? { id: pending.session.id, absent: true } : audit.session,
+    { id: pending.application.id, absent: true }, ...admission.application.value.guards];
+  return { kind: 'final', session: admission.session, application: admission.application, admission,
+    writes, guards: uniqueTransactionGuards(guards) };
 }
 function assessmentReservation(audit: ResearchCallAudit | undefined, role: RoleBinding, environment: Environment, context: unknown): AssessmentReservation | null {
   const namedSession = recordValue(context) ? context.assessmentSession : undefined;
@@ -250,7 +298,12 @@ function assessmentReservation(audit: ResearchCallAudit | undefined, role: RoleB
 function preparedAssessmentCall(reservation: AssessmentReservation | null, call: Write, original: string,
   prepared: { writes: Write[]; guards: TransactionGuard[] } | undefined): void {
   if (!reservation) return;
-  if (reservation.kind !== 'application' && reservation.kind !== 'dossier') applicationAuditInvalid('Operator recovery cannot reserve another physical call');
+  if (reservation.kind !== 'application' && reservation.kind !== 'dossier' && reservation.kind !== 'final') applicationAuditInvalid('Operator recovery cannot reserve another physical call');
+  if (reservation.kind === 'final') {
+    if (prepared !== undefined || canonical(call) !== original)
+      applicationAuditInvalid('The final claim cannot use an assessment transition callback');
+    return;
+  }
   try {
     if (!recordValue(prepared) || !Array.isArray(prepared.writes) || !Array.isArray(prepared.guards)
       || prepared.writes.length !== 1 || canonical(call) !== original)
@@ -326,9 +379,9 @@ function buildResearchEnvelope(role: RoleBinding, environment: Environment, prom
   context: unknown, audit?: Pick<ResearchCallAudit, 'store' | 'draftId' | 'questionId' | 'purpose' | 'pilot' | 'contextContract'>,
   capacity?: Record<string, any>, requestId = '00000000-0000-0000-0000-000000000000',
   requestContract?: string, dossier?: Awaited<ReturnType<typeof prepareDossierContextPacker>>,
-  requestLimitChars?: number) {
+  requestLimitChars?: number, final?: ReturnType<typeof prepareDiscoveryFinalContextPacker>) {
   const draft = audit?.store.get<DiscoveryDraft>(audit.draftId);
-  const planSubject = packetPlanSubject(capacity?.bindings ?? {});
+  const planSubject = final ? null : packetPlanSubject(capacity?.bindings ?? {});
   const assessmentSubject = packetAssessmentSubject(context);
   requireCondition(sameAssessmentSubject(context,capacity?.bindings ?? {}),
     'discovery_assessment_subject_invalid', 'Capacity must bind the complete assessment packet and baseline');
@@ -362,7 +415,8 @@ function buildResearchEnvelope(role: RoleBinding, environment: Environment, prom
   const managedDossier=dossierSessionTransport(context);
   const packetState = (!dossier || managedDossier) && audit?.questionId && draft ? continuationState(audit.store, environment.projectId, audit.draftId,
     audit.questionId, audit.purpose, role.actor, planSubject, assessmentSubject, variantSubject, deepPreparation,
-      managedDossier?{subject:dossier!.packet.subject,session:managedDossier.session.id}:undefined) : null;
+      managedDossier?{subject:dossier!.packet.subject,session:managedDossier.session.id}:undefined,
+      final ? (context as any).finalContinuation : undefined) : null;
   const consolidating = (context as any)?.dispatchMode === 'consolidation';
   const controls = (context as any)?.contextControls;
   const finalizing = !consolidating && controls?.mode === 'finalization';
@@ -377,7 +431,7 @@ function buildResearchEnvelope(role: RoleBinding, environment: Environment, prom
   const overhead = JSON.stringify(outputLimit).length + 32 + Math.max(JSON.stringify({ ...envelope, subject: {} }).length,
     controls && !consolidating ? JSON.stringify({...envelope,prompt:finalInstruction,subject:{}}).length : 0) + (packetState ? 4000 : 0);
   const subjectFor = (limit: number) => {
-    const packed = dossier ? dossier.pack(audit!.draftId, audit!.questionId!, packingContext, limit,
+    const packed = final ? final.pack(limit) : dossier ? dossier.pack(audit!.draftId, audit!.questionId!, packingContext, limit,
       { common:true, purpose:audit!.purpose }) : packetState ? workingContext(audit!.store, environment.projectId, audit!.draftId, audit!.questionId!, packingContext,
       limit, { common: true, purpose: audit!.purpose, ...(planSubject?{subject:planSubject}:{}), ...(assessmentSubject?{assessmentSubject}:{}),
         ...(variantSubject?{variantSubject,actor:role.actor}:{}), ...(deepPreparation?{deepPreparation}:{}), continuation: !packetState.initial,
@@ -386,7 +440,8 @@ function buildResearchEnvelope(role: RoleBinding, environment: Environment, prom
         ...(audit!.pilot ? { extractedChars: audit!.pilot.value.maxRequestChars } : {}),
         ...(audit!.contextContract ? { contextContract: audit!.contextContract } : {}) })
       : packingContext && typeof packingContext === 'object' && !Array.isArray(packingContext) ? { ...packingContext } : packingContext;
-    if (packetState) (packed as any).continuation = continuationMetadata(packetState, (packed as any).working.archive, audit!.store, dossier?.staged().records);
+    if (packetState) (packed as any).continuation = continuationMetadata(packetState, (packed as any).working.archive,
+      final?.view ?? audit!.store, final?.staged().records ?? dossier?.staged().records);
     if (packed && typeof packed === 'object') (packed as Record<string, unknown>).responseOutputLimit = outputLimit;
     return packed;
   };
@@ -451,6 +506,39 @@ function requireVariantIntent(store: Store, ref: Ref, projectId: string, draftId
  * saved before the check, so an off-form answer is a typed refusal on every reading and never a second payment. */
 export async function researchCall(role: RoleBinding, environment: Environment, prompt: string, context: unknown, signal?: AbortSignal,
   audit?: ResearchCallAudit): Promise<unknown> {
+  const purpose = audit?.purpose;
+  const finalInput = recordValue(context) && Object.hasOwn(context, 'finalContinuation')
+    || purpose === 'discovery-final';
+  if (finalInput) {
+    // Capture caller-owned data once, before proof can yield or callbacks run.
+    // The Store, AbortSignal and callbacks remain live capabilities.
+    try {
+      const data = <T>(value: T): T => JSON.parse(canonical(value)) as T;
+      role = data(role);
+      environment = data(environment);
+      context = data(context);
+      if (audit) {
+        const { store, draftId, questionId, pilot, session, onContext, application,
+          prepareCall, finalPending, consumerIntent, consumerDispatchGuards, previewIntent,
+          requestContract, contextContract } = audit;
+        audit = { store, draftId, purpose: purpose!,
+          ...(questionId === undefined ? {} : { questionId }),
+          ...(pilot === undefined ? {} : { pilot: data(pilot) }),
+          ...(session === undefined ? {} : { session: data(session) }),
+          ...(onContext === undefined ? {} : { onContext }),
+          ...(application === undefined ? {} : { application: data(application) }),
+          ...(prepareCall === undefined ? {} : { prepareCall }),
+          ...(finalPending === undefined ? {} : { finalPending: data(finalPending) }),
+          ...(consumerIntent === undefined ? {} : { consumerIntent: data(consumerIntent) }),
+          ...(consumerDispatchGuards === undefined ? {} : { consumerDispatchGuards: data(consumerDispatchGuards) }),
+          ...(previewIntent === undefined ? {} : { previewIntent: data(previewIntent) }),
+          ...(requestContract === undefined ? {} : { requestContract }),
+          ...(contextContract === undefined ? {} : { contextContract }) };
+      }
+    } catch {
+      throw new EngineError('discovery_final_dispatch_unavailable', 'A final dispatch needs stable data inputs');
+    }
+  }
   const answer = await dispatchResearchCall(role, environment, prompt, context, signal, audit);
   if (audit?.purpose === 'variant-proposal' && packetVariantSubject(context)?.kind === 'proposal') decodeVariantGeneration(answer);
   else if (audit?.purpose === 'variant-decision' && audit.consumerIntent && packetVariantSubject(context)?.kind === 'decision') decodeVariantDecisionAnswer(answer);
@@ -460,6 +548,9 @@ export async function researchCall(role: RoleBinding, environment: Environment, 
 async function dispatchResearchCall(role: RoleBinding, environment: Environment, prompt: string, context: unknown, signal?: AbortSignal,
   audit?: ResearchCallAudit): Promise<unknown> {
   recoveryDispatchBoundary();
+  const finalMarker = recordValue(context) && Object.hasOwn(context, 'finalContinuation');
+  requireCondition(!finalMarker || audit?.purpose === 'discovery-final', 'discovery_final_dispatch_unavailable',
+    'A final continuation cannot travel on another research branch');
   const dossier = requireDossierTransportContext(context, audit?.purpose === 'dossier-assessor');
   const capacityDossier = packetDossierSubject((context as any)?.resultCapacity?.bindings);
   requireCondition(!capacityDossier || dossier && dossierSessionTransport(context) && audit, 'discovery_dossier_dispatch_unavailable',
@@ -563,9 +654,11 @@ async function dispatchResearchCall(role: RoleBinding, environment: Environment,
   }
   // Preserve the synchronous legacy admission boundary: yielding here lets a
   // competing legacy call reach its continuation barrier before its owner CAS.
-  const assessment = dossier || dossierSessionTransport(context) || audit?.purpose==='dossier-assessor'
-    ? await dossierAssessmentReservation(audit,role,environment,context)
-    : assessmentReservation(audit,role,environment,context);
+  const assessment = finalMarker || audit?.purpose === 'discovery-final'
+    ? await finalReservation(audit, role, environment, prompt, context)
+    : dossier || dossierSessionTransport(context) || audit?.purpose==='dossier-assessor'
+      ? await dossierAssessmentReservation(audit,role,environment,context)
+      : assessmentReservation(audit,role,environment,context);
   const assessmentSubject = packetAssessmentSubject(context);
   requireCondition(!assessmentSubject || assessment?.kind === 'application' && !consumerIntent,
     'discovery_assessment_subject_invalid', 'Attempts assessment dispatch needs its exact saved application');
@@ -641,9 +734,11 @@ async function dispatchResearchCall(role: RoleBinding, environment: Environment,
     }
   }
   const requestId = randomUUID();
-  const callId = consumerIntent ? `model-call:consumer:v1:${requestId}` : `model-call:${requestId}`;
+  const callId = assessment?.kind === 'final' ? `model-call:final:v1:${hashJson(audit!.application)}`
+    : consumerIntent ? `model-call:consumer:v1:${requestId}` : `model-call:${requestId}`;
   const capacity = consumerIntent?.value.cursor.resultCapacity
-    ?? (assessment?.kind === 'application' || assessment?.kind === 'dossier' ? assessment.application.value.context.resultCapacity : undefined);
+    ?? (assessment?.kind === 'application' || assessment?.kind === 'dossier' || assessment?.kind === 'final'
+      ? assessment.application.value.context.resultCapacity : undefined);
   // G5a (№6218): the saved admission is trusted — its capacity was computed and
   // proved once when the producer wrote the prepared revision. The actual prompt
   // is still compared to that saved declaration below; nothing is recomputed.
@@ -651,7 +746,7 @@ async function dispatchResearchCall(role: RoleBinding, environment: Environment,
     requireCondition(consumerIntent.value.cursor.resultCapacityContract === RESULT_CAPACITY
       && consumerIntent.value.cursor.resultCapacity !== undefined,
       'research_capacity_invalid', 'The saved consumer admission lost its declared capacity');
-  requireCondition(sameSubject(packetPlanSubject(capacity?.bindings ?? {}),planSubject),
+  requireCondition(assessment?.kind === 'final' || sameSubject(packetPlanSubject(capacity?.bindings ?? {}),planSubject),
     'research_plan_subject_invalid', 'The packet binding must equal the saved consumer subject');
   requireCondition(sameAssessmentSubject(context, capacity?.bindings ?? {}),
     'discovery_assessment_subject_invalid', 'The saved capacity must preserve its assessment subject');
@@ -678,11 +773,16 @@ async function dispatchResearchCall(role: RoleBinding, environment: Environment,
   }
   const dossierEnvelope=dossier
     ? await prepareDossierResearchEnvelope(role,environment,prompt,context,packAudit!,capacity,requestId,true) : null;
+  const finalPacker = assessment?.kind === 'final' ? prepareDiscoveryFinalContextPacker(audit!.store, assessment.admission) : null;
   const { packetState, subject, envelope, input, requestLimit } = dossierEnvelope
-    ?? prepareResearchEnvelope(role, environment,prompt,context,packAudit,capacity,requestId,requestContract);
-  if (capacity !== undefined) requireCondition(researchCapacityProjection(capacity, audit?.store).prompt === envelope.prompt,
+    ?? (finalPacker ? buildResearchEnvelope(role, environment, prompt, context, packAudit, capacity, requestId,
+      requestContract, undefined, assessment!.kind === 'final' ? assessment!.admission.prepared.value.input.limitChars : undefined,
+      finalPacker)
+      : prepareResearchEnvelope(role, environment,prompt,context,packAudit,capacity,requestId,requestContract));
+  if (capacity !== undefined && assessment?.kind !== 'final') requireCondition(researchCapacityProjection(capacity, audit?.store).prompt === envelope.prompt,
     'research_capacity_invalid', 'The actual role prompt differs from its predeclared result admission');
-  audit?.onContext?.(subject as Record<string, any>);
+  if (audit?.onContext) audit.onContext(assessment?.kind === 'final'
+    ? structuredClone(subject as Record<string, any>) : subject as Record<string, any>);
   const recovered = operatorReplayedResponse(role, input, audit);
   if (recovered) { audit?.onContext?.(recovered.subject); return recovered.research; }
   if (assessment?.kind === 'replay-only') applicationAuditInvalid('The operator recovery did not consume its selected response');
@@ -720,10 +820,13 @@ async function dispatchResearchCall(role: RoleBinding, environment: Environment,
       try { stageEstimate=estimateCliCall(audit.store,environment.projectId,role,audit.purpose,input.length,
         packetState?.initial===false?'continuation':'initial'); }
       catch(error) {
-        if(assessment?.kind!=='dossier' || !(error instanceof EngineError) || error.code!=='budget_estimate_missing') throw error;
+        if((assessment?.kind!=='dossier' && assessment?.kind!=='final')
+          || !(error instanceof EngineError) || error.code!=='budget_estimate_missing') throw error;
         stageEstimate=estimateCliCall(audit.store,environment.projectId,role,'assessor',input.length,
           packetState?.initial===false?'continuation':'initial');
-        stageEstimate={...stageEstimate,explanation:'Managed dossier bootstrap from measured assessor calls. '+stageEstimate.explanation};
+        stageEstimate={...stageEstimate,explanation:
+          `Managed ${assessment.kind === 'final' ? 'final' : 'dossier'} bootstrap from measured assessor calls. `
+          + stageEstimate.explanation};
       }
     }
     catch (error) {
@@ -738,13 +841,21 @@ async function dispatchResearchCall(role: RoleBinding, environment: Environment,
     throw error;
   }
   const progressContext = (subject as any)?.contextControls ? {...context as Record<string,any>,contextControls:(subject as any).contextControls} : context;
-  const progress=packetState&&!dossier?(contextDeep?deepInvocationProgress(audit!.store,contextDeep,audit!.purpose,role.actor,reference(consumerIntent!))
+  const progress=packetState&&!dossier&&!finalPacker?(contextDeep?deepInvocationProgress(audit!.store,contextDeep,audit!.purpose,role.actor,reference(consumerIntent!))
     :invocationProgress(audit!.store,audit!.questionId!,audit!.purpose,progressContext as Record<string,any>,planSubject,role.actor,assessmentSubject,variantSubject)):null;
   const reservation: { writes: Write[]; guards: TransactionGuard[] } = !stagePlan && audit?.pilot
     ? pilotDispatch(audit.store, audit.pilot, callId, input.length) : { writes: [], guards: [] };
   if(dossierEnvelope) {
     reservation.writes.push(...dossierEnvelope.archives.writes);
     reservation.guards.push(...dossierEnvelope.archives.guards);
+  }
+  if (finalPacker) {
+    reservation.writes.push(...finalPacker.staged().writes);
+    reservation.guards.push(...finalPacker.staged().guards);
+  }
+  if (assessment?.kind === 'final') {
+    reservation.writes.push(...assessment.writes);
+    reservation.guards.push(...assessment.guards);
   }
   if (stagePlan && stageEstimate && audit && draft) {
     // The one closing kind is the proven dossier admission (stageClass above); the shared reservation applies it.
@@ -790,7 +901,7 @@ async function dispatchResearchCall(role: RoleBinding, environment: Environment,
     reservation.guards.push(...manifestReservationResult.guards);
   }
   if (packetState) {
-    const questionCounterId=`question-dispatch:${hashJson(dossier ? ['dossier/v1',environment.projectId,dossier,dossierSessionTransport(context)!.session.id] : variantSubject ? ['variant/v1',environment.projectId,audit!.draftId,audit!.questionId!,variantSubject,audit!.purpose,role.actor] : assessmentSubject ? [environment.projectId,assessmentSubject] : planSubject ? (contextDeep ? [environment.projectId,planSubject,'deep/v1',contextDeep] : [environment.projectId,planSubject]) : audit!.questionId!)}`;
+    const questionCounterId=`question-dispatch:${hashJson(finalPacker ? ['discovery-final/v1',environment.projectId,(context as any).finalContinuation,role.actor] : dossier ? ['dossier/v1',environment.projectId,dossier,dossierSessionTransport(context)!.session.id] : variantSubject ? ['variant/v1',environment.projectId,audit!.draftId,audit!.questionId!,variantSubject,audit!.purpose,role.actor] : assessmentSubject ? [environment.projectId,assessmentSubject] : planSubject ? (contextDeep ? [environment.projectId,planSubject,'deep/v1',contextDeep] : [environment.projectId,planSubject]) : audit!.questionId!)}`;
     const questionCounter=audit!.store.get<{projectId:string;question:string;serial:number;subject?:V7PlanSubject;assessmentKey?:string}>(questionCounterId);
     requireCondition(!questionCounter||(questionCounter.kind==='question-dispatch'&&questionCounter.value.projectId===environment.projectId
       &&questionCounter.value.question===audit!.questionId&&(questionCounter.value.assessmentKey??null)===assessmentSubjectKey(assessmentSubject)&&sameSubject(packetPlanSubject(questionCounter.value),planSubject)
@@ -800,7 +911,7 @@ async function dispatchResearchCall(role: RoleBinding, environment: Environment,
     reservation.writes.push({id:questionCounterId,kind:'question-dispatch',expected:questionCounter?.revision??0,
       value:{projectId:environment.projectId,question:audit!.questionId,...(assessmentSubject?{assessmentKey:assessmentSubjectKey(assessmentSubject)}:{}),...(planSubject?{subject:planSubject}:{}),...(variantSubject?{variantSubject}:{}),...(contextDeep?{deepPreparation:contextDeep}:{}),serial:(questionCounter?.value.serial??0)+1}});
     if(questionCounter) reservation.guards.push(reference(questionCounter));
-    if(audit!.session) reservation.guards.push(audit!.session);
+    if(audit!.session && !(assessment?.kind === 'final' && audit!.finalPending?.session)) reservation.guards.push(audit!.session);
     const dispatch = continuationDispatch(packetState, callId);
     reservation.writes.push(...dispatch.writes); reservation.guards.push(...dispatch.guards,...(progress?.guards??[]),
       ...(deepAdmission?deepAdmission.guards:[]));
@@ -820,7 +931,8 @@ async function dispatchResearchCall(role: RoleBinding, environment: Environment,
       ...(contextDeep?{deepPreparation:contextDeep}:{}),
       ...(dossier?{dossierSubject:dossier,managedDossier:dossierSessionTransport(context)}:{}),
       ...(ownership ?? {}),
-      ...(audit?.application ? { assessmentApplication: audit.application } : {}),
+      ...(assessment?.kind === 'final' ? { finalApplication: audit!.application,
+        finalContinuation: (context as any).finalContinuation } : audit?.application ? { assessmentApplication: audit.application } : {}),
       ...(consumerIntent ? { consumerIntent: reference(consumerIntent) } : {}),
       profile: audit?.pilot ? reference(audit.pilot) : null,
       questionId: planSubject?.planQuestionId ?? audit?.questionId ?? null,
@@ -880,7 +992,27 @@ async function executeResearchPhysicalCall(role:RoleBinding, environment:Environ
       spawnedPid = pid;
       try {
         researchControlScope(audit?.store, environment.projectId);
-        if(call&&audit) call = authorizeModelDispatch(control?.view() ?? audit.store, reference(call), pid);
+        if (call && audit) {
+          let writer = control?.view() ?? audit.store;
+          if (audit.purpose === 'discovery-final') {
+            const at = audit.application;
+            requireCondition(isRef(at), 'discovery_final_dispatch_unavailable',
+              'The final dispatch needs its exact saved application');
+            const application = audit.store.get<Record<string, any>>(at.id, at.revision);
+            requireCondition(application?.kind === 'discovery-final-application' && recordValue(application.value)
+              && canonical(reference(application)) === canonical(at) && hashJson(application.value) === application.hash
+              && Array.isArray(application.value.guards), 'discovery_final_dispatch_unavailable',
+            'The final dispatch lost its exact saved application or guards');
+            const guards = uniqueTransactionGuards([reference(application), ...application.value.guards]);
+            const controlled = writer;
+            // The admission may move after reservation or a resumed-claim
+            // check. Recheck its saved guards in the authorization CAS, before
+            // runProcess can transfer any request bytes to the provider.
+            writer = storeView(controlled, { write: (writes, own) =>
+              controlled.writeMany(writes, uniqueTransactionGuards([...own, ...guards])) });
+          }
+          call = authorizeModelDispatch(writer, reference(call), pid);
+        }
         consumeInvocationAllowance();
       } catch (error) {
         if (error instanceof RunControlLost)
@@ -930,7 +1062,10 @@ async function executeResearchPhysicalCall(role:RoleBinding, environment:Environ
       if (rawResponse !== null) {
         const saved = { id: `model-response:${requestId}`, kind: "model-response", expected: 0,
           value: { projectId: environment.projectId, draftId: audit.draftId, text: rawResponse,
-            ...(audit.application && physicalResult ? { assessmentExecution: { contract: 'assessment-execution/v1',
+            ...(audit.application && audit.purpose === 'discovery-final' && physicalResult ? { finalExecution: {
+              contract: 'discovery-final-execution-receipt/v1', call: claimed, dispatch: reference(call),
+              process: { exitCode: physicalResult.exitCode, signal: physicalResult.signal, stderr: physicalResult.stderr } } }
+              : audit.application && physicalResult ? { assessmentExecution: { contract: 'assessment-execution/v1',
               call: claimed, dispatch: reference(call), process: { exitCode: physicalResult.exitCode,
                 signal: physicalResult.signal, stderr: physicalResult.stderr } } } : {}) } };
         if (consumerIntent && physicalResult) (saved.value as Record<string, unknown>)['consumerExecution'] = {
@@ -1055,4 +1190,92 @@ export async function resumeDossierResearchCall(store:Store,applicationRef:Ref,s
   return executeResearchPhysicalCall(admitted.role,admitted.dispatch,request.value.text,claim.value.requestId,claim,signal,
     {store,draftId:admitted.draft.id,questionId:admitted.question.id,purpose:'dossier-assessor',session:reference(admitted.session),
       application:applicationRef,...(admitted.profile?{pilot:admitted.profile}:{})},control,segment,null);
+}
+
+/** A final reservation can be resumed only by its original still-live owner,
+ * before authorization. An authorized or uncertain provider is never sent a
+ * second request. */
+export async function resumeDiscoveryFinalResearchCall(store: Store, applicationRef: Ref, signal?: AbortSignal) {
+  recoveryDispatchBoundary();
+  let stableApplication: unknown;
+  try { stableApplication = JSON.parse(canonical(applicationRef)); }
+  catch { throw new EngineError('discovery_final_dispatch_unavailable', 'The final application needs a stable exact reference'); }
+  requireCondition(isRef(stableApplication) && recordValue(stableApplication)
+    && Object.keys(stableApplication).sort().join(',') === 'hash,id,revision',
+  'discovery_final_dispatch_unavailable', 'The final application needs a stable exact reference');
+  applicationRef = stableApplication;
+  const admitted = await readDiscoveryFinalDispatchAdmission(store, applicationRef);
+  const callId = `model-call:final:v1:${hashJson(applicationRef)}`;
+  const claim = store.get<ModelCall>(callId, 1), head = store.get<ModelCall>(callId);
+  requireCondition(claim?.kind === 'model-call' && recordValue(claim.value) && head && recordValue(head.value)
+    && canonical(reference(head)) === canonical(reference(claim))
+    && claim.hash === hashJson(claim.value as never) && claim.value.status === 'running'
+    && executionOf(claim.value)?.phase === 'claimed' && claim.value.ownerProcess?.pid === process.pid
+    && claim.value.ownerProcess.started === processStart(process.pid)
+    && canonical(executionOf(claim.value)!.owner) === canonical(claim.value.ownerProcess)
+    && canonical((claim.value as unknown as Record<string, unknown>).finalApplication) === canonical(applicationRef)
+    && canonical((claim.value as unknown as Record<string, unknown>).finalContinuation) === canonical(admitted.context.finalContinuation)
+    && canonical(claim.value.requested) === canonical(admitted.role)
+    && canonical(claim.value.profile ?? null) === canonical(admitted.session.value.profile)
+    && claim.value.projectId === admitted.session.value.projectId && claim.value.draftId === admitted.draft.id
+    && claim.value.questionId === admitted.question.id && claim.value.purpose === 'discovery-final',
+  'model_call_process_uncertain', 'Only the original live owner can resume an un-authorized final claim');
+  for (const witness of evaluateProcessStopWitnesses(store, claim.id))
+    requireCondition(witness.state === 'ended', 'model_call_process_uncertain', 'An unresolved provider prevents final retry');
+  const requestRef = claim.value.request?.record, archiveRef = claim.value.packet?.archive;
+  const request = isRef(requestRef) ? store.get<Record<string, any>>(requestRef.id, requestRef.revision) : null;
+  const archive = isRef(archiveRef) ? store.get<Record<string, any>>(archiveRef.id, archiveRef.revision) : null;
+  requireCondition(recordValue(claim.value.packet) && ['initial', 'continuation'].includes(claim.value.packet.kind)
+    && request?.kind === 'model-request' && canonical(reference(request)) === canonical(requestRef)
+    && hashJson(request.value) === request.hash && request.value.projectId === claim.value.projectId
+    && request.value.draftId === claim.value.draftId && typeof request.value.text === 'string'
+    && digest(request.value.text) === claim.value.request.hash && request.value.text.length === claim.value.request.chars
+    && Buffer.byteLength(request.value.text) === claim.value.request.bytes
+    && archive?.kind === 'research-context' && canonical(reference(archive)) === canonical(archiveRef)
+    && canonical(readArchiveBody(store, archive).body) === canonical(admitted.context),
+  'response_recovery_wire_invalid', 'The final claim lost its exact request or original archive');
+  let wire: any;
+  try { wire = JSON.parse(request.value.text); }
+  catch { throw new EngineError('response_recovery_wire_invalid', 'The saved final request must be complete JSON'); }
+  requireCondition(recordValue(wire) && wire.protocol === 'omg-agent/v1' && wire.requestId === claim.value.requestId
+    && wire.mode === 'research' && wire.model === admitted.role.model && wire.effort === admitted.role.effort
+    && (wire.speed ?? 'inherited') === (admitted.role.speed ?? 'inherited')
+    && wire.prompt === (claim.value.packet!.kind === 'continuation'
+      ? continuationPrompt('discovery-final', admitted.prompt) : admitted.prompt)
+    && canonical(wire.subject?.working?.archive) === canonical(archiveRef)
+    && canonical(wire.subject?.finalContinuation) === canonical(admitted.context.finalContinuation)
+    && canonical(wire.subject?.continuation?.finalContinuation) === canonical(admitted.context.finalContinuation)
+    && canonical(wire.subject?.subject) === canonical(admitted.session.value.subject)
+    && canonical(wire.subject?.schema) === canonical(admitted.context.schema)
+    && canonical(wire.subject?.resultCapacity) === canonical(admitted.context.resultCapacity)
+    && canonical(wire.subject?.responseOutputLimit) === canonical(researchResponseOutputLimit(admitted.profile?.value.physicalLimits?.maxReplyChars ?? null))
+    && request.value.text.length <= admitted.prepared.value.input.limitChars
+    && (!admitted.profile || request.value.text.length <= admitted.profile.value.maxRequestChars)
+    && (!admitted.profile?.value.physicalLimits || request.value.text.length <= admitted.profile.value.physicalLimits.maxRequestChars),
+  'response_recovery_wire_foreign', 'The saved final request differs from its original admission or bounds');
+  requirePacketMaterialDelivery(wire.subject, archiveRef!, (ref, pointer) => {
+    const row = store.get<Record<string, any>>(ref.id, ref.revision);
+    requireCondition(row?.kind === 'research-context' && canonical(reference(row)) === canonical(ref)
+      && hashJson(row.value) === row.hash && row.value.projectId === claim.value.projectId
+      && canonical(row.value.draft) === canonical(admitted.session.value.binding.draft)
+      && canonical(row.value.question) === canonical(admitted.session.value.binding.question),
+    'context_reference_foreign', 'A final page lost its exact original binding');
+    return contextValue({ body: readArchiveBody(store, row).body }, pointer);
+  });
+  requireContextDelivery(admitted.context.contextWorkspace, wire.subject);
+  const current = currentDiscoveryFinalGuards(store, claim.value.projectId, admitted);
+  requireCondition(current.every(guard => admitted.application.value.guards.some(saved => canonical(saved) === canonical(guard))),
+    'discovery_final_dispatch_unavailable', 'The final claim is no longer current');
+  requireInvocationAllowance();
+  const control = researchDispatchControl(store, claim.value.projectId, earlyResearchStage(admitted.draft.value.stage));
+  try { control?.admit(); }
+  catch (error) { if (error instanceof RunControlLost) throw new EngineError(error.refusal.code, error.refusal.message, error.refusal.at); throw error; }
+  const segmentRef = claim.value.budget?.segment;
+  const segment = isRef(segmentRef) ? store.get<BudgetSegment>(segmentRef.id, segmentRef.revision) : null;
+  requireCondition(!segmentRef || segment?.kind === 'research-budget' && canonical(reference(segment)) === canonical(segmentRef),
+    'research_budget_invalid', 'The final claim lost its original budget reservation');
+  return executeResearchPhysicalCall(admitted.role, admitted.dispatch, request.value.text, claim.value.requestId, claim, signal,
+    { store, draftId: admitted.draft.id, questionId: admitted.question.id, purpose: 'discovery-final',
+      session: reference(admitted.session), application: applicationRef,
+      ...(admitted.profile ? { pilot: admitted.profile } : {}) }, control, segment, null);
 }

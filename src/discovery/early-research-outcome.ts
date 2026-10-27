@@ -17,6 +17,7 @@ import { canonical, hashJson, type Json } from '../canonical.js';
 import { isRef, reference, stageId, type Ref, type StageArtifact } from '../pipeline/contracts.js';
 import type { Store } from '../storage/store.js';
 import { inheritanceCandidateFailure } from './research-context.js';
+import { ARCHIVE_PARTS_CONTRACT, readArchiveBody } from './request-parts.js';
 
 export const EARLY_RESEARCH_OUTCOME = 'early-research-outcome/v1' as const;
 export const earlyResearchStage = (stage: unknown): boolean =>
@@ -353,6 +354,27 @@ export function readCapacityProjection(store: Store, record: Ref, pointer: strin
   return saved.value.body as Record<string, unknown>;
 }
 
+/** D7 stores its complete mandatory request in the shared parts archive, not
+ * in the earlier result-capacity-projection/v1 record. This is only an exact
+ * reader: final admission must separately re-prove the packet and schema. */
+export function readFinalCapacityProjection(store: Store, record: Ref, pointer: string) {
+  let snapshot: Ref;
+  try { snapshot = JSON.parse(canonical(record)); }
+  catch { throw new EngineError('research_capacity_invalid', 'The final admission needs its exact request address'); }
+  requireCondition(isRef(snapshot) && pointer === '/body/request', 'research_capacity_invalid',
+    'The final admission needs its exact request address');
+  const saved = store.get<Record<string, any>>(snapshot.id, snapshot.revision);
+  requireCondition(saved?.kind === 'research-context' && saved.revision === 1
+    && canonical(reference(saved)) === canonical(snapshot) && hashJson(saved.value) === snapshot.hash
+    && saved.value?.contract === ARCHIVE_PARTS_CONTRACT,
+  'research_capacity_invalid', 'The exact immutable final admission archive is missing or foreign');
+  const body = readArchiveBody(store, saved).body;
+  requireCondition(Object.keys(body).length === 1 && body.request !== null
+    && typeof body.request === 'object' && !Array.isArray(body.request),
+  'research_capacity_invalid', 'The final archive lost its complete request');
+  return body.request as Record<string, unknown>;
+}
+
 /** The full minimum is counted once by the shared builder. The actual request
  * carries only its exact archive address, avoiding a second question/prompt. */
 export function declareResultCapacity(store: Store, input: ResearchResultCapacityInput): ResearchResultCapacity {
@@ -370,14 +392,20 @@ export function declareResultCapacity(store: Store, input: ResearchResultCapacit
   return capacity;
 }
 export function researchCapacityProjection(saved: ResearchResultCapacity, store?: Store): Record<string, any> {
-  requireCondition(saved?.mandatory && typeof saved.mandatory === 'object',
+  const mandatory = saved?.mandatory;
+  requireCondition(mandatory && typeof mandatory === 'object',
     'research_capacity_invalid', 'The result admission lost its minimum');
-  if ('projection' in saved.mandatory) return saved.mandatory.projection;
+  if ('projection' in mandatory) return mandatory.projection;
   requireCondition(store, 'research_capacity_invalid', 'The admission archive needs its exact store');
-  requireCondition(saved.mandatory.archive && typeof saved.mandatory.archive === 'object',
+  const archive = mandatory.archive;
+  requireCondition(archive && typeof archive === 'object',
     'research_capacity_invalid', 'The result admission lost its archive');
-  const { record, pointer } = saved.mandatory.archive;
-  const projection = readCapacityProjection(store, record, pointer);
+  const actionMode = saved.actionMode;
+  const { record, pointer, hash } = archive;
+  const projection = actionMode === 'final-result-preflight'
+    ? readFinalCapacityProjection(store, record, pointer) : readCapacityProjection(store, record, pointer);
+  if (actionMode === 'final-result-preflight') requireCondition(hashJson(projection) === hash,
+    'research_capacity_invalid', 'The final admission archive does not match its declared hash');
   return projection;
 }
 export function requireResultCapacity(saved: unknown, input: ResearchResultCapacityInput, store?: Store): ResearchResultCapacity {
@@ -406,7 +434,9 @@ export function researchResultFailure(saved: unknown, payload: unknown): EngineE
     && capacity.forms.every(form => form && typeof form.kind === 'string'),
   'research_capacity_invalid', 'The producer lost its declared result forms');
   const response = payload as Record<string, any> | null;
-  const kind = capacity.actionMode === 'dossier-result-preflight'
+  const kind = capacity.actionMode === 'final-result-preflight'
+    ? response?.contract === 'discovery-final-result/v1' ? 'discovery_final' : response?.action
+    : capacity.actionMode === 'dossier-result-preflight'
     ? response?.contract === DOSSIER_ASSESSMENT_RESULT_CONTRACT && ['supported','return'].includes(response?.verdict)
       ? `dossier_${response!.verdict}` : response?.action
     : capacity.actionMode === 'consolidation' ? 'summary'

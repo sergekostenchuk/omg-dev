@@ -1,4 +1,4 @@
-import { canonical, hashJson } from '../canonical.js';
+import { canonical, digest, hashJson } from '../canonical.js';
 import { isRef, type Ref } from '../pipeline/contracts.js';
 import { EngineError, requireCondition } from '../errors.js';
 
@@ -166,19 +166,25 @@ export function researchResultCapacity(input: { role: string; field: 'answer' | 
     allowedFieldChars: Math.max(0, fieldChars - deficitChars), deficitChars };
 }
 
-function request(original: AddressedOriginal): ResearchDelivery['requested'] {
+type DeliverySource = 'original' | 'context-page';
+
+function request(original: AddressedOriginal, source: DeliverySource, serialized?: string): ResearchDelivery['requested'] {
   if (original.page?.encoding === 'canonical-json') {
-    const length = canonical(original.value).length, page = original.page;
+    const page = original.page;
+    const length = source === 'context-page' ? page.total : (serialized ?? canonical(original.value)).length;
     requireCondition(page.unit === 'utf16' && page.total === length
       && Number.isSafeInteger(page.offset) && Number.isSafeInteger(page.end)
+      && Number.isSafeInteger(page.total)
       && page.offset >= 0 && page.end >= page.offset && page.end <= length
+      && (source !== 'context-page' || typeof original.value === 'string'
+        && original.value.length === page.end - page.offset)
       && page.next === (page.end < length ? page.end : null),
     'research_context_invalid', 'The canonical JSON page needs exact saved UTF-16 bounds');
     return { offset: page.offset, end: page.end, total: length, unit: 'utf16' };
   }
   const unit = Array.isArray(original.value) ? 'items' : 'utf16';
   const valueLength = Array.isArray(original.value) || typeof original.value === 'string'
-    ? original.value.length : canonical(original.value).length;
+    ? original.value.length : (serialized ?? canonical(original.value)).length;
   if (!original.page) return { offset: 0, end: valueLength, total: valueLength, unit };
   requireCondition((original.page.unit === 'items' || original.page.unit === 'utf16')
     && original.page.unit === unit && Number.isSafeInteger(original.page.offset)
@@ -190,33 +196,75 @@ function request(original: AddressedOriginal): ResearchDelivery['requested'] {
   return { offset: original.page.offset, end: original.page.end, total: original.page.total, unit };
 }
 
+/** Snapshot JSON without lending the caller's objects to fits. Read keys in
+ * canonical order, but retain their insertion order for the actual wire. */
+function deliverySnapshot(value: unknown, seen = new Set<object>()): unknown {
+  if (value === null || typeof value === 'string' || typeof value === 'boolean'
+    || typeof value === 'number' && Number.isFinite(value)) return value;
+  if (typeof value !== 'object' || seen.has(value as object))
+    throw new EngineError('invalid_json', 'Only finite, acyclic JSON values can be stored');
+  seen.add(value as object);
+  let result: unknown;
+  if (Array.isArray(value)) {
+    if (Object.keys(value).length !== value.length) throw new EngineError('invalid_json', 'Sparse arrays are forbidden');
+    result = value.map(item => deliverySnapshot(item, seen));
+  } else {
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null)
+      throw new EngineError('invalid_json', 'Only plain objects can be stored');
+    const names = Object.keys(value), saved = new Map<string, unknown>();
+    for (const name of [...names].sort()) saved.set(name, deliverySnapshot((value as Record<string, unknown>)[name], seen));
+    const copy: Record<string, unknown> = Object.create(prototype);
+    for (const name of names) Object.defineProperty(copy, name,
+      { value: saved.get(name), enumerable: true, writable: true, configurable: true });
+    result = copy;
+  }
+  seen.delete(value as object);
+  return result;
+}
+
 /** Fit the largest positive prefix against the *actual serialized packet*.
  * If one array item cannot fit, transport an explicitly encoded JSON fragment. */
-export function planResearchDelivery(original: AddressedOriginal, key: string, envelopeLimitChars: number,
+function planDelivery(original: AddressedOriginal, key: string, envelopeLimitChars: number,
   deliveryLimitChars: number,
-  fits: (delivery: ResearchDelivery) => boolean): ResearchDelivery | null {
-  requireCondition(isRef(original.record) && typeof original.pointer === 'string' && typeof key === 'string',
+  fits: (delivery: ResearchDelivery) => boolean, context: boolean): ResearchDelivery | null {
+  // A fit callback can call arbitrary code, including mutating the caller's
+  // material or the candidate it receives. Capture the addressed material once
+  // and never lend that private snapshot to the callback.
+  let record: Ref;
+  try { record = deliverySnapshot(original.record) as Ref; }
+  catch { throw new EngineError('research_context_invalid', 'An addressed delivery needs its original identity'); }
+  const pointer = original.pointer;
+  requireCondition(isRef(record) && typeof pointer === 'string' && typeof key === 'string',
     'research_context_invalid', 'An addressed delivery needs its original identity');
-  const requested = request(original);
-  const base = { contract: 'research-delivery/v1' as const,
-    original: { key, record: original.record, pointer: original.pointer,
-      valueHash: hashJson(original.value), page: original.page ?? null }, requested,
-    envelopeLimitChars, deliveryLimitChars };
+  const value = deliverySnapshot(original.value);
+  const serialized = canonical(value);
+  const sourcePage = original.page;
+  const page = sourcePage === undefined ? undefined : deliverySnapshot(sourcePage) as AddressedOriginal['page'];
+  const snapshot: AddressedOriginal = { record, pointer, value, ...(page === undefined ? {} : { page }) };
+  const source: DeliverySource = context && page?.encoding === 'canonical-json' ? 'context-page' : 'original';
+  const requested = request(snapshot, source, serialized);
+  const valueHash = digest(serialized);
   const start = requested.offset;
-  const canonicalPage = original.page?.encoding === 'canonical-json';
+  const canonicalPage = page?.encoding === 'canonical-json';
   const fragment = (count: number, json = false): ResearchDelivery => {
-    const encoding = json ? 'json-string-fragment' : Array.isArray(original.value) ? 'array-items' : 'utf16-string';
+    const encoding = json ? 'json-string-fragment' : Array.isArray(value) ? 'array-items' : 'utf16-string';
     const offset = json && !canonicalPage ? 0 : start;
-    const content = json ? canonical(original.value).slice(offset, offset + count)
-      : (original.value as string | unknown[]).slice(0, count);
-    const total = json ? canonical(original.value).length : requested.total;
+    const content = json ? source === 'context-page' && canonicalPage
+      ? (value as string).slice(0, count) : serialized.slice(offset, offset + count)
+      : (value as string | unknown[]).slice(0, count);
+    const total = json && !(source === 'context-page' && canonicalPage)
+      ? serialized.length : requested.total;
     const end = offset + count;
-    return { ...base, requested: json && !canonicalPage ? { offset: 0, end: total, total, unit: 'utf16' } : requested,
+    return { contract: 'research-delivery/v1',
+      original: { key, record: structuredClone(record), pointer, valueHash, page: structuredClone(page ?? null) },
+      requested: json && !canonicalPage ? { offset: 0, end: total, total, unit: 'utf16' } : { ...requested },
+      envelopeLimitChars, deliveryLimitChars,
       served: { offset, end, total, next: end < total ? end : null,
         unit: json ? 'utf16' : requested.unit }, encoding,
-      ...(json ? { text: content as string } : { value: content }) };
+      ...(json ? { text: content as string } : { value: structuredClone(content) }) };
   };
-  const isSliceable = !canonicalPage && (typeof original.value === 'string' || Array.isArray(original.value));
+  const isSliceable = !canonicalPage && (typeof value === 'string' || Array.isArray(value));
   if (isSliceable) {
     let low = 0, high = requested.end - start;
     while (low < high) {
@@ -225,7 +273,6 @@ export function planResearchDelivery(original: AddressedOriginal, key: string, e
     }
     if (low > 0) return fragment(low);
   }
-  const serialized = canonical(original.value);
   let low = 0, high = canonicalPage ? requested.end - requested.offset : serialized.length;
   while (low < high) {
     const mid = Math.ceil((low + high) / 2);
@@ -234,9 +281,22 @@ export function planResearchDelivery(original: AddressedOriginal, key: string, e
   return low > 0 ? fragment(low, true) : null;
 }
 
+export function planResearchDelivery(original: AddressedOriginal, key: string, envelopeLimitChars: number,
+  deliveryLimitChars: number, fits: (delivery: ResearchDelivery) => boolean): ResearchDelivery | null {
+  return planDelivery(original, key, envelopeLimitChars, deliveryLimitChars, fits, false);
+}
+
+/** Context lookups are already projections of their saved source. Unlike a
+ * consolidation original, a canonical-json lookup contains the selected raw
+ * UTF-16 page, not the full object from which that page was taken. */
+export function planResearchContextDelivery(original: AddressedOriginal, key: string, envelopeLimitChars: number,
+  deliveryLimitChars: number, fits: (delivery: ResearchDelivery) => boolean): ResearchDelivery | null {
+  return planDelivery(original, key, envelopeLimitChars, deliveryLimitChars, fits, true);
+}
+
 /** Verify a saved delivery using only its exact original. The same function is
  * used before dispatch and when the paid packet is read after a cold restart. */
-export function requireResearchDelivery(original: AddressedOriginal, key: string, delivery: unknown): asserts delivery is ResearchDelivery {
+function requireDelivery(original: AddressedOriginal, key: string, delivery: unknown, source: DeliverySource): asserts delivery is ResearchDelivery {
   requireCondition(!!delivery && typeof delivery === 'object', 'research_context_undelivered',
     'The saved fragment is missing');
   const item = delivery as ResearchDelivery;
@@ -246,20 +306,24 @@ export function requireResearchDelivery(original: AddressedOriginal, key: string
     && item.original.valueHash === hashJson(original.value)
     && canonical(item.original.page) === canonical(original.page ?? null),
   'research_context_undelivered', 'The delivered fragment does not match its saved original');
-  const requested = request(original), served = item.served;
+  const requested = request(original, source), served = item.served;
   if (item.encoding === 'json-string-fragment') {
-    const encoded = canonical(original.value);
-    const expected = original.page?.encoding === 'canonical-json' ? request(original)
+    const contextPage = source === 'context-page' && original.page?.encoding === 'canonical-json';
+    const encoded = contextPage ? original.value as string : canonical(original.value);
+    const expected = original.page?.encoding === 'canonical-json' ? requested
       : { offset: 0, end: encoded.length, total: encoded.length, unit: 'utf16' };
+    const total = contextPage ? expected.total : encoded.length;
     requireCondition(canonical(item.requested) === canonical(expected)
       && served?.offset === expected.offset && Number.isSafeInteger(served.end)
       && served.end > expected.offset && served.end <= expected.end
-      && served.total === encoded.length && served.unit === 'utf16'
-      && served.next === (served.end < encoded.length ? served.end : null)
-      && item.text === encoded.slice(expected.offset, served.end) && !Object.hasOwn(item, 'value'),
+      && served.total === total && served.unit === 'utf16'
+      && served.next === (served.end < total ? served.end : null)
+      && item.text === (contextPage ? encoded.slice(0, served.end - served.offset)
+        : encoded.slice(expected.offset, served.end)) && !Object.hasOwn(item, 'value'),
     'research_context_undelivered', 'The JSON fragment differs from the saved original');
   } else {
-    requireCondition(canonical(item.requested) === canonical(requested)
+    requireCondition(!(source === 'context-page' && original.page?.encoding === 'canonical-json')
+      && canonical(item.requested) === canonical(requested)
       && served?.offset === requested.offset && Number.isSafeInteger(served.end)
       && served.end > served.offset && served.end <= requested.end && served.total === requested.total
       && served.unit === requested.unit && served.next === (served.end < requested.total ? served.end : null)
@@ -272,6 +336,17 @@ export function requireResearchDelivery(original: AddressedOriginal, key: string
     && Number.isSafeInteger(item.deliveryLimitChars) && item.deliveryLimitChars > 0
     && item.deliveryLimitChars <= item.envelopeLimitChars,
   'research_context_undelivered', 'The delivery lost its declared limits');
+}
+
+export function requireResearchDelivery(original: AddressedOriginal, key: string, delivery: unknown): asserts delivery is ResearchDelivery {
+  requireDelivery(original, key, delivery, 'original');
+}
+
+/** The caller is the context-workspace adapter, whose originals are the
+ * results of the shared exact context reader, not caller-provided authority. */
+export function requireResearchContextDelivery(original: AddressedOriginal, key: string, delivery: unknown): asserts delivery is ResearchDelivery {
+  requireDelivery(original, key, delivery,
+    original.page?.encoding === 'canonical-json' ? 'context-page' : 'original');
 }
 
 /** Re-derive a transported archive fragment from the same pinned body used

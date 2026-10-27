@@ -600,9 +600,17 @@ export const FOUNDATION_FIELDS = ['core','map','researchScope','mapStatus','allo
   'constraints','specificationConstraints','concept','requirements','nodes','files','records','value','previousProposal','currentProposal'] as const;
 // This row serializes attempts; successful model-call records establish delivery.
 interface DossierContinuation { subject: DossierAssessmentSubject; session: string }
-interface ContinuationState { dossier?: DossierContinuation; projectId: string; question: string; purpose: string; actor: string; activeCall: string; attempts: number; subject?: V7PlanSubject; assessmentKey?: string; variantSubject?: VariantSubject; draft?: Ref; questionRef?: Ref; deepPreparation?: Ref }
+/** D7 keeps its own immutable operation identity. The origin Ref is revision 1;
+ * later execution revisions guard the cursor, not the continuation key. */
+export interface FinalContinuation {
+  subject: import('./discovery-final.js').DiscoveryFinalSubject;
+  prepared: Ref;
+  execution: Ref;
+}
+interface ContinuationState { finalContinuation?: FinalContinuation; dossier?: DossierContinuation; projectId: string; question: string; purpose: string; actor: string; activeCall: string; attempts: number; subject?: V7PlanSubject; assessmentKey?: string; variantSubject?: VariantSubject; draft?: Ref; questionRef?: Ref; deepPreparation?: Ref }
 export interface ContinuationPacketState {
   dossier?: DossierContinuation;
+  finalContinuation?: FinalContinuation;
   initial: boolean; state: Revision<ContinuationState> | null; id: string; priorCalls: number;
   basis: Ref | null; latest: Ref | null; callGuards: ReadGuard[]; attempts: number;
   projectId: string; question: Revision<Question>; draft: Revision<DiscoveryDraft>; purpose: string; actor: string; subject: V7PlanSubject | null; assessmentSubject: AssessmentTransportSubject | null; variantSubject?: VariantSubject | null; deepPreparation?: Ref | null;
@@ -613,8 +621,9 @@ export function continuationState(store: Store, projectId: string, draftId: stri
   variantSubject?: null, deepPreparation?: null): LegacyContinuationPacketState;
 export function continuationState(store: Store, projectId: string, draftId: string, questionId: string, purpose: string,
   actor: string, subject: V7PlanSubject | null, assessmentSubject: AssessmentTransportSubject | null,
-  variantSubject: VariantSubject | null, deepPreparation?: Ref | null, dossier?: DossierContinuation): ContinuationPacketState;
-export function continuationState(store: Store, projectId: string, draftId: string, questionId: string, purpose: string, actor: string, subject: V7PlanSubject | null = null, assessmentSubject: AssessmentTransportSubject | null = null, variantSubject: VariantSubject | null = null, deepPreparation: Ref | null = null, dossier?: DossierContinuation): ContinuationPacketState {
+  variantSubject: VariantSubject | null, deepPreparation?: Ref | null, dossier?: DossierContinuation,
+  finalContinuation?: FinalContinuation): ContinuationPacketState;
+export function continuationState(store: Store, projectId: string, draftId: string, questionId: string, purpose: string, actor: string, subject: V7PlanSubject | null = null, assessmentSubject: AssessmentTransportSubject | null = null, variantSubject: VariantSubject | null = null, deepPreparation: Ref | null = null, dossier?: DossierContinuation, finalContinuation?: FinalContinuation): ContinuationPacketState {
   const draft=store.get<DiscoveryDraft>(draftId),question=store.get<Question>(questionId);
   requireCondition(draft?.kind==='discovery-draft' && question?.kind==='question' && draft.value.projectId===projectId
     && question.value.projectId===projectId && question.value.draftId===draftId && draft.value.questions.includes(questionId),
@@ -623,21 +632,33 @@ export function continuationState(store: Store, projectId: string, draftId: stri
   if (variantSubject) variantTransportGuards(projectId, draftId, variantSubject);
   const deep = deepTransportSubject(purpose, deepPreparation, subject, variantSubject, assessmentSubject);
   const assessmentKey = assessmentSubjectKey(assessmentSubject);
-  const id=`continuation-state:${hashJson(dossier ? ['dossier/v1',projectId,dossier,actor] : variantSubject ? ['variant/v1',projectId,reference(draft),reference(question),variantSubject,purpose,actor] : assessmentSubject ? [projectId,assessmentSubject,purpose,actor] : subject ? (deep ? [projectId,subject,purpose,actor,'deep/v1',deep] : [projectId,subject,purpose,actor]) : [projectId,questionId,purpose,actor])}`;
+  if (finalContinuation) requireCondition(purpose==='discovery-final' && !dossier && !subject && !assessmentSubject && !variantSubject && !deep
+    && finalContinuation.subject?.contract==='discovery-final-subject/v1' && finalContinuation.subject.projectId===projectId
+    && isRef(finalContinuation.prepared) && isRef(finalContinuation.execution) && finalContinuation.execution.revision===1
+    && Object.keys(finalContinuation).sort().join(',')==='execution,prepared,subject',
+  'continuation_foreign','A final continuation needs its own exact immutable subject and origin');
+  requireCondition(purpose!=='discovery-final' || finalContinuation, 'continuation_foreign',
+    'A final call needs its own continuation identity');
+  const id=`continuation-state:${hashJson(finalContinuation ? ['discovery-final/v1',projectId,finalContinuation,actor] : dossier ? ['dossier/v1',projectId,dossier,actor] : variantSubject ? ['variant/v1',projectId,reference(draft),reference(question),variantSubject,purpose,actor] : assessmentSubject ? [projectId,assessmentSubject,purpose,actor] : subject ? (deep ? [projectId,subject,purpose,actor,'deep/v1',deep] : [projectId,subject,purpose,actor]) : [projectId,questionId,purpose,actor])}`;
   const state=store.get<ContinuationState>(id);
-  const calls=(deep ? deepIdentityCalls(store,deep,purpose,actor) : store.list<ModelCall>('model-call')).filter(c=>c.value.projectId===projectId
+  const calls=(deep ? deepIdentityCalls(store,deep,purpose,actor) : store.list<ModelCall>('model-call')).filter(c=>
+    (!finalContinuation || c.value !== null && typeof c.value === 'object' && !Array.isArray(c.value)) && c.value.projectId===projectId
     && ((c.value as unknown as {assessmentKey?:string}).assessmentKey ?? null) === assessmentKey
-    && callAddressesSubject(c.value as unknown as Record<string,unknown>, reference(question), subject) && c.value.purpose===purpose && c.value.requested.actor===actor
+    && callAddressesSubject(c.value as unknown as Record<string,unknown>, reference(question), subject) && c.value.purpose===purpose
+    && (finalContinuation ? c.value.requested?.actor : c.value.requested.actor)===actor
     && canonical(packetVariantSubject(c.value)) === canonical(variantSubject)
     && canonical(packetDeepPreparation(c.value)) === canonical(deep)
     && canonical(packetDossierSubject(c.value))===canonical(dossier?.subject??null)
     && (!dossier || (c.value as any).managedDossier?.session?.id===dossier.session)
+    && (!finalContinuation || canonical((c.value as any).finalContinuation??null)===canonical(finalContinuation))
     && (!variantSubject || !Object.hasOwn(c.value,'subject') && !Object.hasOwn(c.value,'assessmentSubject')
       && c.value.draftId === draftId && variantCallMatches(store,c,projectId,reference(draft),reference(question),purpose,actor,variantSubject)))
     .sort((a,b)=>a.value.startedAt-b.value.startedAt||a.id.localeCompare(b.id));
   requireCondition(!calls.some(c=>c.value.status==='running'),'continuation_call_active',
     'This question/role has an unfinished invocation; recover its actual outcome before another dispatch');
-  if(state) requireCondition(canonical(state.value.dossier??null)===canonical(dossier??null) && (state.value.assessmentKey ?? null) === assessmentKey && state.kind==='continuation-state' && state.value.question===questionId
+  if (state && finalContinuation) requireCondition(state.value !== null && typeof state.value === 'object'
+    && !Array.isArray(state.value), 'continuation_foreign', 'The final continuation state is missing or malformed');
+  if(state) requireCondition(canonical(state.value.dossier??null)===canonical(dossier??null) && (!finalContinuation || canonical(state.value.finalContinuation??null)===canonical(finalContinuation)) && (state.value.assessmentKey ?? null) === assessmentKey && state.kind==='continuation-state' && state.value.question===questionId
     && canonical(packetVariantSubject(state.value)) === canonical(variantSubject)
     && canonical(packetDeepPreparation(state.value)) === canonical(deep)
     && (!variantSubject || isRef(state.value.draft) && isRef(state.value.questionRef) && canonical(state.value.draft) === canonical(reference(draft)) && canonical(state.value.questionRef) === canonical(reference(question)))
@@ -645,6 +666,12 @@ export function continuationState(store: Store, projectId: string, draftId: stri
     'continuation_foreign','Continuation state belongs to another role/question');
   if(state) requireCondition(typeof state.value.activeCall==='string'&&calls.some(c=>c.id===state.value.activeCall),
     'continuation_call_missing','The serialized attempt has no matching call; repair its outcome before continuation');
+  // A final cursor's earlier calls are just as much a part of its delivery as
+  // the active call. If an old call loses its marker (or disappears), the
+  // filter above must not silently turn the remaining call into a new origin.
+  if(state && finalContinuation) requireCondition(Number.isSafeInteger(state.value.attempts)
+    && state.value.attempts === calls.length, 'continuation_call_missing',
+  'The final continuation lost one of its serialized calls');
   const replays=store.list<{call:Ref}>('research-response-replay');
   const delivered=calls.filter(c=>c.value.status==='succeeded'||replays.some(r=>r.value.call.id===c.id
     &&r.value.call.revision===c.revision&&r.value.call.hash===c.hash));
@@ -652,21 +679,23 @@ export function continuationState(store: Store, projectId: string, draftId: stri
   for(const ref of archives){
     const original=isRef(ref)?store.get<any>(ref.id,ref.revision):null;
     // DRS1a2: the delivered body by the archive's own contract (whole or parts).
-    requireCondition(original?.kind==='research-context'&&original.hash===ref.hash&&original.value?.projectId===projectId
+    requireCondition(original?.kind==='research-context'&&original.hash===ref.hash
+      &&(!finalContinuation || canonical(reference(original))===canonical(ref)) && original.value?.projectId===projectId
       &&isRef(original.value.question)&&original.value.question.id===questionId
       &&sameAssessmentSubject(readArchiveBody(store, original).body, assessmentSubject ? {assessmentSubject} : {})
       &&sameSubject(packetPlanSubject(original.value),subject)
       &&canonical(packetDeepPreparation(readArchiveBody(store, original).body))===canonical(deep)
-      &&canonical(packetDossierSubject(readArchiveBody(store,original).body))===canonical(dossier?.subject??null),'continuation_foreign','Delivered foundation belongs to another question');
+      &&canonical(packetDossierSubject(readArchiveBody(store,original).body))===canonical(dossier?.subject??null)
+      &&(!finalContinuation || canonical(readArchiveBody(store,original).body.finalContinuation??null)===canonical(finalContinuation)),'continuation_foreign','Delivered foundation belongs to another question');
   }
-  return {...(dossier?{dossier}:{}),initial:delivered.length===0,state,id,priorCalls:delivered.length,attempts:calls.length,
+  return {...(dossier?{dossier}:{}),...(finalContinuation?{finalContinuation}:{}),initial:delivered.length===0,state,id,priorCalls:delivered.length,attempts:calls.length,
     basis:archives[0]??null,latest:archives.at(-1)??null,callGuards:calls.map(reference),projectId,question,draft,purpose,actor,subject,assessmentSubject,...(variantSubject?{variantSubject}:{}) ,...(deep?{deepPreparation:deep}:{})};
 }
 export function continuationDispatch(state: LegacyContinuationPacketState, callId: string): {writes: Write[]; guards: ReadGuard[]};
 export function continuationDispatch(state: ContinuationPacketState, callId: string): {writes: Write[]; guards: TransactionGuard[]};
 export function continuationDispatch(state: ContinuationPacketState, callId: string): { writes: Write[]; guards: TransactionGuard[] } {
   return {writes:[{id:state.id,kind:'continuation-state',expected:state.state?.revision??0,
-    value:{projectId:state.projectId,question:state.question.id,purpose:state.purpose,actor:state.actor,...(state.dossier?{dossier:state.dossier}:{}),
+    value:{projectId:state.projectId,question:state.question.id,purpose:state.purpose,actor:state.actor,...(state.dossier?{dossier:state.dossier}:{}),...(state.finalContinuation?{finalContinuation:state.finalContinuation}:{}),
       activeCall:callId,attempts:state.attempts+1,...(state.variantSubject?{variantSubject:state.variantSubject,draft:reference(state.draft),questionRef:reference(state.question)}:{}),...(state.deepPreparation?{deepPreparation:state.deepPreparation}:{}),...(state.assessmentSubject?{assessmentKey:assessmentSubjectKey(state.assessmentSubject)}:{}),...(state.subject?{subject:state.subject}:{})}}],guards:[reference(state.question),reference(state.draft),...state.draft.value.inputs,...state.callGuards,
       ...(state.variantSubject?variantTransportGuards(state.projectId,state.draft.id,state.variantSubject):[]),
       ...(state.deepPreparation?[state.deepPreparation]:[])]};
@@ -749,12 +778,28 @@ export function continuationMetadata(state: ContinuationPacketState, archive: Re
   try { if (original?.kind === 'research-context' && original.hash === foundation.hash) body = readArchiveBody(store, original).body; }
   catch (error) { if (!(error instanceof EngineError)) throw error; }
   requireCondition(original?.kind === 'research-context' && original.hash === foundation.hash
+    && (!state.finalContinuation || canonical(reference(original)) === canonical(foundation))
     && original.value?.projectId === state.projectId && isRef(original.value.draft) && original.value.draft.id === state.draft.id
     && isRef(original.value.question) && original.value.question.id === state.question.id
-    && body !== null && (!state.dossier || canonical(packetDossierSubject(body))===canonical(state.dossier.subject)
+    && body !== null && (!state.finalContinuation || canonical(body.finalContinuation??null)===canonical(state.finalContinuation)) && (!state.dossier || canonical(packetDossierSubject(body))===canonical(state.dossier.subject)
       && dossierSessionTransport(body)?.session.id===state.dossier.session) && sameAssessmentSubject(body,state.assessmentSubject?{assessmentSubject:state.assessmentSubject}:{}) && sameSubject(packetPlanSubject(original.value),state.subject),
   'continuation_foreign', `[${foundation.id}] The exact foundation archive is unavailable`);
-  return {...(state.variantSubject?variantTransportFields(state.projectId,reference(state.draft),reference(state.question),state.purpose,state.actor,state.variantSubject):{}),...(state.deepPreparation?deepTransportFields(state.deepPreparation):{}),...(state.assessmentSubject?{assessmentKey:assessmentSubjectKey(state.assessmentSubject)}:{}),kind:state.initial?'initial':'continuation',role:state.purpose,question:state.subject?.planQuestionId??state.question.id,...(state.subject?{subject:state.subject}:{}),
+  if (state.finalContinuation) {
+    const current = staged?.get(archive.id) ?? store.get<Record<string, any>>(archive.id, archive.revision);
+    let currentBody: Record<string, unknown> | null = null;
+    try {
+      if (current?.kind === 'research-context' && current.hash === archive.hash)
+        currentBody = readArchiveBody(store, current).body;
+    } catch (error) { if (!(error instanceof EngineError)) throw error; }
+    requireCondition(current?.kind === 'research-context' && current.hash === archive.hash
+      && canonical(reference(current)) === canonical(archive)
+      && current.value?.projectId === state.projectId
+      && canonical(current.value.draft) === canonical(reference(state.draft))
+      && canonical(current.value.question) === canonical(reference(state.question))
+      && currentBody !== null && canonical(currentBody.finalContinuation ?? null) === canonical(state.finalContinuation),
+    'continuation_foreign', `[${archive.id}] The current final archive is unavailable or belongs to another execution`);
+  }
+  return {...(state.variantSubject?variantTransportFields(state.projectId,reference(state.draft),reference(state.question),state.purpose,state.actor,state.variantSubject):{}),...(state.deepPreparation?deepTransportFields(state.deepPreparation):{}),...(state.assessmentSubject?{assessmentKey:assessmentSubjectKey(state.assessmentSubject)}:{}),...(state.finalContinuation?{finalContinuation:state.finalContinuation}:{}),kind:state.initial?'initial':'continuation',role:state.purpose,question:state.subject?.planQuestionId??state.question.id,...(state.subject?{subject:state.subject}:{}),
     foundation,current:archive,previousCalls:state.priorCalls,
     foundationPointers:contextSections(body!, [...FOUNDATION_FIELDS]).map(section => section.pointer)};
 }

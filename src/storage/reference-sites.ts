@@ -105,6 +105,12 @@ const contextBodyData = (prefix: readonly PathPatternSegment[]): PathPattern[] =
 
 const capacityData = (prefix: readonly PathPatternSegment[]): PathPattern[] =>
   contextBodyData([...prefix, 'mandatory', 'projection', 'subject']);
+const finalSubjectRefs = (prefix: readonly PathPatternSegment[]): PathPattern[] => [
+  [...prefix, 'dossier', 'root', 'ref'], [...prefix, 'dossier', 'manifest'],
+  ...['assessment', 'draft', 'frame', 'plan', 'session', 'application', 'call', 'request', 'response']
+    .map(key => [...prefix, 'basis', key]),
+  ...['question', 'fact', 'acceptance', 'source'].map(key => [...prefix, 'basis', 'brief', key]),
+];
 const contextData = (prefix: readonly PathPatternSegment[]): PathPattern[] => [
   ...contextBodyData(prefix), ...capacityData([...prefix, 'resultCapacity'])
 ];
@@ -325,6 +331,20 @@ const RECORD_REFERENCE_SEMANTICS: readonly RecordReferenceSemantics[] = [
   { kind: "discovery-dossier-assessment", contract: "discovery-dossier-assessment/v1", data: [], refs: [
     ["subject", "root", "ref"], ["subject", "manifest"], ["manifest"], ["session"], ["application"],
     ["call"], ["request"], ["response"]] },
+  // The paid D7 cursor is distinct from its immutable preparation. Projected
+  // bundle and workspace values remain data, while their exact sources are links.
+  { kind: "discovery-final-execution", contract: "discovery-final-execution/v1", data: [], refs: [
+    ["prepared"], ...finalSubjectRefs(["subject"]), ["binding", "draft"], ["binding", "question"],
+    ["binding", "environment"], ["binding", "inputs", INDEX], ["profile"], ["previous"], ["result"],
+    ["workspace", "entries", INDEX, "result", "record"], ["workspace", "deliveryCoverage", INDEX, "record"]] },
+  { kind: "discovery-final-application", contract: "discovery-final-application/v1", data: [], refs: [
+    ["session"], ["profile"], ["guards", INDEX], ["call"], ["received"], ["after"],
+    ["context", "finalContinuation", "prepared"], ["context", "finalContinuation", "execution"],
+    ...finalSubjectRefs(["context", "finalContinuation", "subject"]),
+    ["context", "resultCapacity", "mandatory", "archive", "record"],
+    ["context", "contextWorkspace", INDEX, "record"]] },
+  { kind: "discovery-final-paid-result", contract: "discovery-final-paid-result/v1", data: [], refs: [
+    ["prepared"], ...finalSubjectRefs(["subject"]), ["session"], ["application"], ["call"], ["request"], ["response"]] },
   // DR6 6.1/6.2: the structural dossier snapshot declares its exact references only — the draft, the accepted frame
   // and plan answers, the grounds of each partial reason, every claim container of the axes, unknowns and
   // contradiction sides, the assessment of each side and the grounds of each resolution.

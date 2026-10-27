@@ -1,5 +1,5 @@
 import { historicalProof, withHistoricalReads } from '../history/proofs.js';
-import { genuineStore } from '../storage/store-view.js';
+import { genuineStore, provenStore } from '../storage/store-view.js';
 import { readDeepPreparation as proveDeepPreparation, requireCurrentDeepPreparation, type ProvenDeepPreparation } from './deep-research.js';
 import { deepPreparationRef, projectPaidDeepResearch } from './research-consumer-transition.js';
 import { decodeVariantExecutionSession, decodeVariantSubject, readVariantNoneStructural, readVariantSetStructural,
@@ -47,7 +47,8 @@ import { archivedContext, contextValue } from './working-context.js';
 import { researchContextReadEra } from './research-limits.js';
 import { requirePacketMaterialDelivery } from './research-delivery.js';
 import { requirePlanningNavigation } from './planning-context.js';
-import { contextWorkspace } from './context-workspace.js';
+import { contextWorkspace, requireContextDelivery } from './context-workspace.js';
+import { DISCOVERY_FINAL_EXECUTION_KIND, readDiscoveryFinalDispatchLeaf } from './discovery-final-execution.js';
 
 import { canonical, digest, hashJson } from '../canonical.js';
 import { reference, isRef, uniqueRefs, type Ref, type Finding, type StageArtifact } from '../pipeline/contracts.js';
@@ -2113,8 +2114,9 @@ export type ResearchExecution = ResearchExecutionContext & (
 /** The receipt records runProcess's close result, not an interpretation of its
  * status label. Both producers share the same physical proof. */
 function physicalExecution(store: Store, call: Revision<ModelCall>, value: Record<string, any>,
-  receiptName: 'assessmentExecution' | 'consumerExecution', claimName: 'assessmentApplication' | 'consumerIntent',
-  contract: 'assessment-execution/v1' | 'research-consumer-execution/v1'): Ref[] {
+  receiptName: 'assessmentExecution' | 'consumerExecution' | 'finalExecution',
+  claimName: 'assessmentApplication' | 'consumerIntent' | 'finalApplication',
+  contract: 'assessment-execution/v1' | 'research-consumer-execution/v1' | 'discovery-final-execution-receipt/v1'): Ref[] {
   const receipt = value[receiptName];
   const fields = (record: Record<string, any>, names: string[]) => Object.keys(record).sort().join(',') === names.sort().join(',');
   const identity = (record: unknown): record is { pid: number; started: string } => object(record)
@@ -2133,7 +2135,7 @@ function physicalExecution(store: Store, call: Revision<ModelCall>, value: Recor
     && hashJson(claim.value) === claim.hash && hashJson(dispatch.value) === dispatch.hash
     && claim.id === call.id && dispatch.id === call.id && claim.revision === 1 && dispatch.revision === claim.revision + 1
     && call.revision > dispatch.revision && claim.value.status === 'running' && claim.value.finishedAt === null
-    && claim.value.response === null && claim.value.error === null && isRef((claim.value as ModelCall & { assessmentApplication?: Ref; consumerIntent?: Ref })[claimName]),
+    && claim.value.response === null && claim.value.error === null && isRef((claim.value as unknown as Record<string, unknown>)[claimName]),
   'response_recovery_execution_invalid', 'The physical receipt must name the original assessment claim and authorization');
   const before = claim.value.execution, authorized = dispatch.value.execution;
   requireCondition(before?.version === 'model-execution/v1' && before.phase === 'claimed' && identity(before.owner)
@@ -2154,7 +2156,7 @@ function physicalExecution(store: Store, call: Revision<ModelCall>, value: Recor
     ? call.value.error === null && receipt.process.exitCode === 0 && receipt.process.signal === null
     : call.value.status === 'failed',
   'response_recovery_execution_invalid', 'The saved status contradicts the physical process outcome');
-  if (contract === 'research-consumer-execution/v1') {
+  if (contract === 'research-consumer-execution/v1' || contract === 'discovery-final-execution-receipt/v1') {
     const profile = isRef(call.value.profile)
       ? store.get<import('./reader-pilot.js').ReaderPilot>(call.value.profile.id, call.value.profile.revision) : null;
     if (isRef(call.value.profile) && (!profile || canonical(reference(profile)) !== canonical(call.value.profile)))
@@ -3552,7 +3554,8 @@ export function prepareResearchConsumerApplication(store: Store, intentRef: Ref,
  * admission and operator authority are checked separately by the caller. */
 function researchExecution(store: Store, project: string, callRef: Ref,
   session: Revision<RecoverableContextSession>, draft: Revision<DiscoveryDraft>, question: Revision<Question>,
-  role: RoleBinding, profile: Ref | null, onlyResponse: boolean): ResearchExecution {
+  role: RoleBinding, profile: Ref | null, onlyResponse: boolean,
+  finalAdmission?: ReturnType<typeof readDiscoveryFinalDispatchLeaf>): ResearchExecution {
   requireCondition(store && typeof store.get === 'function' && typeof project === 'string' && project.length > 0
     && isRef(callRef) && isRef(session) && isRef(draft) && isRef(question) && object(role)
     && typeof role.actor === 'string' && typeof role.model === 'string' && typeof role.effort === 'string'
@@ -3564,11 +3567,12 @@ function researchExecution(store: Store, project: string, callRef: Ref,
       && canonical(saved) === canonical(supplied), code, 'The supplied consumer revision must match its exact saved state');
     return saved;
   };
-  session = exact(session, ['synthesis-session', 'assessment-session'], 'response_recovery_session_stale');
+  session = exact(session, ['synthesis-session', 'assessment-session', DISCOVERY_FINAL_EXECUTION_KIND], 'response_recovery_session_stale');
+  const final = session.kind === DISCOVERY_FINAL_EXECUTION_KIND;
   const dossier = session.kind === 'assessment-session' && session.id.startsWith('dossier-session:v1:');
   requireCondition(!dossier || session.value.contract === DOSSIER_SESSION && !onlyResponse,
     'discovery_dossier_session_invalid', 'Only the managed exact dossier session may read its physical execution');
-  const applicationEra = dossier || assessmentSessionEra(session);
+  const applicationEra = dossier || !final && assessmentSessionEra(session);
   draft = exact(draft, ['discovery-draft'], 'response_recovery_binding_stale');
   question = exact(question, ['question'], 'response_recovery_binding_stale');
   const binding = responseSessionBinding(session);
@@ -3579,7 +3583,7 @@ function researchExecution(store: Store, project: string, callRef: Ref,
     && canonical(draft.value.inputs) === canonical(binding.inputs) && inputs.every(ref => {
       const saved = store.get(ref.id, ref.revision); return saved && saved.hash === ref.hash;
     }), 'response_recovery_binding_stale', 'The archived session must retain its exact research binding');
-  const synthesis = session.kind === 'synthesis-session', purpose = synthesis ? 'analyst' : dossier ? 'dossier-assessor' : 'assessor';
+  const synthesis = session.kind === 'synthesis-session', purpose = synthesis ? 'analyst' : final ? 'discovery-final' : dossier ? 'dossier-assessor' : 'assessor';
   const call = store.get<ModelCall>(callRef.id, callRef.revision);
   // DR3a3-S5: a v3 step's call is addressed to its session's plan-question and
   // plan answer (the formula C writes); a v2 step's to its Question id with no
@@ -3593,7 +3597,7 @@ function researchExecution(store: Store, project: string, callRef: Ref,
     && call.value.purpose === purpose && object(call.value.requested) && canonical(call.value.requested) === canonical(role)
     && canonical(call.value.profile ?? null) === canonical(profile),
   'response_recovery_call_foreign', 'The succeeded call must belong to this exact consumer, profile and role');
-  const controlTerminal = !onlyResponse && !synthesis && !dossier ? assessmentControlTerminal(store, call) : null;
+  const controlTerminal = !onlyResponse && !synthesis && !dossier && !final ? assessmentControlTerminal(store, call) : null;
   requireCondition(object(call.value.request) && (controlTerminal ? call.value.response === null : object(call.value.response))
     && object(call.value.packet),
     'response_recovery_wire_missing', 'The complete paid request, response and context archive must exist');
@@ -3642,7 +3646,8 @@ function researchExecution(store: Store, project: string, callRef: Ref,
   'response_recovery_wire_foreign', 'The raw envelopes must match the selected paid call');
   const savedArchive = store.get<Record<string, unknown>>(archiveRef.id, archiveRef.revision);
   requireCondition(savedArchive?.kind === 'research-context' && savedArchive.hash === archiveRef.hash && object(savedArchive.value)
-    && isRef(savedArchive.value['draft']) && isRef(savedArchive.value['question']) && object(savedArchive.value['body']),
+    && isRef(savedArchive.value['draft']) && isRef(savedArchive.value['question'])
+    && (object(savedArchive.value['body']) || final && savedArchive.value['contract'] === ARCHIVE_PARTS_CONTRACT),
   'context_reference_foreign', 'The context archive must retain exact research references and a complete body');
   // archivedContext shares its existing archive formula. Only its unversioned
   // question lookup is pinned here; this is a separate semantic view, not a
@@ -3663,10 +3668,37 @@ function researchExecution(store: Store, project: string, callRef: Ref,
     && savedWorkspace.entries.every(entry => object(entry) && object(entry.result)),
   'research_context_invalid', 'Saved context workspace is invalid');
   const workspace = contextWorkspace(session.value.workspace, session.value['focus']);
-  const appRef = !synthesis && applicationEra ? call.value.assessmentApplication : undefined;
+  const appRef = final ? (call.value as unknown as Record<string, any>).finalApplication
+    : !synthesis && applicationEra ? call.value.assessmentApplication : undefined;
   const state = synthesis ? { offset: session.value['offset'], materialOffset: session.value['materialOffset'] ?? 0 }
-    : dossier ? {} : { offset: session.value['offset'], candidateOffset: session.value['candidateOffset'] ?? 0, total: JSON.stringify(body.observations).length };
-  if (dossier) {
+    : dossier || final ? {} : { offset: session.value['offset'], candidateOffset: session.value['candidateOffset'] ?? 0, total: JSON.stringify(body.observations).length };
+  if (final) {
+    requireContextDelivery(workspace.entries.map(entry => entry.result), request.subject);
+    requireCondition(isRef(appRef), 'discovery_final_execution_invalid', 'The final call lost its exact application');
+    // A final-only wrapper may have just read this leaf itself. Its private
+    // argument is never supplied by callers and applies only to this read.
+    const admission = finalAdmission ?? readDiscoveryFinalDispatchLeaf(store, appRef);
+    const claim = store.get<ModelCall>(call.id, 1);
+    requireCondition(canonical(reference(admission.application)) === canonical(appRef)
+      && canonical(reference(admission.session)) === canonical(reference(session))
+      && canonical(admission.role) === canonical(role)
+      && canonical(admission.profile ? reference(admission.profile) : null) === canonical(profile)
+      && claim && object(claim.value)
+      && canonical((claim.value as unknown as Record<string, unknown>).finalApplication) === canonical(reference(admission.application))
+      && canonical(archive.draft) === canonical(binding.draft) && canonical(archive.question) === canonical(binding.question)
+      && canonical(body) === canonical(admission.context)
+      && canonical(request.subject.finalContinuation) === canonical(body.finalContinuation)
+      && canonical(request.subject.continuation?.finalContinuation) === canonical(body.finalContinuation)
+      && canonical((call.value as unknown as Record<string, unknown>).finalContinuation) === canonical(body.finalContinuation)
+      && canonical(request.subject.subject) === canonical(admission.session.value.subject)
+      && canonical(request.subject.schema) === canonical(body.schema)
+      && canonical(request.subject.resultCapacity) === canonical(body.resultCapacity)
+      && canonical(body.contextWorkspace) === canonical(workspace.entries.map(entry => entry.result))
+      && !workspace.blocked
+      && request.prompt === (call.value.packet.kind === 'continuation'
+        ? continuationPrompt('discovery-final', admission.prompt) : admission.prompt),
+    'discovery_final_execution_invalid', 'The paid final call differs from its exact application, cursor or wire');
+  } else if (dossier) {
     requireCondition(isRef(appRef), 'discovery_dossier_session_invalid', 'The dossier call lost its prepared application');
     const admission = readDossierDispatchAdmission(store, appRef!);
     const claim = store.get<ModelCall>(call.id, 1), running = store.get<Record<string, any>>(appRef!.id, 2);
@@ -3802,7 +3834,7 @@ function researchExecution(store: Store, project: string, callRef: Ref,
         && canonical(request.subject.readings ?? []) === canonical(supplied.filter((item: any) => item.kind === 'reader').map((item: any) => item.value)),
       'response_recovery_page_foreign', 'The complete material page must match its archived values');
     }
-  } else if (!dossier) {
+  } else if (!dossier && !final) {
     const evidence = request.subject.evidencePage, candidate = request.subject.candidatePage;
     const evidenceText = JSON.stringify(body.observations), candidateText = JSON.stringify(body.value);
     requireCondition(object(evidence) && object(candidate) && evidence.offset === session.value['offset'] && evidence.total === evidenceText.length
@@ -3826,7 +3858,7 @@ function researchExecution(store: Store, project: string, callRef: Ref,
     && Object.hasOwn(response, 'research');
   // RS3 (№4433): the one receipt this call's era proves carries every mark read from the process — the physical proof
   // below, its exit and signal, and the no-response mark of a failed call's own envelope. A sibling receipt is not read.
-  const receiptName = applicationEra ? 'assessmentExecution' as const : consumerEra ? 'consumerExecution' as const : null;
+  const receiptName = final ? 'finalExecution' as const : applicationEra ? 'assessmentExecution' as const : consumerEra ? 'consumerExecution' as const : null;
   const executionReceipt = receiptName ? responseValue![receiptName] : null;
   const absent = call.value.status === 'failed' ? noModelResponse(responseText!, request.protocol, request.requestId,
     object(executionReceipt) && object(executionReceipt.process) ? executionReceipt.process.stderr : undefined) : null;
@@ -3834,7 +3866,8 @@ function researchExecution(store: Store, project: string, callRef: Ref,
     || absent === 'envelope',
     'response_recovery_wire_foreign', 'A foreign or incomplete research envelope is not evidence of an absent response');
   const physicalProof = receiptName === 'assessmentExecution' ? assessmentExecution(store, call, responseValue!)
-    : receiptName === 'consumerExecution' ? physicalExecution(store, call, responseValue!, receiptName, 'consumerIntent', 'research-consumer-execution/v1') : [];
+    : receiptName === 'consumerExecution' ? physicalExecution(store, call, responseValue!, receiptName, 'consumerIntent', 'research-consumer-execution/v1')
+    : receiptName === 'finalExecution' ? physicalExecution(store, call, responseValue!, receiptName, 'finalApplication', 'discovery-final-execution-receipt/v1') : [];
   result.guards = uniqueRefs([...result.guards, responseRef!]);
   if (linked) {
     // Presence, not payload validity, distinguishes a received answer. Even a
@@ -3858,6 +3891,26 @@ export function readResearchExecution(store: Store, project: string, callRef: Re
   session: Revision<RecoverableContextSession>, draft: Revision<DiscoveryDraft>, question: Revision<Question>,
   role: RoleBinding, profile: Ref | null): ResearchExecution {
   return researchExecution(store, project, callRef, session, draft, question, role, profile, false);
+}
+
+/** Prove one final application and its physical outcome together. Callers
+ * supply only exact addresses; the leaf is freshly read in this invocation.
+ * A leaf is reused only on proven reads with an unchanged Store stamp. */
+export function readDiscoveryFinalResearchExecution(store: Store, project: string, callRef: Ref, applicationRef: Ref) {
+  const call = plainExactRef(callRef), application = plainExactRef(applicationRef);
+  requireCondition(call && application, 'discovery_final_execution_invalid', 'A final execution needs exact immutable references');
+  const source = provenStore(store), stamp = source?.changeStamp();
+  let admission = readDiscoveryFinalDispatchLeaf(store, application);
+  let paid = researchExecution(store, project, call, admission.session, admission.draft, admission.question,
+    admission.role, admission.profile ? reference(admission.profile) : null, false, source ? admission : undefined);
+  if (source && (provenStore(store) !== source || source.changeStamp() !== stamp)) {
+    // Another connection or a changed view invalidated the borrowed leaf.
+    // Fall back to the ordinary reader, which proves the leaf independently.
+    admission = readDiscoveryFinalDispatchLeaf(store, application);
+    paid = researchExecution(store, project, call, admission.session, admission.draft, admission.question,
+      admission.role, admission.profile ? reference(admission.profile) : null, false);
+  }
+  return { admission, paid };
 }
 
 /** The operator's original succeeded-response contract and DTO stay exact. */
