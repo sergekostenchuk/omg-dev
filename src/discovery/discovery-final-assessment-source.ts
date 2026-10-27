@@ -47,7 +47,8 @@ function snapshotRef(ref: unknown): Ref {
 }
 function exact<T>(store: Store, ref: Ref, kind: string, message: string): Revision<T> {
   const row = store.get<T>(ref.id, ref.revision);
-  valid(row?.kind === kind && same(reference(row), ref) && hashJson(row.value as never) === row.hash, message);
+  // PAID-SOURCE-SHAPE-01: a consistent hash over a value that is no record is refused before any field is read.
+  valid(row?.kind === kind && same(reference(row), ref) && hashJson(row.value as never) === row.hash && object(row.value), message);
   return row;
 }
 

@@ -118,4 +118,23 @@ test('7a.4 source refusals: foreign, absent, rehashed or reshaped grounds and an
   const application = row.value.application, applied = { ...application, revision: 2 } as Ref;
   for (const absent of [ref, application, applied, f.execution, f.d6, f.packet.subject.basis.brief.source])
     await refused(f, f.store, () => readDiscoveryFinalAssessmentSourceAt(mask(f.store, absent), 'p', ref), '*');
+  // PAID-SOURCE-SHAPE-01: an application or its applied revision whose value is no record, under a consistent hash (the
+  // paid result re-pointed and rehashed for the first), is the source's own typed refusal — never a TypeError.
+  const first = f.store.get<any>(application.id, 1)!, second = f.store.get<any>(application.id, 2)!;
+  for (const variant of ['application', 'applied'] as const) {
+    const broken = { ...(variant === 'application' ? first : second), value: null, hash: hashJson(null) };
+    const paid = structuredClone(row) as any;
+    if (variant === 'application') { paid.value.application = reference(broken); paid.hash = hashJson(paid.value as Json); }
+    await refused(f, f.store, () => readDiscoveryFinalAssessmentSourceAt(overlay(f.store, [broken, paid]), 'p', reference(paid)));
+  }
 });
+/** A read overlay over several exact revisions at once. */
+function overlay(store: Store, rows: { id: string; revision: number }[]): Store {
+  const get = store.get.bind(store), bound = new Map<PropertyKey, unknown>();
+  return new Proxy(store, { get(target, key) {
+    if (key === 'get') return <T>(id: string, revision?: number) =>
+      (rows.find(row => row.id === id && (revision === undefined || row.revision === revision)) as Revision<T> | undefined) ?? get<T>(id, revision);
+    if (!bound.has(key)) { const value = Reflect.get(target, key); bound.set(key, typeof value === 'function' ? value.bind(target) : value); }
+    return bound.get(key);
+  } });
+}
