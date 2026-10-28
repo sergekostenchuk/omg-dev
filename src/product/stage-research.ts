@@ -1,6 +1,7 @@
 import type { ProductEngine, StageContent } from "./engine.js";
 import {
   contractEraOf, discoveryOutcome, executionAdmission, isPostPreparationForm,
+  researchBeforeStageResult, snapshotExecutionPolicy, type DiscoveryExecutionPolicy,
   readDraft, readRecord, readResearchRun, readRun, readStageArtifact, researchRunId, type DiscoveryOutcome, type ResearchRun,
   UPSTREAM_STAGES, type UpstreamStage,
 } from "../discovery/projection-reader.js";
@@ -22,7 +23,11 @@ export interface StageResearchResult {
 /** DRY6-01: a pause on a refused original assessment names the assessed question and its exact recovery door. */
 export type StageReason = Finding & { door?: AssessmentRefusalDoor };
 
-export interface StageResearchOptions { restoreOnly?: boolean }
+export interface StageResearchOptions {
+  restoreOnly?: boolean;
+  /** Trusted embedding policy, never a field of the public JSON command. */
+  producerPolicy?: DiscoveryExecutionPolicy;
+}
 
 const DESIGN_ERRORS = new Set(["graph_invalid", "map_design_missing", "derived_field_conflict", "l1_detail_leak",
   "outcome_uncovered", "journey_uncovered", "graph_semantic_drift"]);
@@ -70,7 +75,8 @@ export class StageResearch {
     }
     const control = readRunControl(store, { project });
     if (!control.ok) throw new EngineError(control.refusal.code, control.refusal.message, control.refusal.at);
-    const admission = executionAdmission(store, draft, 'new-research');
+    const producerPolicy = snapshotExecutionPolicy(options.producerPolicy);
+    const admission = executionAdmission(store, draft, 'new-research', producerPolicy);
     if (admission.paused) {
       const restored = await restorePaid(), run=readResearchRun(store, project, draftId);
       if (control.value.stopped) return {status:'stopped',stage:artifact?reference(artifact):null,
@@ -89,6 +95,16 @@ export class StageResearch {
       return { status: 'stopped', stage: artifact ? reference(artifact) : null,
         research: restored ? reference(restored) : null, feedback: null,
         findings: [stoppedFinding], turnsUsed: 0, reason: stoppedFinding };
+    }
+    if (researchBeforeStageResult(draft.value)) {
+      const previous = readResearchRun(store, project, draftId)?.value.turns ?? 0;
+      const run = await researcher.run(project, draftId, maxTurns, undefined,
+        producerPolicy ? { producerPolicy } : {});
+      const why = run.value.pauseCode ? { code: run.value.pauseCode, target: run.value.ownerQuestion?.question ?? draftId,
+        message: run.value.error ?? 'Discovery research is paused' } : null;
+      return { status: run.value.status === 'needs_owner' ? 'needs_owner' : 'paused',
+        stage: artifact ? reference(artifact) : null, research: reference(run), feedback: null,
+        findings: why ? [why] : [], reason: why, turnsUsed: Math.max(0, run.value.turns - previous) };
     }
     let graphExpected = store.get(`graph:${project}`)?.revision ?? 0;
     const result = await researchForConsumer(store, researcher, project, draftId, maxTurns, () => {

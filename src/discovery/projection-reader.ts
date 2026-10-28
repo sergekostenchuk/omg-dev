@@ -1,9 +1,10 @@
-import { EngineError } from "../errors.js";
+import { EngineError, requireCondition } from "../errors.js";
 import { readVariantGeneration, readVariantModelDecision } from "./variant-session.js";
 import { readVariantOwnerDecision } from "./discovery-decision.js";
 import type { VariantOwnerOperation } from "./variant-decision.js";
 import type { DiscoveryVariant, VariantNone, VariantOrigin, VariantReason, VariantScale, VariantSet } from "./discovery-variants.js";
 import { currentPlan, planOwnerSubject, provePlanQuestions } from "./v7-plan-questions.js";
+import { v7FrameAssessment } from './v7-frame-assessment.js';
 import { readResearchConsumerTurn } from "./response-recovery.js";
 import { turnAction, type ManagedResearchTurn } from "./research-consumer-transition.js";
 import { planSubjectOf, type V7PlanSubject } from "./v7-managed-attempt.js";
@@ -29,7 +30,7 @@ import { planSubjectOf, type V7PlanSubject } from "./v7-managed-attempt.js";
 import { Ajv, type AnySchema, type ValidateFunction } from "ajv";
 import { canonical, hashJson, type Json } from "../canonical.js";
 import { sealed } from "../om/refusal.js";
-import { isRef, reference, stageId, type Ref, type Stage, type StageArtifact } from "../pipeline/contracts.js";
+import { isRef, reference, stageId, uniqueRefs, type Ref, type Stage, type StageArtifact } from "../pipeline/contracts.js";
 import { Store, storeObserved, type Revision } from "../storage/store.js";
 import { provenStore } from "../storage/store-view.js";
 import type { Observation } from "../evidence/evidence.js";
@@ -42,9 +43,9 @@ import {
 } from "./requirements.js";
 import {
   DISCOVERY_ACCEPTANCE_ACT_KIND, DISCOVERY_ACCEPTANCE_ACT_CONTRACT,
-  discoveryAcceptanceActId, type DiscoveryAcceptanceAct,
+  discoveryAcceptanceActId, isDiscoveryV7Draft, V7_REQUIREMENTS, type DiscoveryAcceptanceAct,
 } from "./v7-contracts.js";
-import { readAcceptedResearchAnswer } from "./discovery.js";
+import { Discovery, readAcceptedResearchAnswer } from "./discovery.js";
 import type { Decision, DiscoveryDraft, Fact, FieldSpec, Question } from "./discovery.js";
 import { managedAnswerTurn, type ResearchAcceptanceBinding } from "./research-consumer-transition.js";
 import { readResearchAcceptanceBinding } from "./response-recovery.js";
@@ -1006,6 +1007,16 @@ export type AdmissionPurpose =
   /** Допуск драфта к раннему драйву (early-stage-driver). */
   | "early-drive";
 
+/** Trusted execution configuration is passed through product callers; its
+ * version meaning and all routing decisions stay inside Discovery. */
+export type DiscoveryExecutionPolicy = ProducerPolicy;
+export function snapshotExecutionPolicy(policy?: DiscoveryExecutionPolicy): DiscoveryExecutionPolicy | undefined {
+  return policy === undefined ? undefined : Object.freeze({ ...policy });
+}
+export function researchBeforeStageResult(draft: DiscoveryDraft): boolean {
+  return draft.stage === 'discovery' && contractEraOf(draft) === 7;
+}
+
 export interface ExecutionAdmission {
   readonly era: number;
   readonly explicitEra: number | null | undefined;
@@ -1027,6 +1038,39 @@ export interface ExecutionAdmission {
   readonly form: "valid" | "lost" | "mismatch" | null;
 }
 
+/** The issued initial form and current accepted prefix, never an alternative
+ * interpretation of frame or plan semantics. Their existing consumers own that. */
+export function researchEntryState(store: Store, draft: Revision<DiscoveryDraft>) {
+  requireCondition(isDiscoveryV7Draft(draft.value), 'research_entry_invalid', 'The entry needs Discovery v7');
+  const form = issuedForm(store, draft), expected = V7_REQUIREMENTS.fields.discovery!;
+  requireCondition(!form.defect && form.entries.length === expected.length
+    && form.entries.every((entry, index) => entry.question && entry.specKind === expected[index]!.kind
+      && entry.field === expected[index]!.field
+      && (entry.status === 'open' && entry.question.value.answer === null || entry.status === 'answered' && entry.answered)
+      && canonical(entry.question.value.spec.schema) === canonical(expected[index]!.schema)
+      && entry.question.value.spec.proof === expected[index]!.proof),
+  'research_entry_invalid', 'The entry needs its issued brief, objective, frame and plan questions');
+  const questions = Object.fromEntries(form.entries.map(entry => [entry.field!, entry.question!])) as
+    Record<'brief' | 'objective' | 'frame' | 'plan', Revision<Question>>;
+  const missing = [questions.brief, questions.objective].find(question => question.value.status !== 'answered');
+  if (missing) return { questions, missing, ready: false, mandate: null, guards: [reference(draft), reference(missing)] };
+  const mandate = v7FrameAssessment(store, draft, questions.frame)!;
+  const gate = new Discovery(store).gate(draft.value.projectId, reference(draft));
+  const invalid = gate.findings.find(finding => finding.code !== 'question_unresolved'
+    || ![questions.frame.id, questions.plan.id].includes(finding.target));
+  if (invalid) throw new EngineError(invalid.code, invalid.message, invalid);
+  return { questions, missing: null, mandate, ready: questions.frame.value.status === 'answered'
+    && questions.plan.value.status === 'answered', guards: uniqueRefs([...mandate.guards, ...gate.guards]) };
+}
+
+export function requireResearchEntry(store: Store, draft: Revision<DiscoveryDraft>) {
+  const state = researchEntryState(store, draft);
+  if (state.missing) throw new EngineError('research_owner_input_missing',
+    `Accepted owner ${state.missing.value.spec.field} is missing`,
+    { field: state.missing.value.spec.field, question: reference(state.missing) });
+  return state;
+}
+
 /** Допуск к выполнению/восстановлению. Не требует принятой проекции: отвечает
  * и для неполных исторических форм — отказ типизирован в флагах результата.
  * Для admitted early-drive читает вопросы — тот же обход, что делал драйв
@@ -1040,9 +1084,13 @@ export function executionAdmission(store: Store, draft: Revision<DiscoveryDraft>
   const admitted = v7 ? purpose !== "stage-result" && producerEra === 7
     : purpose === "early-drive" ? ADMISSION_CONTRACT_ERAS.includes(era) : era === producerEra;
   if (v7 && admitted) {
-    const plan = currentPlan(store, draft.value.projectId);
-    if (canonical(reference(plan.draft)) !== canonical(reference(draft)))
-      throw new EngineError("plan_questions_invalid", "Admission requires the exact current plan draft");
+    if (draft.value.fields.plan === null && ['early-drive', 'new-research'].includes(purpose)) {
+      requireResearchEntry(store, draft);
+    } else {
+      const plan = currentPlan(store, draft.value.projectId);
+      if (canonical(reference(plan.draft)) !== canonical(reference(draft)))
+        throw new EngineError("plan_questions_invalid", "Admission requires the exact current plan draft");
+    }
   }
   const paused = purpose === "new-research" && ADMISSION_CONTRACT_ERAS.includes(era) && !admitted;
   const message = admitted || !ADMISSION_CONTRACT_ERAS.includes(era) ? null

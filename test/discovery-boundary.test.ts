@@ -451,14 +451,28 @@ test("boundary: hasBasisApplications — правило форм за грани
   ]), false, "лишняя строка производителя не принимается");
 });
 
-test('R v7 admission remains explicit and requires an accepted plan without opening stage-result',async t=>{
+test('B0 v7 admission requires accepted owner input before its initial plan and keeps stage-result closed',async t=>{
   const {store,discovery}=fixture(t);
   const {createPartialV7Draft}=await import('../src/discovery/v7-contracts.js');
   const draft=createPartialV7Draft(discovery,'r-boundary','concept');
   const before=store.list();
   assert.equal(executionAdmission(store,draft,'new-research').admitted,false);
   assert.equal(executionAdmission(store,draft,'stage-result',{discovery:7}).admitted,false);
-  assert.throws(()=>executionAdmission(store,draft,'new-research',{discovery:7}),{code:'plan_questions_invalid'});
+  assert.throws(()=>executionAdmission(store,draft,'new-research',{discovery:7}),{code:'research_owner_input_missing'});
   assert.equal(acceptedIssuance(store,draft).issued,false);
   assert.deepEqual(store.list(),before);
+
+  const question = (field: string) => draft.value.questions.map(id => store.get<Question>(id)!)
+    .find(row => row.value.spec.field === field)!;
+  const source = discovery.evidence.document('r-boundary', 'owner-input', 'Track project resources', 'text/plain', 0);
+  discovery.fact(question('brief').id, question('brief').revision, reference(source),
+    { kind: 'text-range', start: 0, end: 'Track project resources'.length });
+  discovery.decision(question('objective').id, question('objective').revision, 'owner', 'Reduce lost materials');
+  const initial = store.get<DiscoveryDraft>(draft.id)!, acceptedInput = store.list();
+  assert.equal(question('plan').value.status, 'open');
+  assert.equal(executionAdmission(store,initial,'new-research',{discovery:7}).admitted,true);
+  assert.equal(executionAdmission(store,initial,'early-drive',{discovery:7}).admitted,true);
+  assert.equal(executionAdmission(store,initial,'stage-result',{discovery:7}).admitted,false);
+  assert.equal(acceptedIssuance(store,initial).issued,false);
+  assert.deepEqual(store.list(),acceptedInput);
 });

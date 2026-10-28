@@ -5,6 +5,7 @@ import { canonical, digest, type Json } from "../canonical.js";
 import { Discovery } from "../discovery/discovery.js";
 import {
   executionAdmission, isCurrentEra, listDrafts, orderedQuestions, readAnswer, readDraft,
+  researchBeforeStageResult, snapshotExecutionPolicy, type DiscoveryExecutionPolicy,
   readQuestion, readStageArtifact, readResearchRun, type Decision, type DiscoveryDraft, type Fact, type ResearchRun,
   type UpstreamStage, UPSTREAM_STAGES,
 } from "../discovery/projection-reader.js";
@@ -71,7 +72,11 @@ const refusalReason = (value: Refusal): EarlyStageReason =>
   reason(value.code, value.at.target, value.message, value.at.field);
 
 export class EarlyStageDriver {
-  constructor(private readonly engine: ProductEngine, private readonly budgetReentry?: BudgetReentry) {}
+  readonly #producerPolicy: DiscoveryExecutionPolicy | undefined;
+  constructor(private readonly engine: ProductEngine, private readonly budgetReentry?: BudgetReentry,
+    producerPolicy?: DiscoveryExecutionPolicy) {
+    this.#producerPolicy = snapshotExecutionPolicy(producerPolicy);
+  }
 
   reviseInput(project: string, expected: number, instruction: EarlyStageInstruction): EarlyStageInputRevision {
     this.#prepareInstruction(project, instruction);
@@ -492,10 +497,11 @@ export class EarlyStageDriver {
             return { ...outcome, turnsUsed, handoff: false };
           }
         }
-        const restoreOnly = current.stage === 'discovery' && isCurrentEra('discovery', draft.value.contractVersion, { discovery: 7 })
-          && !executionAdmission(this.engine.store, draft, 'new-research').admitted;
+        const restoreOnly = researchBeforeStageResult(draft.value)
+          && !executionAdmission(this.engine.store, draft, 'new-research', this.#producerPolicy).admitted;
         stageResult = await this.engine.stageResearch.run(request.project, draft.id, request.maxTurns - turnsUsed,
-          restoreOnly ? { restoreOnly: true } : {});
+          { ...(restoreOnly ? { restoreOnly: true } : {}),
+            ...(this.#producerPolicy ? { producerPolicy: this.#producerPolicy } : {}) });
         if (restoreOnly) {
           admitRunControl(this.engine.store, request.project, execution.hold);
           const restored = readResearchRun(this.engine.store, request.project, draft.id);
@@ -667,7 +673,7 @@ export class EarlyStageDriver {
     const required = prior ? this.engine.pipeline.inspect(project, prior).guards : entryRefs;
     if (canonical(draft.value.inputs) !== canonical(required))
       return reason("early_draft_stale", draft.id, "The saved draft does not name the current prerequisite basis", "inputs");
-    const admission = executionAdmission(this.engine.store, draft, 'early-drive');
+    const admission = executionAdmission(this.engine.store, draft, 'early-drive', this.#producerPolicy);
     // Let a started v7 history reach StageResearch's free restore path. Its own admission
     // still forbids a new v7 purchase under the default producer policy.
     if (!admission.admitted && stage === 'discovery' && isCurrentEra('discovery', draft.value.contractVersion, { discovery: 7 })
