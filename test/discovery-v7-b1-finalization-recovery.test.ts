@@ -88,6 +88,10 @@ test('B1 recovery: ordinary Driver spends one shared call regenerating the exact
   assert.notDeepEqual(proof.record.value.final, f.original);
   assert.ok(proof.prepared.value.input.prompt.includes(f.returned.id));
   assert.deepEqual(reference(f.store.get(f.original.id, f.original.revision)!), f.original);
+});
+
+test('B1 recovery: the regenerated D7 restores without a new purchase or write', async t => {
+  const f = await regeneratedFinalWorld(t);
   const before = stamp(f); assert.deepEqual(reference(await run(f, 1, true)), f.run); assert.deepEqual(stamp(f), before);
 });
 

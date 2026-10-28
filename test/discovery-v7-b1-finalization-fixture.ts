@@ -21,7 +21,7 @@ import { configureReaderPilot } from '../src/discovery/reader-pilot.js';
 import { DOSSIER_ASSESSMENT_RESULT_CONTRACT, DOSSIER_QUALITY_DIMENSIONS } from '../src/discovery/research-model.js';
 import { prepareDiscoveryFinalSubject } from '../src/discovery/discovery-final.js';
 import { researchCall } from '../src/discovery/research-protocol.js';
-import { completed, paid } from './discovery-v7-dossier-seed.js';
+import { completed, money, paid } from './discovery-v7-dossier-seed.js';
 import { finalCandidate, type FinalOutcome } from './discovery-v7-final-paid-seed.js';
 
 export const B1_BRIEF = '  Build a ledger with an exact paid conclusion.\nRetain constraints and alternatives — α.  ';
@@ -94,14 +94,16 @@ if(r.subject.contract==='discovery-final-assessment-envelope/v1'){const subject=
 
 
 // Saved cuts of the genuine runner path. Only values and files are shared; every consumer gets its own Store/runtime.
-type ReturnData = { packet: FinalizationWorld['packet']; d6: Ref; calibration: { draft: Ref; question: Ref };
+type Calibration = { draft: Ref; question: Ref };
+type ReturnData = { packet: FinalizationWorld['packet']; d6: Ref; calibration: Calibration;
   original: Ref; returned: Ref; priorFinalization: Ref; run: Ref };
-type ReturnSnapshot = { root: string; data: ReturnData };
+type Snapshot<D extends { calibration: Calibration }> = { root: string; data: D };
+type ReturnSnapshot = Snapshot<ReturnData>;
 const cleanups: (() => void)[] = [];
 process.once('exit', () => { for (const cleanup of cleanups.reverse()) cleanup(); });
 const lifetime = { after: (cleanup: () => void) => cleanups.push(cleanup), diagnostic: () => {} } as unknown as TestContext;
 let returnedSeed: Promise<ReturnSnapshot> | undefined, regeneratedSeed: Promise<ReturnSnapshot> | undefined, assessedSeed: Promise<ReturnSnapshot> | undefined;
-function snapshot(f: { root: string; path: string }, data: ReturnData): ReturnSnapshot {
+function snapshot<D extends { calibration: Calibration }>(f: { root: string; path: string }, data: D): Snapshot<D> {
   const root = mkdtempSync(join(tmpdir(), 'omg-b1-cut-')), database = new Set([f.path, `${f.path}-wal`, `${f.path}-shm`]);
   cpSync(f.root, root, { recursive: true, filter: source => !database.has(source) });
   const db = new DatabaseSync(f.path);
@@ -111,7 +113,7 @@ function snapshot(f: { root: string; path: string }, data: ReturnData): ReturnSn
   cleanups.push(() => rmSync(root, { recursive: true, force: true }));
   return { root, data: structuredClone(data) };
 }
-async function plant(t: TestContext, seed: ReturnSnapshot) {
+async function plant<D extends { calibration: Calibration }>(t: TestContext, seed: Snapshot<D>) {
   const root = mkdtempSync(join(tmpdir(), 'omg-b1-return-copy-')), path = join(root, 'state.sqlite');
   cpSync(seed.root, root, { recursive: true }); chmodSync(path, 0o600);
   writeFileSync(join(root, 'adapter.mjs'), readFileSync(join(root, 'adapter.mjs'), 'utf8').replaceAll(seed.root, root));
@@ -194,4 +196,36 @@ async function buildAssessed(): Promise<ReturnSnapshot> {
 export async function assessedReturnedWorld(t: TestContext) {
   assessedSeed ??= buildAssessed();
   return plant(t, await assessedSeed);
+}
+
+// The owner-selected finalization which the ordinary Driver leaves waiting for the owner, and the bypass finalizations which the ordinary
+// Researcher accepts by machine admission. Each is produced once per process by the genuine path and shared as a saved cut, like the seeds above.
+type WaitingData = { packet: FinalizationWorld['packet']; d6: Ref; calibration: Calibration; driven: Awaited<ReturnType<EarlyStageDriver['run']>> };
+let waitingSeed: Promise<Snapshot<WaitingData>> | undefined;
+async function buildWaiting(): Promise<Snapshot<WaitingData>> {
+  const f = await finalizationWorld(lifetime); await finalizationAdapter(f, 'go');
+  const start = money(f.store).calls.length;
+  const driven = await new EarlyStageDriver(f.engine, undefined, { discovery: 7 }).run({ project: 'p',
+    draftId: f.packet.subject.basis.draft.id, maxTurns: 8, maxCalls: 8 });
+  assert.equal(driven.end, 'needs_owner', JSON.stringify(driven.reason));
+  assert.ok(driven.stageResult?.research);
+  assert.ok(money(f.store).calls.length > start);
+  return snapshot(f, { packet: f.packet, d6: f.d6, calibration: f.data.calibration, driven });
+}
+export async function waitingOwnerWorld(t: TestContext) {
+  waitingSeed ??= buildWaiting();
+  return plant(t, await waitingSeed);
+}
+
+type FinalizedData = { packet: FinalizationWorld['packet']; d6: Ref; calibration: Calibration; value: Awaited<ReturnType<Researcher['run']>> };
+const finalizedSeeds = new Map<FinalOutcome, Promise<Snapshot<FinalizedData>>>();
+async function buildFinalized(outcome: FinalOutcome): Promise<Snapshot<FinalizedData>> {
+  const f = await finalizationWorld(lifetime, 'model'); await finalizationAdapter(f, outcome);
+  const value = await new Researcher(f.store, f.discovery, f.engine.environments)
+    .run('p', f.packet.subject.basis.draft.id, 8, undefined, { producerPolicy: { discovery: 7 } });
+  return snapshot(f, { packet: f.packet, d6: f.d6, calibration: f.data.calibration, value });
+}
+export async function bypassFinalizedWorld(t: TestContext, outcome: FinalOutcome) {
+  if (!finalizedSeeds.has(outcome)) finalizedSeeds.set(outcome, buildFinalized(outcome));
+  return plant(t, await finalizedSeeds.get(outcome)!);
 }

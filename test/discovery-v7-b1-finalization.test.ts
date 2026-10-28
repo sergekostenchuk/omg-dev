@@ -1,21 +1,20 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { reference } from '../src/pipeline/contracts.js';
-import { EarlyStageDriver } from '../src/product/early-stage-driver.js';
 import { Researcher } from '../src/discovery/research-runner.js';
 import { readRunnerDossierAssessmentAt } from '../src/discovery/dossier-assessment-runner.js';
 import { readDiscoveryFinalizationAt, readRunnerFinalizationAt } from '../src/discovery/discovery-finalization-runner.js';
 import { V9_FINAL_CONTRACT } from '../src/discovery/v7-final-contracts.js';
 import { acceptDiscoveryFinal, FinalAcceptanceSessions, issueFinalAcceptanceInvitation } from '../src/product/owner-authority.js';
-import { B1_BRIEF, dossierWorld, finalizationWorld, finalizationAdapter as adapter, type FinalizationWorld as World } from './discovery-v7-b1-finalization-fixture.js';
+import { B1_BRIEF, bypassFinalizedWorld, dossierWorld, finalizationWorld, finalizationAdapter as adapter, waitingOwnerWorld, type FinalizationWorld as World } from './discovery-v7-b1-finalization-fixture.js';
 import { all, completed, money } from './discovery-v7-dossier-seed.js';
 import { readProjectMode } from '../src/product/project-mode.js';
 import { canonical, hashJson, type Json } from '../src/canonical.js';
 import { whileHidden } from './hidden-record.js';
 import { EngineError } from '../src/errors.js';
 
-function stamp(f: World) { return { history: all(f.store), event: f.store.lastEvent(), money: money(f.store), wires: f.wires() }; }
-const run = (f: World, limit = 8, restoreOnly = false) => new Researcher(f.store, f.discovery, f.engine.environments)
+function stamp(f: Pick<World, 'store' | 'wires'>) { return { history: all(f.store), event: f.store.lastEvent(), money: money(f.store), wires: f.wires() }; }
+const run = (f: Pick<World, 'store' | 'discovery' | 'engine' | 'packet'>, limit = 8, restoreOnly = false) => new Researcher(f.store, f.discovery, f.engine.environments)
   .run('p', f.packet.subject.basis.draft.id, limit, undefined, { producerPolicy: { discovery: 7 }, restoreOnly });
 
 test('B1 fixture: optional original brief keys preserve absence, spaces, Unicode and independent copies', async t => {
@@ -51,11 +50,8 @@ test('B1: exact finalization reads refuse absent and non-record addresses withou
   assert.deepEqual(stamp(f), before);
 });
 
-test('B1: owner-selected D6 runs paid v9 and independent assessment, waits, then resumes exact owner acceptance', async t => {
-  const f = await finalizationWorld(t); await adapter(f, 'go');
-  const start = money(f.store).calls.length;
-  const driven = await new EarlyStageDriver(f.engine, undefined, { discovery: 7 }).run({ project: 'p',
-    draftId: f.packet.subject.basis.draft.id, maxTurns: 8, maxCalls: 8 });
+test('B1: owner-selected D6 runs paid v9 and independent assessment, then waits for the owner', async t => {
+  const f = await waitingOwnerWorld(t), { driven } = f;
   assert.equal(driven.end, 'needs_owner', JSON.stringify(driven.reason));
   assert.ok(driven.stageResult?.research);
   const proof = await readRunnerFinalizationAt(f.store, 'p', driven.stageResult.research), pending = proof.run;
@@ -67,9 +63,12 @@ test('B1: owner-selected D6 runs paid v9 and independent assessment, waits, then
   assert.deepEqual(summary.summary.value, proof.final!.bundle.summary);
   assert.deepEqual(summary.projection!.value, proof.final!.bundle.projection);
   assert.deepEqual(summary.constitution!.value, proof.final!.bundle.constitution);
-  assert.ok(money(f.store).calls.length > start);
   assert.deepEqual(proof.final!.packet.final.dossier, f.packet.dossier);
   const before = stamp(f); assert.deepEqual(await run(f, 1, true), pending); assert.deepEqual(stamp(f), before);
+});
+
+test('B1: owner-selected D6 waiting for the owner resumes exact owner acceptance', async t => {
+  const f = await waitingOwnerWorld(t), proof = await readRunnerFinalizationAt(f.store, 'p', f.driven.stageResult!.research!);
   const request = { projectId: 'p', assessment: proof.record.value.assessment!, decision: 'accept' as const, reason: 'Owner accepts the complete exact bundle' };
   const mode = readProjectMode(f.store, 'p');
   const invitation = await issueFinalAcceptanceInvitation(f.store, { ...request, draft: f.packet.subject.basis.draft,
@@ -84,15 +83,19 @@ test('B1: owner-selected D6 runs paid v9 and independent assessment, waits, then
   assert.deepEqual(money(f.store), afterOwner); assert.deepEqual(f.wires(), wires);
 });
 
-for (const outcome of ['no_go', 'insufficient_evidence', 'conditional'] as const) test(`B1: bypass ${outcome} is independently assessed and accepted with its exact lawful material`, async t => {
-  const f = await finalizationWorld(t, 'model'); await adapter(f, outcome);
-  const value = await run(f), proof = await readRunnerFinalizationAt(f.store, 'p', reference(value));
-  assert.equal(proof.status, 'accepted'); assert.equal(proof.outcome, outcome);
-  assert.equal(proof.accepted!.admission.kind, 'machine');
-  if (outcome !== 'conditional') { assert.equal(proof.final!.bundle.projection, null); assert.equal(proof.final!.bundle.constitution, null); }
-  else { assert.deepEqual(proof.accepted!.conditions.open, ['evidence-1']); assert.ok(proof.final!.bundle.projection); }
-  const before = stamp(f); assert.deepEqual(await run(f, 1, true), value); assert.deepEqual(stamp(f), before);
-});
+for (const outcome of ['no_go', 'insufficient_evidence', 'conditional'] as const) {
+  test(`B1: bypass ${outcome} is independently assessed and accepted with its exact lawful material`, async t => {
+    const f = await bypassFinalizedWorld(t, outcome), proof = await readRunnerFinalizationAt(f.store, 'p', reference(f.value));
+    assert.equal(proof.status, 'accepted'); assert.equal(proof.outcome, outcome);
+    assert.equal(proof.accepted!.admission.kind, 'machine');
+    if (outcome !== 'conditional') { assert.equal(proof.final!.bundle.projection, null); assert.equal(proof.final!.bundle.constitution, null); }
+    else { assert.deepEqual(proof.accepted!.conditions.open, ['evidence-1']); assert.ok(proof.final!.bundle.projection); }
+  });
+  test(`B1: bypass ${outcome} restores its accepted bundle without a new purchase or write`, async t => {
+    const f = await bypassFinalizedWorld(t, outcome);
+    const before = stamp(f); assert.deepEqual(await run(f, 1, true), f.value); assert.deepEqual(stamp(f), before);
+  });
+}
 
 test('B1: a nonempty partial D6 return keeps its paid correction instead of becoming final success', async t => {
   const f = await finalizationWorld(t, 'partial');
