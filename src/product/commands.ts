@@ -28,6 +28,7 @@ export type ProductCommand =
   | { type: 'discovery-final-summary'; project: string; manifest: Ref } | { type: 'discovery-final-summary'; project: string; assessment: Ref }
   | { type: 'discovery-final-summary'; project: string; paid: Ref }
   | {type:'recover-research-response';project:string;call:Ref;session:Ref}
+  | {type:'retry-plan-response';project:string;intent:Ref;limit:1;restoreOnly?:boolean}
   | ({type:'declare-adapter-lineage';project:string} & AdapterLineageDeclaration)
   | {type:'observe-runtime';project:string;scope:Ref;obligation:string;key:string}
   | {type:'recover-runtime-observation';project:string;observation:Ref}
@@ -128,6 +129,8 @@ const instruction = object({ title: string, id: project,
   text: { type: "string", minLength: 1, maxLength: 5_000_000 }, media: { enum: ["text/plain", "application/json"] },
   brief: selector });
 instruction.properties['objective'] = selector;
+const retryPlanResponse = command('retry-plan-response', { project, intent: ref, limit: { const: 1 } });
+retryPlanResponse.properties.restoreOnly = { type: 'boolean' };
 const earlyStageRun = command("early-stage-run", { project,
   maxTurns: { type: "integer", minimum: 1, maximum: 100 }, maxCalls: { type: "integer", minimum: 1, maximum: 100 } });
 earlyStageRun.properties['draftId'] = string;
@@ -163,6 +166,7 @@ const schema = { oneOf: [
   command('retry-planned-read',{project,child:ref}),
   command('recover-context-session',{project,session:ref,selector:recoverySelector}),
   command('recover-research-response', { project, call: ref, session: ref }),
+  retryPlanResponse,
   command('declare-adapter-lineage', { project, path: string, sha256: { type: 'string', pattern: '^[a-f0-9]{64}$' },
     basis: { type: 'array', minItems: 1, items: string } }),
   command("recover-model-call", {project,call:ref}),

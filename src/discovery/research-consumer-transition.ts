@@ -1,3 +1,4 @@
+import { RESEARCH_READ_SCHEMAS } from './research-read-contract.js';
 import { decodeVariantDecisionAnswer, decodeVariantExecutionSession, decodeVariantGeneration, type VariantExecutionSession } from './discovery-variants.js';
 import type { AssessmentTransportSubject } from './continuation-packet.js';
 import { DISCOVERY_ASSESSMENT_CONTRACT_V2, DISCOVERY_ASSESSMENT_CONTRACT_V3, type DiscoveryAttemptsAssessmentV2, type DiscoveryAttemptsAssessmentV3, type PaidDiscoveryAttemptsAssessment } from './research-model.js';
@@ -69,28 +70,6 @@ const deltaKeys = ['nodes', 'connectors', 'contracts', 'artifacts', 'edges', 'jo
   'joins', 'anchors', 'tests', 'packets', 'transfers', 'researchObligations'] as const;
 const deltaCollections = (items: object) => ({ type: 'object', additionalProperties: false,
   properties: Object.fromEntries(deltaKeys.map(key => [key, { type: 'array', items }])) });
-const bundleItem = (properties: Record<string, unknown>) => {
-  const schema = object(properties);
-  schema.properties['range'] = object({ start: { type: 'integer', minimum: 0 },
-    end: { type: 'integer', minimum: 0 } });
-  return schema;
-};
-const contextRead = object({ action: { const: 'read_context' }, record: ref, pointer: { type: 'string' } });
-contextRead.properties['purpose'] = text;
-const contextReadPage = object({ offset: { type: 'integer', minimum: 0 },
-  limit: { type: 'integer', minimum: 1 } });
-contextReadPage.properties['encoding'] = { const: 'canonical-json' };
-contextRead.properties['page'] = contextReadPage;
-const readSchemas = [
-  object({ action: { const: 'read_bundle' }, purpose: text,
-    inputs: { type: 'array', minItems: 1, items: { oneOf: [
-      bundleItem({ path: text, media: { enum: ['text/plain', 'application/json'] } }),
-      bundleItem({ source: ref })] } } }), contextRead,
-  object({ action: { const: 'search' }, query: text }),
-  object({ action: { const: 'read_source' }, source: ref,
-    start: { type: 'integer', minimum: 0 }, end: { type: 'integer', minimum: 1 } }),
-  object({ action: { const: 'read' }, path: text, media: { enum: ['text/plain', 'application/json'] } })
-];
 const answerDelta = object({ action: { const: 'answer_delta' }, question: text, base: ref,
   upserts: deltaCollections({ type: 'object', required: ['id'], properties: { id: text } }),
   removes: deltaCollections(text),
@@ -100,9 +79,9 @@ answerDelta.properties['horizon'] = { type: 'array', minItems: 1, uniqueItems: t
 let actionValidator: ValidateFunction<ResearchAction> | undefined;
 const validateAction = (value: unknown): value is ResearchAction =>
   (actionValidator ??= new Ajv({ allErrors: true }).compile<ResearchAction>({ oneOf: [
-  ...readSchemas,
+  ...RESEARCH_READ_SCHEMAS,
   object({ action: { const: 'read_plan' }, question: text,
-    reads: { type: 'array', minItems: 1, maxItems: 16, items: { oneOf: readSchemas } } }),
+    reads: { type: 'array', minItems: 1, maxItems: 16, items: { oneOf: RESEARCH_READ_SCHEMAS } } }),
   object({ action: { const: 'synthesize' }, question: text }),
   object({ action: { const: 'need_research' }, question: text,
     missing: { type: 'array', minItems: 1, items: text } }),

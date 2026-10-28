@@ -396,6 +396,7 @@ export class ProductEngine {
         return stageSummary(this.store, command.project, 'discovery', { section: 'discovery-final', ...exact })
           .then(summary => ({ summary: summary.final, text: renderStageSummary(summary) }));
       }
+      case 'retry-plan-response': this.#project(command.project); return this.researcher.retryPlanResponse(command.project, command.intent, command.limit, command.restoreOnly);
       case 'recover-research-response': this.#project(command.project); return recoverResearchResponse(this.store, this.environments, command.project, command.call, command.session, this.actor);
       case 'declare-adapter-lineage': this.#project(command.project); return declareAdapterLineage(this.store, command.project, command, this.actor);
       case 'observe-runtime': this.#project(command.project); return observeRuntime(this.store,command.project,command);

@@ -1718,8 +1718,9 @@ export function prepareResearchConsumerIntent(store: Store, input: ResearchConsu
     consumerInvalid('research-consumer-intent', 'Retry permits must be exact saved terminal references');
   const scoped = earlyResearchStage(store.get<DiscoveryDraft>(input.draft.id, input.draft.revision)?.value.stage);
   const previous = findResearchConsumerIntent(store, input.projectId, input.kind, input.key, scoped ? input.draft.id : undefined);
-  const retryingRefusal = !!previous && retryableResearchConsumerRefusal(store, previous)
-    && permits.some(permit => canonical(permit) === canonical(reference(previous)));
+  const retryingRefusal = !!previous
+    && permits.some(permit => canonical(permit) === canonical(reference(previous)))
+    && (retryableResearchConsumerRefusal(store, previous) || planResponseSyntaxFailure(store, previous) !== null);
   const replacingDeep = !!previous && deepPreparationRef(input.cursor) !== null
     && staleUnpaidDeepAdmission(store, previous);
   const replacing = retryingRefusal || replacingDeep;
@@ -2260,6 +2261,43 @@ function noModelResponse(text: string, protocol: unknown, requestId: unknown, st
  * model reply error. The original refusal and its physical evidence stay terminal.
  * Pre-RS3 envelope-only failures retain their original representation.
  */
+/** The exact paid syntax refusal eligible for one addressed correction.
+ * This does not grant ordinary continuations permission to retry a refusal. */
+export function planResponseSyntaxFailure(store: Store, intent: Revision<ResearchConsumerIntent>): EngineError | null {
+  if (intent.value.kind !== 'analyst' || Object.hasOwn(intent.value.cursor, 'deepPreparation') || !cursorSubject(intent.value, intent.id)
+    || intent.value.state !== 'refused' || intent.value.refusal?.kind !== 'consumer-invalid'
+    || intent.value.refusal.code !== 'research_response_invalid') return null;
+  const paid = readResearchConsumerExecutionFromIntent(store, intent.value.projectId, intent);
+  if (paid.kind !== 'response') return null;
+  const refusal = intent.value.refusal;
+  requireCondition(canonical(refusal.call) === canonical(reference(paid.call))
+    && canonical(refusal.request) === canonical(paid.request)
+    && canonical(refusal.response) === canonical(paid.response)
+    && canonical(refusal.archive) === canonical(paid.archive),
+    'research_plan_retry_invalid', 'The saved refusal does not name its proven paid response');
+  try { intentResponseAction(store, intent, paid.payload); }
+  catch (error) {
+    if (error instanceof EngineError && error.code === 'research_response_invalid') return error;
+    throw error;
+  }
+  return null;
+}
+export function readPlanResponseCorrection(store: Store, project: string, intentRef: Ref) {
+  const intent = readResearchConsumerIntent(store, intentRef);
+  requireCondition(intent.value.projectId === project, 'research_plan_retry_invalid', 'The refused intent belongs to another project');
+  const error = planResponseSyntaxFailure(store, intent);
+  requireCondition(error, 'research_plan_retry_invalid', 'Correction requires a proven paid plan analyst syntax refusal');
+  const latest = findResearchConsumerIntent(store, project, 'analyst', intent.value.rootKey, intent.value.draft.id)!;
+  requireCondition(latest.id === intent.id || latest.value.generation === intent.value.generation + 1
+    && canonical(latest.value.previous) === canonical(intentRef),
+    'research_plan_retry_stale', 'This refusal already has a different correction chain');
+  const refusal = intent.value.refusal!;
+  return { intent, latest, failure: { contract: 'plan-response-correction/v1', attempt: intentRef, code: error.code,
+    details: { call: refusal.call, response: refusal.response, question: cursorSubject(intent.value, intent.id)!.planQuestionId,
+      message: error.message, validation: error.details ?? null },
+    instruction: 'Correct the syntax of this exact paid response using the supplied read action schema. Keep the same plan-question; the previous attempt and expense remain saved.' } };
+}
+
 export function earlyResearchConsumerFailure(store: Store, intent: Revision<ResearchConsumerIntent>): EngineError | null {
   if (!['analyst', 'escalation-assessor'].includes(intent.value.kind)) return null;
   const draft = store.get<DiscoveryDraft>(intent.value.draft.id, intent.value.draft.revision);

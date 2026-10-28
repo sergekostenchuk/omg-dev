@@ -1,3 +1,6 @@
+import { withChildInvocationAllowance } from './invocation-progress.js';
+import { readPlanResponseCorrection } from './response-recovery.js';
+import { RESEARCH_READ_INSTRUCTION } from './research-read-contract.js';
 import { projectProducerSelection, withProjectProducerSelection } from './project-producer-policy.js';
 import { runDiscoveryFinalization, readRunnerFinalizationAt, nextRunnerFinalReturn } from './discovery-finalization-runner.js';
 import { variantResearchReturn, assessDeepResearchReturns, readResearchReturnAt } from './discovery-research-return.js';
@@ -355,8 +358,14 @@ export class Researcher {
     return withResearchRunControl(this.store, project, hold,
       () => this.run(project, draftId, limit, undefined, { producerPolicy: policy }));
   }
+  async retryPlanResponse(project: string, intent: Ref, limit: number, restoreOnly = false): Promise<Revision<ResearchRun>> {
+    requireCondition(limit === 1, 'research_budget_invalid', 'A plan response correction permits exactly one attempt');
+    const correction = readPlanResponseCorrection(this.store, project, intent);
+    return withChildInvocationAllowance(1, () => this.run(project, correction.intent.value.draft.id, limit, undefined,
+      { restoreOnly, retryPlanResponse: intent }));
+  }
   async run(project: string, draftId: string, limit: number, signal?: AbortSignal,
-    options: { restoreOnly?: boolean; producerPolicy?: ProducerPolicy;
+    options: { restoreOnly?: boolean; producerPolicy?: ProducerPolicy; retryPlanResponse?: Ref;
       /** DRS1a2: trusted opt-in of the compact analyst storage on the v7 path. */
       contextContract?: typeof CONTEXT_PREPARATION_CONTRACT } = {}): Promise<Revision<ResearchRun>> {
     requireCondition(Number.isInteger(limit) && limit >= 1 && limit <= 100, "research_budget_invalid", "Research requires an explicit bounded turn allowance");
@@ -1990,14 +1999,34 @@ export class Researcher {
   /** The v7 open frontier uses the ordinary managed transport and K.
    * Paid work is resolved before today's plan, environment or allowance admits a new send. */
   private async runPlanAttempts(project: string, draftId: string, limit: number, signal: AbortSignal | undefined,
-    options: { restoreOnly?: boolean; producerPolicy?: ProducerPolicy;
+    options: { restoreOnly?: boolean; producerPolicy?: ProducerPolicy; retryPlanResponse?: Ref;
       contextContract?: typeof CONTEXT_PREPARATION_CONTRACT }): Promise<Revision<ResearchRun>> {
+    const correction = options.retryPlanResponse ? readPlanResponseCorrection(this.store, project, options.retryPlanResponse) : null;
+    requireCondition(!correction || correction.intent.value.draft.id === draftId,
+      'research_plan_retry_invalid', 'Correction must retain its original draft');
     const id = `research-run:${hashJson([project, draftId])}`;
     const owner = { pid: process.pid, started: processStart(process.pid) };
     requireCondition(owner.started, "research_process_unknown", "Cannot identify the research process");
     let run = this.store.get<ResearchRun>(id), used = 0;
     requireCondition(!run || run.kind === "research-run" && run.value.projectId === project && run.value.draftId === draftId,
       "research_consumer_intent_invalid", "The research run belongs to another draft");
+    // A correction owns only its analyst reply. Free local application may
+    // finish that turn; any following external work belongs to an ordinary entry.
+    const correctionBoundary = (): 'completed' | 'pending' | null => {
+      if (!correction) return null;
+      const target = this.store.get<ResearchTurn>(paidTurnId(id, correction.intent.value.cursor.turn));
+      if (!target) return null;
+      const checked = readResearchConsumerTurn(this.store, reference(target));
+      const producer = readResearchConsumerIntent(this.store, checked.value.consumerIntent);
+      requireCondition(run && run.value.turns >= checked.value.number
+        && canonical(producer.value.previous) === canonical(reference(correction.intent)),
+        'research_plan_retry_stale', 'The saved turn is not this refusal correction');
+      if (checked.value.status === 'completed') return 'completed';
+      return ['read_source', 'read_context', 'read', 'search', 'answer', 'pause'].includes(turnAction(checked.value).action)
+        ? null : 'pending';
+    };
+    // Cold/repeat never enters a later assessor, child or ordinary pending call.
+    if (correctionBoundary()) return run!;
     requireCondition(run?.value.status !== "running" || processStart(run.value.owner.pid) !== run.value.owner.started,
       "research_busy", "This draft already has an active researcher");
     // The existing D6 physical remainder is shared with every late child page and assessment.
@@ -2272,6 +2301,14 @@ export class Researcher {
         const recovery = selectV7AnalystRecovery(this.store, project, draftId, run, reserved,
           !options.restoreOnly && producerContractEra('discovery', options.producerPolicy) === 7 && used < limit);
         const { turns, intents, outstanding } = recovery;
+        const corrected = correctionBoundary();
+        if (corrected) return run!.value.status === 'running' ? this.save(run!, {
+          status: 'paused', pauseCode: corrected === 'completed' ? 'research_plan_response_corrected' : 'research_plan_response_pending',
+          error: corrected === 'completed' ? 'The corrected response is applied; continue the ordinary research run'
+            : 'The corrected analyst response is saved; its pending action requires an ordinary continuation' }) : run!;
+        requireCondition(!correction || !outstanding || outstanding.value.kind === 'analyst'
+          && canonical(outstanding.value.previous) === canonical(reference(correction.intent)),
+          'research_plan_retry_stale', 'Correction cannot dispatch a different consumer');
         // Recover the original paid deep identity before current selection, actor,
         // allowance or coverage can select another cell. Its ordinary K then goes
         // through the existing shared MR/P checkpoint below.
@@ -2541,10 +2578,12 @@ export class Researcher {
           planOwnerSubject(this.store, run); // The answered physical plan does not resolve this owner request.
           return run;
         }
-        const refused = intents.find(row => row.value.state === "refused" && row.value.cursor.turn === (run?.value.turns ?? 0) + 1);
-        if (refused) throw new EngineError(refused.value.refusal!.code,
+        const refused = intents.filter(row => row.value.state === "refused" && row.value.cursor.turn === (run?.value.turns ?? 0) + 1)
+          .sort((a, b) => b.value.generation - a.value.generation)[0];
+        if (refused && (!correction || canonical(reference(refused)) !== canonical(reference(correction.intent))
+          || options.restoreOnly)) throw new EngineError(refused.value.refusal!.code,
           `[${refused.id}] Paid response retained for this plan subject; call ${refused.value.refusal!.call.id}`);
-        if (run) run = await this.checkpointV7Attempts(project,draftId,run,turns,owner,signal,
+        if (run && !correction) run = await this.checkpointV7Attempts(project,draftId,run,turns,owner,signal,
           !options.restoreOnly && producerContractEra('discovery',options.producerPolicy) === 7, next => { run = next; });
         const plan = currentPlan(this.store, project);
         requireCondition(plan.draft.id === draftId, "plan_questions_invalid", "The selected plan belongs to another draft");
@@ -2574,6 +2613,8 @@ export class Researcher {
         }
         const readiness = variantSnapshotReadiness(this.store, project);
         if (readiness.budget?.exhausted) {
+          requireCondition(!correction, 'research_budget_exhausted',
+            'The original stage account has no budget for this plan response correction');
           if (!run) {
             const effective = this.environments.effective(project);
             run = this.store.writeMany<ResearchRun>([{ id, kind: "research-run", expected: 0,
@@ -2646,6 +2687,8 @@ export class Researcher {
           error: "Research turn allowance reached; paid attempts are preserved" });
         const subject: V7PlanSubject = { contract: V7_PLAN_SUBJECT_CONTRACT,
           planAnswer: selection.planAnswer, planQuestionId: selection.next.planQuestionId };
+        requireCondition(!correction || sameSubject(planSubjectOf(correction.intent.value.cursor), subject),
+          'research_plan_retry_stale', 'The selected plan-question changed after the refused response');
         const selectedTurns = turns.filter(row => sameSubject(planSubjectOf(row.value), subject));
         const settingsPilot = readerPilot(this.store, project);
         const planning = planningForPlanSubject(this.store, project, reference(selection.draft), subject,
@@ -2654,7 +2697,7 @@ export class Researcher {
         requireCondition(!planning || planningPilot, "reading_plan_settings_missing",
           "A new planner intent requires its exact settings snapshot");
         const savedMaterials = savedV7SynthesisMaterials(this.store, selection.draft, selection.question, subject);
-        const mode = savedMaterials ? "synthesis" : planning
+        const mode = correction ? correction.intent.value.cursor.mode : savedMaterials ? "synthesis" : planning
           ? v7DispatchMode(this.store, project, turns, selection.question, subject, planning) : null;
         if (run.value.status !== "running") run = this.save(run,
           { status: "running", owner, limit, ownerQuestion: null, error: null, pauseCode: null });
@@ -2665,7 +2708,9 @@ export class Researcher {
           return paid.kind === "response" ? paid.subject : null;
         });
         const dispatch = { ...environment.value, workspace: effective.root };
-        const context = { role: "research", stage: "discovery", subject, ...(mode ? { dispatchMode: mode } : {}), inventory: sources.inventory(),
+        const context = { role: "research", stage: "discovery", subject,
+          ...(correction ? { failures: [correction.failure] } : {}),
+          ...(mode ? { dispatchMode: mode } : {}), inventory: sources.inventory(),
           history: selectedTurns.map(row => row.value), contextWorkspace: workspace.entries.map(entry => entry.result),
           ...(webResearchCapability("discovery", "analyst", dispatch)
             ? { webResearch: webResearchGuide(webBudgetView(this.store, project, "discovery", dispatch.webResearch!)) } : {}) };
@@ -2684,7 +2729,7 @@ export class Researcher {
           used++;
           continue;
         }
-        const instruction = mode === "planning" ? PLANNING_INSTRUCTION + SOURCE_READ_INSTRUCTION : "Research the exact selected plan-question. Return an ordinary ResearchAction. An answer has question equal to the plan-question id, value equal to one of the four attempt ends in the supplied schema, and citations: []; claim evidence belongs inside the end. An attempt does not accept claims or close the stage. Read sources and context when needed; never invent evidence." + SOURCE_READ_INSTRUCTION;
+        const instruction = (mode === "planning" ? PLANNING_INSTRUCTION + SOURCE_READ_INSTRUCTION : "Research the exact selected plan-question. Return an ordinary ResearchAction. An answer has question equal to the plan-question id, value equal to one of the four attempt ends in the supplied schema, and citations: []; claim evidence belongs inside the end. An attempt does not accept claims or close the stage. Read sources and context when needed; never invent evidence." + SOURCE_READ_INSTRUCTION) + RESEARCH_READ_INSTRUCTION;
         prepareResearchConsumerIntent(this.store, { projectId: project, kind: mode === "planning" ? "reading-planner" : "analyst",
           key: hashJson([id, run.value.turns + 1, mode === "planning" ? "reading-planner" : "analyst"]), owner: reference(run),
           draft: reference(selection.draft), question: reference(selection.question),
@@ -2695,7 +2740,7 @@ export class Researcher {
           guards: uniqueTransactionGuards([reference(run), reference(selection.draft), reference(selection.question),
             reference(environment), ...effective.guards, ...selection.draft.value.inputs, selection.planAnswer, ...selection.guards,
             ...(planningPilot ? [reference(planningPilot)] : []), ...selectedTurns.map(reference), ...sources.list().map(reference),
-            { id: paidTurnId(id, run.value.turns + 1), absent: true }]) }, [],
+            { id: paidTurnId(id, run.value.turns + 1), absent: true }]) }, correction ? [reference(correction.intent)] : [],
           options.contextContract && mode !== "planning" ? { contextContract: options.contextContract } : {});
       }
     } catch (error) {
