@@ -237,6 +237,12 @@ test('DRS1a2 subject binding: two plan-questions of one Question and the same id
   f.configure([ended('refused'), ended()]);
   f.finishFrontier();assert.equal((await f.run()).value.pauseCode, 'project_mode_unset');
   const [a, b] = f.intents().sort((x, y) => x.value.cursor.turn - y.value.cursor.turn);
+  // The list is ordered by entity id, not by plan-question: every intent compared across the editions is chosen by its
+  // exact plan answer and plan-question id.
+  const intentOf = (planAnswer: Parameters<typeof canonical>[0], planQuestionId: string) => f.intents().find(row =>
+    canonical(row.value.cursor.subject.planAnswer) === canonical(planAnswer) && row.value.cursor.subject.planQuestionId === planQuestionId);
+  const edition1 = intentOf(f.v.planAnswer, 'block');
+  assert.ok(edition1, 'the first edition has an intent for the plan-question block');
   assert.notEqual(a!.value.cursor.subject.planQuestionId, b!.value.cursor.subject.planQuestionId);
   assert.deepEqual(a!.value.question, b!.value.question, 'one physical plan Question');
   assert.notEqual(a!.value.preparation!.id, b!.value.preparation!.id);
@@ -247,10 +253,12 @@ test('DRS1a2 subject binding: two plan-questions of one Question and the same id
   const next = acceptNextPlanEdition(f, 'p', f.v.draft, f.v.frameRef, f.v.planAnswer, [planQuestion('block', 'industry', 'blocking'), planQuestion('support', 'market')]);
   f.configure([ended()]); writeFileSync(join(f.root, 'wire.ndjson'), '');
   f.finishFrontier();assert.equal((await f.run()).value.pauseCode, 'project_mode_unset');
-  const edition2 = f.intents().find(row => canonical(row.value.cursor.subject.planAnswer) === canonical(next.planAnswer))!;
-  assert.equal(edition2.value.cursor.subject.planQuestionId, 'block');
-  assert.notEqual(edition2.value.preparation!.id, a!.value.preparation!.id);
-  assert.match(failure(() => readPreparationRecord(f.store, a!.value.preparation!, preparationBinding(edition2.value))),
+  const edition2 = intentOf(next.planAnswer, 'block');
+  assert.ok(edition2, 'the second edition has its own intent for the same plan-question id');
+  assert.notEqual(canonical(edition2.value.cursor.subject.planAnswer), canonical(edition1.value.cursor.subject.planAnswer));
+  assert.equal(edition2.value.cursor.subject.planQuestionId, edition1.value.cursor.subject.planQuestionId);
+  assert.notEqual(edition2.value.preparation!.id, edition1.value.preparation!.id);
+  assert.match(failure(() => readPreparationRecord(f.store, edition1.value.preparation!, preparationBinding(edition2.value))),
     /^context_preparation_invalid: .*belongs to another step/);
   // Parts are project-scoped: the same context of another project names other parts (nothing is written).
   const prepared = readPreparedContext(f.store, a!.value.preparation!, preparationBinding(a!.value));
