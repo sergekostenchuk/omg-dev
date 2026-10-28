@@ -1,5 +1,5 @@
 {
-  "producerDigest": "f425c23c243b74c3c3ce36027caccfcbc367b9c6c9662d72470657ffb5231089",
+  "producerDigest": "6d15a9e96ef3730494fc3358d7ada1701a4ad351d92b11099571ab4710527ffc",
   "inputs": [
     {
       "path": "package-lock.json",
@@ -216,6 +216,10 @@
     {
       "path": "src/discovery/discovery-final-session.ts",
       "sha256": "046f6008b670a3fbb97c46b44f3096a5788915c7cbf326b0d971ef56191bd716"
+    },
+    {
+      "path": "src/discovery/discovery-final-summary.ts",
+      "sha256": "e164cac5d7e969c7f61094fb84c545fa14b9df5eb551292942e4d7847514e02e"
     },
     {
       "path": "src/discovery/discovery-final.ts",
@@ -991,7 +995,7 @@
     },
     {
       "path": "src/product/commands.ts",
-      "sha256": "91912c34bd3350a6ff6b3b4aaeb00f06aae1d843663d41e9c8597f105403d8d9"
+      "sha256": "ae8834d996989c114f7c7ffdd9306baaa52793a0c35f8a73add19300f0abfe1e"
     },
     {
       "path": "src/product/early-stage-driver.ts",
@@ -999,7 +1003,7 @@
     },
     {
       "path": "src/product/engine.ts",
-      "sha256": "a43c0d509bb2434aae3f93da188a73d11cb0407ea9485732b152aaa6005b361e"
+      "sha256": "4285a9e948bc5e6ce06ce97afaae7d50aea3fe0636b63a7d7d351536e52b7bc7"
     },
     {
       "path": "src/product/interpretation-authority.ts",
@@ -1067,7 +1071,7 @@
     },
     {
       "path": "src/product/stage-summary.ts",
-      "sha256": "69298a3a1a26fccb487e21632839b9782b9384060e1130ba358fb378561572e9"
+      "sha256": "d7001b5c8765d75a6171aeb4b57ed2ed8a6065568ea94f12b565d960ce1009a7"
     },
     {
       "path": "src/runtime/environment.ts",
@@ -1167,48 +1171,48 @@
     "discovery": {
       "id": "stage:golden:discovery",
       "revision": 2,
-      "hash": "4ce1ae9e7c56e58ed85fa32b1505bcaef3420e647817a71e8a66966c38d99c34"
+      "hash": "8065fd695e740b1a6170f617fee49a7fc14acef96525481349e3d4e9e40a727d"
     },
     "concept": {
       "id": "stage:golden:concept",
       "revision": 2,
-      "hash": "f261fb1493be9bb0fbf1c21b38597cf85c291068417f2ac96eb79af7a8280952"
+      "hash": "78ea8dca02e6b5db810f684fbe9fde021da970e464fbe826ea77ed18f368af37"
     },
     "operation-map": {
       "id": "stage:golden:operation-map",
       "revision": 2,
-      "hash": "8445a09b46de52d7027f1002fa8a355c1769fd5a18acf83e3bea306a595b3ffa"
+      "hash": "6efc7a3039365a316f79bdd02d709bcd1498ed1c81f21c0a169a2297e4e6eaf8"
     },
     "specification": {
       "id": "stage:golden:specification",
       "revision": 2,
-      "hash": "67f6daca5eef8a40894ea7773735a25214f2fc8affaf7446b3fe118503bbbf61"
+      "hash": "8a02e7ed9a6ee9eff517dbf09d9e5a20a52d6b8cffc4368606d1b7309d0b2ea5"
     },
     "features": {
       "id": "stage:golden:features",
       "revision": 2,
-      "hash": "54e1a07193759320bb00be14b467b1f760dcaab797d67dc6e17cad482267dc27"
+      "hash": "e713492e86d23bfd449a0800dab3a543618bc4a64baa5522c3d6eecdee376ef0"
     },
     "om-g2": {
       "id": "stage:golden:om-g2",
       "revision": 1,
-      "hash": "026047a891bee909a6eef8f46bee76fbe45aef5532fb2808f4cd94ac32ac3f30"
+      "hash": "83e86c078823a684d7f2611df55d6accf34cde62b38f3e4717c7ddcf3a4bb9a5"
     },
     "compilation": {
       "id": "stage:golden:compilation",
       "revision": 2,
-      "hash": "75757566ce9efb20475cedff23ae3a7caedfb23bf3cb7193ceaadbf25d84c785"
+      "hash": "e9804b9fd53b5644c73337dd713f57348a41c5fa3d8688f63abd70124c1a8b62"
     },
     "execution": {
       "id": "stage:golden:execution",
       "revision": 1,
-      "hash": "762d76e158ada2c37e9ef76516c635577f0d6ce62a3db3aab0f9d6bfb6ab06ee"
+      "hash": "9ee1bdbf8347154e98479db95e0ac33ea129fbd96892fa0c618174bdbb53c3cd"
     }
   },
   "databaseId": "089133aa-dc16-4529-a3b9-be5ba223092f",
   "proofCache": "empty",
-  "externalRoot": "/Users/kostenchuksergey/omg-wt/omg-int-s78/.golden-build-4cK9cj/",
+  "externalRoot": "/Users/kostenchuksergey/omg-wt/omg-int-s79/.golden-build-1XRfSO/",
   "format": "golden-sample/v1",
-  "sqliteFileSha256": "9c7658b43519949d2c7386818c43a5089afbd48473afe3183e76434a1dff4958",
-  "sqliteBytes": 14585856
+  "sqliteFileSha256": "9feea435c91b9da3f981bec306d8dde87a86d60984fdbab7a930f6a04bb86522",
+  "sqliteBytes": 14598144
 }
