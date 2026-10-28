@@ -17,9 +17,8 @@ import { readResearchRun } from '../src/discovery/projection-reader.js';
 import { readRunnerFinalizationAt } from '../src/discovery/discovery-finalization-runner.js';
 import { readDiscoveryHandoffAt, withDiscoveryHandoffAt } from '../src/discovery/discovery-handoff.js';
 import { researchPrerequisitesAt } from '../src/discovery/research-context.js';
-import { acceptDiscoveryFinal } from '../src/product/owner-authority.js';
 import { V9_FINAL_CONTRACT } from '../src/discovery/v7-final-contracts.js';
-import { finalAssessmentPaid } from './discovery-v7-final-assessment-seed.js';
+import { acceptedAssessmentPaid } from './discovery-v7-final-assessment-seed.js';
 import { finalizationWorld, finalizationAdapter } from './discovery-v7-b1-finalization-fixture.js';
 import { modeOf, money } from './discovery-v7-dossier-seed.js';
 import { preparedField } from './preparation-fixture.js';
@@ -29,7 +28,7 @@ import { storeUnchanged } from './store-unchanged.js';
 // original paid commands alive until the file ends; every consumer gets its own DB.
 const checkpointCleanup: (() => unknown)[] = [];
 after(async () => { for (const cleanup of checkpointCleanup.reverse()) await cleanup(); });
-function checkpoint<T extends Awaited<ReturnType<typeof finalizationWorld>>>(build: (t: test.TestContext) => Promise<T>) {
+function checkpoint<T extends { store: Store }>(build: (t: test.TestContext) => Promise<T>) {
   let ready: Promise<T> | undefined;
   return async (t: test.TestContext) => {
     const owner = new Proxy(t, { get(target, key) {
@@ -50,11 +49,12 @@ function checkpoint<T extends Awaited<ReturnType<typeof finalizationWorld>>>(bui
   };
 }
 
-async function world(t: test.TestContext) {
-  const f = await finalAssessmentPaid(t, { form: V9_FINAL_CONTRACT }); modeOf(f.store, 'bypass');
-  const accepted = await acceptDiscoveryFinal(f.store, { projectId: 'p', assessment: f.paidResult, decision: 'accept', reason: 'Use this exact product' });
-  assert.ok(accepted.accepted);
-  const manifest = reference(accepted.accepted.manifest), engine = new ProductEngine(f.open());
+// The accepted paid v9 product is a precondition of the first two tests, so it is copied from the run's catalog (layer `accepted`), not accepted
+// again; its concept draft, every question answered and drafted as the stage artifact, is made once, in the first test that needs it, and each
+// test takes its own copy of that checkpoint.
+const conceptDraftCheckpoint = checkpoint(async t => {
+  const f = await acceptedAssessmentPaid(t, { form: V9_FINAL_CONTRACT });
+  const manifest = f.data.accepted.manifest, engine = new ProductEngine(f.open());
   const draft = await engine.prepareAcceptedConsumer('p', 'concept', manifest);
   const h = await readDiscoveryHandoffAt(engine.store, 'p', reference(draft));
   for (const id of draft.value.questions) {
@@ -65,7 +65,11 @@ async function world(t: test.TestContext) {
     await engine.execute({ type: 'answer-decision', question: id, expected: q.revision, value });
   }
   const artifact = await engine.execute({ type: 'draft-stage', project: 'p', stage: 'concept', draftId: draft.id, expected: 0 }) as any;
-  return { f, engine, draft: engine.store.get<DiscoveryDraft>(draft.id)!, manifest, h, artifact };
+  return { ...f, manifest, draftId: draft.id, h, artifact };
+});
+async function world(t: test.TestContext) {
+  const f = await conceptDraftCheckpoint(t), engine = new ProductEngine(f.open());
+  return { f, engine, draft: engine.store.get<DiscoveryDraft>(f.draftId)!, manifest: f.manifest, h: f.h, artifact: f.artifact };
 }
 
 test('C2 recovery: historic Discovery heads may advance but the saved concept root and its exact proofs remain unchanged', async t => {

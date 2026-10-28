@@ -18,12 +18,11 @@ import { readDiscoveryConsumerProjectionAt, consumerPreparationFields } from '..
 import { researchCall } from '../src/discovery/research-protocol.js';
 import { assessAnswer } from '../src/discovery/research-assessment.js';
 import { V9_FINAL_CONTRACT } from '../src/discovery/v7-final-contracts.js';
-import { acceptDiscoveryFinal } from '../src/product/owner-authority.js';
 import { configureDispatch } from '../src/om/dispatch.js';
 import { prepareOmInputAt, type InputRequest } from '../src/om/input.js';
 import { designOf } from '../src/graph/builder.js';
-import { finalAssessmentPaid } from './discovery-v7-final-assessment-seed.js';
-import { modeOf, money } from './discovery-v7-dossier-seed.js';
+import { acceptedAssessmentPaid } from './discovery-v7-final-assessment-seed.js';
+import { money } from './discovery-v7-dossier-seed.js';
 import { preparedField } from './preparation-fixture.js';
 import { enrichedGraph } from './enriched-graph-fixture.js';
 import { exampleGraph } from './graph-fixture.js';
@@ -32,10 +31,9 @@ import { storeUnchanged } from './store-unchanged.js';
 const valueFor = (field: string): Json => JSON.parse(JSON.stringify(preparedField('p', field))
   .replaceAll('p-user', 'operator').replaceAll('p-result', 'record'));
 async function world(t: test.TestContext) {
-  const f = await finalAssessmentPaid(t, { form: V9_FINAL_CONTRACT }); modeOf(f.store, 'bypass');
-  const result = await acceptDiscoveryFinal(f.store, { projectId: 'p', assessment: f.paidResult, decision: 'accept', reason: 'Use this exact assessed product' });
-  assert.ok(result.accepted);
-  const manifest = reference(result.accepted.manifest), source = await readAcceptedDiscoveryProjectionAt(f.store, 'p', manifest);
+  // The accepted paid v9 product is a precondition here, so it is copied from the run's catalog (layer `accepted`), not accepted again.
+  const f = await acceptedAssessmentPaid(t, { form: V9_FINAL_CONTRACT });
+  const manifest = f.data.accepted.manifest, source = await readAcceptedDiscoveryProjectionAt(f.store, 'p', manifest);
   const catalogue = acceptedDiscoveryBasisCatalogue(source), sections = valueFor('conceptSections') as any[];
   sections[0].requirements[0].statement = 'Deliver the selected product while retaining its accepted constraints';
   sections[0].requirements[0].acceptance = catalogue.constraints.map(c => (c.value as any).rule);
