@@ -125,6 +125,14 @@ const contextData = (prefix: readonly PathPatternSegment[]): PathPattern[] => [
  * of silently borrowing the semantics of another era.
  */
 const RECORD_REFERENCE_SEMANTICS: readonly RecordReferenceSemantics[] = [
+  { kind: 'discovery-research-return', contract: 'discovery-research-return/v1', data: [], refs: [['request'],['session'],['application']] },
+  { kind: 'discovery-research-return-request', contract: 'discovery-research-return-request/v1', data: [], refs: [
+    ['input','scope'],['input','plan'],['input','final'],['input','grounds',INDEX,'container'],['environment'],
+    ['subject','scope'],['subject','selection'],['subject','decision'],['subject','set','ref'],['subject','members',INDEX,'ref'],
+    ['subject','draft'],['subject','question','planAnswer'],['subject','grounds',INDEX,'address','container'],['subject','grounds',INDEX,'container'],
+    ['subject','grounds',INDEX,'contradictions',INDEX,'address','container'],['subject','grounds',INDEX,'contradictions',INDEX,'container'],
+    ['finalMaterial','paid'],['finalMaterial','application'],['finalMaterial','terminal'],['finalMaterial','prepared'] ] },
+
   { kind: "limited-call-retry-permit", contract: "limited-call-retry-permit/v1", data: [], refs: [["call"], ["terminal"], ["consumer"]] },
   { kind: "decision", contract: null, data: [["value"]] },
   { kind: "design", contract: null, data: [["value"]] },
@@ -444,6 +452,9 @@ const RECORD_REFERENCE_SEMANTICS: readonly RecordReferenceSemantics[] = [
   { kind: "discovery-variant-owner-decision", contract: "discovery-variant-owner-decision/v1", data: [], refs: [
     ["draft"], ["set"], ["mode"], ["expectedSelection"], ["previous"], ["outcome", "member"], ["authority", "grant"], ["authority", "session"]] },
   { kind: "discovery-variant-model-decision", contract: "discovery-variant-model-decision/v1", data: [], refs: [
+    ["draft"], ["set"], ["mode"], ["expectedSelection"], ["previous"], ["outcome", "member"],
+    ["origin", "intent"], ["origin", "call"], ["origin", "response"]] },
+  { kind: "discovery-variant-model-decision", contract: "discovery-variant-model-decision/v2", data: [], refs: [
     ["draft"], ["set"], ["mode"], ["expectedSelection"], ["previous"], ["outcome", "member"],
     ["origin", "intent"], ["origin", "call"], ["origin", "response"]] },
   { kind: "discovery-variant-state", contract: "discovery-variant-state/v1", data: [], refs: [

@@ -1,3 +1,4 @@
+import { variantResearchReturn, researchReturnMaterial } from './discovery-research-return.js';
 import { canonical, hashJson } from '../canonical.js';
 import { EngineError, requireCondition } from '../errors.js';
 import { reference, isRef, type Ref } from '../pipeline/contracts.js';
@@ -53,6 +54,8 @@ export function prepareVariantSession(store:Store,input:VariantSessionInput):{
     const set=readProvenVariantSet(store,input.projectId,subject.set);
     draft=set.session.value.draft; question=set.session.value.question;
     shown={set:set.publication.result.value,members:set.publication.members.map(member=>member.value)};
+    const returned=subject.expectedSelection ? variantResearchReturn(store,input.projectId,subject.expectedSelection) : null;
+    if(returned) { shown.researchReturn=reference(returned.record); shown.value={researchReturn:researchReturnMaterial(returned)}; }
   }
   const initial:VariantExecutionSession={contract:VARIANT_SESSION_CONTRACT,projectId:input.projectId,
     draft,question,variantSubject:subject,purpose:`variant-${subject.kind}`,actor:input.role.actor,cursor:0,result:null};

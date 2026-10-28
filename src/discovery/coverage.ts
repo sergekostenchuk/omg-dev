@@ -1,3 +1,4 @@
+import { researchReturnGap } from './discovery-research-return.js';
 import { canonical, hashJson, type Json } from '../canonical.js';
 import { EngineError } from '../errors.js';
 import { isRef, reference, type Ref } from '../pipeline/contracts.js';
@@ -98,7 +99,8 @@ export interface AppliedCoverageGround {
 export type CoverageMissing =
   | { code: 'coverage_no_applied_grounds'; message: string }
   | { code: 'coverage_no_variant_ground'; message: string }
-  | { code: 'coverage_no_sufficiency'; message: string };
+  | { code: 'coverage_no_sufficiency'; message: string }
+  | { code: 'coverage_addressed_return'; message: string };
 /** The proven applied sufficiency that closed a cell: the exact applied assessment and its saved transition. */
 export interface AppliedSufficiency { assessment: Ref; transition: V7QuestionTransition }
 export interface CellCoverage {
@@ -224,9 +226,10 @@ function computeCoverage(store: Store, project: string, scope: Ref, planAnswer: 
     // whose saved sufficiency names this plan question's own criterion and depth, and whose bases stand on this
     // member's own variant ground — the applied chain is proven by the MR/P door, the paid assessment by its own.
     const sufficiency = provenSufficiency(store, project, planAnswer, question, grounds, boundary);
-    const covered = sufficiency !== null;
+    const returned = researchReturnGap(store, project, scope, planAnswer, question.planQuestionId, sufficiency?.assessment ?? null, boundary);
+    const covered = sufficiency !== null && returned === null;
     return { cell, key: coverageCellKey(cell), covered, grounds, common, sufficiency,
-      missing: covered ? null : grounds.length > 0
+      missing: covered ? null : returned ? { code: 'coverage_addressed_return', message: returned.reason.message } : grounds.length > 0
         ? { code: 'coverage_no_sufficiency', message: 'The applied variant grounds are material; no proven applied closed sufficiency of this exact depth and criterion stands on this member' }
         : serving > 0
           ? { code: 'coverage_no_variant_ground', message: 'The applied grounds serve the question but none is scoped to this exact member; common material and a foreign member never close it' }

@@ -8,6 +8,7 @@ import { VARIANT_SCOPE_CONTRACT, readVariantNoneStructural, readVariantSetStruct
 
 export const VARIANT_OWNER_DECISION_CONTRACT = 'discovery-variant-owner-decision/v1' as const;
 export const VARIANT_MODEL_DECISION_CONTRACT = 'discovery-variant-model-decision/v1' as const;
+export const VARIANT_MODEL_REVISION_CONTRACT = 'discovery-variant-model-decision/v2' as const;
 export const VARIANT_STATE_CONTRACT = 'discovery-variant-state/v1' as const;
 export const VARIANT_HANDOFF_CONTRACT = 'discovery-variant-handoff/v1' as const;
 export const VARIANT_OWNER_ACTION = 'discovery-variant-choice' as const;
@@ -24,7 +25,7 @@ export interface VariantOwnerDecision extends VariantDecisionBasis {
   authority: { grant: Ref; session: Ref };
 }
 export interface VariantModelDecision extends VariantDecisionBasis {
-  contract: typeof VARIANT_MODEL_DECISION_CONTRACT; origin: VariantOrigin;
+  contract: typeof VARIANT_MODEL_DECISION_CONTRACT | typeof VARIANT_MODEL_REVISION_CONTRACT; origin: VariantOrigin;
 }
 export type VariantDecision = VariantOwnerDecision | VariantModelDecision;
 /** Full prospective scope of the future owner door. Decoding it does not mint authority. */
@@ -68,8 +69,9 @@ export function decodeVariantOwnerDecision(value: unknown): VariantOwnerDecision
 }
 export function decodeVariantModelDecision(value: unknown): VariantModelDecision {
   variantShape(value, [...decisionFields, 'origin'], 'modelDecision', 'discovery_variant_decision_invalid');
-  basis(value, VARIANT_MODEL_DECISION_CONTRACT); variantOrigin(value.origin, 'origin');
-  if (value.previous !== null) decisionError('previous', 'A model does not revise a saved choice of the same set');
+  basis(value, value.contract === VARIANT_MODEL_REVISION_CONTRACT ? VARIANT_MODEL_REVISION_CONTRACT : VARIANT_MODEL_DECISION_CONTRACT); variantOrigin(value.origin, 'origin');
+  if ((value.contract === VARIANT_MODEL_DECISION_CONTRACT) !== (value.previous === null))
+    decisionError('previous', 'Initial model choice has no predecessor; a revision retains its exact predecessor');
   return structuredClone(value) as unknown as VariantModelDecision;
 }
 export function decodeVariantChoiceScope(value: unknown): VariantChoiceScope {
@@ -249,8 +251,14 @@ export function variantDecisionPublicationWrites(view: VariantRecordView, sessio
     if (!member) variantInvalid('key', 'The choice names an existing member of the exact set', 'discovery_variant_answer_invalid');
     outcome = { kind: 'choose', member: member!, reason: answer.reason };
   }
-  const value = decodeVariantModelDecision({ contract: VARIANT_MODEL_DECISION_CONTRACT, projectId: receipt.projectId, draft: set.draft,
-    set: subjectSet, mode: subject.mode, expectedSelection: subject.expectedSelection, previous: null, outcome, origin: receipt.result });
+  const prior = readVariantStateStructural(view, receipt.projectId, set.draft.id, subject.expectedSelection!).record.value;
+  if (prior.decision && outcome.kind === 'choose') {
+    const old = readVariantDecisionStructural(view, receipt.projectId, prior.decision).record.value.outcome;
+    if (old.kind === 'choose' && variantSame(old.member, outcome.member))
+      decisionError('outcome', 'A refuted member cannot be selected again by this revision');
+  }
+  const value = decodeVariantModelDecision({ contract: prior.decision ? VARIANT_MODEL_REVISION_CONTRACT : VARIANT_MODEL_DECISION_CONTRACT, projectId: receipt.projectId, draft: set.draft,
+    set: subjectSet, mode: subject.mode, expectedSelection: subject.expectedSelection, previous: prior.decision, outcome, origin: receipt.result });
   const id = variantRecordId('discovery-variant-model-decision', value);
   const decision = { id, kind: 'discovery-variant-model-decision', value, ref: { id, revision: 1, hash: hashJson(value as unknown as Json) } };
   const expected = subject.expectedSelection!, stateId = variantStateId(receipt.projectId, set.draft.id);

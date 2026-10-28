@@ -1,3 +1,4 @@
+import { variantResearchReturn, assessDeepResearchReturns, readResearchReturnAt } from './discovery-research-return.js';
 import type { ModelCall } from '../runtime/model-usage.js';
 import { variantSnapshotReadiness, produceVariantSnapshot, readVariantSnapshot } from "./variant-snapshot.js";
 import { prepareVariantSession, applyVariantSession, readVariantExecutionSession, readVariantGeneration, readVariantModelDecision,
@@ -1861,7 +1862,8 @@ export class Researcher {
       const handoff = await publishVariantHandoff(this.store, project, { draft: session.value.draft, result: result.ref, decision: null, scope: null });
       await receivePartial(reference(handoff.record));
     }
-    if (state.value.decision) {
+    const returned = variantResearchReturn(this.store, project, reference(state));
+    if (state.value.decision && !returned) {
       const ref = state.value.decision, kind = this.store.get(ref.id, ref.revision)?.kind;
       requireCondition(kind === "discovery-variant-model-decision" || kind === "discovery-variant-owner-decision",
         "discovery_variant_decision_invalid", "The current selection needs a proven model or owner act");
@@ -1894,15 +1896,18 @@ export class Researcher {
         { draft: session.value.draft, set: result.ref, mode: choice.decision.value.mode,
           decision: ref, selection: applied, scope, handoff: reference(handoff.record), reason: outcome.kind, next: outcome.kind === "choose" ? "deep" : "dossier" });
     }
-    requireCondition(generation.state && canonical(reference(state)) === canonical(generation.state),
+    requireCondition(returned || generation.state && canonical(reference(state)) === canonical(generation.state),
       "research_variant_context_stale", "The generation lost its proven undecided selection");
     if (variantSnapshotReadiness(this.store, project).budget?.exhausted) {
+      requireCondition(!returned, 'research_budget_exhausted', 'A return does not replenish the stage research budget');
       const handoff = await publishVariantHandoff(this.store, project, { draft: session.value.draft, result: result.ref, decision: null, scope: null, earlyLimit: true });
       await receivePartial(reference(handoff.record));
     }
-    const previous = variants.decisions.filter(choice => canonical(choice.decision.value.set) === canonical(result.ref));
+    const previous = variants.decisions.filter(choice => canonical(choice.decision.value.set) === canonical(result.ref)
+      && (!returned || canonical(choice.decision.value.expectedSelection) === canonical(reference(state))));
     if (mode.mode === "questions") pause("research_variant_owner_required", "An explicit owner choice of this exact set is required",
       { door: "discovery-variant-choice", draft: session.value.draft, set: result.ref, mode: mode.ref, expectedSelection: reference(state),
+        researchReturn: returned ? reference(returned.record) : null, previous: state.value.decision,
         paidDecision: previous[0]?.decision.ref ?? null, stale: previous[0]?.stale ?? null });
     if (previous.length) pause("research_variant_context_stale", "The paid decision was retained without applying to this selection",
       { decision: previous[0]!.decision.ref, stale: previous[0]!.stale });
@@ -1948,7 +1953,20 @@ export class Researcher {
       "research_consumer_intent_invalid", "The research run belongs to another draft");
     requireCondition(run?.value.status !== "running" || processStart(run.value.owner.pid) !== run.value.owner.started,
       "research_busy", "This draft already has an active researcher");
-    if (run && (Object.hasOwn(run.value, 'dossierAssessment')
+    // B2 may reopen only an addressed, independently assessed return. An old
+    // dossier remains historical; without new contradictory evidence its fixed point is unchanged.
+    if (run && !run.value.researchReturn && Object.hasOwn(run.value, 'dossierAssessment')) {
+      await assessDeepResearchReturns(this.store, project,
+        !options.restoreOnly && producerContractEra('discovery', options.producerPolicy) === 7,
+        () => { used++; }, signal);
+      run = this.store.get<ResearchRun>(id)!;
+    }
+    if (run?.value.researchReturn) {
+      const returned = await readResearchReturnAt(this.store, project, run.value.researchReturn);
+      requireCondition(['D4','D5'].includes(returned.destination ?? '') && returned.request.value.subject.draft.id === draftId,
+        'discovery_research_return_invalid', 'The continuing run needs its proved addressed return');
+    }
+    if (run && !run.value.researchReturn && (Object.hasOwn(run.value, 'dossierAssessment')
       || ['research_dossier_ready', 'research_dossier_return'].includes(run.value.pauseCode ?? ''))) {
       await readRunnerDossierAssessmentAt(this.store, project, reference(run));
       return run;
@@ -1972,13 +1990,13 @@ export class Researcher {
       run = this.save(run, { status: 'paused', owner, pauseCode: code,
         error: canonical({ code, dossier: settled.result.manifest, assessment: settled.result.assessment,
           return: settled.result.return, next: settled.result.verdict === 'supported' ? 'discovery-final' : 'addressed-research' }),
-        dossierAssessment: settled.result },
+        dossierAssessment: settled.result, ...(run.value.researchReturn ? { researchReturn: null } : {}) },
       [reference(settled.origin), settled.result.root, settled.result.manifest, settled.result.assessment]);
       return run;
     };
     // The pause carries exact durable addresses. Its historical replay precedes today's
     // selection and cannot activate a new paid step after a mode or plan revision.
-    const savedSelected = run && [SELECTED_DOSSIER_PENDING,SELECTED_DOSSIER_PAUSE].includes(run.value.pauseCode ?? '')
+    const savedSelected = run && !run.value.researchReturn && [SELECTED_DOSSIER_PENDING,SELECTED_DOSSIER_PAUSE].includes(run.value.pauseCode ?? '')
       ? await readSelectedResearchPause(this.store,project,draftId,run) : null;
     if (savedSelected && run!.value.pauseCode === SELECTED_DOSSIER_PAUSE) return finishDossier();
     let savedPartial: { handoff: Ref; [field: string]: unknown } | null = null;
@@ -2490,7 +2508,11 @@ export class Researcher {
           if (run!.value.status !== "running") run = this.save(run!, { status: "running", owner, ownerQuestion: null, error: null, pauseCode: null });
           used++;
         }, receivePartial, receiveDeep);
-        if (generations.length && run) { await advanceChoice(); continue; }
+        if (generations.length) {
+          await assessDeepResearchReturns(this.store, project, allowNew && used < limit, () => { used++; }, signal);
+          run = this.store.get<ResearchRun>(id);
+          if (run) { await advanceChoice(); continue; }
+        }
         const readiness = variantSnapshotReadiness(this.store, project);
         if (readiness.budget?.exhausted) {
           if (!run) {

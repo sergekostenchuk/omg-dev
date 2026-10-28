@@ -1,3 +1,4 @@
+import { returnDiscoveryResearch } from '../discovery/discovery-research-return.js';
 import { answerDiscoveryCondition } from '../discovery/discovery-decision.js';
 import { runIntegrityCheck } from "../om/integrity.js";
 import { listBypassDecisions } from "../om/addressing.js";
@@ -277,6 +278,11 @@ export class ProductEngine {
   execute(input: unknown): unknown {
     const command = parseCommand(input);
     switch (command.type) {
+      case 'discovery-research-return': {
+        const { type, ...input } = command;
+        return returnDiscoveryResearch(this.store, input).then(result => ({ return: reference(result.record),
+          destination: result.destination, reason: result.reason, requiredResult: result.requiredResult, final: result.final }));
+      }
       case 'discovery-final-decision':
         return acceptDiscoveryFinal(this.store, { projectId: command.project, assessment: command.assessment,
           decision: command.decision, reason: command.reason }).then(discoveryDecisionOutput);

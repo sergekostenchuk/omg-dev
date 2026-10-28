@@ -1,3 +1,4 @@
+import { variantResearchReturn } from './discovery-research-return.js';
 import { hashJson, type Json } from '../canonical.js';
 import { EngineError } from '../errors.js';
 import { isRef, reference, type Ref } from '../pipeline/contracts.js';
@@ -144,6 +145,8 @@ function currentGuards(store: Store, project: string, value: DeepPreparation,
     || !variantSame(frameQuestion.value.answer, proof.frame) || hashJson(frameQuestion.value) !== frameQuestion.hash) stale('frame');
   const scope = readCurrentVariantScope(store, project, reference(plan.draft));
   if (!variantSame(reference(scope.scope), value.scope)) stale('scope');
+  if (variantResearchReturn(store, project, reference(scope.state)))
+    throw new EngineError('discovery_return_d4', 'The selected variant is refuted; a new choice must precede research');
   const mode = readProjectMode(store, project);
   if (!variantSame(mode.ref, selected.mode)) stale('mode');
   const guards = uniqueTransactionGuards([reference(plan.draft), reference(plan.question), plan.planAnswer, reference(frameQuestion), proof.frame,

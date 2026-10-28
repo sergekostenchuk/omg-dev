@@ -1,3 +1,4 @@
+import { variantResearchReturn, readVariantResearchReturnAt, researchReturnMaterial } from './discovery-research-return.js';
 import { historicalProof, withHistoricalReads } from '../history/proofs.js';
 import { genuineStore, provenStore } from '../storage/store-view.js';
 import { readDeepPreparation as proveDeepPreparation, requireCurrentDeepPreparation, type ProvenDeepPreparation } from './deep-research.js';
@@ -4362,6 +4363,17 @@ export function readVariantExecutionSession(store:Store,project:string,ref:Ref):
     const outputs=paid.intent.value.outputs;
     if(paid.kind!=='response' || paid.intent.value.state!=='applied' || !outputs?.length || !variantSame(outputs[0],ref))
       variantSessionInvalid('The execution receipt has no atomic managed application');
+    if(v.variantSubject.kind==='decision' && v.variantSubject.expectedSelection) {
+      const prior=readVariantStateStructural(store,project,v.draft.id,v.variantSubject.expectedSelection).record.value;
+      if(prior.decision) {
+        const context=running.value.cursor.context;
+        if(!isRef(context?.researchReturn)) variantSessionInvalid('The revised choice lost its exact return');
+        const returned=readVariantResearchReturnAt(store,project,context.researchReturn,v.variantSubject.expectedSelection);
+        if(!variantSame(returned.request.value.subject.decision,prior.decision)
+          || !variantSame(context.value?.researchReturn,researchReturnMaterial(returned)))
+          variantSessionInvalid('The revised paid choice lost its proven refutation and full subject');
+      }
+    }
     const initial=variantExact<VariantExecutionSession>(store,running.value.owner,'discovery-variant-session');
     const projected=projectPaidVariantSession(initial,running,{call:reference(paid.call),response:paid.response,payload:paid.payload});
     if(!variantSame(projected,v) || paid.intent.revision!==running.revision+1
@@ -4467,14 +4479,18 @@ export function requireVariantDecisionAdmission(store:Store,project:string,subje
   if(mode.mode!=='bypass') throw new EngineError('discovery_variant_owner_door','In questions mode the choice belongs to the owner door; no model decision is bought');
   if(!subject.expectedSelection) throw new EngineError('discovery_variant_decision_invalid','A model decision names the exact current selection of its set');
   const state=readVariantStateStructural(store,project,proven.session.value.draft.id,subject.expectedSelection).record.value;
-  const decided=store.list<{set?:Ref}>('discovery-variant-model-decision').concat(store.list<{set?:Ref}>('discovery-variant-owner-decision'))
-    .some(row=>variantSame(row.value.set,subject.set));
+  const returned=state.decision ? variantResearchReturn(store,project,subject.expectedSelection) : null;
+  const revisit=returned?.destination==='D4' && variantSame(returned.request.value.subject.decision,state.decision)
+    && variantSame(returned.request.value.subject.set.ref,subject.set) && variantSame(returned.request.value.subject.draft,session.draft);
+  const decided=store.list<{set?:Ref;expectedSelection?:Ref}>('discovery-variant-model-decision').concat(store.list<{set?:Ref;expectedSelection?:Ref}>('discovery-variant-owner-decision'))
+    .some(row=>variantSame(row.value.set,subject.set) && (!revisit || variantSame(row.value.expectedSelection,subject.expectedSelection)));
   const bought=store.list<ResearchConsumerIntent>('research-consumer-intent').some(row=>{
     // Select competing purchases by their immutable admission, before a new session can be written. A damaged head
     // cannot hide an already paid choice by changing its set (or kind); only this set's originals need proof here.
     const original=store.get<ResearchConsumerIntent>(row.id,1);
     if(original?.value?.kind!=='variant-decision' || original.value.projectId!==project
-      || !variantSame(original.value.cursor?.variantSubject?.set,subject.set)) return false;
+      || !variantSame(original.value.cursor?.variantSubject?.set,subject.set)
+      || (revisit && !variantSame(original.value.cursor.variantSubject?.expectedSelection,subject.expectedSelection))) return false;
     const first=readResearchConsumerIntent(store,reference(original)),current=readResearchConsumerIntent(store,reference(row));
     if(!variantSame(first.value.owner,current.value.owner)
       || !variantSame(first.value.cursor.variantSubject,current.value.cursor.variantSubject))
@@ -4482,13 +4498,13 @@ export function requireVariantDecisionAdmission(store:Store,project:string,subje
     return current.value.state!=='refused' && current.value.owner.id!==sessionId
       && (current.value.state!=='prepared' || transactionGuardsCurrent(store,current.value.guards));
   });
-  if(!variantSame(state.set,subject.set) || state.decision!==null || decided || bought)
+  if(!variantSame(state.set,subject.set) || (state.decision!==null && !revisit) || decided || bought)
     throw new EngineError('discovery_variant_decision_exists','This set is already decided or being decided; another mode, actor or selection buys no new choice');
   if(variantStateId(project,proven.session.value.draft.id)!==subject.expectedSelection.id)
     throw new EngineError('discovery_variant_decision_invalid','The expected selection is the state of the set\'s own draft');
-  if(!variantSame(proven.state,subject.expectedSelection))
+  if(!revisit && !variantSame(proven.state,subject.expectedSelection))
     throw new EngineError('discovery_variant_decision_invalid','The undecided selection must be the exact state of the paid set publication');
-  return [subject.set,subject.mode,subject.expectedSelection];
+  return [subject.set,subject.mode,subject.expectedSelection,...(revisit?[reference(returned!.record)]:[])];
 }
 
 /** The proven set a model decision is over; an unprovable or no_variants result is a typed "set not ready". */

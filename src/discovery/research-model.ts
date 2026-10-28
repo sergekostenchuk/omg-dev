@@ -49,6 +49,7 @@ export type ResearchAction =
   | { action: "need_owner"; question: string; reason: string; searched: Ref[] }
   | { action: "pause"; reason: string };
 export interface ResearchRun {
+  researchReturn?: Ref | null;
   projectId: string; draftId: string; environment: Ref; status: "running" | "completed" | "needs_owner" | "paused" | "failed";
   turns: number; limit: number; inputs: Ref[];
   ownerQuestion: { question: string; reason: string; searched: Ref[] } | null;
