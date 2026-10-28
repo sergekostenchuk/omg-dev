@@ -1,8 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync, writeFileSync } from 'node:fs';
-import { V7_AXES } from '../src/discovery/v7-contracts.js';
-import { researchSetup } from './discovery-v7-fixture.js';
+import { fixtureApplicableAxes, researchSetup } from './discovery-v7-fixture.js';
 import { EngineError } from '../src/errors.js';
 import { reference } from '../src/pipeline/contracts.js';
 import { completed, addresses, money, revise, claim, deep, assess, modeOf } from './discovery-v7-dossier-seed.js';
@@ -46,7 +45,7 @@ async function runnerWorld(t: test.TestContext) {
     if(settings.reply)return settings.reply;
     if(s.variantSubject?.kind==='decision')return {action:'choose',key:'v1',reason:'Initial viable member'};
     if(s.variantSubject){const grounds=[s.variantSubject.snapshot],keys=['value','user','payer','costAndTime','risk','mandateFit'];return {action:'variants',variants:[1,2].map(i=>({key:'v'+i,title:'Variant '+i,proposal:{bounded:true},criteria:Object.fromEntries(keys.map(k=>[k,{conclusion:'Bounded',grounds,assumptions:[],unknowns:['Demand'],quantity:null}]))})),scale:Object.fromEntries(keys.map(k=>[k,'Same bounded scale'])),comparison:'Two alternatives',recommendation:{key:'v1',reason:'Initial candidate'},searchLimits:['Saved sweep'],unknowns:['Demand']};}
-    if(at?.contract==='v7-plan-subject/v1')return {action:'answer',question:id,value:{type:'submitted',contract:'discovery-claims/v7',value:{claims:(s.deepCell&&id==='q-industry'?${JSON.stringify(V7_AXES)}:[id==='q-market'?'market':'industry']).map(axis=>({id:'basis-'+id+'-'+axis+'-'+(s.deepCell?'deep':'common'),kind:'hypothesis',text:'Observed '+id+' '+axis,axis,planQuestions:[{planAnswer:at.planAnswer,planQuestionId:id}],scope:{variants:s.deepCell?[s.deepCell.variant.member]:'common'},basis:{howToVerify:'Measure exact evidence '+axis}}))}},citations:[]};
+    if(at?.contract==='v7-plan-subject/v1')return {action:'answer',question:id,value:{type:'submitted',contract:'discovery-claims/v7',value:{claims:(s.deepCell&&id==='q-industry'?${JSON.stringify(fixtureApplicableAxes(f.v.draft))}:[id==='q-market'?'market':'industry']).map(axis=>({id:'basis-'+id+'-'+axis+'-'+(s.deepCell?'deep':'common'),kind:'hypothesis',text:'Observed '+id+' '+axis,axis,planQuestions:[{planAnswer:at.planAnswer,planQuestionId:id}],scope:{variants:s.deepCell?[s.deepCell.variant.member]:'common'},basis:{howToVerify:'Measure exact evidence '+axis}}))}},citations:[]};
     return {action:'answer',question:s.question?.id??'reader',value:{type:'impossible',code:'source_unavailable',evidence:[],text:'No accessible source'},citations:[]};
   })()`;
   assert.ok(original.includes('const research='));
