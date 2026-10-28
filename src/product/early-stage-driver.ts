@@ -558,9 +558,9 @@ export class EarlyStageDriver {
       const selected = this.#selectDraft(request.project, current.stage, current.artifact, explicit, execution, input);
       explicit = undefined;
       if ("outcome" in selected) return { ...selected.outcome, turnsUsed, handoff: false };
-      const draft = selected.draft;
+      let draft = selected.draft;
       if (current.stage === "discovery" && input) {
-        try { this.#ensureInputAnswers(draft, input, execution); }
+        try { draft = this.#ensureInputAnswers(draft, input, execution); }
         catch (error) { return this.#entryFailure(request.project, error, turnsUsed); }
       }
       let stageResult: StageResearchResult;
@@ -634,10 +634,10 @@ export class EarlyStageDriver {
     }
   }
 
-  #ensureInputAnswers(selected: Revision<DiscoveryDraft>, input: ResolvedInput, execution: RunExecution): void {
+  #ensureInputAnswers(selected: Revision<DiscoveryDraft>, input: ResolvedInput, execution: RunExecution): Revision<DiscoveryDraft> {
     const store = this.engine.store, gate = new RunControlGate(store, selected.value.projectId, execution.hold);
     const discovery = new Discovery(gate.view());
-    const answer = (field: "brief" | "objective"): void => {
+    const answer = (field: "brief" | "objective"): Revision<DiscoveryDraft> => {
       const draft = readDraft(store, selected.id);
       requireCondition(draft?.kind === "discovery-draft" && draft.value.projectId === input.binding.value.projectId
         && canonical(draft.value.inputs) === canonical(input.refs),
@@ -669,9 +669,10 @@ export class EarlyStageDriver {
       "instruction_answer_stale", "The objective was not copied verbatim by the driver");
       requireCondition(canonical(currentDraft.value.fields[field]) === canonical(field === "brief" ? input.brief : input.objective),
         "instruction_answer_stale", `The ${field} answer differs from its draft field`);
+      return currentDraft;
     };
     answer("brief");
-    answer("objective");
+    return answer("objective");
   }
 
   #entryFailure(project: string, error: unknown, turnsUsed: number): EarlyResult {

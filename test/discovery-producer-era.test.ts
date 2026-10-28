@@ -337,7 +337,7 @@ test("DR1b: принятая история v1–v6 читается грани�
   }
 });
 
-test("DR1b: вне src/discovery нет выбора версии производителя — структурная проверка", () => {
+test("DR1b: эры принадлежат Discovery; отдельная owner-дверь только сохраняет разрешение проекта", () => {
   const srcRoot = fileURLToPath(new URL("../../src/", import.meta.url));
   const files: string[] = [];
   const walk = (dir: string) => {
@@ -352,7 +352,12 @@ test("DR1b: вне src/discovery нет выбора версии произво
   const offenders = files
     .filter(file => !file.startsWith(join(srcRoot, "discovery") + "/"))
     .filter(file => banned.test(readFileSync(file, "utf8")));
-  assert.deepEqual(offenders, [], "выбор эры производителя остаётся внутри модуля Discovery — CLI и модельные команды до него не доходят");
+  const ownerDoor = [join(srcRoot, 'cli.ts'), join(srcRoot, 'product/producer-policy-authority.ts')];
+  assert.deepEqual(offenders.sort(), ownerDoor.sort(),
+    'Only the separate owner door may carry producer-policy authority outside Discovery');
+  for (const file of ownerDoor) assert.doesNotMatch(readFileSync(file, 'utf8'),
+    /producerContractEra|producerRequirements|NEXT_CONTRACT_ERA|PRODUCER_V7_STAGES|discovery_v7_producer_not_ready/,
+    'The owner door stores a scoped permission; interpreting eras remains inside Discovery');
 });
 
 test("DR1b: канонические specs выключенного и включённого производителя совпадают", t => {

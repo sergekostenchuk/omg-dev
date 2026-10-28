@@ -412,6 +412,9 @@ const RECORD_REFERENCE_SEMANTICS: readonly RecordReferenceSemantics[] = [
     ['choice','mandate','source'],['choice','frame'],['choice','previous'],['choice','set','value','brief','source'],['choice','set','value','frame'],['choice','set','value','previousSet']]},
   {kind:'interpretation-application',contract:'interpretation-application/v1',data:[],refs:[['generation'],['decision'],['proposal'],['before'],['opened']]},
   {kind:'interpretation-ready',contract:'interpretation-ready/v1',data:[],refs:[['generation'],['application'],['draft'],['frame']]},
+  {kind:'owner-session-grant',contract:'producer-policy-grant/v1',data:[],refs:[['project'],['scope','previous']]},
+  {kind:'owner-session',contract:'producer-policy-session/v1',data:[],refs:[['grant'],['scope','previous']]},
+  {kind:'project-producer-policy',contract:'project-producer-policy/v1',data:[],refs:[['previous'],['session']]},
   {kind:'owner-session-grant',contract:'interpretation-choice-grant/v1',data:[],refs:[['scope','generation']]},
   {kind:'owner-session',contract:'interpretation-choice-session/v1',data:[],refs:[['grant'],['scope','generation']]},
   { kind: "frame-interpretations", contract: "frame-interpretations/v1", data: [], refs: [

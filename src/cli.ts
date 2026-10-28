@@ -145,6 +145,27 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
   }
   // DR1a: the trusted local project-mode command owns the whole scoped invitation/session lifecycle exactly like
   // OC1 — no secret or bearer crosses stdin/stdout, so the general command/HTTP route has no credential to replay.
+  if (command === "owner-producer-policy") {
+    const { ProducerPolicySessions, issueProducerPolicyInvitation, setProjectProducerPolicy } =
+      await import('./product/producer-policy-authority.js');
+    const store = new Store(resolve(database)), sessions = new ProducerPolicySessions(store);
+    let bearer: string | null = null;
+    let output: unknown;
+    try {
+      let request: unknown;
+      try { request = JSON.parse(readFileSync(0, 'utf8')); }
+      catch { throw new EngineError('producer_policy_invalid', 'owner-producer-policy reads one JSON request from stdin',
+        { door: 'owner-producer-policy' }); }
+      const session = sessions.exchange(issueProducerPolicyInvitation(store, request));
+      bearer = session.bearer;
+      const result = setProjectProducerPolicy(store, request, session.authority);
+      output = { record: reference(result.record), discovery: result.record.value.discovery, repeated: result.repeated };
+    } finally {
+      try { if (bearer) sessions.revoke(bearer); } finally { store.close(); }
+    }
+    console.log(JSON.stringify(output));
+    return;
+  }
   if (command === "owner-project-mode") {
     const [{ ProjectModeSessions, issueProjectModeInvitation }, { setProjectMode,
       validateProjectModeRequest }] = await Promise.all([
@@ -206,7 +227,7 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
     return;
   }
   if (!["init", "inspect", "backup", "command"].includes(command ?? "")) {
-    throw new EngineError("invalid_command", "Usage: npm start -- init|inspect|backup|restore|owner-invite|owner-discovery-choice|owner-project-mode|owner-variant-choice|owner-final-acceptance|owner-final-condition|command [database] [backup-directory]; owner doors and command read JSON from stdin; probe --help");
+    throw new EngineError("invalid_command", "Usage: npm start -- init|inspect|backup|restore|owner-invite|owner-discovery-choice|owner-project-mode|owner-producer-policy|owner-variant-choice|owner-final-acceptance|owner-final-condition|command [database] [backup-directory]; owner doors and command read JSON from stdin; probe --help");
   }
   const store = new Store(resolve(database));
   try {
@@ -225,12 +246,12 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
 main().catch(error => {
   const details = error instanceof EngineError && error.details && typeof error.details === "object"
     ? error.details as { door?: unknown } : undefined;
-  const scopedOwnerError = ["owner-discovery-choice", "owner-project-mode", "owner-variant-choice"].includes(process.argv[2] ?? "")
+  const scopedOwnerError = ["owner-producer-policy", "owner-discovery-choice", "owner-project-mode", "owner-variant-choice"].includes(process.argv[2] ?? "")
     || details?.door === "owner-discovery-choice" || details?.door === "owner-project-mode"
     || details?.door === "owner-variant-choice";
   console.error(JSON.stringify({ error: error instanceof EngineError ? error.code : "internal_error", message: error.message,
     ...(error instanceof EngineError && scopedOwnerError ? { details: error.details,
-      door: details?.door ?? (process.argv[2] === "owner-project-mode" ? "owner-project-mode"
+      door: details?.door ?? (process.argv[2] === "owner-producer-policy" ? "owner-producer-policy" : process.argv[2] === "owner-project-mode" ? "owner-project-mode"
         : process.argv[2] === "owner-variant-choice" ? "owner-variant-choice" : "stage-summary") } : {}) }));
   process.exitCode = 1;
 });

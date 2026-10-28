@@ -1,3 +1,4 @@
+import { projectProducerSelection, withProjectProducerSelection } from './project-producer-policy.js';
 import { runDiscoveryFinalization, readRunnerFinalizationAt, nextRunnerFinalReturn } from './discovery-finalization-runner.js';
 import { variantResearchReturn, assessDeepResearchReturns, readResearchReturnAt } from './discovery-research-return.js';
 import type { ModelCall } from '../runtime/model-usage.js';
@@ -361,12 +362,15 @@ export class Researcher {
     requireCondition(Number.isInteger(limit) && limit >= 1 && limit <= 100, "research_budget_invalid", "Research requires an explicit bounded turn allowance");
     let draft = this.store.get<DiscoveryDraft>(draftId);
     requireCondition(draft?.kind === "discovery-draft" && draft.value.projectId === project, "discovery_foreign", "Research draft must belong to this project");
-    if (draft.value.stage === "discovery" && draft.value.contractVersion === 7)
-      return runResearchEntry(this.store, project, draftId, limit,
+    if (draft.value.stage === "discovery" && draft.value.contractVersion === 7) {
+      const selected = options.restoreOnly ? null : projectProducerSelection(this.store, project, options.producerPolicy);
+      if (selected?.policy) options = { ...options, producerPolicy: selected.policy };
+      return withProjectProducerSelection(this.store, project, selected, () => runResearchEntry(this.store, project, draftId, limit,
         remaining => this.runFields(project, draftId, remaining, signal, options, true),
         remaining => this.runPlanAttempts(project, draftId, remaining, signal, options),
         { restoreOnly: options.restoreOnly === true || producerContractEra('discovery', options.producerPolicy) !== 7,
-          ...(signal ? { signal } : {}) });
+          ...(signal ? { signal } : {}) }));
+    }
     return this.runFields(project, draftId, limit, signal, options);
   }
   private async runFields(project: string, draftId: string, limit: number, signal: AbortSignal | undefined,

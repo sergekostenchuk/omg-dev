@@ -1,3 +1,4 @@
+import { projectProducerSelection } from './project-producer-policy.js';
 import { scopedDiscoveryProjection } from './discovery-handoff.js';
 import { EngineError, requireCondition } from "../errors.js";
 import { readVariantGeneration, readVariantModelDecision } from "./variant-session.js";
@@ -1093,7 +1094,9 @@ export function requireResearchEntry(store: Store, draft: Revision<DiscoveryDraf
 export function executionAdmission(store: Store, draft: Revision<DiscoveryDraft>,
   purpose: AdmissionPurpose, policy?: ProducerPolicy): ExecutionAdmission {
   const era = contractEraOf(draft.value), explicitEra = explicitContractEraOf(draft.value).version;
-  const producerEra = producerContractEra(draft.value.stage as UpstreamStage, policy);
+  const effective = draft.value.stage === 'discovery' && era === 7 && purpose !== 'stage-result'
+    ? projectProducerSelection(store, draft.value.projectId, policy).policy : policy;
+  const producerEra = producerContractEra(draft.value.stage as UpstreamStage, effective);
   const v7 = era === 7 && draft.value.stage === "discovery";
   const admitted = v7 ? purpose !== "stage-result" && producerEra === 7
     : purpose === "early-drive" ? ADMISSION_CONTRACT_ERAS.includes(era) : era === producerEra;

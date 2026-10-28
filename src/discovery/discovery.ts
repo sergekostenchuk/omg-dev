@@ -1,7 +1,8 @@
+import { projectProducerSelection } from './project-producer-policy.js';
 import { Ajv } from "ajv";
 import { randomUUID } from "node:crypto";
 import { Store, storeObserved, type Revision, type TransactionGuard, type Write } from "../storage/store.js";
-import { provenStore } from "../storage/store-view.js";
+import { storeView, provenStore } from "../storage/store-view.js";
 import { Evidence, sourceIsCurrent, type Observation, type Selector, type Source } from "../evidence/evidence.js";
 import { canonical, hashJson, type Json } from "../canonical.js";
 import { requireCondition, EngineError } from "../errors.js";
@@ -9,7 +10,7 @@ import { reference, STAGES, isRef, uniqueRefs, type Ref, type Stage, type Findin
   type StageExternalCheck } from "../pipeline/contracts.js";
 import type { Graph } from "../graph/model.js";
 import { NEXT_CONTRACT_ERA, REQUIREMENTS, producerContractEra, producerRequirements, type ProducerPolicy, type UpstreamStage } from "./requirements.js";
-import { checkV7FieldAnswer, DISCOVERY_ACCEPTANCE_ACT_KIND, DISCOVERY_ACCEPTANCE_ACT_CONTRACT, discoveryAcceptanceActId, type DiscoveryAcceptanceAct } from "./v7-contracts.js";
+import { V7_REQUIREMENTS, checkV7FieldAnswer, DISCOVERY_ACCEPTANCE_ACT_KIND, DISCOVERY_ACCEPTANCE_ACT_CONTRACT, discoveryAcceptanceActId, type DiscoveryAcceptanceAct } from "./v7-contracts.js";
 import { provenAcceptance } from "./claim-address.js";
 import { proveIssuedAnswer, savedAcceptanceAct } from "./projection-reader.js";
 import type { ResearchAnswer, ResearchAssessment } from "./research-model.js";
@@ -172,6 +173,16 @@ export class Discovery {
   forStage(projectId: string, stage: UpstreamStage, consumer: string, inputs: Ref[] = [],
     policy?: ProducerPolicy, manifest?: Ref): Revision<DiscoveryDraft> {
     requireCondition(Object.hasOwn(REQUIREMENTS, stage), "stage_contract_missing", "No research contract for this stage");
+    if (stage === 'discovery') {
+      const selected = projectProducerSelection(this.store, projectId, policy);
+      const writer = storeView(this.store, { write: (writes, guards) =>
+        this.store.writeMany(writes, [...guards, ...selected.guards]) });
+      // A project opt-in enables the ordinary initial D1–D2 subject. It does not declare D7 complete.
+      const specs = selected.record?.value.discovery === 7 ? V7_REQUIREMENTS.fields.discovery!
+        : producerRequirements(stage, selected.policy);
+      return new Discovery(writer).create(projectId, stage, 'R0', consumer, JSON.parse(canonical(specs)) as FieldSpec[], inputs,
+        producerContractEra(stage, selected.policy), manifest);
+    }
     return this.create(projectId, stage, "R0", consumer, producerRequirements(stage, policy), inputs,
       producerContractEra(stage, policy), manifest);
   }
