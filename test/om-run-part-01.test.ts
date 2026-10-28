@@ -282,10 +282,14 @@ test("OWN1 №3719 P2-1 an owner's H2 answer of a question the bypass gives the 
     [["discovery:spare", "owner", "Retain every record permanently", reference(owner.result), 0]]);
 });
 
-// RD2 pages individual values; distinct read addresses must themselves exceed the fixed continuation budget.
+// RD2 pages individual values; distinct read addresses must themselves exceed the fixed continuation budget. Measured: the
+// root request is about 25 000 chars and each read adds about 280, so the reads below exceed the capacity by about 22 % (as
+// the first version's 256 reads over 80 000 chars did); with fewer than about 90 reads at this capacity the continuation
+// fits and the outcome is another one. Every cycle builds and measures the whole wire again, so its cost follows both numbers.
+const LP3_READS = 128, LP3_CAPACITY = 50_000;
 test("LP3 (№2817 rows 3, 4, №52) a continuation the capacity cannot hold ends its cycle blocked and is never sent: the pass closes each attempt through G7, goes up the ladder and ends by A6 — never waiting on the blocked packet; the start of the root's cycle is chosen by its links in both positions of root and continuation", async t => {
   const f = runFixture(t, ["encoding"], "executed");
-  f.environment(80_000);
+  f.environment(LP3_CAPACITY);
   const b = f.bases("lp3-52"), request = f.request(b);
   ok(startRun(f.store, { project }));
   const selected = await until(f, request, "cycle");
@@ -295,8 +299,8 @@ test("LP3 (№2817 rows 3, 4, №52) a continuation the capacity cannot hold end
   };
   // Select by stable record identity, not the label order (labels are ordered by hashes).
   const context = body.brief.labels.find(label => label.domain === "context" && label.value.id === `graph:${project}`)!.value;
-  const pointers = lp3Pointers(f.store.get(context.id, context.revision)!.value).slice(0, 256);
-  assert.equal(pointers.length, 256);
+  const pointers = lp3Pointers(f.store.get(context.id, context.revision)!.value).slice(0, LP3_READS);
+  assert.equal(pointers.length, LP3_READS);
   const reads = pointers.map(pointer => ({ action: "read_context", record: context, pointer }));
   const need = lp3Need(f, b.routes, reads);
   f.steps([need, need, need, stopAnswer(f, false)]);
@@ -319,7 +323,7 @@ test("LP3 (№2817 rows 3, 4, №52) a continuation the capacity cannot hold end
   const end = await ends(f, request, 60);
   assert.equal(end.state.phase, "unable", JSON.stringify(end.state));
   assert.equal(mechanismSeries(f).value.attempts.length, 3, "Three attempts of the ladder");
-  lp3Blocked(f, 4, "packet_too_large", reads.length, 80_000);
+  lp3Blocked(f, 4, "packet_too_large", reads.length, LP3_CAPACITY);
   const roots = f.store.list<QuestionPacketRecord>("question-packet").filter(row => !row.value.request.continuation).map(reference);
   const two = cycleStartOf(f.store, project, roots.slice(0, 2));
   assert.ok(!two.ok && two.refusal.code === "run_record_invalid", "Two starts are an addressed refusal, never a second dispatch");
