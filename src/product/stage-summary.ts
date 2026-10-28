@@ -21,6 +21,8 @@ import { isRef, predecessor, reference, STAGES, stageId, uniqueRefs, type Ref, t
 import { type StageContent } from "./stage-checks.js";
 import { Store, type Revision, type Write } from "../storage/store.js";
 import { storeView } from "../storage/store-view.js";
+import { readDiscoveryFinalSummaryAt, type DiscoveryFinalSummary,
+  type FinalSummaryAcceptance, type FinalSummaryAddress, type FinalSummaryNext } from "../discovery/discovery-final-summary.js";
 
 export type SummaryOriginLabel = "Слова поручения (дословно)" | "Факт источника"
   | "Решение вызывающего" | "Предложение модели, принято по оценке" | "Проектное предложение";
@@ -206,6 +208,13 @@ export interface StructuredStageSummary {
   accepted: SummaryStructuredAccepted | null; candidate: SummaryStructuredCandidate | null; candidates: Ref[];
 }
 export type StageSummary = DiscoveryStageSummary | StructuredStageSummary;
+/** OMG-V7-C4 (codex-omg2 №16923): the owner's summary of one exact saved D7 outcome — a paid D7 result, its paid
+ * assessment or one exact accepted edition. */
+/** Exactly one of manifest, assessment or paid; the shared decoder refuses any other composition. */
+export interface DiscoveryFinalSummarySectionRequest { section: "discovery-final"; manifest?: Ref; assessment?: Ref; paid?: Ref }
+export interface DiscoveryFinalStageSummary {
+  contract: "stage-summary/discovery-final/v1"; project: string; stage: "discovery"; final: DiscoveryFinalSummary;
+}
 
 interface EarlyStageInput {
   contract: "early-stage-input/v1"; projectId: string; project: Ref; source: Ref; brief: Selector;
@@ -963,12 +972,15 @@ export function stageSummary(store: Store, project: string, stage: "discovery", 
 export function stageSummary(store: Store, project: string, stage: "discovery", request: VariantGenerationSummaryRequest): VariantGenerationStageSummary;
 export function stageSummary(store: Store, project: string, stage: "discovery", request: DiscoveryIndexSummaryRequest): DiscoveryIndexStageSummary;
 export function stageSummary(store: Store, project: string, stage: "discovery", request: DossierSnapshotSummaryRequest): Promise<DossierSnapshotStageSummary>;
+export function stageSummary(store: Store, project: string, stage: "discovery", request: DiscoveryFinalSummarySectionRequest): Promise<DiscoveryFinalStageSummary>;
 export function stageSummary(store: Store, project: string, stage: "discovery", draftId?: string): DiscoveryStageSummary;
 export function stageSummary(store: Store, project: string, stage: SummaryStructuredStage, draftId?: string): StructuredStageSummary;
 export function stageSummary(store: Store, project: string, stage: Stage, draftId?: string): StageSummary;
 export function stageSummary(store: Store, project: string, stage: Stage,
-  draftId?: string | DiscoveryIndexSummaryRequest | VariantGenerationSummaryRequest | VariantChoiceSummaryRequest | DossierSnapshotSummaryRequest):
-  StageSummary | DiscoveryIndexStageSummary | VariantGenerationStageSummary | VariantChoiceStageSummary | Promise<DossierSnapshotStageSummary> {
+  draftId?: string | DiscoveryIndexSummaryRequest | VariantGenerationSummaryRequest | VariantChoiceSummaryRequest | DossierSnapshotSummaryRequest
+    | DiscoveryFinalSummarySectionRequest):
+  StageSummary | DiscoveryIndexStageSummary | VariantGenerationStageSummary | VariantChoiceStageSummary | Promise<DossierSnapshotStageSummary>
+    | Promise<DiscoveryFinalStageSummary> {
   if (draftId !== undefined && typeof draftId !== "string") {
     if (object(draftId) && draftId.section === "variant-choice") {
       requireCondition(stage === "discovery" && Object.keys(draftId).length === 2
@@ -985,6 +997,7 @@ export function stageSummary(store: Store, project: string, stage: Stage,
         generation: variantGenerationSummary(store, project, draftId.result) };
     }
     if (object(draftId) && draftId.section === "dossier-snapshot") return dossierSnapshotStageSummary(store, project, stage, draftId);
+    if (object(draftId) && draftId.section === "discovery-final") return discoveryFinalStageSummary(store, project, stage, draftId);
     requireCondition(stage === "discovery" && object(draftId) && draftId.section === "v7-index",
       "stage_summary_index_request_invalid", "Expected an explicit Discovery v7 index section request");
     // This section has its own historical boundary. It does not read the current outcome,
@@ -1099,6 +1112,13 @@ async function dossierSnapshotSummary(store: Store, project: string, root: Ref):
 
 /** The asynchronous section of stageSummary: it rests on async proof readers, so only this branch returns a Promise (and rejects, never throws
  * synchronously); every other request keeps its synchronous result. */
+/** Asynchronous like the dossier section: it rests on the shared async proof readers and rejects, never throws. */
+async function discoveryFinalStageSummary(store: Store, project: string, stage: Stage, request: DiscoveryFinalSummarySectionRequest): Promise<DiscoveryFinalStageSummary> {
+  requireCondition(stage === "discovery" && object(request) && request.section === "discovery-final",
+    "stage_summary_final_request_invalid", "Expected an explicit Discovery final section request");
+  const { section: _section, ...exact } = request as Record<string, unknown>;
+  return { contract: "stage-summary/discovery-final/v1", project, stage: "discovery", final: await readDiscoveryFinalSummaryAt(store, project, exact) };
+}
 async function dossierSnapshotStageSummary(store: Store, project: string, stage: Stage, request: DossierSnapshotSummaryRequest): Promise<DossierSnapshotStageSummary> {
   requireCondition(stage === "discovery" && object(request) && Object.keys(request).length === 2 && Object.hasOwn(request, "section")
     && request.section === "dossier-snapshot" && Object.hasOwn(request, "root") && isRef(request.root),
@@ -1348,7 +1368,74 @@ function renderDossierSnapshotSummary(summary: DossierSnapshotStageSummary): str
   return `${lines.join("\n").trimEnd()}\n`;
 }
 
-export function renderStageSummary(summary: StageSummary | DiscoveryIndexStageSummary | VariantGenerationStageSummary | VariantChoiceStageSummary | DossierSnapshotStageSummary): string {
+const OUTCOME_TEXT: Record<DiscoveryFinalSummary["outcome"], string> = { go: "go — продолжать", conditional: "conditional — продолжать при условиях",
+  no_go: "no_go — не продолжать", insufficient_evidence: "insufficient_evidence — недостаточно оснований" };
+const finalAddressText = (address: FinalSummaryAddress): string => `${address.record.id}@${address.record.revision}${address.pointer}`;
+function acceptanceText(acceptance: FinalSummaryAcceptance): string[] {
+  switch (acceptance.state) {
+    case "unassessed": return ["Состояние: оплаченный результат без названной оценки — не оценён и не принят; принятого манифеста нет."];
+    case "returned": return [`Состояние: возврат независимой оценки ${exactRefText(acceptance.assessment)} — не принят; принятого манифеста нет.`];
+    case "awaiting_decision": return [`Состояние: оценка supported ${exactRefText(acceptance.assessment)}; ожидает решения владельца — не принят; принятого манифеста нет.`];
+    case "declined": return [`Состояние: отклонён владельцем — акт ${exactRefText(acceptance.act)}; принятого манифеста нет.`, `Причина владельца: ${acceptance.reason}`];
+    case "accepted": return [`Состояние: принят (${acceptance.admission.kind === "owner" ? "решение владельца" : "допуск по политике bypass"} ${exactRefText(acceptance.admission.record)}).`,
+      `Редакция манифеста: ${exactRefText(acceptance.manifest)}${acceptance.previous ? `; предыдущая ${exactRefText(acceptance.previous)}` : "; первая редакция"}`,
+      ...(acceptance.reason ? [`Причина владельца: ${acceptance.reason}`] : []),
+      ...acceptance.resolutions.map(ref => `- разрешение редакции ${exactRefText(ref)}`)];
+  }
+}
+function assessmentAddressText(paid: Ref, address: Record<string, unknown>): string {
+  if (typeof address.candidate === "string") return `${paid.id}@${paid.revision}/projection/result/bundle${address.candidate}`;
+  return canonical(address as Json);
+}
+function nextText(summary: DiscoveryFinalSummary, next: FinalSummaryNext | null): string[] {
+  if (!next) return [summary.outcome === "no_go" || summary.outcome === "insufficient_evidence"
+    ? "Адреса следующего действия в сохранённом результате нет: отрицательный исход не разрешает следующую стадию."
+    : "Адреса следующего действия в сохранённом результате нет."];
+  switch (next.action) {
+    case "return": return [`Возврат: ${next.reason}`, ...next.targets.map(target => `- цель [${assessmentAddressText(summary.paid, target as Record<string, unknown>)}]`)];
+    case "owner_decision": return [`Решение владельца о принятии оценки ${exactRefText(next.assessment)}.`];
+    case "resolve_conditions": return [`Разрешить открытые условия редакции ${exactRefText(next.manifest)}:`,
+      ...next.open.map(item => `- ${item.conditionId} [${finalAddressText(item.address)}]`)];
+    case "consume_accepted": return [`Принятая редакция ${exactRefText(next.manifest)} без открытых условий — основа следующей стадии.`];
+  }
+}
+function renderDiscoveryFinalSummary(summary: DiscoveryFinalStageSummary): string {
+  const s = summary.final;
+  const lines = ["# Итог Discovery (D7): сводка для владельца", "",
+    `Основа сводки: ${s.basis.kind === "manifest" ? "принятая редакция" : s.basis.kind === "assessment" ? "оплаченная оценка" : "оплаченный результат D7"} ${exactRefText(s.basis.record)}`,
+    `Оплаченный D7: ${exactRefText(s.paid)}; форма ${s.form}`, "",
+    "## Исход комплекта", "", `Исход: ${OUTCOME_TEXT[s.outcome]}`, `Причина [${finalAddressText(s.reason.address)}]: ${s.reason.value}`, "",
+    "## Принятие", "", ...acceptanceText(s.acceptance),
+    `Следующая стадия: ${s.permitsNextStage ? "разрешена принятой редакцией без открытых условий" : "не разрешена"}`, "",
+    `## Сохранённый итог [${finalAddressText(s.summary.address)}]`, "", valueText(s.summary.value as unknown as Json), ""];
+  if (s.selectedVariant) lines.push("## Выбранный вариант", "", `Вариант [${finalAddressText(s.selectedVariant.member.address)}]: ${valueText(s.selectedVariant.member.value)}`,
+    `Набор: ${s.selectedVariant.set ? exactRefText(s.selectedVariant.set) : "нет"}`,
+    `Решение: ${s.selectedVariant.decision ? finalAddressText(s.selectedVariant.decision.address) : "нет"}`, "");
+  else lines.push("## Выбранный вариант", "", "Нет выбранного варианта в сохранённом маршруте досье.", "");
+  lines.push("## Ограничения, риски, неизвестное", "");
+  if (!s.material.length) lines.push("Нет: у отрицательного исхода нет проекции.");
+  for (const item of s.material) lines.push(`### ${item.address.pointer.split("/").at(-1)} [${finalAddressText(item.address)}]`, valueText(item.value), "");
+  lines.push("", "## Условия", "");
+  if (!s.conditions.length) lines.push("Нет.");
+  for (const condition of s.conditions) {
+    lines.push(`- ${condition.id} (${condition.kind}) [${finalAddressText(condition.address)}]: ${condition.status === "resolved" ? "разрешено"
+      : condition.status === "open" ? "открыто" : "до принятия"}`, `  ${canonical(condition.condition)}`);
+    const r = condition.resolution;
+    if (r && r.kind === "owner_choice") lines.push(`  - основание: выбор владельца ${exactRefText(r.record)} — ${canonical(r.option as Json)}; причина: ${r.reason}`);
+    if (r && r.kind === "evidence") lines.push(`  - основание: оплаченная оценка материала ${exactRefText(r.evidence!)} (разрешение ${exactRefText(r.record)})`,
+      ...r.reasons.map(reason => `    - ${reason}`));
+  }
+  lines.push("", "## Независимая оценка", "");
+  if (!s.assessment) lines.push("Не названа в запросе.");
+  else lines.push(`Оценка ${exactRefText(s.assessment.record)}: ${s.assessment.verdict}`, ...s.assessment.reasons.map(reason => `- ${reason}`),
+    ...(s.assessment.return ? [`Возврат: ${s.assessment.return.reason}`] : []));
+  lines.push("", "## Следующее действие", "", ...nextText(s, s.next));
+  return `${lines.join("\n").trimEnd()}\n`;
+}
+
+export function renderStageSummary(summary: StageSummary | DiscoveryIndexStageSummary | VariantGenerationStageSummary | VariantChoiceStageSummary | DossierSnapshotStageSummary
+  | DiscoveryFinalStageSummary): string {
+  if (summary.contract === "stage-summary/discovery-final/v1") return renderDiscoveryFinalSummary(summary);
   if (summary.contract === "stage-summary/dossier-snapshot/v1") return renderDossierSnapshotSummary(summary);
   if (summary.contract === "stage-summary/variant-choice/v1") return renderVariantChoiceSummary(summary);
   if (summary.contract === "stage-summary/variant-generation/v1") return renderVariantGenerationSummary(summary);
