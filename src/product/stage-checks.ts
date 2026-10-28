@@ -106,10 +106,17 @@ export class StageChecks {
     if (!draft || draft.value.stage !== stage || draft.value.projectId !== context.projectId
       || canonical(draft.value.fields) !== canonical(content.fields)) return rejected("discovery_foreign", "Research does not belong to this stage or its fields changed");
     let handoff: ReturnType<typeof discoveryConsumerForDraft> = null;
+    let conceptHandoff: ReturnType<typeof requireDiscoveryHandoff> | null = null;
     try {
       if (canonical(content.discoveryHandoff ?? null) !== canonical(draft.value.discoveryHandoff ?? null))
         return rejected('discovery_handoff_invalid', 'The stage must preserve its exact draft binding');
-      if (hasDiscoveryHandoff(this.store, draft.value) && stage !== 'concept') handoff = discoveryConsumerForDraft(this.store, draft.value);
+      if (hasDiscoveryHandoff(this.store, draft.value)) {
+        if (stage === 'concept') {
+          conceptHandoff = requireDiscoveryHandoff(this.store, draft.value);
+          requireCondition('actors' in conceptHandoff.source.projection.value && 'outcomes' in conceptHandoff.source.projection.value,
+            'discovery_consumer_projection_incomplete', 'The concept needs the accepted full product projection');
+        } else handoff = discoveryConsumerForDraft(this.store, draft.value);
+      }
     } catch (error) { if (!(error instanceof EngineError)) throw error; return rejected(error.code, error.message); }
     let inspection: ReturnType<typeof discoveryInspection>;
     try { inspection = discoveryInspection(this.store, draft, () => this.discovery.gate(context.projectId, content.draft)); }
@@ -119,7 +126,7 @@ export class StageChecks {
     }
     const { outcome, gate: result } = inspection;
     result.findings.push(...outcome.findings); result.guards.push(...outcome.guards);
-    if (handoff) result.guards.push(...discoveryHandoffGrounds(this.store, draft.value));
+    if (handoff || conceptHandoff) result.guards.push(...discoveryHandoffGrounds(this.store, draft.value));
     const version = contractEraOf(draft.value);
     const legacy = isLegacyEra(version);
     const contract = researchContract(stage as UpstreamStage, version, context.accepted === true);
@@ -131,12 +138,16 @@ export class StageChecks {
     if (!legacy && result.findings.length === 0) {
       const outcomes = this.store.get<{ projection: { artifacts: Graph['artifacts'] } }>(`graph-layer:${context.projectId}:1`);
       result.findings.push(...preparationFindings(stage, content.fields,
-        name => name === 'discovery' && handoff ? consumerPreparationFields(handoff) : stageFields(this.store, context.projectId, name),
+        name => name === 'discovery' && conceptHandoff ? { preparation: conceptHandoff.source.projection.value as unknown as Json }
+          : name === 'discovery' && handoff ? consumerPreparationFields(handoff) : stageFields(this.store, context.projectId, name),
         outcomes?.value.projection.artifacts.map(artifact => artifact.id) ?? []));
     }
     if (stage === 'concept' && isBasisApplicationEra(version)) {
       const source = context.inputs[0];
       try {
+        if (conceptHandoff) {
+          result.findings.push(...conceptApplicationFindings(content.fields['conceptSections'] ?? null, conceptHandoff.catalogue));
+        } else {
         requireCondition(source?.value.stage === 'discovery' && source.value.status === 'accepted',
           'basis_application_material_invalid',
           `[${stageId(context.projectId, 'discovery')}] The concept needs its exact accepted Discovery source`);
@@ -146,6 +157,7 @@ export class StageChecks {
         const catalogue = discoveryBasisCatalogue({ ref: reference(source), fields });
         result.findings.push(...conceptApplicationFindings(content.fields['conceptSections'] ?? null, catalogue));
         result.guards.push(reference(source));
+        }
       } catch (error) {
         if (!(error instanceof EngineError)) throw error;
         result.findings.push({ code: error.code, target: source?.id ?? stageId(context.projectId, 'discovery'),

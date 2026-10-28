@@ -1,3 +1,4 @@
+import { hasDiscoveryHandoff, hasDiscoveryHandoffScope, withDiscoveryHandoffAt } from './discovery-handoff.js';
 import { hasV7PlanCoverage } from './v7-contracts.js';
 import { readV7PlanBasis, requireV7PlanBasisAt, V7_PLAN_ASSESSMENT_PROMPT } from './v7-plan-assessment.js';
 import { DOSSIER_ASSESSMENT_KIND, DOSSIER_ASSESSMENT_CONTRACT, type PaidDossierAssessment } from './dossier-manifest.js';
@@ -158,7 +159,7 @@ function materialPrefix(context: Record<string, any>, id: string): Ref[] | null 
     refs.push(...plan.prefix);
   }
   if (catalogue !== undefined) {
-    if (!object(catalogue) || catalogue.contract !== 'discovery-basis-catalogue/v1' || !isRef(catalogue.source))
+    if (!object(catalogue) || !['discovery-basis-catalogue/v1', 'discovery-basis-catalogue/v2'].includes(catalogue.contract) || !isRef(catalogue.source))
       originInvalid(id, 'The saved assessor material lost its exact Discovery basis catalogue');
     refs.push(catalogue.source);
   }
@@ -436,7 +437,7 @@ export async function assessAnswer(store: Store, question: Revision<Question>, a
   const bindingId = assessmentBindingId(question.value.projectId, turn.id);
   const prior = readRecord<ResearchAssessmentBinding>(store, bindingId);
   if (prior) {
-    readResearchAssessmentAt(store, question.value.projectId, turn.id, assessmentRef);
+    await readResearchAssessmentWithHandoffAt(store, question.value.projectId, turn.id, assessmentRef);
     requireCondition(same(prior.value, binding), 'research_assessment_binding_invalid',
       'A managed turn cannot be rebound to another assessment');
     return existing!;
@@ -456,11 +457,7 @@ export async function assessAnswer(store: Store, question: Revision<Question>, a
   return exact<ResearchAssessment>(store, assessmentRef, 'research-assessment');
 }
 
-/** The managed answer is read under the exact paid turn, terminal assessor, and
- * original captured evidence. Later Source, question, session or call heads do
- * not reinterpret its historical assessment. */
-export function readResearchAssessmentAt(store: Store, projectId: string, turnId: string,
-  assessmentRef: Ref): Revision<ResearchAssessment> {
+function checkedAssessmentBinding(store: Store, projectId: string, turnId: string, assessmentRef: Ref) {
   requireCondition(typeof projectId === 'string' && projectId.trim() && typeof turnId === 'string' && turnId.trim()
     && isRef(assessmentRef), 'research_assessment_binding_invalid', 'Managed assessment needs an exact turn and result');
   const binding = readRecord<ResearchAssessmentBinding>(store, assessmentBindingId(projectId, turnId));
@@ -478,6 +475,28 @@ export function readResearchAssessmentAt(store: Store, projectId: string, turnId
     'research_assessment_binding_invalid', `[${turnId}] Managed assessment origin is missing or malformed`);
   const value = binding.value;
   const draft = exact<DiscoveryDraft>(store, value.draft, 'discovery-draft');
+  requireCondition(object(draft.value) && draft.value.projectId === projectId,
+    'research_assessment_binding_invalid', `[${turnId}] The exact assessment draft is malformed or foreign`);
+  return { binding, draft };
+}
+
+/** A cold external read reconstructs the exact C1 operation from the paid binding, never from a caller manifest. */
+export async function readResearchAssessmentWithHandoffAt(store: Store, projectId: string, turnId: string,
+  assessmentRef: Ref): Promise<Revision<ResearchAssessment>> {
+  const { draft } = checkedAssessmentBinding(store, projectId, turnId, assessmentRef);
+  const saved = JSON.parse(canonical({ projectId, turnId, assessmentRef })) as { projectId: string; turnId: string; assessmentRef: Ref };
+  const read = () => readResearchAssessmentAt(store, saved.projectId, saved.turnId, saved.assessmentRef);
+  return hasDiscoveryHandoff(store, draft.value) && !hasDiscoveryHandoffScope(store, draft.value)
+    ? withDiscoveryHandoffAt(store, saved.projectId, reference(draft), read) : read();
+}
+
+/** The managed answer is read under the exact paid turn, terminal assessor, and
+ * original captured evidence. Later Source, question, session or call heads do
+ * not reinterpret its historical assessment. */
+export function readResearchAssessmentAt(store: Store, projectId: string, turnId: string,
+  assessmentRef: Ref): Revision<ResearchAssessment> {
+  const { binding, draft } = checkedAssessmentBinding(store, projectId, turnId, assessmentRef);
+  const value = binding.value;
   const question = exact<Question>(store, value.question, 'question');
   const environment = exact<Environment>(store, value.environment, 'environment');
   requireCondition(draft.value.projectId === projectId && question.value.projectId === projectId

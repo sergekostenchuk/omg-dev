@@ -265,6 +265,9 @@ export function researchCapacityInput(input: {
   const mandatory = Object.fromEntries(keys.filter(key => Object.hasOwn(c, key)).map(key => [key, c[key]]));
   const planBasis = planBasisOf(c);
   if (planBasis) mandatory.planBasis = planBasis;
+  const conceptMaterial = Array.isArray(c.prerequisites)
+    ? c.prerequisites.find((item: any) => item.stage === 'discovery')?.conceptBasisMaterial : undefined;
+  if (conceptMaterial !== undefined) mandatory.conceptBasisMaterial = conceptMaterial;
   const operationMapMaterial = Array.isArray(c.prerequisites)
     ? c.prerequisites.find((item: any) => item.stage === 'concept')?.operationMapMaterial : undefined;
   if (operationMapMaterial !== undefined) mandatory.operationMapMaterial = operationMapMaterial;

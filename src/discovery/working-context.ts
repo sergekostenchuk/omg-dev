@@ -1,3 +1,5 @@
+import { hasDiscoveryHandoff, requireDiscoveryHandoff } from './discovery-handoff.js';
+import { conceptBasisMaterial } from './research-context.js';
 import { planBasisOf } from './v7-plan-assessment.js';
 import { researchCapacityProjection } from './early-research-outcome.js';
 import type { DossierAssessmentPacket } from './research-model.js';
@@ -388,8 +390,20 @@ function packWorkingContext(store: Store, projectId: string, draftId: string, qu
   // The archive that owns a newly paid step fixes its context-read era. A
   // historical archive without this marker keeps the original size refusal.
   body['contextReadContract'] = 'research-context-read/v2';
+  const handoffCatalogue = ['concept', 'specification'].includes(draft.value.stage)
+    && hasDiscoveryHandoff(store, draft.value) ? requireDiscoveryHandoff(store, draft.value).catalogue : null;
+  const conceptMaterial = conceptBasisMaterial(store, draft.value);
+  if (conceptMaterial) {
+    const rows = Array.isArray(body['prerequisites'])
+      ? body['prerequisites'].filter((row: any) => row?.conceptBasisMaterial !== undefined) : [];
+    requireCondition(rows.length === 1 && rows[0].stage === 'discovery'
+      && canonical(rows[0].ref) === canonical(conceptMaterial.source.manifest)
+      && canonical(rows[0].conceptBasisMaterial) === canonical(conceptMaterial),
+      'context_discovery_incomplete', `[${question.id}] Concept needs its full exact accepted material`);
+  }
   if (draft.value.contractVersion === 6 && ['concept', 'specification'].includes(draft.value.stage)) requireCondition(
-    body['discoveryBasisCatalogue']?.contract === 'discovery-basis-catalogue/v1'
+    (handoffCatalogue ? canonical(body['discoveryBasisCatalogue'] ?? null) === canonical(handoffCatalogue)
+      : body['discoveryBasisCatalogue']?.contract === 'discovery-basis-catalogue/v1')
       && isRef(body['discoveryBasisCatalogue'].source)
       && Array.isArray(body['discoveryBasisCatalogue'].constraints)
       && body['discoveryBasisCatalogue'].variant !== undefined,
@@ -501,6 +515,12 @@ function packWorkingContext(store: Store, projectId: string, draftId: string, qu
       || packet.working?.materialAddresses?.some((item: {field:string;valueHash:string}) =>
         item.field === 'discoveryContext' && item.valueHash === hashJson(relatedResearch)),
     'context_discovery_incomplete', `[${question.id}] The packed question lost its accepted research grounds`);
+    if (conceptMaterial) requireCondition(
+      Array.isArray(packet.prerequisites) && packet.prerequisites.some((row: any) =>
+        canonical(row?.conceptBasisMaterial ?? null) === canonical(conceptMaterial))
+      || packet.working?.materialAddresses?.some((item: {field:string;valueHash:string}) =>
+        item.field === 'prerequisites' && item.valueHash === hashJson(archivedBody['prerequisites'])),
+      'context_discovery_incomplete', `[${question.id}] The packed concept lost its full accepted material`);
     if (relatedCatalogue !== undefined) requireCondition(
       packet.discoveryBasisCatalogue !== undefined && canonical(packet.discoveryBasisCatalogue) === canonical(relatedCatalogue)
       || packet.working?.materialAddresses?.some((item: {field:string;valueHash:string}) =>

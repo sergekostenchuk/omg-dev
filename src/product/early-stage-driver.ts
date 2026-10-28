@@ -1,3 +1,4 @@
+import { hasDiscoveryHandoff, requireDiscoveryHandoff, prepareDiscoveryHandoff, withDiscoveryHandoffAt } from '../discovery/discovery-handoff.js';
 import { readPartialDossier } from "../discovery/dossier-manifest.js";
 import { readSelectedResearchPause, SELECTED_DOSSIER_PENDING, SELECTED_DOSSIER_PAUSE, type BudgetReentry } from "../discovery/research-runner.js";
 import { readVariantHandoff, discoveryInspection } from '../discovery/discovery-outcome.js';
@@ -16,7 +17,8 @@ import { isRef, predecessor, reference, stageId, STAGES, uniqueRefs, type Ref, t
 import type { Revision, TransactionGuard, Write } from "../storage/store.js";
 import { storeView } from "../storage/store-view.js";
 import { continuePass, startPass, type PassOutcome } from "../om/run-driver.js";
-import { readRun } from "../om/run.js";
+import { readRun, runId, type RunRecord } from "../om/run.js";
+import { readOmInput, readAcceptedUpstreamStageAt, type OmInputRecord } from "../om/input.js";
 import { acquireRunExecution, admitRunControl, releaseRunExecution, readRunControl, RunControlGate, RunControlLost, type RunExecution } from "../om/run-control.js";
 import type { Refusal } from "../om/refusal.js";
 import type { Project, StageContent, ProductEngine } from "./engine.js";
@@ -126,7 +128,9 @@ export class EarlyStageDriver {
       // An addressed dossier result is a read, not a new execution lease.
       // Prove its saved outputs before acquiring control so malformed addresses and
       // hot/cold fixed points leave even control history unchanged.
-      const current = !inspected || 'binding' in inspected ? this.#currentStage(project) : null;
+      // A consumer already pins its own accepted source; later Discovery heads do not select a replacement.
+      const pinnedConcept = listDrafts(this.engine.store, project, 'concept').some(row => hasDiscoveryHandoff(this.engine.store, row.value));
+      const current = !pinnedConcept && (!inspected || 'binding' in inspected) ? this.#currentStage(project) : null;
       const draft = current?.stage === 'discovery' && !current.blocked
         ? this.#savedDraft(project, current.stage, current.artifact, request.draftId,
           inspected && 'binding' in inspected ? inspected.refs : []).draft : null;
@@ -140,7 +144,8 @@ export class EarlyStageDriver {
         const newReturn = canonical(returned) !== canonical(proof.record.value.return)
           && maxTurns > 0 && maxCalls > 0
           && executionAdmission(this.engine.store, draft, 'new-research', this.#producerPolicy).admitted;
-        if (!newReturn && (['accepted','declined','returned'].includes(proof.status)
+        if (!newReturn && !(proof.status === 'accepted' && proof.view.next === 'concept' && maxTurns > 0 && maxCalls > 0)
+          && (['accepted','declined','returned'].includes(proof.status)
           || proof.status === 'needs_owner' && provenAcceptanceMode(this.engine.store, project).mode === 'questions')) {
           const reason = { code: `discovery_finalization_${proof.status}`, target: proof.view.record.id,
             message: proof.correction?.reason ?? `Discovery continuation: ${proof.view.next ?? proof.outcome}` };
@@ -207,33 +212,105 @@ export class EarlyStageDriver {
         early.reason, early.turnsUsed, maxTurns, maxCalls, callsMade, early.om);
     }
 
-    const saved = readRun(this.engine.store, { project });
-    if (!saved.ok) return this.#result(project, "om_refused", null, early.draft, [], early.stageResult,
-      refusalReason(saved.refusal), early.turnsUsed, maxTurns, maxCalls, callsMade, null);
-    const driven = saved.value
-      ? await continuePass(this.engine.store, { project })
-      : await startPass(this.engine.store, { project, ...(request.outcomes ? { outcomes: request.outcomes } : {}) });
-    if (!driven.ok) return this.#result(project, "om_refused", null, early.draft, [], early.stageResult,
-      refusalReason(driven.refusal), early.turnsUsed, maxTurns, maxCalls, callsMade, null);
-    return this.#result(project, `om_${driven.value.end}` as EarlyStageEnd, null, early.draft, [], early.stageResult,
-      driven.value.refusal ? refusalReason(driven.value.refusal) : null, early.turnsUsed, maxTurns, maxCalls, callsMade,
-      driven.value as PassOutcome);
+    try {
+      return await this.#withOmHandoff(project, async () => {
+        const saved = readRun(this.engine.store, { project });
+        if (!saved.ok) return this.#result(project, "om_refused", null, early.draft, [], early.stageResult,
+          refusalReason(saved.refusal), early.turnsUsed, maxTurns, maxCalls, callsMade, null);
+        const driven = saved.value
+          ? await continuePass(this.engine.store, { project })
+          : await startPass(this.engine.store, { project, ...(request.outcomes ? { outcomes: request.outcomes } : {}) });
+        if (!driven.ok) return this.#result(project, "om_refused", null, early.draft, [], early.stageResult,
+          refusalReason(driven.refusal), early.turnsUsed, maxTurns, maxCalls, callsMade, null);
+        return this.#result(project, `om_${driven.value.end}` as EarlyStageEnd, null, early.draft, [], early.stageResult,
+          driven.value.refusal ? refusalReason(driven.value.refusal) : null, early.turnsUsed, maxTurns, maxCalls, callsMade,
+          driven.value as PassOutcome);
+      });
+    } catch (error) {
+      if (!(error instanceof EngineError)) throw error;
+      return this.#result(project, "om_refused", null, early.draft, [], early.stageResult,
+        reason(error.code, runId(project), error.message), early.turnsUsed, maxTurns, maxCalls, callsMade, null);
+    }
+  }
+
+  /** Select only the address here; the shared OM readers still prove the input and run. */
+  async #withOmHandoff<T>(project: string, work: () => Promise<T>): Promise<T> {
+    const store = this.engine.store, saved = store.get<RunRecord>(runId(project));
+    let features: Revision<StageArtifact> | null;
+    let manifest: Ref | undefined;
+    if (saved) {
+      requireCondition(saved.value && isRef(saved.value.input), 'discovery_handoff_invalid',
+        'The saved OM run lost its exact input address');
+      const input = store.get<OmInputRecord>(saved.value.input.id, saved.value.input.revision);
+      requireCondition(input && canonical(reference(input)) === canonical(saved.value.input)
+        && input.value?.projectId === project && Array.isArray(input.value.input?.sources),
+      'discovery_handoff_invalid', 'The saved OM input is missing or belongs to another project');
+      const sources = input.value.input.sources.filter(row => row?.stage === 'features');
+      requireCondition(sources.length === 1 && isRef(sources[0]), 'discovery_handoff_invalid',
+        'The saved OM input must name its exact features artifact');
+      const source = sources[0]!;
+      features = store.get<StageArtifact>(source.id, source.revision);
+      requireCondition(features && features.hash === source.hash, 'discovery_handoff_invalid',
+        'The saved features artifact is missing or substituted');
+      manifest = input.value.input.discovery?.manifest;
+    } else features = readStageArtifact<StageArtifact>(store, stageId(project, 'features'));
+    const content = features?.value?.content as unknown as Partial<StageContent> | undefined;
+    const draft = isRef(content?.draft) ? store.get<DiscoveryDraft>(content.draft.id, content.draft.revision) : null;
+    requireCondition(!draft || (draft.value !== null && typeof draft.value === 'object' && !Array.isArray(draft.value)),
+      'discovery_handoff_invalid', 'The OM features draft lost its record value');
+    const bound = draft && hasDiscoveryHandoff(store, draft.value);
+    if (!bound) {
+      requireCondition(!manifest && !content?.discoveryHandoff, 'discovery_handoff_invalid',
+        'The OM features source lost its Discovery handoff');
+      return work();
+    }
+    requireCondition(features?.value?.projectId === project && features.value.stage === 'features'
+      && canonical(reference(draft)) === canonical(content!.draft), 'discovery_handoff_invalid',
+    'The OM features draft is foreign or substituted');
+    return withDiscoveryHandoffAt(store, project, reference(draft), () => {
+      const handoff = requireDiscoveryHandoff(store, draft.value);
+      requireCondition(handoff.binding.stage === 'features'
+        && (!saved || (isRef(manifest) && canonical(manifest) === canonical(handoff.source.manifest))),
+      'discovery_handoff_invalid', 'The saved OM input and features name different Discovery roots');
+      if (saved) {
+        const input = readOmInput(store, project, saved.value.input);
+        if (!input.ok) throw new EngineError(input.refusal.code, input.refusal.message, input.refusal.at);
+        readAcceptedUpstreamStageAt(store, project, 'features', reference(features!));
+      }
+      return work();
+    });
   }
 
   async #restoreStopped(request: EarlyStageRequest, refusal: Refusal): Promise<EarlyStageOutcome> {
-    const current = this.#currentStage(request.project), stopped = refusalReason(refusal);
-    if (!current || current.blocked)
-      return this.#result(request.project, "stopped", current?.stage ?? null, current?.draft ?? null, [], null,
+    const stopped = refusalReason(refusal);
+    const restore = async (manifest?: Ref) => {
+      const current = this.#currentStage(request.project, manifest);
+      if (!current || current.blocked)
+        return this.#result(request.project, "stopped", current?.stage ?? null, current?.draft ?? null, [], null,
+          stopped, 0, request.maxTurns, request.maxCalls, 0, null);
+      const explicit = request.draftId ? readDraft(this.engine.store, request.draftId) : null;
+      const selected = this.#savedDraft(request.project, current.stage, current.artifact,
+        manifest && explicit?.value.stage === 'discovery' ? undefined : request.draftId, this.#inputRefs(request.project));
+      if (!selected.draft)
+        return this.#result(request.project, "stopped", current.stage, null, selected.candidates, null,
+          stopped, 0, request.maxTurns, request.maxCalls, 0, null);
+      const restored = await this.engine.stageResearch.run(request.project, selected.draft.id,
+        Math.max(1, request.maxTurns), { restoreOnly: true });
+      return this.#result(request.project, "stopped", current.stage, reference(selected.draft), [], restored,
         stopped, 0, request.maxTurns, request.maxCalls, 0, null);
-    const selected = this.#savedDraft(request.project, current.stage, current.artifact, request.draftId,
-      this.#inputRefs(request.project));
-    if (!selected.draft)
-      return this.#result(request.project, "stopped", current.stage, null, selected.candidates, null,
-        stopped, 0, request.maxTurns, request.maxCalls, 0, null);
-    const restored = await this.engine.stageResearch.run(request.project, selected.draft.id,
-      Math.max(1, request.maxTurns), { restoreOnly: true });
-    return this.#result(request.project, "stopped", current.stage, reference(selected.draft), [], restored,
-      stopped, 0, request.maxTurns, request.maxCalls, 0, null);
+    };
+    try {
+      const selected = this.#conceptRoot(request);
+      if (selected.candidates.length) return this.#result(request.project, 'stopped', 'concept', null,
+        selected.candidates, null, stopped, 0, request.maxTurns, request.maxCalls, 0, null);
+      if (!selected.draft) return await restore();
+      return await withDiscoveryHandoffAt(this.engine.store, request.project, reference(selected.draft), () =>
+        restore(requireDiscoveryHandoff(this.engine.store, selected.draft!.value).source.manifest));
+    } catch (error) {
+      if (!(error instanceof EngineError)) throw error;
+      return this.#result(request.project, 'stopped', 'concept', null, [], null,
+        reason(error.code, request.draftId ?? 'concept', error.message), 0, request.maxTurns, request.maxCalls, 0, null);
+    }
   }
 
   #selection(text: string, media: Source["mediaType"], selector: unknown): Json {
@@ -459,13 +536,18 @@ export class EarlyStageDriver {
       : { draft: null, candidates: valid.map(reference) };
   }
 
-  async #driveEarly(request: EarlyStageRequest, execution: RunExecution, input: ResolvedInput | null): Promise<EarlyResult> {
-    let turnsUsed = 0, explicit = request.draftId;
+  async #driveEarly(request: EarlyStageRequest, execution: RunExecution, input: ResolvedInput | null,
+    turnsUsed = 0, root?: Ref): Promise<EarlyResult> {
+    if (!root) {
+      const continued = await this.#continueConcept(request, execution, input, turnsUsed);
+      if (continued) return continued;
+    }
+    let explicit = request.draftId;
     for (;;) {
       try { admitRunControl(this.engine.store, request.project, execution.hold); }
       catch (error) { return this.#controlOutcome(request.project, error, turnsUsed); }
 
-      const current = this.#currentStage(request.project);
+      const current = this.#currentStage(request.project, root);
       if (!current) return { ...this.#base(request.project, "om_ready", null, null, [], null, null), turnsUsed, handoff: true };
       if (current.blocked) return { ...this.#base(request.project, "blocked", current.stage, current.draft, [], null,
         current.reason), turnsUsed, handoff: false };
@@ -539,6 +621,10 @@ export class EarlyStageDriver {
         throw error;
       }
       turnsUsed += stageResult.turnsUsed ?? 0;
+      if (current.stage === 'discovery' && stageResult.finalization?.next === 'concept') {
+        const continued = await this.#continueConcept(request, execution, input, turnsUsed);
+        if (continued) return continued;
+      }
       if (stageResult.status === "accepted") continue;
       const outcome = await this.#stageOutcome(request.project, current.stage, reference(draft), stageResult);
       if (turnsUsed >= request.maxTurns && outcome.end === "stage_paused" && stageResult.feedback && !outcome.reason?.handoff)
@@ -602,9 +688,64 @@ export class EarlyStageDriver {
     throw error;
   }
 
-  #currentStage(project: string): { stage: UpstreamStage; artifact: Revision<StageArtifact> | null; draft: Ref | null;
+  #conceptRoot(request: EarlyStageRequest): { draft: Revision<DiscoveryDraft> | null; candidates: Ref[] } {
+    const store = this.engine.store, project = request.project;
+    const artifact = readStageArtifact<StageArtifact>(store, stageId(project, 'concept'));
+    const content = artifact?.value.content as unknown as Partial<StageContent> | undefined;
+    const candidates = listDrafts(store, project, 'concept').filter(row => hasDiscoveryHandoff(store, row.value));
+    const explicit = request.draftId ? readDraft(store, request.draftId) : null;
+    const named = explicit?.value.stage === 'concept' ? explicit.id
+      : isRef(content?.draft) ? content.draft.id : undefined;
+    if (named && isRef(content?.draft)) requireCondition(named === content.draft.id, 'early_draft_conflict',
+      'The concept artifact already pins another draft');
+    if (!named && candidates.length > 1) return { draft: null, candidates: candidates.map(reference) };
+    const draft = named ? readDraft(store, named) : candidates[0] ?? null;
+    if (draft && hasDiscoveryHandoff(store, draft.value)) return { draft, candidates: [] };
+    requireCondition(!content?.discoveryHandoff, 'discovery_handoff_invalid', 'The concept lost its pinned draft');
+    return { draft: null, candidates: [] };
+  }
+
+  /** The pinned consumer draft, not a later Discovery head, selects a resumed root. */
+  async #continueConcept(request: EarlyStageRequest, execution: RunExecution, input: ResolvedInput | null,
+    turnsUsed: number): Promise<EarlyResult | null> {
+    const store = this.engine.store, project = request.project;
+    const selected = this.#conceptRoot(request);
+    if (selected.candidates.length)
+      return { ...this.#base(project, 'select_draft', 'concept', null, selected.candidates, null,
+        reason('early_draft_ambiguous', 'concept', 'Several pinned concepts require an explicit draftId', 'draftId')),
+        turnsUsed, handoff: false };
+    let draft = selected.draft;
+    if (!draft) {
+      const current = this.#currentStage(project);
+      if (current?.stage !== 'discovery' || current.blocked) return null;
+      const discovery = this.#savedDraft(project, 'discovery', current.artifact, request.draftId, input?.refs ?? []).draft;
+      const run = discovery ? readResearchRun(store, project, discovery.id) : null;
+      if (!run?.value.finalization) return null;
+      const { readRunnerFinalizationAt } = await import('../discovery/discovery-finalization-runner.js');
+      const proof = await readRunnerFinalizationAt(store, project, reference(run));
+      if (proof.status !== 'accepted' || proof.view.next !== 'concept' || !proof.view.manifest
+        || turnsUsed >= request.maxTurns || request.maxCalls === 0) return null;
+      // C1 is re-proved by the shared producer; every write carries the acquired hold.
+      draft = await prepareDiscoveryHandoff(store,
+        { project, stage: 'concept', manifest: proof.view.manifest, inputs: [proof.view.manifest] }, execution.hold);
+    }
+    const at = reference(draft);
+    return withDiscoveryHandoffAt(store, project, at, () => {
+      const bound = requireDiscoveryHandoff(store, draft!.value);
+      const current = this.#currentStage(project, bound.source.manifest);
+      const explicit = request.draftId ? readDraft(store, request.draftId) : null;
+      const draftId = current?.stage === 'concept'
+        ? !request.draftId || explicit?.value.stage === 'discovery' ? draft!.id : request.draftId
+        : explicit?.value.stage === 'discovery' || explicit?.value.stage === 'concept' ? undefined : request.draftId;
+      const { draftId: _selected, ...rest } = request;
+      return this.#driveEarly({ ...rest, ...(draftId ? { draftId } : {}) }, execution, input, turnsUsed, bound.source.manifest);
+    });
+  }
+
+  #currentStage(project: string, manifest?: Ref): { stage: UpstreamStage; artifact: Revision<StageArtifact> | null; draft: Ref | null;
     blocked: boolean; reason: EarlyStageReason | null } | null {
     for (const stage of UPSTREAM_STAGES) {
+      if (stage === 'discovery' && manifest) continue;
       const projection = this.engine.pipeline.inspect(project, stage);
       if (projection.state === "accepted") continue;
       const content = projection.artifact?.value.content as unknown as Partial<StageContent> | undefined;
@@ -692,7 +833,9 @@ export class EarlyStageDriver {
       || draft.value.level !== "R0" || draft.value.consumer !== STAGES[STAGES.indexOf(stage) + 1])
       return reason("early_draft_foreign", draft?.id ?? stage, "The selected draft does not belong to this project stage", "draftId");
     const prior = predecessor(stage);
-    const required = prior ? this.engine.pipeline.inspect(project, prior).guards : entryRefs;
+    const bound = hasDiscoveryHandoff(this.engine.store, draft.value) ? requireDiscoveryHandoff(this.engine.store, draft.value) : null;
+    const required = stage === 'concept' && bound ? [bound.source.manifest]
+      : prior ? this.engine.pipeline.inspect(project, prior).guards : entryRefs;
     if (canonical(draft.value.inputs) !== canonical(required))
       return reason("early_draft_stale", draft.id, "The saved draft does not name the current prerequisite basis", "inputs");
     const admission = executionAdmission(this.engine.store, draft, 'early-drive', this.#producerPolicy);

@@ -1,4 +1,4 @@
-import { prepareDiscoveryHandoff, withDiscoveryHandoffAt, hasDiscoveryHandoffScope, hasDiscoveryHandoff, discoveryConsumerForDraft } from '../discovery/discovery-handoff.js';
+import { prepareDiscoveryHandoff, withDiscoveryHandoffAt, hasDiscoveryHandoffScope, hasDiscoveryHandoff, requireDiscoveryHandoff, discoveryConsumerForDraft } from '../discovery/discovery-handoff.js';
 import { consumerPreparationFields } from '../discovery/discovery-consumer-projection.js';
 import { readAcceptedDiscoveryProjectionAt } from '../discovery/discovery-accepted-projection.js';
 import { returnDiscoveryResearch } from '../discovery/discovery-research-return.js';
@@ -137,6 +137,9 @@ export class ProductEngine {
   /** Pin the accepted manifest before preparing a downstream consumer. Existing stage admission remains in force. */
   async prepareAcceptedConsumer(project: string, stage: 'concept' | 'operation-map' | 'specification' | 'features', manifest: Ref): Promise<Revision<DiscoveryDraft>> {
     this.#project(project);
+    manifest = JSON.parse(canonical(manifest)) as Ref;
+    if (stage === 'concept')
+      return prepareDiscoveryHandoff(this.store, { project, stage, manifest, inputs: [manifest] });
     const prior = predecessor(stage)!;
     const saved = this.store.get<StageArtifact>(stageId(project, prior));
     const bound = (saved?.value?.content as unknown as { draft?: Ref; discoveryHandoff?: { manifest: Ref } });
@@ -164,7 +167,10 @@ export class ProductEngine {
     requireCondition(executionAdmission(this.store, draft, 'stage-result').admitted, "research_contract_upgrade_required",
       "Prepare enriched research before creating a new stage result; previous accepted versions remain historical");
     const layer = stage === "operation-map" ? this.store.get(`graph-layer:${project}:1`) : null;
-    if (hasDiscoveryHandoff(this.store, draft.value)) discoveryConsumerForDraft(this.store, draft.value);
+    if (hasDiscoveryHandoff(this.store, draft.value)) {
+      if (stage === 'concept') requireDiscoveryHandoff(this.store, draft.value);
+      else discoveryConsumerForDraft(this.store, draft.value);
+    }
     const content = { draft: reference(draft), fields: draft.value.fields, graph: layer ? reference(layer) : null,
       ...(draft.value.discoveryHandoff ? { discoveryHandoff: structuredClone(draft.value.discoveryHandoff) } : {}) };
     return this.pipeline.draft(project, stage, content as unknown as Json, expected);

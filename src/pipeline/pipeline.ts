@@ -1,3 +1,6 @@
+import { DISCOVERY_MANIFEST_KIND } from '../discovery/discovery-manifest.js';
+import { hasDiscoveryHandoff, requireDiscoveryHandoff, discoveryHandoffGrounds } from '../discovery/discovery-handoff.js';
+import type { DiscoveryDraft } from '../discovery/discovery.js';
 import { Store, checkTransactionGuards, storeObserved, type Revision, type TransactionGuard, type Write } from "../storage/store.js";
 import { provenStore } from "../storage/store-view.js";
 import { EngineError, requireCondition } from "../errors.js";
@@ -78,6 +81,30 @@ export class Pipeline {
   #requireProject(projectId: string): void {
     requireCondition(typeof projectId === "string" && /^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/.test(projectId), "invalid_project", "Project ID is invalid");
   }
+  /** The C1 proof is operation-local. These immutable source revisions are acceptance grounds, not current-head guards. */
+  #handoff(projectId: string, stage: Stage, content: Json): { manifest: Ref; grounds: Ref[] } | null {
+    if (!content || typeof content !== 'object' || Array.isArray(content)) return null;
+    const body = content as Record<string, unknown>;
+    const declared = Object.hasOwn(body, 'discoveryHandoff');
+    const at = body['draft'];
+    const draft = isRef(at) ? this.store.get<DiscoveryDraft>(at.id, at.revision) : null;
+    if (draft?.kind === 'discovery-draft') requireCondition(draft.value !== null && typeof draft.value === 'object'
+      && !Array.isArray(draft.value), 'discovery_handoff_invalid', 'The saved downstream draft must be a record');
+    if (!declared && (!draft || draft.kind !== 'discovery-draft' || !hasDiscoveryHandoff(this.store, draft.value))) return null;
+    requireCondition(draft?.kind === 'discovery-draft' && isRef(at) && canonical(reference(draft)) === canonical(at)
+      && draft.value.projectId === projectId && draft.value.stage === stage,
+    'discovery_handoff_invalid', 'The stage needs its exact bound downstream draft');
+    const handoff = requireDiscoveryHandoff(this.store, draft.value);
+    requireCondition(canonical(body['discoveryHandoff'] ?? null) === canonical(handoff.binding),
+      'discovery_handoff_invalid', 'The stage must preserve its original exact Discovery binding');
+    if (stage === 'concept') requireCondition(canonical(draft.value.inputs) === canonical([handoff.source.manifest]),
+      'discovery_handoff_invalid', 'The bound concept draft must name only its exact accepted manifest');
+    return { manifest: handoff.source.manifest, grounds: discoveryHandoffGrounds(this.store, draft.value) };
+  }
+  #liveProofs(refs: readonly Ref[], historical: readonly Ref[]): Ref[] {
+    const pinned = new Set(historical.map(ref => canonical(ref)));
+    return refs.filter(ref => !pinned.has(canonical(ref)));
+  }
   #requireStage(stage: Stage): void {
     requireCondition(STAGES.includes(stage), "unknown_stage", "Unknown pipeline stage");
   }
@@ -104,10 +131,11 @@ export class Pipeline {
   }
   #prepareDraft(projectId: string, stage: Stage, content: Json, expected: number, admissionGuards: TransactionGuard[]): PreparedStage {
     this.#requireProject(projectId); this.#requireStage(stage);
-    const prior = predecessor(stage);
+    const prior = predecessor(stage), handoff = this.#handoff(projectId, stage, content);
+    const manifestRoot = stage === 'concept' ? handoff?.manifest : null;
     let input: Revision<StageArtifact> | null = null;
     const guards = uniqueTransactionGuards(admissionGuards);
-    if (prior) {
+    if (prior && !manifestRoot) {
       const projection = this.inspect(projectId, prior);
       requireCondition(projection.state === "accepted", "predecessor_not_ready", `${prior} must be accepted and current`);
       input = projection.artifact;
@@ -115,7 +143,7 @@ export class Pipeline {
     }
     return { write: {
       id: stageId(projectId, stage), kind: "stage", expected,
-      value: { projectId, stage, status: "draft", content, inputs: input ? [reference(input)] : [], proofs: [] },
+      value: { projectId, stage, status: "draft", content, inputs: manifestRoot ? [manifestRoot] : input ? [reference(input)] : [], proofs: [] },
     }, guards: uniqueTransactionGuards(guards) };
   }
   inspect(projectId: string, stage: Stage): StageProjection {
@@ -135,12 +163,22 @@ export class Pipeline {
       && Object.hasOwn(value, "content") && Array.isArray(value.inputs) && value.inputs.every(isRef)
       && Array.isArray(value.proofs) && value.proofs.every(isRef),
     "artifact_invalid", "Stored stage artifact has missing or malformed fields");
+    // The persisted closure of a legacy stage must not reopen its draft/questions just to discover an absent
+    // handoff. The binding and manifest grounds route new records to the full common proof; an address alone
+    // grants no acceptance. Keeping the grounds route also refuses a removed binding on a manifest stage.
+    const body = value.content;
+    const manifestBacked = !!body && typeof body === 'object' && !Array.isArray(body) && Object.hasOwn(body, 'discoveryHandoff')
+      || [...value.inputs, ...value.proofs].some(ref => ref.id.startsWith(`${DISCOVERY_MANIFEST_KIND}:`));
+    const handoff = manifestBacked ? this.#handoff(projectId, stage, value.content) : null;
+    const historical = handoff?.grounds ?? [];
+    if (stage === 'concept' && handoff) requireCondition(canonical(value.inputs) === canonical([handoff.manifest]),
+      'discovery_handoff_invalid', 'The concept input must be its pinned accepted manifest');
     // G1: an accepted artifact with a recorded closure is checked by one snapshot of heads plus its
     // declared external checks — the stage validator does not run, and the predecessor is not
     // re-inspected. Any miss falls through to the full inspection below, which names the same
     // findings as before; a malformed closure is an addressed refusal, not a miss.
     if (artifact && value.status === "accepted" && value.closure !== undefined) {
-      const closed = this.#closedProjection(projectId, stage, value, artifact);
+      const closed = this.#closedProjection(projectId, stage, value, artifact, historical);
       if (closed) return closed;
     }
     const findings: Finding[] = [];
@@ -149,7 +187,10 @@ export class Pipeline {
     const inputs: Revision<StageArtifact>[] = [];
     const prior = predecessor(stage);
     if (value.inputs.length !== (prior ? 1 : 0)) findings.push({ code: "input_set_invalid", target: id, message: "Stage input set is incomplete or contains extras" });
-    if (prior) {
+    if (stage === 'concept' && handoff) {
+      if (value.inputs.length !== 1 || canonical(value.inputs[0]) !== canonical(handoff.manifest))
+        findings.push({ code: 'discovery_handoff_invalid', target: id, message: 'The concept input must be its pinned accepted manifest' });
+    } else if (prior) {
       // Execution consumes a sealed compilation version. Its commits must not make
       // historical R3 evidence retroactively invalidate the completed result.
       const sealed = value.status === "accepted" && sealedResult(stage, value)
@@ -164,7 +205,7 @@ export class Pipeline {
         findings.push({ code: "input_stale", target: stageId(projectId, prior), message: "A prerequisite changed; revise this stage against its current version" });
       } else inputs.push(current.artifact);
     }
-    for (const proof of uniqueRefs(value.proofs)) {
+    for (const proof of this.#liveProofs(uniqueRefs(value.proofs), historical)) {
       const current = this.store.get(proof.id);
       if (!current || current.hash !== proof.hash || current.revision !== proof.revision) findings.push({ code: "proof_stale", target: proof.id, message: "The evidence used by this stage has changed" });
       else guards.push(reference(current));
@@ -173,7 +214,7 @@ export class Pipeline {
       ...(admissionGuards.length ? { admissionGuards: uniqueTransactionGuards(admissionGuards) } : {}) };
     const validation = this.validators[stage]({ projectId, content: value.content, inputs, accepted: value.status === "accepted" });
     findings.push(...validation.findings);
-    guards.push(...validation.guards);
+    guards.push(...this.#liveProofs(validation.guards, historical));
     admissionGuards.push(...(validation.admissionGuards ?? []));
     if (!findings.length && admissionGuards.length && !transactionGuardsCurrent(this.store, [...guards, ...admissionGuards]))
       findings.push({ code: "input_stale", target: id, message: "An admission dependency changed while this stage was checked" });
@@ -194,13 +235,14 @@ export class Pipeline {
    * answers `stage_closure_invalid` instead of falling back: an addressed refusal, not a change of
    * basis (№6174 п.1).
    */
-  #closedProjection(projectId: string, stage: Stage, value: StageArtifact, artifact: Revision<StageArtifact>): StageProjection | null {
+  #closedProjection(projectId: string, stage: Stage, value: StageArtifact, artifact: Revision<StageArtifact>, historical: Ref[]): StageProjection | null {
     const id = stageId(projectId, stage);
+    const liveProofs = this.#liveProofs(value.proofs, historical);
     const closure = value.closure;
     const invalid = (message: string): StageProjection => ({
       stage, state: "stale", artifact,
       findings: [{ code: "stage_closure_invalid", target: id, message }],
-      guards: uniqueRefs([reference(artifact), ...value.proofs]) });
+      guards: uniqueRefs([reference(artifact), ...liveProofs]) });
     if (!closure || typeof closure !== "object" || Array.isArray(closure)
       || closure.contract !== STAGE_CLOSURE_CONTRACT
       || !Array.isArray(closure.proofs) || !closure.proofs.every(isRef)
@@ -222,12 +264,12 @@ export class Pipeline {
     // checks the same guards by observable gets so the journal keeps the reads the old path always made.
     const source = provenStore(this.store);
     const stale = (findings: Finding[]): StageProjection => ({ stage, state: "stale", artifact,
-      findings, guards: uniqueRefs([reference(artifact), ...value.proofs]),
+      findings, guards: uniqueRefs([reference(artifact), ...liveProofs]),
       ...(closure.admission.length ? { admissionGuards: [...closure.admission] } : {}) });
     if (source && !storeObserved(source)) {
-      const match = source.headsMatch([...closure.proofs, ...closure.admission]);
+      const match = source.headsMatch([...liveProofs, ...closure.admission]);
       if (!match.ok) {
-        const proofIds = new Set(closure.proofs.map(ref => ref.id));
+        const proofIds = new Set(liveProofs.map(ref => ref.id));
         return stale(match.mismatches.map(miss => proofIds.has(miss.id)
           ? { code: "proof_stale", target: miss.id, message: "The evidence used by this stage has changed" }
           : { code: "input_stale", target: miss.id,
@@ -236,7 +278,7 @@ export class Pipeline {
     } else {
       const findings: Finding[] = [];
       const flagged = new Set<string>();
-      for (const proof of closure.proofs) {
+      for (const proof of liveProofs) {
         const current = this.store.get(proof.id);
         if (!current || current.revision !== proof.revision || current.hash !== proof.hash) {
           flagged.add(proof.id);
@@ -268,7 +310,7 @@ export class Pipeline {
       if (!handler || outcome !== null) return null;
     }
     return { stage, state: "accepted", artifact, findings: [],
-      guards: uniqueRefs([reference(artifact), ...value.proofs]),
+      guards: uniqueRefs([reference(artifact), ...liveProofs]),
       ...(closure.admission.length ? { admissionGuards: closure.admission } : {}) };
   }
   /**
@@ -298,7 +340,8 @@ export class Pipeline {
     // head): its closure inherits none of the compilation's external checks and records only the
     // admission its own validator issued — never a historical repository or source check (№6254).
     const sealed = sealedResult(value.stage, value);
-    if (prior && !sealed) {
+    const manifestRoot = value.stage === 'concept' && this.#handoff(value.projectId, value.stage, value.content) !== null;
+    if (prior && !sealed && !manifestRoot) {
       const predecessorArtifact = this.store.get<StageArtifact>(prior.id, prior.revision);
       const priorClosure = predecessorArtifact?.value.closure;
       // A malformed prior closure does not poison this stage's own — the predecessor's unknown
@@ -328,8 +371,9 @@ export class Pipeline {
       writeGuards: [...writeGuards] };
   }
   #acceptedValue(value: StageArtifact, checked: StageProjection, writeGuards: TransactionGuard[]): StageArtifact {
+    const historical = this.#handoff(value.projectId, value.stage, value.content)?.grounds ?? [];
     const accepted: StageArtifact = { ...value, status: "accepted",
-      proofs: checked.guards.filter(ref => ref.id !== stageId(value.projectId, value.stage)) };
+      proofs: uniqueRefs([...checked.guards, ...historical]).filter(ref => ref.id !== stageId(value.projectId, value.stage)) };
     const closure = this.#closureValue(value, checked, writeGuards);
     if (closure) { closure.proofs = accepted.proofs; accepted.closure = closure; }
     else delete accepted.closure;

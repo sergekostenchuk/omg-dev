@@ -363,11 +363,20 @@ function discoveryUnknowns(record: Revision<StageArtifact>) {
     source: { record: reference(record), pointer: `/content/fields/preparation/unknowns/${index}` } })) };
 }
 
+/** Full concept material uses the same proved C1 source and catalogue as stage admission. */
+export function conceptBasisMaterial(store: Store, draft: DiscoveryDraft) {
+  if (draft.stage !== 'concept' || !hasDiscoveryHandoff(store, draft)) return null;
+  const h = requireDiscoveryHandoff(store, draft);
+  return { source: { manifest: h.source.manifest, bundle: h.source.bundle }, summary: h.source.summary,
+    projection: h.source.projection, constitution: h.source.constitution, catalogue: h.catalogue };
+}
+
 interface ResearchPrerequisite {
   ref: Ref;
   stage: DiscoveryDraft['stage'];
   fields: Record<string, unknown>;
   discoveryMaterial?: DiscoveryConsumerProjection;
+  conceptBasisMaterial?: NonNullable<ReturnType<typeof conceptBasisMaterial>>;
   operationMapMaterial?: ReturnType<typeof operationMapMaterial>;
   featureBasisMaterial?: ReturnType<typeof featureBasisMaterial>;
   unknowns?: ReturnType<typeof discoveryUnknowns>;
@@ -410,6 +419,8 @@ export function researchPrerequisites(store: Store, draft: DiscoveryDraft, propo
       ...(featureMaterial && record.value.stage === 'specification' ? { featureBasisMaterial: featureMaterial } : {}),
       ...(unknowns ? { unknowns } : {}) };
   });
+  const concept = conceptBasisMaterial(store, draft);
+  if (concept) return [...inherited, { ref: concept.source.manifest, stage: 'discovery', fields: {}, conceptBasisMaterial: concept }];
   return handoff ? [...inherited, { ref: handoff.manifest, stage: 'discovery', fields: consumerPreparationFields(handoff),
     discoveryMaterial: handoff }] : inherited;
 }
