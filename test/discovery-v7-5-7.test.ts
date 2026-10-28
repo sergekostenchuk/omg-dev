@@ -1,3 +1,4 @@
+import { fixtureApplicableAxes } from './discovery-v7-fixture.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync, writeFileSync, copyFileSync, mkdtempSync, rmSync } from 'node:fs';
@@ -83,7 +84,7 @@ if(r.subject.subject?.contract==='v7-plan-subject/v1'&&!r.subject.deepPreparatio
 if(r.subject.deepPreparation){
  const cell=r.subject.deepCell, id=cell.subject.planQuestionId;
  const claim={id:'deep-'+prior.length,kind:'hypothesis',text:'Exact variant material '+prior.length,axis:id==='q-one'?'industry':'market',planQuestions:[{planAnswer:cell.subject.planAnswer,planQuestionId:id}],scope:{variants:s.deepMode==='common'?'common':[cell.variant.member]},basis:{howToVerify:'Measure the exact chosen variant'}};
- const claims=s.deepClaims??(s.selectedAxes&&id==='q-two'&&s.deepMode!=='common'?${JSON.stringify(V7_AXES)}.map(axis=>({...claim,id:claim.id+'-'+axis,text:claim.text+' '+axis,axis,basis:{howToVerify:claim.basis.howToVerify+' '+axis}})):[claim]);
+ const claims=s.deepClaims??(s.selectedAxes&&id==='q-two'&&s.deepMode!=='common'?s.applicableAxes.map(axis=>({...claim,id:claim.id+'-'+axis,text:claim.text+' '+axis,axis,basis:{howToVerify:claim.basis.howToVerify+' '+axis}})):[claim]);
  research={action:'answer',question:id,value:s.deepMode==='impossible'?{type:'impossible',code:'source_unavailable',evidence:[],text:'No accessible source'}:{type:'submitted',contract:'discovery-claims/v7',value:{claims}},citations:[]};
 }
 if(r.subject.variantSubject?.kind==='decision')research=s.reject?{action:'reject_all',reason:'Model rejects this exact set'}:{action:'choose',key:'v1',reason:'Model chooses the bounded member'};
@@ -109,6 +110,7 @@ console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,u
     ? { actor: 'reader', model: 'fixture', effort: 'high', speed: 'inherited', command } : ['assessor', 'escalation-assessor'].includes(purpose) ? environment.value.reviewer : environment.value.implementer,
     environment.value, 'Calibrate', {}, undefined, { store: f.store, draftId: calibration.id, questionId: calibration.value.questions[0]!, purpose });
   const v = acceptPlan(f, 'p', questions);
+  configure({applicableAxes:fixtureApplicableAxes(v.draft)});
   function mode(value: 'questions'|'bypass', store = f.store) {
     const request = { project: 'p', mode: value, previous: store.get('project-mode:p') ? reference(store.get('project-mode:p')!) : null };
     const sessions = new ProjectModeSessions(store), invitation = issueProjectModeInvitation(store, request);
@@ -309,7 +311,7 @@ test('5.7: complete coverage and an unpaid pending frontier are not partial', as
   assert.equal(result.value.pauseCode, 'research_selected_dossier_assessment_unavailable', result.value.error!);
   const details=JSON.parse(result.value.error!), selected=readSelectedDossier(f.store,'p',details.selected);
   for(const axis of V7_AXES){
-    assert.ok(selected.manifest.value.axes[axis].claims.length,axis);
+    assert.equal(selected.manifest.value.axes[axis].claims.length > 0, selected.manifest.value.axes[axis].depth !== 'inapplicable', axis);
     for(const address of selected.manifest.value.axes[axis].claims){
       const claim=resolveClaimAddress(f.store,address).claim;
       assert.ok(claim&&typeof claim==='object'&&!Array.isArray(claim));

@@ -1,3 +1,4 @@
+import { fixtureApplicableAxes } from './discovery-v7-fixture.js';
 import test, { describe, before, after, mock } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
@@ -74,12 +75,12 @@ let research=s.actions?.[prior.filter(row=>!row.subject.assessmentSubject&&!row.
 if(research.question==='$selected')research.question=q;
 if(r.subject.subject?.contract==='v7-plan-subject/v1'&&!r.subject.deepPreparation){
  const at=r.subject.subject,id=at.planQuestionId;
- research={action:'answer',question:id,value:{type:'submitted',contract:'discovery-claims/v7',value:{claims:[{id:'broad-'+prior.length,kind:'hypothesis',text:'Common sweep material '+prior.length,axis:id==='q-one'?'industry':'market',planQuestions:[{planAnswer:at.planAnswer,planQuestionId:id}],scope:{variants:'common'},basis:{howToVerify:'Measure the common domain'}}]}},citations:[]};
+ research={action:'answer',question:id,value:{type:'submitted',contract:'discovery-claims/v7',value:{claims:[{id:'broad-'+prior.length,kind:'hypothesis',text:'Common sweep material '+prior.length,axis:s.claimAxis??(id==='q-one'?'industry':'market'),planQuestions:[{planAnswer:at.planAnswer,planQuestionId:id}],scope:{variants:'common'},basis:{howToVerify:'Measure the common domain'}}]}},citations:[]};
 }
 if(r.subject.deepPreparation){
  const cell=r.subject.deepCell, id=cell.subject.planQuestionId;
- const claim={id:'deep-'+prior.length,kind:'hypothesis',text:'Exact variant material '+prior.length,axis:id==='q-one'?'industry':'market',planQuestions:[{planAnswer:cell.subject.planAnswer,planQuestionId:id}],scope:{variants:s.deepMode==='common'?'common':[cell.variant.member]},basis:{howToVerify:'Measure the exact chosen variant'}};
- const claims=s.deepClaims??(s.selectedAxes&&id==='q-two'&&s.deepMode!=='common'?${JSON.stringify(V7_AXES)}.map(axis=>({...claim,id:claim.id+'-'+axis,text:claim.text+' '+axis,axis,basis:{howToVerify:claim.basis.howToVerify+' '+axis}})):[claim]);
+ const claim={id:'deep-'+prior.length,kind:'hypothesis',text:'Exact variant material '+prior.length,axis:s.claimAxis??(id==='q-one'?'industry':'market'),planQuestions:[{planAnswer:cell.subject.planAnswer,planQuestionId:id}],scope:{variants:s.deepMode==='common'?'common':[cell.variant.member]},basis:{howToVerify:'Measure the exact chosen variant'}};
+ const claims=s.deepClaims??(s.selectedAxes&&id==='q-two'&&s.deepMode!=='common'?s.applicableAxes.map(axis=>({...claim,id:claim.id+'-'+axis,text:claim.text+' '+axis,axis,basis:{howToVerify:claim.basis.howToVerify+' '+axis}})):[claim]);
  research={action:'answer',question:id,value:s.deepMode==='impossible'?{type:'impossible',code:'source_unavailable',evidence:[],text:'No accessible source'}:{type:'submitted',contract:'discovery-claims/v7',value:{claims}},citations:[]};
 }
 if(r.subject.variantSubject?.kind==='decision')research=s.reject?{action:'reject_all',reason:'Model rejects this exact set'}:{action:'choose',key:'v1',reason:'Model chooses the bounded member'};
@@ -105,6 +106,7 @@ console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,u
     ? { actor: 'reader', model: 'fixture', effort: 'high', speed: 'inherited', command } : ['assessor', 'escalation-assessor'].includes(purpose) ? environment.value.reviewer : environment.value.implementer,
     environment.value, 'Calibrate', {}, undefined, { store: f.store, draftId: calibration.id, questionId: calibration.value.questions[0]!, purpose });
   const v = acceptPlan(f, project, questions);
+  configure({applicableAxes:fixtureApplicableAxes(v.draft)});
   function mode(value: 'questions'|'bypass', store = f.store) {
     const request = { project: project, mode: value, previous: store.get(`project-mode:${project}`) ? reference(store.get(`project-mode:${project}`)!) : null };
     const sessions = new ProjectModeSessions(store), invitation = issueProjectModeInvitation(store, request);
@@ -164,9 +166,9 @@ async function inert(f: Awaited<ReturnType<typeof setup>>, store: Store, action:
 async function ready(t:Parameters<typeof discoveryFixture>[0],model=false,config:Record<string,unknown>={},
   shared?: { project: string; fixture: DiscoveryFixture; questions?: PlanQuestion[] }) {
   const f=await setup(t,shared?.questions,model?'bypass':'questions',shared);
+  f.configure(config);
   const generated=await f.run(3);
   assert.equal(generated.value.pauseCode,model?'research_turns_exhausted':'research_variant_owner_required',generated.value.error!);
-  f.configure(config);
   if(model)await f.run(1);else owner(f.store,choiceScope(f));
   const pending=await f.run(1,f.store,true), details=JSON.parse(pending.value.error!);
   assert.equal(pending.value.pauseCode,'research_deep_frontier_pending',pending.value.error!);
@@ -184,7 +186,7 @@ async function complete(f:Awaited<ReturnType<typeof ready>>,run:Revision<Researc
   const handoff=(await readVariantHandoff(f.store,f.project,saved.handoff)).record;
   assert.deepEqual(reference(proof.manifest),saved.dossier);assert.equal(proof.manifest.value.completeness,'complete');
   for(const axis of V7_AXES){
-    assert.ok(proof.manifest.value.axes[axis].claims.length,axis);
+    assert.equal(proof.manifest.value.axes[axis].claims.length > 0, proof.manifest.value.axes[axis].depth !== 'inapplicable', axis);
     for(const address of proof.manifest.value.axes[axis].claims){
       const claim=resolveClaimAddress(f.store,address).claim;
       assert.ok(claim&&typeof claim==='object'&&!Array.isArray(claim));
@@ -225,7 +227,7 @@ for(const model of [false,true])test(`selected runner: real ${model?'model':'own
   await fixed(f,run,model);
 });
 test('selected runner: closed cells without material on every investigated axis refuse publication without further payment',async t=>{
-  const f=await ready(t,false,{selectedAxes:false});let paid:unknown,wire:unknown;
+  const f=await ready(t,false,{selectedAxes:false,claimAxis:'industry'});let paid:unknown,wire:unknown;
   const restore=interceptWrites(t,f.store,(writes,commit)=>{
     const rows=commit();
     if(writes.some(row=>row.kind==='research-run'&&(row.value as ResearchRun).pauseCode===SELECTED_DOSSIER_PENDING)){

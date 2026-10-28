@@ -1,3 +1,4 @@
+import { fixtureApplicableAxes } from './discovery-v7-fixture.js';
 import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
@@ -281,7 +282,7 @@ async function assess(f: Selected, entry: Entry, outcome: 'closed' | 'open' | 'u
   return mr;
 }
 async function complete(f: Selected) {
-  const industry = await deep(f, 'q-industry', V7_AXES.map(axis => claim(f, 'q-industry', axis, `Exact ${axis} evidence`)));
+  const industry = await deep(f, 'q-industry', fixtureApplicableAxes(f.v.draft).map(axis => claim(f, 'q-industry', axis, `Exact ${axis} evidence`)));
   await assess(f, industry);
   const market = await deep(f, 'q-market', [claim(f, 'q-market', 'market', 'Market cell evidence')]);
   await assess(f, market);
@@ -346,9 +347,9 @@ async function completeSnapshot(t: test.TestContext, f: CompleteWorld, model: bo
     assert.equal(row.depth, saved.manifest.value.axes[row.axis].depth);
     assert.equal(row.claims, saved.manifest.value.axes[row.axis].claims.length);
   }
-  assert.equal(s.axes.reduce((sum, row) => sum + row.claims, 0), 13);
+  assert.equal(s.axes.reduce((sum, row) => sum + row.claims, 0), 3);
   assert.deepEqual(s.materials, { accepted: countOf(saved.materials, 'accepted'), rejected: countOf(saved.materials, 'rejected'), unassessed: countOf(saved.materials, 'unassessed') });
-  assert.equal(s.materials.accepted, 13);
+  assert.equal(s.materials.accepted, 3);
   assert.deepEqual([s.unknowns, s.contradictions, s.partial, s.stop], [[], [], null, null]);
   // The only next step of a full snapshot is its assessment, addressed at the exact root.
   assert.deepEqual(s.next.map(step => step.action), ['assess-dossier']);

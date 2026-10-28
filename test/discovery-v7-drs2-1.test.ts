@@ -356,7 +356,7 @@ test('DRS2.1 two genuine editions of one draft/Question isolate exact sources an
   f.discovery.reopen(question.id,question.revision);
   answerDiscoveryFixture(f.engine,'p',f.store.get<DiscoveryDraft>(f.v.draft.id)!,f.store.get<Question>(question.id)!,
     validPlan(f.v.frameRef,[planQuestion('q-industry','industry','blocking'),planQuestion('q-market','market'),
-      planQuestion('q-new','outcome')],2,firstPlan),source);
+      planQuestion('q-new','industry')],2,firstPlan),source);
   const nextQuestion=f.store.get<Question>(question.id)!,nextPlan=nextQuestion.value.answer!;
   const nextAct=f.store.get<DiscoveryAcceptanceAct>(
     discoveryAcceptanceActId('p',f.v.draft.id,'plan',nextPlan))!;

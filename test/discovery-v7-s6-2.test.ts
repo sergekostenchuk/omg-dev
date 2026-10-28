@@ -123,7 +123,7 @@ function nextEdition(f: Awaited<ReturnType<typeof setup>>) {
   f.discovery.reopen(plan.id, plan.revision);
   const source = f.discovery.evidence.document('p', 'next-edition', 'Second accepted plan basis', 'text/plain', 0);
   answerDiscoveryFixture(f.engine, 'p', f.store.get<DiscoveryDraft>(f.v.draft.id)!, f.store.get<Question>(plan.id)!,
-    validPlan(f.v.frameRef, [planQuestion('block', 'industry', 'blocking')], 2, f.v.planAnswer), source);
+    validPlan(f.v.frameRef, [planQuestion('block', 'industry', 'blocking'), planQuestion('support', 'market')], 2, f.v.planAnswer), source);
   return f.store.get<Question>(plan.id)!.value.answer!;
 }
 

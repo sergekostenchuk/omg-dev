@@ -1,3 +1,4 @@
+import { fixtureApplicableAxes } from './discovery-v7-fixture.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { copyFileSync, existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
@@ -265,7 +266,7 @@ async function assess(f: Selected, entry: Entry, outcome: 'closed' | 'open' | 'u
   return mr;
 }
 async function complete(f: Selected) {
-  const industry = await deep(f, 'q-industry', V7_AXES.map(axis => claim(f, 'q-industry', axis, `Exact ${axis} evidence`)));
+  const industry = await deep(f, 'q-industry', fixtureApplicableAxes(f.v.draft).map(axis => claim(f, 'q-industry', axis, `Exact ${axis} evidence`)));
   await assess(f, industry);
   const market = await deep(f, 'q-market', [claim(f, 'q-market', 'market', 'Market cell evidence')]);
   await assess(f, market);
@@ -286,7 +287,7 @@ for (const model of [false, true]) test(`6.3 selected: real ${model ? 'model' : 
   assert.equal(first.verification, 'complete'); assert.equal(first.repeated, false);
   assert.equal(first.manifest.value.completeness, 'complete'); assert.deepEqual(first.manifest.value.reasons, []);
   assert.equal(first.coverage.cells.length, 2); assert.equal(first.coverage.missing.length, 0);
-  for (const axis of V7_AXES) assert.ok(first.manifest.value.axes[axis].claims.length);
+  for (const axis of V7_AXES) assert.equal(first.manifest.value.axes[axis].claims.length > 0, first.manifest.value.axes[axis].depth !== 'inapplicable', axis);
   assert.deepEqual(money(f.store), moneyBefore); assert.deepEqual(f.wires(), wires);
   const cold = new Store(f.store.path); t.after(() => cold.close());
   for (const store of [cold, f.store]) {
@@ -332,7 +333,7 @@ test(`6.3 selected: ${cold ? 'cold' : 'hot'} foreign frame Question head cannot 
 });
 
 test('6.3 selected: missing cell, merely paid MR, common/foreign grounds, material-only and reopened sufficiency never imply completeness', async t => {
-  const f = await setup(t), original = await deep(f, 'q-industry', V7_AXES.map(axis => claim(f, 'q-industry', axis, `Required ${axis}`)));
+  const f = await setup(t), original = await deep(f, 'q-industry', fixtureApplicableAxes(f.v.draft).map(axis => claim(f, 'q-industry', axis, `Required ${axis}`)));
   await assess(f, original); unchanged(f, f.store, () => produceSelectedDossier(f.store, 'p', f.input), true);
   const common = await deep(f, 'q-market', [claim(f, 'q-market', 'market', 'Common market closure', 'common')]);
   await assess(f, common); unchanged(f, f.store, () => produceSelectedDossier(f.store, 'p', f.input), true);

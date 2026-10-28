@@ -244,7 +244,7 @@ test('DRS1a2 subject binding: two plan-questions of one Question and the same id
   assert.match(failure(() => readPreparationRecord(f.store, b!.value.preparation!, preparationBinding(a!.value))),
     /^context_preparation_invalid: .*belongs to another step/);
   // The next plan edition with the same plan-question id is another subject and another preparation.
-  const next = acceptNextPlanEdition(f, 'p', f.v.draft, f.v.frameRef, f.v.planAnswer, [planQuestion('block', 'industry', 'blocking')]);
+  const next = acceptNextPlanEdition(f, 'p', f.v.draft, f.v.frameRef, f.v.planAnswer, [planQuestion('block', 'industry', 'blocking'), planQuestion('support', 'market')]);
   f.configure([ended()]); writeFileSync(join(f.root, 'wire.ndjson'), '');
   f.finishFrontier();assert.equal((await f.run()).value.pauseCode, 'project_mode_unset');
   const edition2 = f.intents().find(row => canonical(row.value.cursor.subject.planAnswer) === canonical(next.planAnswer))!;

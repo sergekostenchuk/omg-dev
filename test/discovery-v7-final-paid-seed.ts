@@ -1,3 +1,4 @@
+import { fixtureApplicableAxes } from './discovery-v7-fixture.js';
 import assert from 'node:assert/strict';
 import { canonical } from '../src/canonical.js';
 import type { TestContext } from 'node:test';
@@ -18,7 +19,6 @@ import { VARIANT_OWNER_ACTION, variantStateId, type VariantModelDecision } from 
 import { answerVariantChoice } from '../src/discovery/discovery-decision.js';
 import { VariantChoiceSessions, issueVariantChoiceInvitation } from '../src/product/owner-authority.js';
 import { publishVariantScope } from '../src/discovery/variant-scope.js';
-import { V7_AXES } from '../src/discovery/v7-contracts.js';
 import { produceSelectedDossier } from '../src/discovery/selected-dossier.js';
 import { producePartialDossier } from '../src/discovery/dossier-manifest.js';
 import { publishVariantHandoff } from '../src/discovery/discovery-outcome.js';
@@ -119,7 +119,7 @@ async function buildDossier(route: FinalSeedRoute) {
     const selected = publishVariantScope(f.store, 'p', decision).scope;
     const world: Selected = { ...f, saved, set, draft: set.value.draft, scope, scopeRecord: selected,
       input: { scope: reference(selected), plan: f.v.planAnswer } };
-    const industry = await deep(world, 'q-industry', V7_AXES.map(axis => claim(world, 'q-industry', axis, `Exact ${axis} basis`)));
+    const industry = await deep(world, 'q-industry', fixtureApplicableAxes(world.v.draft).map(axis => claim(world, 'q-industry', axis, `Exact ${axis} basis`)));
     await assess(world, industry);
     const market = await deep(world, 'q-market', [claim(world, 'q-market', 'market', 'Market basis')]);
     await assess(world, market);

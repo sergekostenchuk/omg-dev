@@ -1,3 +1,4 @@
+import { fixtureApplicableAxes } from './discovery-v7-fixture.js';
 import test, { after, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
@@ -33,7 +34,7 @@ import { DISCOVERY_COVERAGE_CELL_CONTRACT } from '../src/discovery/coverage.js';
 import { V7_PLAN_SUBJECT_CONTRACT } from '../src/discovery/v7-managed-attempt.js';
 import { provePlanQuestions, proveAttempt } from '../src/discovery/v7-plan-questions.js';
 import { runDeepResearch } from '../src/discovery/deep-research-execution.js';
-import { V7_AXES, DISCOVERY_CLAIMS_CONTRACT, DISCOVERY_ACCEPTANCE_ACT_KIND, discoveryAcceptanceActId, type DiscoveryAcceptanceAct } from '../src/discovery/v7-contracts.js';
+import { DISCOVERY_CLAIMS_CONTRACT, DISCOVERY_ACCEPTANCE_ACT_KIND, discoveryAcceptanceActId, type DiscoveryAcceptanceAct } from '../src/discovery/v7-contracts.js';
 import type { ClaimAddress } from '../src/discovery/claim-address.js';
 import { produceSelectedDossier } from '../src/discovery/selected-dossier.js';
 import { producePartialDossier } from '../src/discovery/dossier-manifest.js';
@@ -135,7 +136,7 @@ async function selectedWorld(t: TestContext) {
   const act = answerVariantChoice(f.store, f.scope!, mint(f.store, f.scope!).authority);
   const scope = publishVariantScope(f.store, 'p', reference(act.decision)).scope;
   const world = { ...f, scopeRecord: scope, input: { scope: reference(scope), plan: f.v.planAnswer } };
-  const industry = await deep(world, 'q-industry', V7_AXES.map(axis => claim(world, 'q-industry', axis, `Exact ${axis} evidence`)));
+  const industry = await deep(world, 'q-industry', fixtureApplicableAxes(world.v.draft).flatMap(axis => Array.from({ length: 6 }, (_, i) => claim(world, 'q-industry', axis, `Exact ${axis} evidence ${i}`))));
   await assess(world, industry);
   const market = await deep(world, 'q-market', [claim(world, 'q-market', 'market', 'Market cell evidence')]);
   await assess(world, market);

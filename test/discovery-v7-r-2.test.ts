@@ -265,7 +265,7 @@ test('R.2: a prepared unpaid dispatch of a replaced edition cannot bypass the cu
   const f=await setup(t),restore=interrupt(f,'model-call');
   const first=await f.run(1);restore();assert.equal(first.value.status,'paused');
   assert.equal(f.wires().length,0);assert.equal(f.store.list('research-attempt').length,0);
-  acceptNextPlanEdition(f,'p',f.v.draft,f.v.frameRef,f.v.planAnswer,[planQuestion('block','industry','blocking')]);
+  acceptNextPlanEdition(f,'p',f.v.draft,f.v.frameRef,f.v.planAnswer,[planQuestion('block','industry','blocking'),planQuestion('support','market')]);
   const ledger=f.store.list('research-budget-ledger');
   const cold=await f.run(1,f.open());assert.equal(cold.value.pauseCode,'research_consumer_context_stale');
   assert.equal(f.wires().length,0);assert.deepEqual(f.store.list('research-budget-ledger'),ledger);

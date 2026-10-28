@@ -1,3 +1,4 @@
+import { fixturePlanCoverage, validFrame, type PlanQuestion } from './discovery-v7-fixture.js';
 import test from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -502,14 +503,14 @@ function writePlanAccepted(store: Store, discovery: Discovery, options: {
   const questionId = `question:${project}:${rand()}`;
   const draft = store.write<DiscoveryDraft>({ id: draftId, kind: "discovery-draft", expected: 0,
     value: { projectId: project, createdAt: 1, stage: "discovery", level: "R0",
-      consumer: "om-g2", fields: { plan: null }, questions: [questionId], inputs: [],
+      consumer: "om-g2", fields: { frame: validFrame(options.questions as PlanQuestion[]), plan: null }, questions: [questionId], inputs: [],
       contractVersion: V7_CONTRACT_ERA } });
   const question = store.write<Question>({ id: questionId, kind: "question", expected: 0,
     value: { projectId: project, draftId, stage: "discovery", level: "R0", consumer: "om-g2",
       spec: V7_PLAN_FIELD, beforeHash: hashJson(null), status: "open", answer: null } });
   const planValue = { edition: 1,
     frame: { id: `research-answer:${project}:frame`, revision: 1, hash: hashJson("frame") },
-    previous: null, questions: options.questions } as unknown as Json;
+    previous: null, questions: options.questions, coverage: fixturePlanCoverage(options.questions as PlanQuestion[]) } as unknown as Json;
   const source = discovery.evidence.document(project, `basis-${rand()}`, "s", "text/plain", 0);
   const env = store.write({ id: `environment:${project}:${rand()}`, kind: "environment",
     expected: 0, value: { state: "ready" } });

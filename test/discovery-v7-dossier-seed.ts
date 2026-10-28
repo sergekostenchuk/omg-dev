@@ -1,3 +1,4 @@
+import { fixtureApplicableAxes } from './discovery-v7-fixture.js';
 import type { TestContext } from 'node:test';
 import { chmodSync, copyFileSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -37,7 +38,7 @@ import { V7_PLAN_SUBJECT_CONTRACT, type V7PlanSubject } from '../src/discovery/v
 import { provePlanQuestions } from '../src/discovery/v7-plan-questions.js';
 import { answerDiscoveryFixture } from './product-fixture.js';
 import { runDeepResearch } from '../src/discovery/deep-research-execution.js';
-import { V7_AXES, DISCOVERY_CLAIMS_CONTRACT } from '../src/discovery/v7-contracts.js';
+import { DISCOVERY_CLAIMS_CONTRACT } from '../src/discovery/v7-contracts.js';
 import type { ClaimAddress } from '../src/discovery/claim-address.js';
 
 /**
@@ -291,7 +292,7 @@ export async function assess(f: Selected, entry: Entry, outcome: 'closed' | 'ope
   return mr;
 }
 async function complete(f: Selected) {
-  const industry = await deep(f, 'q-industry', V7_AXES.map(axis => claim(f, 'q-industry', axis, `Exact ${axis} evidence`)));
+  const industry = await deep(f, 'q-industry', fixtureApplicableAxes(f.v.draft).map(axis => claim(f, 'q-industry', axis, `Exact ${axis} evidence`)));
   await assess(f, industry);
   const market = await deep(f, 'q-market', [claim(f, 'q-market', 'market', 'Market cell evidence')]);
   await assess(f, market);

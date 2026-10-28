@@ -1,3 +1,4 @@
+import { fixtureApplicableAxes } from './discovery-v7-fixture.js';
 import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
@@ -266,7 +267,7 @@ async function assess(f: Selected, entry: Entry, outcome: 'closed' | 'open' | 'u
   return mr;
 }
 async function complete(f: Selected) {
-  const industry = await deep(f, 'q-industry', V7_AXES.map(axis => claim(f, 'q-industry', axis, `Exact ${axis} evidence`)));
+  const industry = await deep(f, 'q-industry', fixtureApplicableAxes(f.v.draft).map(axis => claim(f, 'q-industry', axis, `Exact ${axis} evidence`)));
   await assess(f, industry);
   const market = await deep(f, 'q-market', [claim(f, 'q-market', 'market', 'Market cell evidence')]);
   await assess(f, market);
@@ -320,7 +321,7 @@ test(`6.4 dossier subject: real ${model ? 'model' : 'owner'} complete snapshot h
   assert.ok(packet.route.scope && packet.route.set && packet.route.member && packet.route.decision);
   for (const axis of V7_AXES) for (const address of packet.manifest.value.axes[axis].claims)
     assert.ok(packet.materials.some(item => canonical(item.address) === canonical(address) && (item.value as any).text));
-  assert.equal(packet.materials.filter(item => item.status === 'accepted').length, 13);
+  assert.equal(packet.materials.filter(item => item.status === 'accepted').length, 3);
   const late = await deep(f, 'q-market', [claim(f, 'q-market', 'market', 'Late unknown reopens current coverage')]);
   const mr = await assess(f, late, 'unknown', false);
   const second = produceSelectedDossier(f.store, 'p', f.input);

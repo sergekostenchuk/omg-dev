@@ -71,6 +71,13 @@ export function fixturePlanCoverage(questions: readonly Pick<PlanQuestion, 'id' 
   }));
 }
 
+/** Claims for a small fixture follow its saved accepted frame, never the current heads. */
+export function fixtureApplicableAxes(draft: Revision<DiscoveryDraft>): (typeof V7_AXES)[number][] {
+  const frame = draft.value.fields['frame'] as { axes: Record<string, { depth: string }> };
+  assert.ok(frame && frame.axes, 'the fixture needs its accepted frame');
+  return V7_AXES.filter(axis => frame.axes[axis]!.depth !== 'inapplicable');
+}
+
 export function validPlan(frameRef: Ref, questions: PlanQuestion[], edition = 1, previous: Ref | null = null): Json {
   return { edition, frame: frameRef, previous, questions, coverage: fixturePlanCoverage(questions) } as unknown as Json;
 }

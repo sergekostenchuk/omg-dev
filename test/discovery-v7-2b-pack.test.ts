@@ -21,6 +21,7 @@ import { contextValue, prepareFrameInterpretationContextPacker
 import { prepareFrameInterpretationEnvelope, checkFrameInterpretationEnvelope,
   FRAME_INTERPRETATION_ENVELOPE_CONTRACT } from "../src/discovery/frame-interpretation-packing.js";
 import { answerDiscoveryFixture } from "./product-fixture.js";
+import { V7_AXES } from "../src/discovery/v7-contracts.js";
 import { discoveryFixture, questionOf, validFrame, validPlan, planQuestion,
   type DiscoveryFixture } from "./discovery-v7-fixture.js";
 
@@ -306,7 +307,7 @@ test("2b-P heads moved before preparation and by a second store between staging 
   // only afterwards — a new input revision would stale every later answer.
   answerDiscoveryFixture(f.engine, project, f.store.get<DiscoveryDraft>(b.draft.id)!,
     f.store.get<Question>(b.planQ.id)!,
-    validPlan(b.frameRef, [planQuestion("q-site", "industry", "blocking")]), b.src);
+    validPlan(b.frameRef, V7_AXES.map(axis => planQuestion(axis === "industry" ? "q-site" : `q-${axis}`, axis, ["industry", "rules", "feasibility"].includes(axis) ? "blocking" : "supporting"))), b.src);
   f.discovery.reopen(b.briefQ.id, f.store.get<Question>(b.briefQ.id)!.revision);
   const headDraft = f.store.get<DiscoveryDraft>(b.draft.id)!;
   const headQuestion = f.store.get<Question>(b.briefQ.id)!;

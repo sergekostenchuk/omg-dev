@@ -142,7 +142,7 @@ test('DRS2.3 foreign edition/database/project and malformed or damaged grounds r
   f.discovery.reopen(q.id,q.revision);
   const src=f.discovery.evidence.document('p','edition-two','New edition','text/plain',0);
   answerDiscoveryFixture(f.engine,'p',f.store.get<DiscoveryDraft>(f.v.draft.id)!,f.store.get<Question>(q.id)!,
-    validPlan(f.v.frameRef,[planQuestion('q-industry','industry','blocking')],2,oldPlan),src);
+    validPlan(f.v.frameRef,[planQuestion('q-industry','industry','blocking'),planQuestion('q-market','market')],2,oldPlan),src);
   const next=f.store.get<Question>(q.id)!.value.answer!,foreign=acceptPlan(f,'other',[planQuestion('foreign','industry')],{sourceKey:'per-draft'});
   const cursor=discoveryIndexCursor(f.store);buildDiscoveryIndexAt(f.store,'p',oldPlan,cursor);
   const req=request(oldPlan,cursor,[entry.attempt]),before=snapshot(f.store),wires=f.wires();

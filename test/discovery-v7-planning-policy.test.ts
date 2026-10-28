@@ -3,12 +3,11 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { Json } from '../src/canonical.js';
 import { Store } from '../src/storage/store.js';
 import { ProductEngine } from '../src/product/engine.js';
 import { reference } from '../src/pipeline/contracts.js';
 import type { DiscoveryDraft, Question } from '../src/discovery/discovery.js';
-import { createPartialV7Draft, V7_AXES, V7_STAGE_TOKEN_CEILING } from '../src/discovery/v7-contracts.js';
+import { createPartialV7Draft, V7_STAGE_TOKEN_CEILING } from '../src/discovery/v7-contracts.js';
 import { V7_PLAN_SUBJECT_CONTRACT, type V7PlanSubject } from '../src/discovery/v7-managed-attempt.js';
 import { configureReaderPilot, prepareReaderPilot, readerPilot, type ReaderPilotSettings,
   type V7PlanningSettings } from '../src/discovery/reader-pilot.js';
@@ -17,6 +16,7 @@ import { layerDesignSpec, LAYER_DESIGN_VERSION } from '../src/graph/layer-design
 import type { Graph } from '../src/graph/model.js';
 import { answerDiscoveryFixture } from './product-fixture.js';
 import { createOmFixture } from './om-fixture.js';
+import { fixturePlanAxes, validPlan } from './discovery-v7-fixture.js';
 
 const planning: V7PlanningSettings = { contract: 'v7-plan-planning/v1', maxRequestChars: 17321, maxRounds: 4 };
 const policy = { discovery: 7 } as const;
@@ -45,17 +45,17 @@ function fixture(t: test.TestContext) {
     const draft = createPartialV7Draft(engine.discovery, id, 'concept');
     const source = engine.discovery.evidence.document(id, 'basis', 'The exact basis for this test plan', 'text/plain', 0);
     const question = (field: string) => draft.value.questions.map(q => store.get<Question>(q)!).find(q => q.value.spec.field === field)!;
-    answerDiscoveryFixture(engine, id, draft, question('frame'), {
-      productType: 'internal', scale: '30 users across 10 sites', industries: ['construction'], domains: ['supply'],
-      axes: Object.fromEntries(V7_AXES.map(axis => [axis, { depth: 'deep' }])),
-      budget: { ceiling: V7_STAGE_TOKEN_CEILING, axisHints: { industry: 4_000_000 }, completionReserve: 2_000_000 },
-    }, source);
-    const frame = question('frame').value.answer!;
     const questions = ['a', 'b'].map((key, index) => ({ id: key, axis: index ? 'market' : 'industry', domain: 'construction',
       text: `What proves ${key}?`, class: index ? 'supporting' : 'blocking', criterion: 'An exact document',
       requiredDepth: 'deep', roles: ['domain expert'], searchPlaces: ['domain documents'] }));
+    answerDiscoveryFixture(engine, id, draft, question('frame'), {
+      productType: 'internal', scale: '30 users across 10 sites', industries: ['construction'], domains: ['supply'],
+      axes: fixturePlanAxes(questions),
+      budget: { ceiling: V7_STAGE_TOKEN_CEILING, axisHints: { industry: 4_000_000 }, completionReserve: 2_000_000 },
+    }, source);
+    const frame = question('frame').value.answer!;
     answerDiscoveryFixture(engine, id, store.get<DiscoveryDraft>(draft.id)!, question('plan'),
-      { edition: 1, previous: null, frame, questions } as unknown as Json, source);
+      validPlan(frame, questions), source);
     const anchor = question('plan');
     const subject = (key = 'a'): V7PlanSubject => ({ contract: V7_PLAN_SUBJECT_CONTRACT, planAnswer: anchor.value.answer!, planQuestionId: key });
     return { draft: store.get<DiscoveryDraft>(draft.id)!, anchor, frame, questions, source, subject };
@@ -151,7 +151,7 @@ test('S3-route: new selection refuses a reopened or superseded plan while the ne
   const reopened = f.store.get<Question>(f.v.anchor.id)!;
   assert.throws(() => f.select(), { code: 'research_plan_subject_invalid' });
   answerDiscoveryFixture(f.engine, 'p', f.store.get<DiscoveryDraft>(f.v.draft.id)!, reopened,
-    { edition: 2, previous: f.v.subject().planAnswer, frame: f.v.frame, questions: f.v.questions } as unknown as Json, f.v.source);
+    validPlan(f.v.frame, f.v.questions, 2, f.v.subject().planAnswer), f.v.source);
   const draft = reference(f.store.get(f.v.draft.id)!), subject = { ...f.v.subject(), planAnswer: f.store.get<Question>(f.v.anchor.id)!.value.answer! };
   assert.throws(() => f.select(f.v.subject(), policy, f.store, draft), { code: 'research_plan_subject_invalid' });
   assert.throws(() => f.select(subject), { code: 'research_plan_subject_invalid' });
