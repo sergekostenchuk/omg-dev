@@ -35,7 +35,7 @@ function acceptPlan(f: Fixture, project: string, questions: PlanQuestion[]) {
   const base = createPartialV7Draft(f.discovery, project, "concept");
   const src = f.discovery.evidence.document(project, "basis", `Exact source for ${project}`, "text/plain", 0);
   const frame = questionOf(f.store, base, "frame");
-  answerDiscoveryFixture(f.engine, project, base, frame, validFrame(), src);
+  answerDiscoveryFixture(f.engine, project, base, frame, validFrame(questions), src);
   const frameRef = f.store.get<Question>(frame.id)!.value.answer!;
   const planQ = questionOf(f.store, base, "plan");
   answerDiscoveryFixture(f.engine, project, base, planQ, validPlan(frameRef, questions), src);
@@ -167,7 +167,7 @@ for(const boundary of ['paid','published','before-apply','after-apply'] as const
 for(const boundary of ['paid','published','after-apply'] as const)test(`R.1: ${boundary} recovery retains the original plan after a lawful new edition`,async t=>{
   const f=await setup(t,[planQuestion('block','industry','blocking')]),restore=cutAt(f,boundary);
   await f.run();restore();const sent=f.wires().length,ledger=f.store.list('research-budget-ledger');
-  acceptNextPlanEdition(f,'p',f.v.draft,f.v.frameRef,f.v.planAnswer,[planQuestion('new','market')]);
+  acceptNextPlanEdition(f,'p',f.v.draft,f.v.frameRef,f.v.planAnswer,[planQuestion('new','industry')]);
   const result=await f.run(1,f.open(),false);assert.equal(result.value.status,'paused');assert.equal(result.value.pauseCode,'research_contract_upgrade_required',JSON.stringify(result.value));
   assert.equal(f.wires().length,sent);assert.deepEqual(f.store.list('research-budget-ledger'),ledger);
   const state=f.store.list<any>('v7-progress-state')[0]!;assert.deepEqual(state.value.subject.planAnswer,f.v.planAnswer);assert.equal(state.value.subject.planQuestionId,'block');
@@ -320,7 +320,7 @@ test('R.1-01: a stale assessor continuation pauses its own running revision and 
  writeFileSync(f.settings,JSON.stringify({replies:[],tokens:10,assessmentReply:{action:'assessment_checkpoint',notes:['Continue exact packet']}}));
  const restore=cutAt(f,'paid');await f.run();restore();
  const waiting=await f.run(1,f.open(),false);assert.equal(waiting.value.pauseCode,'research_assessment_pending');
- acceptNextPlanEdition(f,'p',f.v.draft,f.v.frameRef,f.v.planAnswer,[planQuestion('new','market')]);
+ acceptNextPlanEdition(f,'p',f.v.draft,f.v.frameRef,f.v.planAnswer,[planQuestion('new','industry')]);
  const before=counters(f);
  const stale=await f.run(1,f.open());assert.equal(stale.value.status,'paused',JSON.stringify(stale.value));
  assert.equal(stale.value.pauseCode,'input_stale',JSON.stringify(stale.value));assert.deepEqual(counters(f),before);
@@ -452,7 +452,7 @@ test(`R.1: replacement edition leaves ${boundary} old assessment uncounted and c
  }) as Store['writeMany'];
  await f.run();f.store.writeMany=write;assert.ok(cut);
  const old=f.store.list('research-attempt')[0]!,oldRef=reference(old);
- const next=acceptNextPlanEdition(f,'p',f.v.draft,f.v.frameRef,f.v.planAnswer,[planQuestion('new','market')]);
+ const next=acceptNextPlanEdition(f,'p',f.v.draft,f.v.frameRef,f.v.planAnswer,[planQuestion('new','industry')]);
  const calls=f.wires().length,ledger=f.store.list('research-budget-ledger');
  const pending=await f.run(1,f.open(),false);
  assert.equal(pending.value.pauseCode,'research_assessment_pending',JSON.stringify(pending.value));

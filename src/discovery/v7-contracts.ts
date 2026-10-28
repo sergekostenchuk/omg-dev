@@ -67,6 +67,9 @@ export const V7_PLAN_SCHEMA: Json = object({
   frame: refSchema,
   previous: { anyOf: [refSchema, { type: "null" }] },
   questions: { type: "array", minItems: 1, items: planQuestionSchema },
+  coverage: object(Object.fromEntries(V7_AXES.map(axis => [axis, { oneOf: [
+    object({ questions: texts(1) }), object({ inapplicable: text }),
+  ] }]))),
 });
 
 // DS2, verbatim from the v6 researchPlan prompt: analogues belong to the plan's search places.
@@ -83,7 +86,7 @@ export const V7_FRAME_FIELD = { field: "frame", kind: "design", proof: "assessme
   risk: "Исследуется не та область реального мира, или поручение молча сужено",
   schema: V7_FRAME_SCHEMA } satisfies FieldSpec;
 export const V7_PLAN_FIELD = { field: "plan", kind: "design", proof: "assessment",
-  prompt: "Составь план исследования по принятой рамке: questions — вопросы по домену и оси с устойчивыми id. У каждого вопроса: axis — одна из 12 осей рамки; domain; text — формулировка; class — blocking (держит переход к досье) или supporting; criterion — что считать ответом, без критерия исследование выходит по усталости; requiredDepth — deep или brief; roles — роли-перспективы, чьим взглядом проверяется вопрос (отрасль, юрист региона, экономист, пользователи, инженер); searchPlaces — где искать основания. edition — номер редакции, начиная с 1; frame — точный Ref принятого ответа рамки; previous — точный Ref принятой предыдущей редакции плана или null для первой. Новый вопрос получает новый id; id прежнего вопроса нельзя присвоить другому тексту; пересмотр класса существующего вопроса — только с основанием в classRevision. Вопросы по правилам (rules) и реализуемости (feasibility) — блокирующие по умолчанию.\n\n" + ANALOGUES_PROMPT,
+  prompt: "Составь план исследования по принятой рамке: questions — вопросы по домену и оси с устойчивыми id. У каждого вопроса: axis — одна из 12 осей рамки; domain; text — формулировка; class — blocking (держит переход к досье) или supporting; criterion — что считать ответом, без критерия исследование выходит по усталости; requiredDepth — deep или brief; roles — роли-перспективы, чьим взглядом проверяется вопрос (отрасль, юрист региона, экономист, пользователи, инженер); searchPlaces — где искать основания. edition — номер редакции, начиная с 1; frame — точный Ref принятого ответа рамки; previous — точный Ref принятой предыдущей редакции плана или null для первой. Новый вопрос получает новый id; id прежнего вопроса нельзя присвоить другому тексту; пересмотр класса существующего вопроса — только с основанием в classRevision. Вопросы по правилам (rules) и реализуемости (feasibility) — блокирующие по умолчанию.\n\n" + " coverage явно перечисляет все 12 осей: questions — точные ID вопросов этой оси, либо inapplicable — предметное основание неприменимости. Каждая применимая ось рамки покрыта вопросами не меньшей глубины; deep нельзя заменить brief. Неприменимость должна быть согласована с принятой рамкой и полным поручением, а не менять их. Противоречие требует исправления рамки. Общая отписка вместо основания недопустима." + ANALOGUES_PROMPT,
   risk: "План не покрывает оси рамки блокирующими вопросами или выходит по усталости",
   schema: V7_PLAN_SCHEMA } satisfies FieldSpec;
 
@@ -159,7 +162,7 @@ function refuse(rule: string, reason: string): never {
 export function checkV7FieldAnswer(draft: DiscoveryDraft, spec: FieldSpec, value: Json,
   prove: FieldAnswerProver): void {
   if (spec.field === V7_FRAME_FIELD.field) return checkV7Frame(value);
-  if (spec.field === V7_PLAN_FIELD.field) return checkV7Plan(draft, value, prove);
+  if (spec.field === V7_PLAN_FIELD.field) return checkV7Plan(draft, value, prove, hasV7PlanCoverage(spec));
   if (spec.field === V7_FINAL_FIELD.field) { checkV7Final(value); return; }
 }
 
@@ -227,9 +230,50 @@ function checkV7Frame(value: Json): void {
  * its subject (axis, domain, text) and its acceptance criterion. Under one
  * id they are immutable — a different question takes a new id; under a new
  * id an unchanged question is a rename and is refused. */
+/** The issued question, not today's global schema, selects the plan contract. */
+export function hasV7PlanCoverage(spec: FieldSpec): boolean {
+  const schema = spec.schema;
+  return spec.field === "plan" && obj(schema) && Array.isArray(schema["required"])
+    && schema["required"].includes("coverage");
+}
+
+/** Structural coverage only; the assessor judges the adequacy of questions and reasons. */
+export function checkV7PlanCoverage(frame: Json, plan: Json): void {
+  if (!obj(frame) || !obj(frame["axes"]) || !obj(plan) || !obj(plan["coverage"])
+    || !Array.isArray(plan["questions"]) || !plan["questions"].every(obj))
+    refuse("plan.coverage", "coverage needs the complete accepted frame and explicit plan questions");
+  const coverage = plan["coverage"], axes = frame["axes"], questions = plan["questions"];
+  if (Object.keys(coverage).length !== V7_AXES.length || Object.keys(coverage).some(axis => !(V7_AXES as readonly string[]).includes(axis)))
+    refuse("plan.coverage", "coverage names exactly the twelve axes");
+  const ids = new Set<string>();
+  for (const q of questions) {
+    if (!nonempty(q["id"]) || ids.has(q["id"]) || !(V7_AXES as readonly Json[]).includes(q["axis"]!))
+      refuse("plan.questions", "each question needs a unique id and a declared axis");
+    ids.add(q["id"]);
+  }
+  for (const axis of V7_AXES) {
+    const required = axes[axis], row = coverage[axis], at = `plan.coverage.${axis}`;
+    if (!obj(required) || !obj(row)) refuse(at, "the accepted axis and its coverage must be present");
+    const assigned = questions.filter(q => q["axis"] === axis);
+    if (required["depth"] === "inapplicable") {
+      if (Object.keys(row).length !== 1 || !nonempty(row["inapplicable"]) || assigned.length)
+        refuse(at, "an inapplicable axis needs its concrete reason and cannot carry research questions");
+    } else {
+      if (!["deep", "brief"].includes(required["depth"] as string) || Object.keys(row).length !== 1
+        || !Array.isArray(row["questions"]) || !row["questions"].length
+        || row["questions"].some(id => !nonempty(id)) || new Set(row["questions"]).size !== row["questions"].length
+        || canonical([...row["questions"]].sort()) !== canonical(assigned.map(q => q["id"]!).sort()))
+        refuse(at, "each applicable axis names all and only its real question ids; a reason cannot change the accepted frame");
+      if (assigned.some(q => !["deep", "brief"].includes(q["requiredDepth"] as string)
+        || (required["depth"] === "deep" && q["requiredDepth"] !== "deep")))
+        refuse(at, "question depth must meet the accepted axis depth");
+    }
+  }
+}
+
 const QUESTION_IDENTITY = ["axis", "domain", "text", "criterion"] as const;
 
-function checkV7Plan(draft: DiscoveryDraft, value: Json, prove: FieldAnswerProver): void {
+function checkV7Plan(draft: DiscoveryDraft, value: Json, prove: FieldAnswerProver, coverage: boolean): void {
   if (!obj(value)) refuse("plan", "the plan is not an object");
   const priorField = draft.fields["plan"];
   const prior = obj(priorField) ? priorField : null;
@@ -260,6 +304,7 @@ function checkV7Plan(draft: DiscoveryDraft, value: Json, prove: FieldAnswerProve
   const frameProven = prove("frame", frameRef);
   if (frameProven === null || canonical(frameProven.value) !== canonical(frameField))
     refuse("plan.frame", "the Ref is not the proven accepted frame saved in this draft");
+
 
   const questions = Array.isArray(value["questions"]) ? value["questions"].filter(obj) : [];
   const seen = new Set<string>();
@@ -296,6 +341,7 @@ function checkV7Plan(draft: DiscoveryDraft, value: Json, prove: FieldAnswerProve
       }
     }
   }
+  if (coverage) checkV7PlanCoverage(frameField, value);
 }
 
 /** Договор отдельной неизменяемой записи акта принятия Discovery (DR2, №6009/6010). */

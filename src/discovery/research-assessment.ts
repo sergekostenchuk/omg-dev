@@ -1,3 +1,5 @@
+import { hasV7PlanCoverage } from './v7-contracts.js';
+import { readV7PlanBasis, requireV7PlanBasisAt, V7_PLAN_ASSESSMENT_PROMPT } from './v7-plan-assessment.js';
 import { DOSSIER_ASSESSMENT_KIND, DOSSIER_ASSESSMENT_CONTRACT, type PaidDossierAssessment } from './dossier-manifest.js';
 import { runDossierAssessmentSession, readDossierAssessmentSessionAt, DOSSIER_APPLICATION,
   type DossierAssessmentApplication } from './assessment-session.js';
@@ -62,8 +64,8 @@ function inheritanceProposal(draft: DiscoveryDraft, question: Question, value: J
   return undefined;
 }
 function assessmentPrompt(bases: ResearchAssessment['bases'] | undefined, obligationContract: unknown,
-  discoveryPreparation = false, neighbors = false, conceptApplications = false, specificationGrounds = false): string {
-  return "Evaluate whether the supplied observations actually support the proposed answer to this exact question and all its required details. Source hashes prove identity only. A fact needs relevant evidence of the claimed behavior, not an unrelated quote, a plan, or model confidence. For kind=decision, only existing explicit owner intent supports the value. For kind=design, evaluate a model-authored proposal for completeness, usefulness to the named consumer, consistency with the supplied intent and constraints; it may introduce a design but must not pretend it is existing implementation or a new owner decision. Reject invented facts, unsupported inapplicability, and empty generic filler. Return JSON {verdict: supported|insufficient|conflicting, reasons: string[]}. If unsupported or contradictory explain exactly why. Do not change files or perform external actions." + (bases ? " bases[].proofLimit limits the claim: quoted-intent-requires-attribution requires establishing explicit attributable owner intent, not trusting the document ingestion label; reported-not-runtime-proof is a documentary report and does not establish current environment behavior or completed implementation. Preserve documentary support with its stated limits instead of promoting it to a repository fact or discarding it." : "") + (obligationContract ? " Assess each coverage member against its fixed assignment.kind and consumer. A documentaryAllowance only admits the named source: the actual claim must stay within assignment.documentaryAllowance.claimLimit and the quoted evidence. Reject broader claims; admission of a document does not certify runtime behavior or implementation." : "") + (discoveryPreparation ? ' For Discovery preparation, compare every rule with its addressed report constraint: a correct basis with opposite meaning is not supported. The outcomes, scenarios and external systems must develop verdict.variant without replacing it; preserve its risks and unresolved questions with their moments. Exact owner choices select conditions, not facts of feasibility.' : '') + (neighbors ? STAGE_NEIGHBOR_INSTRUCTION + ' If a necessary premise is missing, classify support as insufficient.' : '') + (conceptApplications ? ' For conceptSections, compare each requirement and its acceptance criterion with the exact selected variant and every addressed constraint in discoveryBasisCatalogue. An address alone does not establish semantic consistency: reject an application whose requirement reverses the source rule. Evaluate the proposed benefit and outcome against the accepted Discovery goals. If the source material is insufficient, say what evidence is missing rather than inventing support.' : '') + (specificationGrounds ? ' For specification, compare the separate constraints strings with the exact selected Discovery variant and constraints; a new project limit is a proposal, not invented source provenance. For behaviorContracts, check each inherited requirement ground against the addressed entry, inputs, success, failures, forbiddenEffects, state, compatibility or proof of that same contract. An exact address alone does not establish semantic consistency. Use the accepted conceptSections in prerequisites and the accepted prior fields in stageNeighbors; do not treat pending fields as accepted.' : '');
+  discoveryPreparation = false, neighbors = false, conceptApplications = false, specificationGrounds = false, plan = false): string {
+  return "Evaluate whether the supplied observations actually support the proposed answer to this exact question and all its required details. Source hashes prove identity only. A fact needs relevant evidence of the claimed behavior, not an unrelated quote, a plan, or model confidence. For kind=decision, only existing explicit owner intent supports the value. For kind=design, evaluate a model-authored proposal for completeness, usefulness to the named consumer, consistency with the supplied intent and constraints; it may introduce a design but must not pretend it is existing implementation or a new owner decision. Reject invented facts, unsupported inapplicability, and empty generic filler. Return JSON {verdict: supported|insufficient|conflicting, reasons: string[]}. If unsupported or contradictory explain exactly why. Do not change files or perform external actions." + (bases ? " bases[].proofLimit limits the claim: quoted-intent-requires-attribution requires establishing explicit attributable owner intent, not trusting the document ingestion label; reported-not-runtime-proof is a documentary report and does not establish current environment behavior or completed implementation. Preserve documentary support with its stated limits instead of promoting it to a repository fact or discarding it." : "") + (obligationContract ? " Assess each coverage member against its fixed assignment.kind and consumer. A documentaryAllowance only admits the named source: the actual claim must stay within assignment.documentaryAllowance.claimLimit and the quoted evidence. Reject broader claims; admission of a document does not certify runtime behavior or implementation." : "") + (discoveryPreparation ? ' For Discovery preparation, compare every rule with its addressed report constraint: a correct basis with opposite meaning is not supported. The outcomes, scenarios and external systems must develop verdict.variant without replacing it; preserve its risks and unresolved questions with their moments. Exact owner choices select conditions, not facts of feasibility.' : '') + (neighbors ? STAGE_NEIGHBOR_INSTRUCTION + ' If a necessary premise is missing, classify support as insufficient.' : '') + (conceptApplications ? ' For conceptSections, compare each requirement and its acceptance criterion with the exact selected variant and every addressed constraint in discoveryBasisCatalogue. An address alone does not establish semantic consistency: reject an application whose requirement reverses the source rule. Evaluate the proposed benefit and outcome against the accepted Discovery goals. If the source material is insufficient, say what evidence is missing rather than inventing support.' : '') + (specificationGrounds ? ' For specification, compare the separate constraints strings with the exact selected Discovery variant and constraints; a new project limit is a proposal, not invented source provenance. For behaviorContracts, check each inherited requirement ground against the addressed entry, inputs, success, failures, forbiddenEffects, state, compatibility or proof of that same contract. An exact address alone does not establish semantic consistency. Use the accepted conceptSections in prerequisites and the accepted prior fields in stageNeighbors; do not treat pending fields as accepted.' : '') + (plan ? '\n' + V7_PLAN_ASSESSMENT_PROMPT : '');
 }
 function assessmentBasisMaterial(store: Store, draft: Revision<DiscoveryDraft>) {
   if (contractEraOf(draft.value) !== BASIS_APPLICATION_CONTRACT_ERA || !['concept', 'specification'].includes(draft.value.stage)) return null;
@@ -145,9 +147,16 @@ function materialPrefix(context: Record<string, any>, id: string): Ref[] | null 
   const discovery = object(context.discoveryContext) ? context.discoveryContext : undefined;
   const catalogue = context.discoveryBasisCatalogue;
   const frame = context.v7Frame;
-  if (neighbors === undefined && discovery === undefined && catalogue === undefined && frame === undefined) return null;
+  if (neighbors === undefined && discovery === undefined && catalogue === undefined && frame === undefined && context.planBasis === undefined) return null;
   const refs: Ref[] = [];
   if (frame !== undefined) refs.push(...v7FrameAssessmentBasis(frame));
+  if (context.planBasis !== undefined) {
+    const plan = context.planBasis;
+    if (!object(plan) || plan.contract !== 'v7-plan-basis/v1' || !Array.isArray(plan.prefix)
+      || plan.prefix.length !== 3 || !plan.prefix.every(isRef))
+      originInvalid(id, 'The plan assessor lost its exact accepted prefix');
+    refs.push(...plan.prefix);
+  }
   if (catalogue !== undefined) {
     if (!object(catalogue) || catalogue.contract !== 'discovery-basis-catalogue/v1' || !isRef(catalogue.source))
       originInvalid(id, 'The saved assessor material lost its exact Discovery basis catalogue');
@@ -180,6 +189,7 @@ function directAssessment(store: Store, projectId: string, proof: AssessmentProo
   const question = exact<Question>(store, proof.question, 'question');
   const environment = exact<Environment>(store, proof.environment, 'environment');
   const shown = proof.context;
+  if (hasV7PlanCoverage(question.value.spec)) requireV7PlanBasisAt(store, question, shown.value, shown.planBasis);
   if (question.value.projectId !== projectId || !Array.isArray(shown.observations)
     || !same(shown.observations.slice(0, observations.length), observations)
     || !same(shown.bases ?? null, bases ? bases.map(({ quote: _quote, ...binding }) => binding) : null)
@@ -311,6 +321,11 @@ export async function assessAnswer(store: Store, question: Revision<Question>, a
   if (priorOrigin) requireCondition(same(related.context, priorOrigin.value.context['discoveryContext'] ?? null),
     'research_assessment_binding_invalid', 'The saved assessor context lost its accepted Discovery grounds');
   requireDiscoveryProposal(draft.value, question, action.value, related.context, observations.length);
+  // Old paid origins retain the material of their own issued contract.
+  const planBasis = !priorOrigin || priorOrigin.value.context['planBasis'] !== undefined
+    ? readV7PlanBasis(inputStore, draft.value, question, action.value) : null;
+  if (priorOrigin && planBasis) requireCondition(same(priorOrigin.value.context['planBasis'], planBasis.context),
+    'research_assessment_binding_invalid', 'The plan assessor lost its exact accepted frame and mandate');
   const basisMaterial = assessmentBasisMaterial(inputStore, draft);
   const specificationApplications = requiresSpecificationApplications(draft.value, question.value);
   if (basisMaterial && schemaOk && (requiresConceptApplications(draft.value, question.value) || specificationApplications)) {
@@ -346,10 +361,11 @@ export async function assessAnswer(store: Store, question: Revision<Question>, a
     representation: question.value.spec.field === "layerDesign" ? "changes_against_exact_base_after_machine_L2_validation" : "complete_field",
     observations:assessmentObservations, consumerFeedback: consumerFeedback(store, draft.value) }
     : { role: "assess-answer", ...(basisBindings ? { bases: basisBindings } : {}), ...(runtime.proofs.length?{runtimeProofs:runtime.proofs}:{}), question: question.value.spec, value: action.value, observations:assessmentObservations,
-      prerequisites: researchPrerequisites(contractEraOf(draft.value) === BASIS_APPLICATION_CONTRACT_ERA
+      prerequisites: planBasis ? [{ ref: planBasis.context.frame.answer, stage: 'discovery', fields: {} }] : researchPrerequisites(contractEraOf(draft.value) === BASIS_APPLICATION_CONTRACT_ERA
         && ['specification', 'operation-map', 'features'].includes(draft.value.stage)
         ? inputStore : store, draft.value, proposedInheritance), operationMap: researchGraphContext(store, draft.value),
       consumerFeedback: consumerFeedback(store, draft.value) };
+  if (computedContext && planBasis) Object.assign(computedContext, { planBasis: planBasis.context });
   if (computedContext && related.context) Object.assign(computedContext, { discoveryContext: related.context });
   if (computedContext && frame) Object.assign(computedContext, { v7Frame: frame.context });
   if (computedContext && basisMaterial) Object.assign(computedContext, { discoveryBasisCatalogue: basisMaterial.catalogue });
@@ -374,14 +390,14 @@ export async function assessAnswer(store: Store, question: Revision<Question>, a
   const prompt = priorOrigin?.value.prompt ?? direct?.prompt ?? (assessmentPrompt(bases, question.value.spec.obligationContract,
     related.context !== null && question.value.spec.field === 'preparation', withNeighbors,
     requiresConceptApplications(draft.value, question.value), contractEraOf(draft.value) === BASIS_APPLICATION_CONTRACT_ERA
-      && draft.value.stage === 'specification') + (frame ? V7_FRAME_ASSESSMENT_INSTRUCTION : ''));
+      && draft.value.stage === 'specification', planBasis !== null) + (frame ? V7_FRAME_ASSESSMENT_INSTRUCTION : ''));
   const paidOrigin: AssessmentPaidOriginInput | undefined = managedPending && assessmentReads
     ? { ...(withNeighbors ? { materialContract: STAGE_NEIGHBOR_CONTEXT } : {}), pending: managedPending, root: canonicalRoot, graph: proposalGraph, legacyPaths, reads: assessmentReads, runtime, runtimeAdmission: selection.admission }
     : undefined;
   // A direct call has no paid origin; its completed session still yields the exact proof of what its assessor saw.
   const delivered = await assessmentSessionWithProof(store, draft, question, environment, dispatch, pilot, context, prompt, signal,
     uniqueTransactionGuards([...runtimeGuards, ...related.guards, ...neighbors.guards,
-      ...(frame?.guards ?? []), ...(basisMaterial?.guards ?? []), ...(readView?.guards ?? [])]), paidOrigin);
+      ...(frame?.guards ?? []), ...(planBasis?.guards ?? []), ...(basisMaterial?.guards ?? []), ...(readView?.guards ?? [])]), paidOrigin);
   const response = delivered.result as { verdict?: unknown; reasons?: unknown } | null;
   requireCondition(response !== null && response !== undefined, 'assessment_invalid', 'Assessment returned no verdict');
   // ASM1.1 (№4791): a direct assessment on a prefixed material is bound to that exact material: its identity differs per
@@ -397,11 +413,11 @@ export async function assessAnswer(store: Store, question: Revision<Question>, a
   const existing = readRecord<ResearchAssessment>(store, id);
   if (!managedPending) {
     const guards = uniqueTransactionGuards([reference(question), reference(environment), ...draft.value.inputs,
-      ...observations.map(item => item.source), ...runtimeGuards, ...related.guards, ...neighbors.guards, ...(frame?.guards ?? [])]);
+      ...observations.map(item => item.source), ...runtimeGuards, ...related.guards, ...neighbors.guards, ...(frame?.guards ?? []), ...(planBasis?.guards ?? [])]);
     if (existing) {
       // Returning an existing value is a current admission too: a second Store
       // may have changed the prefix after session selection or paid application.
-      if (direct || withNeighbors || frame) store.writeMany([], guards);
+      if (direct || withNeighbors || frame || planBasis) store.writeMany([], guards);
       return existing;
     }
     return store.writeMany<ResearchAssessment>([{ id, kind: "research-assessment", expected: 0, value }], guards)[0]!;
@@ -542,6 +558,11 @@ export function readResearchAssessmentAt(store: Store, projectId: string, turnId
   requireDiscoveryProposal(capturedDraft.value, question, action.value, related.context, observations.length);
   requireCondition(same(related.context, outcome.context.discoveryContext ?? null),
     'research_assessment_binding_invalid', `[${turnId}] The assessor did not receive its exact Discovery grounds`);
+  if (hasV7PlanCoverage(question.value.spec)) {
+    const plan = readV7PlanBasis(view.store, capturedDraft.value, question, action.value);
+    requireCondition(plan !== null && same(outcome.context.planBasis, plan.context),
+      'research_assessment_binding_invalid', `[${turnId}] The plan assessor did not receive its exact frame and mandate`);
+  }
   const basisMaterial = assessmentBasisMaterial(view.store, capturedDraft);
   if (basisMaterial) requireCondition(
     same(outcome.context.discoveryBasisCatalogue ?? null, basisMaterial.catalogue)
@@ -588,7 +609,7 @@ export function readResearchAssessmentAt(store: Store, projectId: string, turnId
     && outcome.prompt === assessmentPrompt(bases, question.value.spec.obligationContract,
       related.context !== null && question.value.spec.field === 'preparation', withNeighbors,
       requiresConceptApplications(capturedDraft.value, question.value), contractEraOf(capturedDraft.value) === BASIS_APPLICATION_CONTRACT_ERA
-        && capturedDraft.value.stage === 'specification') + (frame ? V7_FRAME_ASSESSMENT_INSTRUCTION : ''),
+        && capturedDraft.value.stage === 'specification', outcome.context.planBasis !== undefined) + (frame ? V7_FRAME_ASSESSMENT_INSTRUCTION : ''),
     'research_assessment_binding_invalid', `[${turnId}] The assessor context does not derive from the paid proposal and exact sources`);
   const projected = assessmentValue(question, action, environment, observations, bases, runtime.proofs,
     outcome.result as { verdict: unknown; reasons: unknown });

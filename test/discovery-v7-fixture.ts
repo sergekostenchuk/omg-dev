@@ -44,10 +44,10 @@ export const discoveryFixture = fixture;
 export const rand = () => Math.random().toString(16).slice(2);
 export const allAxes = (depth: string) => Object.fromEntries(V7_AXES.map(axis => [axis, { depth }]));
 
-export function validFrame(): Json {
+export function validFrame(questions?: readonly PlanQuestion[]): Json {
   return { productType: "internal", scale: "30 users across 10 sites",
     industries: ["construction"], domains: ["materials supply", "equipment accounting"],
-    axes: allAxes("deep"),
+    axes: questions ? fixturePlanAxes(questions) : allAxes("deep"),
     budget: { ceiling: V7_STAGE_TOKEN_CEILING, axisHints: { industry: 4_000_000 }, completionReserve: 2_000_000 } };
 }
 export type PlanQuestion = { id: string; axis: string; domain: string; text: string; class: string;
@@ -57,8 +57,22 @@ export function planQuestion(id: string, axis: string, cls = "supporting"): Plan
     class: cls, criterion: `Named basis answering ${id}`, requiredDepth: "deep",
     roles: ["domain expert"], searchPlaces: ["domain documents"] };
 }
+/** Small transport fixtures explicitly scope their mandate to the given axes.
+ * Full coverage tests use validFrame() (all twelve deep) instead. */
+const fixtureAxisReason = (axis: string) => `The fixture is an isolated documentary check of its named research questions; ${axis} concerns no product behaviour, consumer or operation in that test mandate.`;
+export function fixturePlanAxes(questions: readonly Pick<PlanQuestion, 'axis'>[]): Json {
+  return Object.fromEntries(V7_AXES.map(axis => [axis, questions.some(q => q.axis === axis)
+    ? { depth: 'deep' } : { depth: 'inapplicable', reason: fixtureAxisReason(axis) }]));
+}
+export function fixturePlanCoverage(questions: readonly Pick<PlanQuestion, 'id' | 'axis'>[]): Json {
+  return Object.fromEntries(V7_AXES.map(axis => {
+    const ids = questions.filter(q => q.axis === axis).map(q => q.id);
+    return [axis, ids.length ? { questions: ids } : { inapplicable: fixtureAxisReason(axis) }];
+  }));
+}
+
 export function validPlan(frameRef: Ref, questions: PlanQuestion[], edition = 1, previous: Ref | null = null): Json {
-  return { edition, frame: frameRef, previous, questions } as unknown as Json;
+  return { edition, frame: frameRef, previous, questions, coverage: fixturePlanCoverage(questions) } as unknown as Json;
 }
 export function questionOf(store: Store, draft: Revision<DiscoveryDraft>, field: string): Revision<Question> {
   const question = draft.value.questions.map(id => store.get<Question>(id)!).find(q => q.value.spec.field === field);
@@ -76,7 +90,7 @@ export function acceptPlan(f: Pick<Fixture, 'store' | 'engine' | 'discovery'>, p
   const src = f.discovery.evidence.document(project, options.sourceKey === 'per-draft' ? `basis:${base.id}` : "basis",
     `Exact source for ${project}`, "text/plain", 0);
   const frame = questionOf(f.store, base, "frame");
-  answerDiscoveryFixture(f.engine, project, base, frame, validFrame(), src);
+  answerDiscoveryFixture(f.engine, project, base, frame, validFrame(questions), src);
   const frameRef = f.store.get<Question>(frame.id)!.value.answer!;
   const planQ = questionOf(f.store, base, "plan");
   answerDiscoveryFixture(f.engine, project, base, planQ, validPlan(frameRef, questions), src);

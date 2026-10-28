@@ -1,3 +1,4 @@
+import { planBasisOf } from './v7-plan-assessment.js';
 import { requireDossierAssessmentSubject } from './dossier-assessment.js';
 import { DOSSIER_ASSESSMENT_RESULT_CONTRACT } from './research-model.js';
 import { assessmentRolePrompt } from './assessment-session.js';
@@ -262,6 +263,8 @@ export function researchCapacityInput(input: {
     'dispatchMode', 'savedOnly', 'scope', 'responseContract', 'access', 'deliveryRules', 'criteria',
     'contextControls', 'synthesisState', 'synthesisSession', 'previousProposalRef', 'consolidation'];
   const mandatory = Object.fromEntries(keys.filter(key => Object.hasOwn(c, key)).map(key => [key, c[key]]));
+  const planBasis = planBasisOf(c);
+  if (planBasis) mandatory.planBasis = planBasis;
   const operationMapMaterial = Array.isArray(c.prerequisites)
     ? c.prerequisites.find((item: any) => item.stage === 'concept')?.operationMapMaterial : undefined;
   if (operationMapMaterial !== undefined) mandatory.operationMapMaterial = operationMapMaterial;

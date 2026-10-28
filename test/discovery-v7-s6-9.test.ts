@@ -28,7 +28,7 @@ function acceptPlan(f: Fixture, project: string, questions: PlanQuestion[]) {
   const base = createPartialV7Draft(f.discovery, project, "concept");
   const src = f.discovery.evidence.document(project, "basis", `Exact source for ${project}`, "text/plain", 0);
   const frame = questionOf(f.store, base, "frame");
-  answerDiscoveryFixture(f.engine, project, base, frame, validFrame(), src);
+  answerDiscoveryFixture(f.engine, project, base, frame, validFrame(questions), src);
   const frameRef = f.store.get<Question>(frame.id)!.value.answer!;
   const planQ = questionOf(f.store, base, "plan");
   answerDiscoveryFixture(f.engine, project, base, planQ, validPlan(frameRef, questions), src);
@@ -133,7 +133,7 @@ test('S6.9: an owner pause keeps its logical question and exact plan edition in 
   const run = await f.run(); assert.equal(run.value.status, 'needs_owner', JSON.stringify(run.value));
   const before = f.cold();
   assert.equal(before.candidate.run!.subjectBinding, 'owner'); assert.equal(before.candidate.run!.subjectText, 'What covers block?');
-  const next = acceptNextPlanEdition(f, 'p', f.v.draft, f.v.frameRef, f.v.planAnswer, [planQuestion('next', 'market')]);
+  const next = acceptNextPlanEdition(f, 'p', f.v.draft, f.v.frameRef, f.v.planAnswer, [planQuestion('next', 'industry')]);
   assert.notDeepEqual(next, f.v.planAnswer);
   const { candidate, text } = f.cold();
   assert.equal(candidate.runFailure, null, JSON.stringify(candidate.runFailure));

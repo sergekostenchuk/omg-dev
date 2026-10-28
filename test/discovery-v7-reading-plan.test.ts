@@ -1,3 +1,4 @@
+import { fixturePlanAxes, fixturePlanCoverage } from "./discovery-v7-fixture.js";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { Discovery, type DiscoveryDraft, type Question } from "../src/discovery/discovery.js";
@@ -17,7 +18,7 @@ import { reference, uniqueRefs, type Ref } from "../src/pipeline/contracts.js";
 import { uniqueTransactionGuards } from "../src/runtime/environment.js";
 import { Store, type Revision } from "../src/storage/store.js";
 import { answerDiscoveryFixture } from "./product-fixture.js";
-import { discoveryFixture, allAxes } from "./discovery-v7-fixture.js";
+import { discoveryFixture } from "./discovery-v7-fixture.js";
 
 // DR3a3-S3 (codex-omg №7690 §3 S3; граница проверок — №8173, вариант (b)):
 // the reading queue of the v7 planner. The plan, the run and the planner
@@ -29,13 +30,13 @@ import { discoveryFixture, allAxes } from "./discovery-v7-fixture.js";
 const fixture = (t: { after(fn: () => void): void }) => discoveryFixture(t, "omg-dr3a3s3-queue-");
 type Fixture = ReturnType<typeof fixture>;
 const validFrame = (): Json => ({ productType: "internal", scale: "30 users across 10 sites",
-  industries: ["construction"], domains: ["materials supply"], axes: allAxes("deep"),
+  industries: ["construction"], domains: ["materials supply"], axes: fixturePlanAxes([{ axis: "industry" }, { axis: "market" }]),
   budget: { ceiling: V7_STAGE_TOKEN_CEILING, axisHints: { industry: 4_000_000 }, completionReserve: 2_000_000 } });
 const planQuestion = (id: string, axis: string, cls = "supporting") => ({ id, axis, domain: "construction",
   text: `What covers ${id}?`, class: cls, criterion: `Named basis answering ${id}`, requiredDepth: "deep",
   roles: ["domain expert"], searchPlaces: ["domain documents"] });
 const validPlan = (frame: Ref, ids: string[]): Json =>
-  ({ edition: 1, frame, previous: null, questions: ids.map((id, i) => planQuestion(id, i ? "market" : "industry",
+  ({ edition: 1, frame, previous: null, coverage: fixturePlanCoverage(ids.map((id, i) => ({ id, axis: i ? "market" : "industry" }))), questions: ids.map((id, i) => planQuestion(id, i ? "market" : "industry",
     i ? "supporting" : "blocking")) }) as unknown as Json;
 const questionOf = (store: Store, draft: Revision<DiscoveryDraft>, field: string) =>
   draft.value.questions.map(id => store.get<Question>(id)!).find(q => q.value.spec.field === field)!;

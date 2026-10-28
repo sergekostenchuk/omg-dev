@@ -18,7 +18,7 @@ import { synthesisReservationConsumed, turnAction, type ManagedResearchTurn } fr
 import { issuedAnswerSchemaHolds, orderedQuestions, proveIssuedAnswer, readExact,
   savedAcceptanceAct } from "./projection-reader.js";
 import { DISCOVERY_ACCEPTANCE_ACT_KIND, DISCOVERY_CLAIMS_CONTRACT, V7_ATTEMPT_CONTRACT,
-  V7_ATTEMPT_END_CODES, V7_ATTEMPT_KIND, V7_CONTRACT_ERA, checkV7Claims,
+  V7_ATTEMPT_END_CODES, V7_ATTEMPT_KIND, V7_CONTRACT_ERA, checkV7Claims, checkV7PlanCoverage, hasV7PlanCoverage,
   discoveryAcceptanceActId, provenAcceptance, type DiscoveryAcceptanceAct } from "./v7-contracts.js";
 
 const obj = (value: unknown): value is Record<string, Json> =>
@@ -110,6 +110,14 @@ export function provePlanQuestions(view: Store, draft: Revision<DiscoveryDraft>,
   if (!issued.ok || !provenAcceptance(issued.proof.provenance))
     refuse("plan_questions_invalid", "planAnswer",
       "the saved plan answer has no complete research provenance");
+  if (hasV7PlanCoverage(question.value.spec)) {
+    const before = readExact<DiscoveryDraft>(view, act.value.draftBefore)!;
+    try { checkV7PlanCoverage(before.value.fields['frame']!, fieldValue); }
+    catch (error) {
+      if (error instanceof EngineError) refuse('plan_questions_invalid', 'coverage', error.message);
+      throw error;
+    }
+  }
   const plan = fieldValue as Record<string, Json>;
   const questions = plan["questions"] as Json[];
   return questions.map(item => ({ planAnswer,

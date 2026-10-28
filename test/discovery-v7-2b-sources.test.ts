@@ -1,3 +1,5 @@
+import { validPlan, planQuestion } from "./discovery-v7-fixture.js";
+import { V7_AXES } from "../src/discovery/v7-contracts.js";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { existsSync, readFileSync } from "node:fs";
@@ -243,10 +245,8 @@ test("2b.1-S the same subject is restored after heads move and after a cold reop
   // Move the draft head and write more records: exact historical material does not move.
   const planQ = questionOf(f.store, b.draft, "plan");
   answerDiscoveryFixture(f.engine, project, f.store.get<DiscoveryDraft>(b.draft.id)!,
-    f.store.get<Question>(planQ.id)!, { edition: 1, frame: b.frameRef, previous: null,
-      questions: [{ id: "q1", axis: "industry", domain: "materials", text: "What covers it?",
-        class: "supporting", criterion: "Named basis", requiredDepth: "deep",
-        roles: ["expert"], searchPlaces: ["documents"] }] } as unknown as Json, b.src);
+    f.store.get<Question>(planQ.id)!, validPlan(b.frameRef, V7_AXES.map(axis => planQuestion(`q-${axis}`, axis,
+      ['rules', 'feasibility'].includes(axis) ? 'blocking' : 'supporting'))), b.src);
   assert.notEqual(f.store.get<DiscoveryDraft>(b.draft.id)!.revision, first.frame.draft.revision,
     "the head really moved past the proven revision");
   const again = collectFrameInterpretationSubject(f.store, req);
@@ -357,9 +357,8 @@ test("2b.1-S foreign, missing and mismatched inputs refuse at their typed addres
   // The 'plan' answer is a real research-answer — but not the frame field's.
   const planQ = questionOf(f.store, b.draft, "plan");
   answerDiscoveryFixture(f.engine, project, f.store.get<DiscoveryDraft>(b.draft.id)!,
-    f.store.get<Question>(planQ.id)!, { edition: 1, frame: b.frameRef, previous: null,
-      questions: [{ id: "q1", axis: "industry", domain: "d", text: "Q?", class: "supporting",
-        criterion: "Named basis", requiredDepth: "deep", roles: ["e"], searchPlaces: ["s"] }] } as unknown as Json, b.src);
+    f.store.get<Question>(planQ.id)!, validPlan(b.frameRef, V7_AXES.map(axis => planQuestion(`q-${axis}`, axis,
+      ['rules', 'feasibility'].includes(axis) ? 'blocking' : 'supporting'))), b.src);
   const planRef = f.store.get<Question>(planQ.id)!.value.answer!;
   assert.equal(code(() => collectFrameInterpretationSubject(f.store, { ...req, frame: planRef })),
     "frame_subject_missing", "a non-frame answer has no saved frame acceptance");

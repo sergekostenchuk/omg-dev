@@ -33,7 +33,7 @@ function acceptPlan(f: Fixture, project: string, questions: PlanQuestion[]) {
   const base = createPartialV7Draft(f.discovery, project, "concept");
   const src = f.discovery.evidence.document(project, "basis", `Exact source for ${project}`, "text/plain", 0);
   const frame = questionOf(f.store, base, "frame");
-  answerDiscoveryFixture(f.engine, project, base, frame, validFrame(), src);
+  answerDiscoveryFixture(f.engine, project, base, frame, validFrame(questions), src);
   const frameRef = f.store.get<Question>(frame.id)!.value.answer!;
   const planQ = questionOf(f.store, base, "plan");
   answerDiscoveryFixture(f.engine, project, base, planQ, validPlan(frameRef, questions), src);
@@ -162,7 +162,7 @@ for(const recorded of [false,true])test(`R: plan replacement ${recorded?'finishe
   }) as typeof f.store.writeMany;
   await f.run();assert.equal(cut,true);f.store.writeMany=write;
   const ledger=f.store.list('research-budget-ledger'),calls=f.wires().length;
-  acceptNextPlanEdition(f,'p',f.v.draft,f.v.frameRef,f.v.planAnswer,[planQuestion('next','market')]);
+  acceptNextPlanEdition(f,'p',f.v.draft,f.v.frameRef,f.v.planAnswer,[planQuestion('next','industry')]);
   const result=await f.run(1,f.open(),false);
   assert.equal(result.value.status,'paused');
   assert.equal(result.value.pauseCode,recorded?'research_assessment_pending':'attempt_invalid',JSON.stringify(result.value));
@@ -207,7 +207,7 @@ test('R: owner pause is proved by logical subject and survives cold summary and 
   assert.equal(summary.candidate!.run!.status,'needs_owner');
   assert.deepEqual(summary.candidate!.run!.subject,{contract:'v7-plan-subject/v1',planAnswer:f.v.planAnswer,planQuestionId:'block'});
   const before=f.history();assert.deepEqual(await f.run(1,cold,false),run);assert.deepEqual(f.history(),before);
-  acceptNextPlanEdition(f,'p',f.v.draft,f.v.frameRef,f.v.planAnswer,[planQuestion('next','market')]);
+  acceptNextPlanEdition(f,'p',f.v.draft,f.v.frameRef,f.v.planAnswer,[planQuestion('next','industry')]);
   const edited=f.history();assert.deepEqual(await f.run(1,f.open(),false),run);assert.deepEqual(f.history(),edited);
   const updated=stageSummary(f.open(),'p','discovery',f.v.draft.id);
   assert.equal(updated.candidate!.runFailure,null);assert.deepEqual(updated.candidate!.run!.subject,summary.candidate!.run!.subject);

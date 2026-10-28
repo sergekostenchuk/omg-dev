@@ -39,7 +39,7 @@ function acceptPlan(store: Store, engine: ProductEngine, discovery: Discovery, p
   const base = draft ?? createPartialV7Draft(discovery, project, "concept");
   const src = discovery.evidence.document(project, "basis", `Exact source for ${project}`, "text/plain", 0);
   const frame = questionOf(store, base, "frame");
-  answerDiscoveryFixture(engine, project, base, frame, validFrame(), src);
+  answerDiscoveryFixture(engine, project, base, frame, validFrame(questions), src);
   const frameRef = store.get<Question>(frame.id)!.value.answer!;
   const plan = questionOf(store, base, "plan");
   answerDiscoveryFixture(engine, project, base, plan, validPlan(frameRef, questions), src);
@@ -171,7 +171,7 @@ test("DR3a1: вторая редакция плана — текущий пла�
   const { draft, planAnswer, frameRef } = acceptPlan(store, engine, discovery, "p3",
     [planQuestion("q-v1", "market")]);
   const plan2 = acceptNextPlanEdition(store, engine, discovery, "p3", draft, frameRef, planAnswer,
-    [planQuestion("q-v2", "rules", "blocking")]);
+    [planQuestion("q-v2", "market", "blocking")]);
   // Текущий план — вторая редакция.
   const current = currentPlan(store, "p3");
   assert.deepEqual(current.planAnswer, plan2);
@@ -404,7 +404,7 @@ test("DR3a1: историческая попытка — после reopen и н
     end: submittedEnd([factClaim(store, "p10", "c-1", planAnswer, "q-v1")]) });
   // Новая редакция плана — попытка первой редакции доказывается по своим Ref.
   acceptNextPlanEdition(store, engine, discovery, "p10", draft, frameRef, planAnswer,
-    [planQuestion("q-v2", "market")]);
+    [planQuestion("q-v2", "rules", "blocking")]);
   const proof = proveAttempt(store, reference(attempt));
   assert.equal(proof.planQuestion.planQuestionId, "q-v1");
   assert.equal(proof.claims!.length, 1);

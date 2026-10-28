@@ -1,3 +1,5 @@
+import { readV7PlanBasis } from './v7-plan-assessment.js';
+import { hasV7PlanCoverage, isDiscoveryV7Draft } from './v7-contracts.js';
 import type { Revision, Store } from "../storage/store.js";
 import { STAGES, isRef, reference, stageId, type StageArtifact } from "../pipeline/contracts.js";
 import type { DiscoveryDraft } from "./discovery.js";
@@ -348,9 +350,26 @@ function discoveryUnknowns(record: Revision<StageArtifact>) {
     source: { record: reference(record), pointer: `/content/fields/preparation/unknowns/${index}` } })) };
 }
 
+interface ResearchPrerequisite {
+  ref: Ref;
+  stage: DiscoveryDraft['stage'];
+  fields: Record<string, unknown>;
+  operationMapMaterial?: ReturnType<typeof operationMapMaterial>;
+  featureBasisMaterial?: ReturnType<typeof featureBasisMaterial>;
+  unknowns?: ReturnType<typeof discoveryUnknowns>;
+  planBasis?: NonNullable<ReturnType<typeof readV7PlanBasis>>['context'];
+}
+
 /** The immediate accepted prerequisite carries the detailed handoff; older stages
  * supply identities needed for traceability, without duplicating every report. */
-export function researchPrerequisites(store: Store, draft: DiscoveryDraft, proposal?: InheritanceProposal) {
+export function researchPrerequisites(store: Store, draft: DiscoveryDraft, proposal?: InheritanceProposal): ResearchPrerequisite[] {
+  if (isDiscoveryV7Draft(draft)) {
+    const plan = draft.questions.map(id => readQuestion(store, id)).find(q => q?.value.status === 'open');
+    if (plan && hasV7PlanCoverage(plan.value.spec)) {
+      const basis = readV7PlanBasis(store, draft, plan)!;
+      return [{ ref: basis.context.frame.answer, stage: 'discovery', fields: {}, planBasis: basis.context }];
+    }
+  }
   const stages = draft.inputs.flatMap(ref => {
     const record = readStageArtifact<StageArtifact>(store, ref.id, ref.revision);
     return record?.kind === "stage" && record.hash === ref.hash ? [record] : [];

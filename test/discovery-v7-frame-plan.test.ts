@@ -1,3 +1,4 @@
+import { fixturePlanCoverage } from "./discovery-v7-fixture.js";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { Discovery, type DiscoveryDraft, type Question } from "../src/discovery/discovery.js";
@@ -55,7 +56,10 @@ function planQuestion(id: string, axis: string, cls = "supporting"): PlanQuestio
 }
 
 function validPlan(frameRef: Ref, questions: PlanQuestion[], edition = 1, previous: Ref | null = null): Json {
-  return { edition, frame: frameRef, previous, questions } as unknown as Json;
+  // These acceptance/edition tests retain their full twelve-axis frame.
+  const complete = [...questions, ...V7_AXES.filter(axis => !questions.some(q => q.axis === axis))
+    .map(axis => planQuestion(`coverage-${axis}`, axis, ['rules', 'feasibility'].includes(axis) ? 'blocking' : 'supporting'))];
+  return { edition, frame: frameRef, previous, questions: complete, coverage: fixturePlanCoverage(complete) } as unknown as Json;
 }
 
 test("DR2: фабрика создаёт частичный черновик v7 с полями D1–D2", t => {
@@ -285,9 +289,12 @@ test("DR2: устойчивость id в обе стороны — переим
     validPlan(frameRef, [planQuestion("q-rules", "rules", "blocking"), newCriterion], 2, firstPlanRef), source_),
     "answer_invalid", "criterion");
 
-  // Соседи: законные изменения под прежним id — глубина, роли, места поиска — проходят.
-  const tightened = { ...planQuestion("q-market", "market"), requiredDepth: "brief",
+  // Roles/search places can change; weakening a deep axis to brief now refuses.
+  const tightened = { ...planQuestion("q-market", "market"), requiredDepth: "deep",
     roles: ["buyer", "regional lawyer"], searchPlaces: ["analogues", "competitor docs"] };
+  thrown(() => answerDiscoveryFixture(engine, "p8", draft, reopened,
+    validPlan(frameRef, [planQuestion("q-rules", "rules", "blocking"), { ...tightened, requiredDepth: "brief" }], 2, firstPlanRef), source_),
+    "answer_invalid", "depth");
   answerDiscoveryFixture(engine, "p8", draft, reopened,
     validPlan(frameRef, [planQuestion("q-rules", "rules", "blocking"), tightened], 2, firstPlanRef), source_);
   assert.equal(store.get<Question>(plan.id)!.value.status, "answered");

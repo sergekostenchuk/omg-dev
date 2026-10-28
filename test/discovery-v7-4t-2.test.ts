@@ -1,3 +1,4 @@
+import { fixturePlanAxes, fixturePlanCoverage } from "./discovery-v7-fixture.js";
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {mkdtempSync, rmSync} from 'node:fs';
@@ -16,7 +17,7 @@ import {canonical, type Json} from '../src/canonical.js';
 import {type Revision} from '../src/storage/store.js';
 import {ProductEngine} from '../src/product/engine.js';
 import {Discovery, type DiscoveryDraft, type Question} from '../src/discovery/discovery.js';
-import {createPartialV7Draft, V7_AXES, V7_STAGE_TOKEN_CEILING} from '../src/discovery/v7-contracts.js';
+import {createPartialV7Draft, V7_STAGE_TOKEN_CEILING} from '../src/discovery/v7-contracts.js';
 import {answerDiscoveryFixture} from './product-fixture.js';
 import {researchCall} from '../src/discovery/research-protocol.js';
 import {VARIANT_CRITERIA} from '../src/discovery/discovery-variants.js';
@@ -271,7 +272,6 @@ function generation(label:string):Json {
 }
 const choice = (label:string):Json => ({choice:'decline-all',reason:`Transport only: ${label}`});
 const errorCode = (code:string) => (error:unknown) => error instanceof EngineError && error.code === code;
-const allAxes = (depth:string) => Object.fromEntries(V7_AXES.map(axis => [axis, {depth}]));
 const questionOf = (store:Store, draft:Revision<DiscoveryDraft>, field:string) =>
   draft.value.questions.map(id => store.get<Question>(id)!).find(question => question.value.spec.field === field)!;
 async function realPath(t:test.TestContext) {
@@ -319,10 +319,10 @@ console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research:s
     const src = discovery.evidence.document(id, 'basis', `Exact source for ${id}`, 'text/plain', 0);
     const frame = questionOf(store, base, 'frame');
     answerDiscoveryFixture(engine, id, base, frame, {productType:'internal', scale:'30 users', industries:['construction'],
-      domains:['materials supply'], axes:allAxes('deep'),
+      domains:['materials supply'], axes:fixturePlanAxes([{axis:'industry'}]),
       budget:{ceiling:V7_STAGE_TOKEN_CEILING, axisHints:{industry:4_000_000}, completionReserve:2_000_000}} as Json, src);
     const frameRef = store.get<Question>(frame.id)!.value.answer!, planQ = questionOf(store, base, 'plan');
-    answerDiscoveryFixture(engine, id, base, planQ, {edition:1, frame:frameRef, previous:null, questions:[{id:'q-industry',
+    answerDiscoveryFixture(engine, id, base, planQ, {edition:1, frame:frameRef, previous:null, coverage:fixturePlanCoverage([{id:'q-industry',axis:'industry'}]), questions:[{id:'q-industry',
       axis:'industry', domain:'construction', text:'What covers the industry?', class:'blocking', criterion:'Named basis',
       requiredDepth:'deep', roles:['domain expert'], searchPlaces:['domain documents']}]} as unknown as Json, src);
     return {id, environment, draftId:base.id, planId:planQ.id};

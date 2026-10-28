@@ -24,7 +24,7 @@ function acceptPlan(f: Fixture, project: string, questions: PlanQuestion[]) {
   const base = createPartialV7Draft(f.discovery, project, "concept");
   const src = f.discovery.evidence.document(project, "basis", `Exact source for ${project}`, "text/plain", 0);
   const frame = questionOf(f.store, base, "frame");
-  answerDiscoveryFixture(f.engine, project, base, frame, validFrame(), src);
+  answerDiscoveryFixture(f.engine, project, base, frame, validFrame(questions), src);
   const frameRef = f.store.get<Question>(frame.id)!.value.answer!;
   const planQ = questionOf(f.store, base, "plan");
   answerDiscoveryFixture(f.engine, project, base, planQ, validPlan(frameRef, questions), src);

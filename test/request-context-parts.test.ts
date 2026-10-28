@@ -1,3 +1,4 @@
+import { fixturePlanAxes, fixturePlanCoverage } from "./discovery-v7-fixture.js";
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { writeFileSync, readFileSync, statSync, existsSync } from 'node:fs';
@@ -21,7 +22,7 @@ import { checkStoreIntegrity } from '../src/storage/fsck.js';
 import { researchContextReadEra } from '../src/discovery/research-limits.js';
 import { repeatedContextRead } from '../src/discovery/research-continuation.js';
 import { referenceSites } from '../src/storage/reference-sites.js';
-import { discoveryFixture, rand, allAxes, questionOf, type PlanQuestion } from './discovery-v7-fixture.js';
+import { discoveryFixture, rand, questionOf, type PlanQuestion } from './discovery-v7-fixture.js';
 
 // DRS1a2 (пул G; codex-omg №6057/№6196/№7487): the compact storage of an analyst
 // call on the standard v7 path. Every record here is written by its real
@@ -30,19 +31,19 @@ import { discoveryFixture, rand, allAxes, questionOf, type PlanQuestion } from '
 
 const fixture = (t: { after(fn: () => void): void }) => discoveryFixture(t, 'omg-drs1a2-');
 type Fixture = ReturnType<typeof fixture>;
-const validFrame = (): Json => ({ productType: 'internal', scale: '30 users across 10 sites',
-  industries: ['construction'], domains: ['materials supply', 'equipment accounting'], axes: allAxes('deep'),
+const validFrame = (questions: PlanQuestion[]): Json => ({ productType: 'internal', scale: '30 users across 10 sites',
+  industries: ['construction'], domains: ['materials supply', 'equipment accounting'], axes: fixturePlanAxes(questions),
   budget: { ceiling: V7_STAGE_TOKEN_CEILING, axisHints: { industry: 4_000_000 }, completionReserve: 2_000_000 } });
 const planQuestion = (id: string, axis: string, cls = 'supporting'): PlanQuestion => ({ id, axis, domain: 'construction',
   text: `What covers ${id}?`, class: cls, criterion: `Named basis answering ${id}`, requiredDepth: 'deep',
   roles: ['domain expert'], searchPlaces: ['domain documents'] });
 const validPlan = (frame: Ref, questions: PlanQuestion[], edition = 1, previous: Ref | null = null): Json =>
-  ({ edition, frame, previous, questions }) as unknown as Json;
+  ({ edition, frame, previous, questions, coverage: fixturePlanCoverage(questions) }) as unknown as Json;
 function acceptPlan(f: Fixture, project: string, questions: PlanQuestion[]) {
   const base = createPartialV7Draft(f.discovery, project, 'concept');
   const src = f.discovery.evidence.document(project, 'basis', `Exact source for ${project}`, 'text/plain', 0);
   const frame = questionOf(f.store, base, 'frame');
-  answerDiscoveryFixture(f.engine, project, base, frame, validFrame(), src);
+  answerDiscoveryFixture(f.engine, project, base, frame, validFrame(questions), src);
   const frameRef = f.store.get<Question>(frame.id)!.value.answer!;
   const planQ = questionOf(f.store, base, 'plan');
   answerDiscoveryFixture(f.engine, project, base, planQ, validPlan(frameRef, questions), src);

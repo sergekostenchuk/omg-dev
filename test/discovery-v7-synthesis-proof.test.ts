@@ -1,3 +1,4 @@
+import { fixturePlanAxes, fixturePlanCoverage } from "./discovery-v7-fixture.js";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { type DiscoveryDraft, type Question } from "../src/discovery/discovery.js";
@@ -21,7 +22,7 @@ import { canonical, hashJson, type Json } from "../src/canonical.js";
 import { reference, type Ref } from "../src/pipeline/contracts.js";
 import { Store, type Revision } from "../src/storage/store.js";
 import { answerDiscoveryFixture } from "./product-fixture.js";
-import { discoveryFixture, rand, allAxes, questionOf } from "./discovery-v7-fixture.js";
+import { discoveryFixture, rand, questionOf } from "./discovery-v7-fixture.js";
 
 // DR3a3-S1 (codex-omg №7690 решения 2, 3, 5, 8; §3 S1): the subject forms of
 // v7 planner/synthesis — the v3 session, the v2 partial note, the v2 saved-only
@@ -42,13 +43,13 @@ const failure = (fn: () => unknown): string => {
   return "no-error";
 };
 const validFrame = (): Json => ({ productType: "internal", scale: "30 users across 10 sites",
-  industries: ["construction"], domains: ["materials supply", "equipment accounting"], axes: allAxes("deep"),
+  industries: ["construction"], domains: ["materials supply", "equipment accounting"], axes: fixturePlanAxes([{ axis: "industry" }, { axis: "market" }]),
   budget: { ceiling: V7_STAGE_TOKEN_CEILING, axisHints: { industry: 4_000_000 }, completionReserve: 2_000_000 } });
 const planQuestion = (id: string, axis: string, cls = "supporting") => ({ id, axis, domain: "construction",
   text: `What covers ${id}?`, class: cls, criterion: `Named basis answering ${id}`, requiredDepth: "deep",
   roles: ["domain expert"], searchPlaces: ["domain documents"] });
 const validPlan = (frame: Ref, ids: string[], edition = 1, previous: Ref | null = null): Json =>
-  ({ edition, frame, previous, questions: ids.map((id, i) => planQuestion(id, i ? "market" : "industry", i ? "supporting" : "blocking")) }) as unknown as Json;
+  ({ edition, frame, previous, coverage: fixturePlanCoverage(ids.map((id, i) => ({ id, axis: i ? "market" : "industry" }))), questions: ids.map((id, i) => planQuestion(id, i ? "market" : "industry", i ? "supporting" : "blocking")) }) as unknown as Json;
 const subjectOf = (planAnswer: Ref, planQuestionId: string): V7PlanSubject =>
   ({ contract: V7_PLAN_SUBJECT_CONTRACT, planAnswer, planQuestionId });
 

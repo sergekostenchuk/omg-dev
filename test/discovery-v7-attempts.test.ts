@@ -36,7 +36,7 @@ function acceptPlan(store: Store, engine: ProductEngine, discovery: Discovery, p
   const base = draft ?? createPartialV7Draft(discovery, project, "concept");
   const src = discovery.evidence.document(project, "basis", `Exact source for ${project}`, "text/plain", 0);
   const frame = questionOf(store, base, "frame");
-  answerDiscoveryFixture(engine, project, base, frame, validFrame(), src);
+  answerDiscoveryFixture(engine, project, base, frame, validFrame(questions), src);
   const frameRef = store.get<Question>(frame.id)!.value.answer!;
   const plan = questionOf(store, base, "plan");
   answerDiscoveryFixture(engine, project, base, plan, validPlan(frameRef, questions), src);
