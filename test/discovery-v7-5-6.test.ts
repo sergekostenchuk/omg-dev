@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import { copyFileSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { DatabaseSync } from 'node:sqlite';
+import { DatabaseSync, backup } from 'node:sqlite';
 import { reference } from '../src/pipeline/contracts.js';
 import { Store, type Revision, type TransactionGuard, type Write } from '../src/storage/store.js';
 import { Discovery, type DiscoveryDraft, type Question } from '../src/discovery/discovery.js';
@@ -292,7 +292,16 @@ for(const outcome of ['open','unknown'] as const)test(`5.6: a later real applied
   }
 });
 
-test('5.6: N and exact run cursor survive restart and an environment revision; stalled cells are not bought again',async t=>{
+// The six real turns of the two stalled cells are built once, by the first test that needs them; the exact bytes of
+// their end are saved, and the next test opens its own Stores over a restored copy of them.
+type SixWorld={base:Base;snapshot:string;scope:any};
+let sixWorld:SixWorld|undefined;
+async function six(t:test.TestContext){
+  if(sixWorld){
+    for(const file of WORLD_FILES){rmSync(join(sixWorld.base.root,file),{force:true});
+      if(existsSync(join(sixWorld.snapshot,file)))copyFileSync(join(sixWorld.snapshot,file),join(sixWorld.base.root,file));}
+    return {...bind(t,sixWorld.base),scope:structuredClone(sixWorld.scope)};
+  }
   const f=await ready(t,false,{deepMode:'impossible'});
   await f.run(1);
   assert.equal(deepPlanSelection(f.store,'p',f.scope).progress[0]!.summary!.streak,1);
@@ -306,6 +315,24 @@ test('5.6: N and exact run cursor survive restart and an environment revision; s
   await f.run(3,f.open());frontier=deepPlanSelection(f.store,'p',f.scope);
   assert.equal(frontier.next,null);assert.deepEqual(frontier.progress.map(row=>row.summary!.streak),[3,3]);
   assert.deepEqual(deepCalls(f).map(row=>row.subject.deepCell.subject.planQuestionId),['q-one','q-one','q-one','q-two','q-two','q-two']);
+  const run=f.store.list<any>('research-run').find(row=>row.value.draftId===f.v.draft.id)!;
+  assert.equal(run.value.pauseCode,'research_dossier_assessment_unavailable');assert.equal(run.value.turns,8);
+  const snapshot=mkdtempSync(join(tmpdir(),'omg-56-six-'));roots.push(snapshot);
+  const source=new DatabaseSync(f.path,{readOnly:true});
+  try{await backup(source,join(snapshot,'state.sqlite'));}finally{source.close();}
+  for(const file of ['settings.json','wire.ndjson'])copyFileSync(join(f.root,file),join(snapshot,file));
+  sixWorld={base:readyWorlds.get(JSON.stringify([false,{deepMode:'impossible'}]))!.base,snapshot,scope:structuredClone(f.scope)};
+  return f;
+}
+test('5.6: N and exact run cursor survive restart and an environment revision; stalled cells are not bought again',async t=>{
+  // The steps and their assertions are those of six(): three paid turns of one cell, an environment revision, two
+  // restarts, and three of the other cell, every one counted once.
+  const f=await six(t);
+  assert.deepEqual(deepCalls(f).map(row=>row.subject.deepCell.subject.planQuestionId),['q-one','q-one','q-one','q-two','q-two','q-two']);
+  assert.equal(deepPlanSelection(f.store,'p',f.scope).next,null);
+});
+test('5.6: the stalled stop and its partial dossier are read as saved; a restore-only run on the hot and on a newly opened Store buys and writes nothing',async t=>{
+  const f=await six(t), frontier=deepPlanSelection(f.store,'p',f.scope);
   const run=f.store.list<any>('research-run').find(row=>row.value.draftId===f.v.draft.id)!;
   assert.equal(run.value.pauseCode,'research_dossier_assessment_unavailable');assert.equal(run.value.turns,8);
   const details=JSON.parse(run.value.error!), stop=await readDeepFrontierStop(f.store,'p',details.stop);

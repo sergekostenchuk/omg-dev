@@ -293,6 +293,13 @@ for (const model of [false, true]) test(`5.7: real ${model ? 'model' : 'owner'} 
   });
   assert.equal(history(f.store),before);
 });
+test('5.7: three N turns of one cell on a Store and three of the other in another process leave six applied turns and a stalled frontier', async t => {
+  // The shared prefix: built once by the real runner for the whole file, here or by the first test that needs it. Its steps
+  // assert the order of the paid cells as they happen; the tests below take copies of the exact bytes of its end.
+  const f = await stalled(t);
+  assert.deepEqual(deepCalls(f).map(row => row.subject.deepCell.subject.planQuestionId), ['q-one', 'q-one', 'q-one', 'q-two', 'q-two', 'q-two']);
+  assert.equal(f.store.get<ResearchRun>(f.pending.id)!.value.pauseCode, 'research_dossier_assessment_unavailable');
+});
 test('5.7: one stalled cell does not stop another; all applied N limits stop without repeat payment', async t => {
   const f = await stalled(t),result=f.store.get<ResearchRun>(f.pending.id)!,details=JSON.parse(result.value.error!);
   assert.equal(result.value.pauseCode, 'research_dossier_assessment_unavailable', result.value.error!);
@@ -535,7 +542,19 @@ async function paidReentry(t:test.TestContext){
   reentryPrefix={...await saveWorld(f),stopped:reference(stopped),assessment:reference(assessment),paidBefore};
   return {...f,stopped:reentryPrefix.stopped,assessment:reentryPrefix.assessment,paidBefore};
 }
-for (const cold of [false,true]) test(`5.7: ${cold?'cold':'hot'} current applied evidence resumes stalled frontier with retained N and historical partial`, async t => {
+test('5.7: a real new paid assessment of the stalled cell is prepared as a shared prefix and none of it is applied yet', async t => {
+  const f=await paidReentry(t),stopped=f.store.get<ResearchRun>(f.stopped.id,f.stopped.revision)!;
+  assert.deepEqual(reference(stopped),f.stopped);
+  assert.equal(stopped.value.pauseCode,'research_dossier_assessment_unavailable',stopped.value.error!);
+  assert.equal(deepCalls(f).length,7);
+  const assessment=f.store.get(f.assessment.id,f.assessment.revision)!;
+  assert.deepEqual(reference(assessment),f.assessment);assert.equal(assessment.kind,'discovery-assessment');
+});
+// The stalled frontier is resumed by a real applied evidence on a hot or a cold Store; the exact bytes of the world after
+// the resume are saved, so that a newly opened Store reads the historical partial in a test of its own.
+type Resumed={world:SavedWorld;prior:{dossier:Ref;stop:Ref};oldRecord:unknown};
+const resumedWorlds=new Map<boolean,Resumed>();
+async function resumeStalled(t:test.TestContext,cold:boolean){
   const f=await paidReentry(t),stopped=f.store.get<ResearchRun>(f.stopped.id,f.stopped.revision)!;
   assert.deepEqual(reference(stopped),f.stopped);
   assert.equal(stopped.value.pauseCode,'research_dossier_assessment_unavailable',stopped.value.error!);
@@ -553,13 +572,25 @@ for (const cold of [false,true]) test(`5.7: ${cold?'cold':'hot'} current applied
   assert.equal(resumed.value.pauseCode,'research_dossier_assessment_unavailable',resumed.value.error!);
   assert.equal(deepCalls(f).length,8);
   for(const at of paidBefore)assert.deepEqual(reference(store.get(at.id,at.revision)!),at);
-  const before=history(store);
-  for(const read of [store,f.open()])await inert(f,read,async()=>{
-    assert.deepEqual((await readPartialDossier(read,'p',prior.dossier)).record,old.record);
-    if(read!==store)assert.equal((await produceStoppedPartialDossier(read,'p',prior.stop)).repeated,true);
-    else await f.run(1,read,true);
+  resumedWorlds.set(cold,{world:await saveWorld(f),prior:{dossier:prior.dossier,stop:prior.stop},oldRecord:structuredClone(old.record)});
+  return {f,store,prior,old};
+}
+for (const cold of [false,true]) test(`5.7: ${cold?'cold':'hot'} current applied evidence resumes stalled frontier with retained N and historical partial`, async t => {
+  const {f,store,prior,old}=await resumeStalled(t,cold),before=history(store);
+  await inert(f,store,async()=>{
+    assert.deepEqual((await readPartialDossier(store,'p',prior.dossier)).record,old.record);
+    await f.run(1,store,true);
   });
   assert.equal(history(store),before);
+});
+for (const cold of [false,true]) test(`5.7: ${cold?'cold':'hot'} current applied evidence: a newly opened Store reads the historical partial and repeats its production without a write`, async t => {
+  if(!resumedWorlds.has(cold))await resumeStalled(t,cold);
+  const saved=resumedWorlds.get(cold)!,f=copyWorld(t,saved.world),read=f.store,before=history(read);
+  await inert(f,read,async()=>{
+    assert.deepEqual((await readPartialDossier(read,'p',saved.prior.dossier)).record,saved.oldRecord);
+    assert.equal((await produceStoppedPartialDossier(read,'p',saved.prior.stop)).repeated,true);
+  });
+  assert.equal(history(read),before);
 });
 
 test('5.7: exhausted stage budget remains terminal after choice, plan and allowance changes', async t => {
