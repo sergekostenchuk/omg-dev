@@ -19,6 +19,7 @@ import { discoveryFinalAssessmentExecutionId, readDiscoveryFinalAssessmentDispat
   readDiscoveryFinalAssessmentPaidResultAt, runDiscoveryFinalAssessmentExecution } from '../src/discovery/discovery-final-assessment-execution.js';
 import { finalCandidate, finalPaid } from './discovery-v7-final-paid-seed.js';
 import { storeRefused, storeUnchanged } from './store-unchanged.js';
+import { whileHidden } from './hidden-record.js';
 
 type World = Awaited<ReturnType<typeof finalPaid>>;
 type Route = 'owner' | 'model' | 'partial';
@@ -246,19 +247,26 @@ test('final assessment paid: a small wire delivers an oversized context page and
   const cursor = f.store.get(discoveryFinalAssessmentExecutionId(f.paidResult, prepared));
   const application = (active.value as unknown as Record<string, any>).finalAssessmentApplication as Ref;
   assert.ok(missing && cursor && application);
-  // Hide a real previous receipt through a read-only Store view; the paid
-  // records themselves remain untouched. A direct resume is its own door.
+  // Hide a real previous receipt; the paid records themselves remain untouched. A direct resume is its own door. The
+  // genuine Store answers without that record, so its proofs are derived once and kept across the three doors, as in
+  // production.
+  const missingResponse = (error: unknown) => error instanceof EngineError && error.code === 'response_recovery_wire_invalid';
+  await whileHidden(f.store, { id: missing.id, revision: missing.revision }, null, () => fixed(f, f.store, async () => {
+    await assert.rejects(() => readDiscoveryFinalAssessmentExecutionAt(f.store, 'p', reference(cursor)), missingResponse);
+    await assert.rejects(() => readDiscoveryFinalAssessmentDispatchAdmission(f.store, application), missingResponse);
+    await assert.rejects(() => resumeDiscoveryFinalAssessmentResearchCall(f.store, application), missingResponse);
+    assert.deepEqual(f.store.get(active.id), active);
+  }));
+  // The same history door through an opaque read-only view: no proof is kept across its reads, the whole history of the
+  // paid run is derived again (about ten seconds), so one door stands for that path.
   const view = new Proxy(f.store, { get(target, key) {
     if (key === 'get') return (id: string, revision?: number) =>
       id === missing.id && (revision === undefined || revision === missing.revision) ? null : f.store.get(id, revision);
     const value = Reflect.get(target, key);
     return typeof value === 'function' ? value.bind(target) : value;
   } });
-  const missingResponse = (error: unknown) => error instanceof EngineError && error.code === 'response_recovery_wire_invalid';
   await fixed(f, f.store, async () => {
     await assert.rejects(() => readDiscoveryFinalAssessmentExecutionAt(view, 'p', reference(cursor)), missingResponse);
-    await assert.rejects(() => readDiscoveryFinalAssessmentDispatchAdmission(view, application), missingResponse);
-    await assert.rejects(() => resumeDiscoveryFinalAssessmentResearchCall(view, application), missingResponse);
     assert.deepEqual(f.store.get(active.id), active);
   });
   // The same claim is usable when the real history is present. Applying its

@@ -4,6 +4,7 @@ import { copyFileSync, existsSync, mkdtempSync, rmSync, writeFileSync } from 'no
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { storeUnchanged } from './store-unchanged.js';
+import { whileHidden } from './hidden-record.js';
 import { DatabaseSync } from 'node:sqlite';
 import { canonical, hashJson, type Json } from '../src/canonical.js';
 import { reference, type Ref } from '../src/pipeline/contracts.js';
@@ -752,17 +753,28 @@ test('5.345-01 current-choice proof refuses missing state, decision, grant, sess
     { id: act.decision.id }, { id: act.decision.value.authority.grant.id },
     { id: act.decision.value.authority.session.id }, { id: f.scopeRecord.value.set.id }, { id: f.scopeRecord.value.member.id },
   ];
-  // The masked overlay changes the reads and stays one; the genuine Store under it proves no write by its change stamp
-  // around every window, and one full before/after pair of its whole history stands for each of the hot and cold Stores.
+  // The genuine Store answers without the record, so its proofs are derived once and kept across the windows, as in
+  // production; it proves no write by its change stamp around every window, and one full before/after pair of its whole
+  // history stands for each of the hot and cold Stores.
   for (const store of [f.store, cold]) for (const [index, absent] of missing.entries()) {
+    const before = index === 0 ? all(store) : null;
+    await whileHidden(store, { id: absent.id, reads: absent.headOnly ? 'head' : 'every' }, null, () => storeUnchanged(store, () => {
+      assert.throws(() => staleUnpaidDeepAdmission(store, old), EngineError, absent.id);
+      assert.throws(() => readCurrentVariantChoice(store, 'p', reference(f.v.draft)), EngineError, absent.id);
+    }));
+    if (before !== null) assert.equal(all(store), before);
+    assert.deepEqual(money(store), account); assert.equal(f.wires().length, sent);
+  }
+  // One window through a masked overlay that changes the reads and forbids every write: no proof is kept across the reads
+  // of an opaque view, so the whole chain is derived again (about ten seconds); the decision on the hot Store stands for it.
+  {
+    const absent = missing[1]!, store = f.store;
     const view = storeView(store, { get: (id, revision) => id === absent.id && (!absent.headOnly || revision === undefined) ? null : undefined,
       write: () => { throw new Error('A read-only proof attempted a write'); } });
-    const before = index === 0 ? all(store) : null;
     await storeUnchanged(store, () => {
       assert.throws(() => staleUnpaidDeepAdmission(view, old), EngineError, absent.id);
       assert.throws(() => readCurrentVariantChoice(view, 'p', reference(f.v.draft)), EngineError, absent.id);
     });
-    if (before !== null) assert.equal(all(store), before);
     assert.deepEqual(money(store), account); assert.equal(f.wires().length, sent);
   }
 });

@@ -29,6 +29,7 @@ import { ProjectModeSessions, VariantChoiceSessions, issueProjectModeInvitation,
 import { setProjectMode } from '../src/product/project-mode.js';
 import { researchSetup, produce, rand, validPlan, type PlanQuestion } from './discovery-v7-fixture.js';
 import { storeUnchanged } from './store-unchanged.js';
+import { whileHidden } from './hidden-record.js';
 import type { OmResult } from '../src/om/refusal.js';
 import { DISCOVERY_DEEP_PREPARATION_CONTRACT, produceDeepPreparation, type DeepPreparation } from '../src/discovery/deep-research.js';
 import { DISCOVERY_COVERAGE_CELL_CONTRACT } from '../src/discovery/coverage.js';
@@ -674,21 +675,25 @@ test('final pack: mixed subjects, incomplete envelopes, foreign role and changed
 test('final pack: missing archive, archive part and rehashed capacity cannot impersonate paid grounds hot or cold',async()=>{
   const archive=negative.store.get<any>(partialCell.value.archive.id,partialCell.value.archive.revision)!;
   assert.ok(archive.value.parts.length);const part=archive.value.parts[0] as Ref;
+  // The genuine Store answers the masked record, so its proofs are derived once and kept across the windows, as in
+  // production; the very first window goes through an opaque Proxy, where no proof is kept across reads and the whole
+  // history is derived again, and stands for that path.
+  let opaque=true;
   for(const [store,mode] of [[negative.store,'full'],[negative.open(),'stamp']] as const) await unchanged(negative,store,async()=>{
+    const doors=async(reader:Store)=>{
+      await assert.rejects(()=>readDiscoveryFinalSessionAt(reader,'p',reference(partialCell)),e=>e instanceof EngineError);
+      await assert.rejects(()=>checkDiscoveryFinalResearchReply(reader,'p',partialPacket,RESULT_LIMIT,
+        partialCell.value.envelope.capacity,candidate(partialPacket,'no_go')),e=>e instanceof EngineError);
+    };
     for(const ref of [partialCell.value.archive,part,partialPacket.subject.basis.brief.source,
       partialPacket.subject.basis.assessment,partialPacket.subject.basis.response]) {
-      const masked=mask(store,ref);
-      await assert.rejects(()=>readDiscoveryFinalSessionAt(masked,'p',reference(partialCell)),e=>e instanceof EngineError);
-      await assert.rejects(()=>checkDiscoveryFinalResearchReply(masked,'p',partialPacket,RESULT_LIMIT,
-        partialCell.value.envelope.capacity,candidate(partialPacket,'no_go')),e=>e instanceof EngineError);
+      if(opaque){opaque=false;await doors(mask(store,ref));}
+      else await whileHidden(store,{id:ref.id,revision:ref.revision},null,()=>doors(store));
     }
     const savedPart=store.get<any>(part.id,part.revision)!;
     const value={...savedPart.value,text:savedPart.value.text+'x'};
     const substituted={...savedPart,value,hash:hashJson(value)};
-    const maskedPart=mask(store,part,substituted);
-    await assert.rejects(()=>readDiscoveryFinalSessionAt(maskedPart,'p',reference(partialCell)),e=>e instanceof EngineError);
-    await assert.rejects(()=>checkDiscoveryFinalResearchReply(maskedPart,'p',partialPacket,RESULT_LIMIT,
-      partialCell.value.envelope.capacity,candidate(partialPacket,'no_go')),e=>e instanceof EngineError);
+    await whileHidden(store,{id:part.id,revision:part.revision},substituted,()=>doors(store));
     for(const mutate of [(x:any)=>{x.mandatory.archive.record.hash='0'.repeat(64);},
       (x:any)=>{x.mandatory.archive.pointer='/body/foreign';},(x:any)=>{x.mandatory.archive.hash='0'.repeat(64);},
       (x:any)=>{x.bindings.finalSubject=ownerPacket.subject;}]) {

@@ -60,6 +60,7 @@ import { DISCOVERY_FINAL_ASSESSMENT_ENVELOPE, prepareDiscoveryFinalAssessmentEnv
 import { readArchiveBody } from '../src/discovery/request-parts.js';
 import { storeRefused, storeUnchanged } from './store-unchanged.js';
 import { RESULT_CAPACITY_REFUSAL } from '../src/discovery/early-research-outcome.js';
+import { whileHidden } from './hidden-record.js';
 
 // DR7 7a.3 (codex-omg2 №15531): the complete request to the D7 assessor, its physical envelope through the common
 // archive/delivery helpers and the check of the terminal reply through the accepted RESULT. The paid D6 worlds below
@@ -608,20 +609,25 @@ test('7a.3 request refusals: foreign role or subject, missing or substituted arc
         refusal(), JSON.stringify(Object.keys(broken)));
   });
   const coldStore = negative.open();
+  let opaque = true;
   for (const store of [negative.store, coldStore]) await (store === coldStore ? fixedPoint : unchanged)(negative, store, async () => {
     // The transport's own archive and part, hot and cold; the shared D6 grounds once, on the hot Store (the subject
     // and RESULT files hold their other doors).
     const grounds = store === negative.store ? [partialFinal.subject.basis.brief.source, partialFinal.subject.basis.assessment,
       partialFinal.subject.basis.response] : [];
+    const doors = async (reader: Store) => {
+      await assert.rejects(() => requireDiscoveryFinalAssessmentEnvelope(reader, 'p', packet.subject, input, envelope), refusal());
+      await assert.rejects(() => checkDiscoveryFinalAssessmentReply(reader, 'p', packet.subject, RESULT_LIMIT, envelope.capacity, reply), refusal());
+    };
     for (const ref of [envelope.archive, part, ...grounds]) {
-      const masked = mask(store, ref);
-      await assert.rejects(() => requireDiscoveryFinalAssessmentEnvelope(masked, 'p', packet.subject, input, envelope), refusal());
-      await assert.rejects(() => checkDiscoveryFinalAssessmentReply(masked, 'p', packet.subject, RESULT_LIMIT, envelope.capacity, reply), refusal());
+      // The genuine Store answers without the record, so its proofs are derived once and kept across the windows, as in
+      // production; the very first window goes through an opaque Proxy, where no proof is kept across reads and the
+      // whole history is derived again, and stands for that path.
+      if (opaque) { opaque = false; await doors(mask(store, ref)); }
+      else await whileHidden(store, { id: ref.id, revision: ref.revision }, null, () => doors(store));
     }
     const savedPart = store.get<any>(part.id, part.revision)!, value = { ...savedPart.value, text: savedPart.value.text + 'x' };
-    const substituted = mask(store, part, { ...savedPart, value, hash: hashJson(value) });
-    await assert.rejects(() => requireDiscoveryFinalAssessmentEnvelope(substituted, 'p', packet.subject, input, envelope), refusal());
-    await assert.rejects(() => checkDiscoveryFinalAssessmentReply(substituted, 'p', packet.subject, RESULT_LIMIT, envelope.capacity, reply), refusal());
+    await whileHidden(store, { id: part.id, revision: part.revision }, { ...savedPart, value, hash: hashJson(value) }, () => doors(store));
     for (const mutate of [(x: any) => { x.mandatory.archive.record.hash = '0'.repeat(64); }, (x: any) => { x.mandatory.archive.pointer = '/body/foreign'; },
       (x: any) => { x.mandatory.archive.hash = '0'.repeat(64); }, (x: any) => { x.bindings.finalAssessmentSubject = ownerPacket.subject; },
       (x: any) => { x.role = 'synthesizer'; }, (x: any) => { delete x.mandatory; }]) {

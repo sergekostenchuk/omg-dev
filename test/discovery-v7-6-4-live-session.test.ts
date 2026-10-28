@@ -5,6 +5,7 @@ import { cpSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync }
 import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
 import { storeUnchanged, storeRefused } from './store-unchanged.js';
+import { whileHidden } from './hidden-record.js';
 import { DatabaseSync } from 'node:sqlite';
 import { canonical, hashJson, type Json } from '../src/canonical.js';
 import { reference, type Ref } from '../src/pipeline/contracts.js';
@@ -531,9 +532,16 @@ test('live dossier: exact reservation cut resumes on hot/new Store only for its 
     const running=store.get<DossierAssessmentApplication>(claim.value.assessmentApplication!.id,2)!;
     const readBefore=all(store);
     // Both Store modes recover this real reservation. The hot table covers both
-    // missing-row and null-body forms; cold repeats each missing proof class.
-    for(const row of [running,claim])for(const value of cold?[null]:[null,{...row,value:null}])
-      await unchanged(f,store,()=>runDossierAssessmentSession(mask(store,reference(row),value),'p',packet.subject),true);
+    // missing-row and null-body forms; cold repeats each missing proof class. The genuine Store answers the masked
+    // record, so its proofs are derived once and kept across the windows, as in production; the very first window goes
+    // through an opaque Proxy, where no proof is kept across reads and the whole history is derived again, and stands
+    // for that path.
+    let opaque=!cold;
+    for(const row of [running,claim])for(const value of cold?[null]:[null,{...row,value:null}]) {
+      const through=opaque;opaque=false;
+      await unchanged(f,store,()=>through?runDossierAssessmentSession(mask(store,reference(row),value),'p',packet.subject)
+        :whileHidden(store,{id:row.id,revision:row.revision},value as never,()=>runDossierAssessmentSession(store,'p',packet.subject)),true);
+    }
     if(!cold) {
       await unchanged(f,store,()=>runDossierAssessmentSession(store,'p',packet.subject,undefined,undefined,undefined,{restoreOnly:true}));
       await unchanged(f,store,()=>runDossierAssessmentSession(store,'p',packet.subject,undefined,undefined,undefined,{allowance:0}),true);
@@ -542,7 +550,7 @@ test('live dossier: exact reservation cut resumes on hot/new Store only for its 
     // An honest foreign owner cannot acquire the original prepared application's identity.
     const foreign={...claim,value:{...claim.value,ownerProcess:{pid:process.pid,started:'foreign'},execution:{...claim.value.execution!,owner:{pid:process.pid,started:'foreign'}}}};
     foreign.hash=hashJson(foreign.value as never);
-    await unchanged(f,store,()=>runDossierAssessmentSession(mask(store,reference(claim),foreign),'p',packet.subject),true);
+    await unchanged(f,store,()=>whileHidden(store,{id:claim.id,revision:claim.revision},foreign as never,()=>runDossierAssessmentSession(store,'p',packet.subject)),true);
     assert.equal(all(store),readBefore);
     const result=await runDossierAssessmentSession(store,'p',packet.subject);
     assert.ok(result.result);assert.equal(dossierCalls(store).length,1);assert.equal(f.wires().length,wires.length+1);

@@ -20,6 +20,7 @@ import { DISCOVERY_FINAL_ASSESSMENT_RESULT } from '../src/discovery/discovery-fi
 import { discoveryFinalAssessmentExecutionId, readDiscoveryFinalAssessmentDispatchAdmission, readDiscoveryFinalAssessmentExecutionAt,
   readDiscoveryFinalAssessmentPaidResultAt, runDiscoveryFinalAssessmentExecution } from '../src/discovery/discovery-final-assessment-execution.js';
 import { storeRefused, storeUnchanged } from './store-unchanged.js';
+import { whileHidden } from './hidden-record.js';
 
 // DR7 7b.3-class (codex-omg2 №16183): the recovery of both D7 contracts — a classed discovery-final/v8 world and the
 // historical discovery-final/v7 one restore free of charge, hot and cold — and the refusal of a substituted version or
@@ -132,19 +133,26 @@ test('7b.3-class bounded recovery: a paid multi-page assessment of a v8 candidat
   const cursor = f.store.get(discoveryFinalAssessmentExecutionId(f.paidResult, prepared))!;
   const application = (active.value as unknown as Record<string, any>).finalAssessmentApplication as Ref;
   assert.ok(missing && cursor && application);
-  // The first real response hidden through a read-only view: history, admission and a direct resume refuse, typed,
-  // with no send, payment or write; the claim stays claimed.
+  // The first real response hidden: history, admission and a direct resume refuse, typed, with no send, payment or write;
+  // the claim stays claimed. The genuine Store answers without that record, so its proofs are derived once and kept
+  // across the three doors, as in production.
+  const lost = (error: unknown) => error instanceof EngineError && error.code === 'response_recovery_wire_invalid';
+  await whileHidden(f.store, { id: missing.id, revision: missing.revision }, null, () => fixed(f, f.store, async () => {
+    await assert.rejects(() => readDiscoveryFinalAssessmentExecutionAt(f.store, 'p', reference(cursor)), lost);
+    await assert.rejects(() => readDiscoveryFinalAssessmentDispatchAdmission(f.store, application), lost);
+    await assert.rejects(() => resumeDiscoveryFinalAssessmentResearchCall(f.store, application), lost);
+    assert.deepEqual(f.store.get(active.id), active);
+  }));
+  // The same history door through an opaque read-only view: no proof is kept across its reads, the whole history of the
+  // paid run is derived again (about ten seconds), so one door stands for that path.
   const view = new Proxy(f.store, { get(target, key) {
     if (key === 'get') return (id: string, revision?: number) =>
       id === missing.id && (revision === undefined || revision === missing.revision) ? null : f.store.get(id, revision);
     const value = Reflect.get(target, key);
     return typeof value === 'function' ? value.bind(target) : value;
   } });
-  const lost = (error: unknown) => error instanceof EngineError && error.code === 'response_recovery_wire_invalid';
   await fixed(f, f.store, async () => {
     await assert.rejects(() => readDiscoveryFinalAssessmentExecutionAt(view, 'p', reference(cursor)), lost);
-    await assert.rejects(() => readDiscoveryFinalAssessmentDispatchAdmission(view, application), lost);
-    await assert.rejects(() => resumeDiscoveryFinalAssessmentResearchCall(view, application), lost);
     assert.deepEqual(f.store.get(active.id), active);
   });
   // On the real Store the same claim continues; its paid response is applied, and the saved run restores free of
