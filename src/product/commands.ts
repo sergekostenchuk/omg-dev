@@ -21,6 +21,7 @@ export type ProductCommand =
   | {type:'choose-frame-interpretation';project:string;generation:Ref;interpretation:string;justification:string}
   | { type: 'discovery-final-decision'; project: string; assessment: Ref; decision: 'accept' | 'decline'; reason: string }
   | { type: 'discovery-final-accepted'; project: string; manifest: Ref }
+  | { type: 'discovery-accepted-projection'; project: string; manifest: Ref }
   | { type: 'discovery-final-condition'; project: string; manifest: Ref; conditionId: string; optionId: string; reason: string }
   | { type: 'discovery-final-condition'; project: string; manifest: Ref; conditionId: string; claims: ClaimAddress[]; reason: string }
   | {type:'recover-research-response';project:string;call:Ref;session:Ref}
@@ -141,6 +142,7 @@ const schema = { oneOf: [
   command('choose-frame-interpretation', {project,generation:ref,interpretation:text,justification:text}),
   command('discovery-final-decision', { project, assessment: ref, decision: { enum: ['accept', 'decline'] }, reason: text }),
   command('discovery-final-accepted', { project, manifest: ref }),
+  command('discovery-accepted-projection', { project, manifest: ref }),
   command('discovery-final-condition', { project, manifest: ref, conditionId: text, optionId: text, reason: text }),
   command('discovery-final-condition', { project, manifest: ref, conditionId: text, reason: text,
     claims: { type: 'array', minItems: 1, items: object({ project, container: ref, containerKind: text, pointer: string, claimId: text }) } }),

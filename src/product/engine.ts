@@ -1,3 +1,4 @@
+import { readAcceptedDiscoveryProjectionAt } from '../discovery/discovery-accepted-projection.js';
 import { returnDiscoveryResearch } from '../discovery/discovery-research-return.js';
 import { advanceInterpretationFlow, readInterpretationFlowReadyAt } from '../discovery/interpretation-flow.js';
 import { chooseInterpretation } from './interpretation-authority.js';
@@ -295,6 +296,8 @@ export class ProductEngine {
       case 'discovery-final-decision':
         return acceptDiscoveryFinal(this.store, { projectId: command.project, assessment: command.assessment,
           decision: command.decision, reason: command.reason }).then(discoveryDecisionOutput);
+      case 'discovery-accepted-projection':
+        return readAcceptedDiscoveryProjectionAt(this.store, command.project, command.manifest);
       case 'discovery-final-accepted':
         return readAcceptedDiscoveryManifestAt(this.store, command.project, command.manifest).then(acceptedDiscoveryOutput);
       case 'discovery-final-condition':
