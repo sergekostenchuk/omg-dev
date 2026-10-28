@@ -19,8 +19,22 @@ import { deepPlanSelection } from '../src/discovery/v7-plan-questions.js';
 import { readEffectiveStageBudget, stageBudgetIncreaseId } from '../src/discovery/stage-token-budget.js';
 import { history, interceptWrites, build, bind, money, choiceScope, owner, deepCalls, deepIntents, inert, ready, copyWorld, saveWorld, stopped, increase, driver, oldSnapshot, assertAdvanced } from './discovery-v7-budget-reentry-fixture.js';
 
-test('budget re-entry: no owner increase, new plan/allowance, restoreOnly and zero driver allowances cannot buy research', async t => {
+// The route below is walked one owner act at a time: the stopped route (0), its choice revised (1), the budget increased on top
+// of the revision (2), a new plan edition on top of both (3). Each state has its own test; the acts are the same and come in the
+// same order, and an inert window changes nothing, so a state does not depend on the windows of the states before it.
+async function walked(t: test.TestContext, acts: 0 | 1 | 2 | 3) {
   const f = await stopped(t);
+  if (acts >= 1) {
+    const state = f.store.get<VariantState>(variantStateId('p', f.v.draft.id))!;
+    owner(f.store, { ...choiceScope(f), operation: 'revise', previous: state.value.decision!, expectedSelection: reference(state) });
+  }
+  if (acts >= 2) increase(f);
+  if (acts >= 3) f.nextEdition();
+  return f;
+}
+
+test('budget re-entry: without an owner increase restoreOnly and the ordinary driver cannot buy research', async t => {
+  const f = await walked(t, 0);
   // Exact old D6 pauses are inert in restoreOnly. A normal invocation may now
   // spend the completion reserve on D6, while the ordinary driver and the
   // re-entry reader below must still reject another research purchase.
@@ -29,16 +43,24 @@ test('budget re-entry: no owner increase, new plan/allowance, restoreOnly and ze
     assert.deepEqual(await f.run(20, f.store, true), f.original);
     await driver(f); assert.equal(deepCalls(f).length, 1);
   });
-  const state = f.store.get<VariantState>(variantStateId('p', f.v.draft.id))!;
-  owner(f.store, { ...choiceScope(f), operation: 'revise', previous: state.value.decision!, expectedSelection: reference(state) });
+});
+
+test('budget re-entry: a revised owner choice leaves restoreOnly unable to buy research', async t => {
+  const f = await walked(t, 1);
   await inert(f, f.store, async () => assert.deepEqual(await f.run(20, f.store, true), f.original));
-  increase(f);
+});
+
+test('budget re-entry: an owner increase after a revised choice does not re-enter the stopped route', async t => {
+  const f = await walked(t, 2);
   await inert(f, f.store, async () => {
     assert.equal(await readBudgetStopReentry(f.store, 'p', f.v.draft.id, f.details.stop), false);
     assert.deepEqual(await f.run(1, f.store, true), f.original);
     assert.equal((await driver(f)).budget.callsMade, 0);
   });
-  f.nextEdition();
+});
+
+test('budget re-entry: a new plan edition leaves restoreOnly, the driver and zero allowances unable to buy research', async t => {
+  const f = await walked(t, 3);
   await inert(f, f.store, async () => {
     assert.deepEqual(await f.run(1, f.store, true), f.original);
     assert.equal((await driver(f)).budget.callsMade, 0);
