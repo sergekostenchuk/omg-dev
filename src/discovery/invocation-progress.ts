@@ -62,7 +62,7 @@ export function invocationProgress(store:Store,questionId:string,purpose:string,
   return {key,guards:[...calls.map(reference),...(variantSubject?variantTransportGuards((question.value as any).projectId,draft!.id,variantSubject):[])]};
 }
 
-interface InvocationAllowanceState { limit:number; remaining:number; used:number }
+interface InvocationAllowanceState { limit:number; remaining:number; used:number; parent?:InvocationAllowanceState }
 export interface InvocationAllowanceReport<T> { value:T; limit:number; remaining:number; used:number }
 
 const allowance=new AsyncLocalStorage<InvocationAllowanceState>();
@@ -82,15 +82,22 @@ export async function withInvocationAllowanceReport<T>(limit:number,work:()=>Pro
  return {value,limit:current.limit,remaining:current.remaining,used:current.used};
 }
 
+/** A bounded sub-operation shares every durable physical claim with its caller. */
+export function withChildInvocationAllowance<T>(limit:number,work:()=>Promise<T>):Promise<T>{
+ const current=state(limit),parent=allowance.getStore();
+ if(parent)current.parent=parent;
+ return allowance.run(current,work);
+}
+
 /** Check before preparing a physical dispatch; consume only after its durable claim is written. */
 export function requireInvocationAllowance(){
- const current=allowance.getStore();if(!current)return;
- requireCondition(current.remaining>0,'research_call_allowance','The research call allowance is exhausted; all inner-role invocations count');
+ for(let current=allowance.getStore();current;current=current.parent)
+  requireCondition(current.remaining>0,'research_call_allowance','The research call allowance is exhausted; all inner-role invocations count');
 }
 
 export function consumeInvocationAllowance(){
- const current=allowance.getStore();if(!current)return;
- requireInvocationAllowance();current.remaining--;current.used++;
+ requireInvocationAllowance();
+ for(let current=allowance.getStore();current;current=current.parent){current.remaining--;current.used++;}
 }
 
 // ---- 5.4 (codex-omg №12595, правки №12770): the separate identity progress of one deep step. ----
