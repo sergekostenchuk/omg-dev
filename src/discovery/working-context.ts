@@ -10,7 +10,7 @@ import { sameSubject, type V7PlanSubject } from './v7-managed-attempt.js';
 import { STAGE_NEIGHBOR_CONTEXT } from './stage-neighbors.js';
 import { activeSynthesisNotes, consolidationInput, consolidationPage, consolidationFragment,
   CONSOLIDATION_DELIVERY, CONSOLIDATION_FRAGMENT } from './conclusion-consolidation.js';
-import { variantTransportSubject, requireVariantContext, variantTransportFields, variantTransportGuards, requireVariantArchive, proveAssessmentTransportSubject, sameAssessmentSubject, assessmentQuestionContract, type AssessmentTransportSubject, FOUNDATION_FIELDS, contextSections, selectedQuestion, packetPlanSubject, planQuestionContract, replaceFoundationCopies, candidateDelta, originalIndex, compactConclusions, CONCLUSION_ENCODING, correctionIndex,
+import { variantTransportSubject, requireVariantContext, variantTransportFields, variantTransportGuards, requireVariantArchive, proveAssessmentTransportSubject, sameAssessmentSubject, assessmentQuestionContract, type AssessmentTransportSubject, FOUNDATION_FIELDS, contextSections, selectedQuestion, packetPlanSubject, planQuestionContract, planClaimsContract, replaceFoundationCopies, candidateDelta, originalIndex, compactConclusions, CONCLUSION_ENCODING, correctionIndex,
   packetDeepPreparation, deepTransportSubject, requireDeepContext, deepTransportFields, requireDeepArchive } from "./continuation-packet.js";
 import { requireCurrentDeepPreparation } from "./deep-research.js";
 import type { Store, Revision, Write, TransactionGuard } from "../storage/store.js";
@@ -355,6 +355,7 @@ function packWorkingContext(store: Store, projectId: string, draftId: string, qu
         'research_plan_subject_invalid', 'The supplied question differs from its accepted plan question');
     }
     body = {...body, subject:planSubject, question:planContract,
+      discoveryClaims: planClaimsContract(store, projectId, planSubject!, body['history'] ?? []),
       ...(Object.hasOwn(body,'questions')?{questions:[planContract]}:{})};
   }
   if ((planSubject || assessmentSubject) && options.previous) {
@@ -752,7 +753,7 @@ function packWorkingContext(store: Store, projectId: string, draftId: string, qu
     if (!packet.materialDelivery) serveArchivedMaterial(packet, addressed, maxChars);
     return finish(packet);
   }
-  const mandatory = [...(variantFields?Object.keys(variantFields):[]),"managedDossier","dossierNotes","dossierSubject","dossierPacket","dossierResultTransport","dossierReplyContract","assessmentDelivery","deepPreparation","deepCell","deepScope","variantSubject", "assessmentSubject", "resultCapacity", "assessmentContextContract", "stageNeighbors", "discoveryContext", "discoveryBasisCatalogue", "planBasis", "webResearch", "answerContext", "contextWorkspace", "savedEvidence", "conclusions", "conclusionCitations", "conclusionRefs", "conclusionUnresolved", "conclusionEncoding", "contextControls", "contextCorrection", "currentRead", "originals", "corrections", "request", "candidate", "proposalChanges", "purpose", "sources", "questions", "prerequisites", "operationMap", "researchMissing", "fields", "mapStatusFindings", "mapStatus", "researchScope", "role", "stage", "level", "consumer", "contextEncoding", "allowedConsumers", "gapFields", "graphBase",
+  const mandatory = [...(variantFields?Object.keys(variantFields):[]),"discoveryClaims","managedDossier","dossierNotes","dossierSubject","dossierPacket","dossierResultTransport","dossierReplyContract","assessmentDelivery","deepPreparation","deepCell","deepScope","variantSubject", "assessmentSubject", "resultCapacity", "assessmentContextContract", "stageNeighbors", "discoveryContext", "discoveryBasisCatalogue", "planBasis", "webResearch", "answerContext", "contextWorkspace", "savedEvidence", "conclusions", "conclusionCitations", "conclusionRefs", "conclusionUnresolved", "conclusionEncoding", "contextControls", "contextCorrection", "currentRead", "originals", "corrections", "request", "candidate", "proposalChanges", "purpose", "sources", "questions", "prerequisites", "operationMap", "researchMissing", "fields", "mapStatusFindings", "mapStatus", "researchScope", "role", "stage", "level", "consumer", "contextEncoding", "allowedConsumers", "gapFields", "graphBase",
     "core", "map", "draft", "question", "value", "representation", "consumerFeedback", "assessmentState", "openGaps", "failures", "unresolvedEvidence", "dispatchMode", "readPlanStatus", "sourceCatalogue", "sourceLocations", "bases", "runtimeProofs", "synthesisState", "synthesisNotes", "previousProposalRef"];
   if(body['assessmentState']) mandatory.splice(mandatory.indexOf("value"),1);
   if(frameMaterial !== undefined) mandatory.push('v7Frame');
@@ -768,7 +769,7 @@ function packWorkingContext(store: Store, projectId: string, draftId: string, qu
   // Defaults preserve the action protocol's collection shapes, not completeness.
   Object.assign(packet, { readings: [], directReadings: [], history: [], observations: [], checkpoints: [] });
   const addressedCore = addressArchivedMaterials(packet, reference(archive),
-    exactArchivedFields(packet, ['dossierPacket', 'dossierReplyContract', 'dossierNotes', 'fields', 'discoveryContext', 'discoveryBasisCatalogue', 'planBasis', 'stageNeighbors', 'v7Frame',
+    exactArchivedFields(packet, ['discoveryClaims', 'dossierPacket', 'dossierReplyContract', 'dossierNotes', 'fields', 'discoveryContext', 'discoveryBasisCatalogue', 'planBasis', 'stageNeighbors', 'v7Frame',
       'prerequisites', 'operationMap', 'inventory', 'request', 'consumerFeedback',
       'answerContext', 'currentRead', 'originals', 'corrections', 'researchScope',
       'mapStatus', 'mapStatusFindings', 'readPlanStatus', 'openGaps', 'failures', 'sourceCatalogue',

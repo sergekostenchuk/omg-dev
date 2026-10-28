@@ -409,6 +409,60 @@ const CLAIM_REQUIRED: readonly string[] = ["id", "kind", "text", "axis", "planQu
 const CLAIM_ADDRESS_FIELDS: readonly string[] = ["project", "container", "containerKind",
   "pointer", "claimId"];
 
+/** Model-facing form of the existing claims validator. This is delivery, not
+ * a new acceptance rule; historical attempts keep their original checks. */
+const claimText: Json = { type: "string", minLength: 1, pattern: "\\S" };
+const claimAddressSchema = object({ project: claimText, container: refSchema,
+  containerKind: claimText, pointer: { type: "string", pattern: V7_CLAIM_POINTER.source }, claimId: claimText });
+const claimBasisSchemas: Record<typeof V7_CLAIM_KINDS[number], Json> = {
+  fact: object({ source: object({ ref: refSchema,
+    range: object({ start: { type: "integer", minimum: 0, maximum: Number.MAX_SAFE_INTEGER },
+      end: { type: "integer", minimum: 1, maximum: Number.MAX_SAFE_INTEGER } }),
+    valueHash: { type: "string", pattern: HASH_PATTERN } }), limit: claimText, asOf: claimText,
+    apiVersion: claimText, region: claimText }, ["apiVersion", "region"]),
+  inference: object({ from: { type: "array", minItems: 1, items: claimAddressSchema }, reasoning: claimText }),
+  hypothesis: object({ howToVerify: claimText }),
+  unknown: object({ origin: claimText, unknownId: claimText, question: claimText,
+    affects: { type: "array", minItems: 1, items: claimText }, consumer: claimText,
+    blocksCurrentStage: { type: "boolean" }, moment: { enum: [...V7_UNKNOWN_MOMENTS] }, closeCriterion: claimText }),
+  "owner-decision": object({ authority: refSchema }),
+};
+export const V7_CLAIMS_SCHEMA: Json = {
+  type: "object", additionalProperties: false, required: ["claims"], properties: {
+    claims: { type: "array", minItems: 1, items: {
+      type: "object", additionalProperties: false, required: [...CLAIM_REQUIRED], properties: {
+        id: claimText, kind: { enum: [...V7_CLAIM_KINDS] }, text: claimText, axis: { enum: [...V7_AXES] },
+        planQuestions: { type: "array", minItems: 1, items: object({ planAnswer: refSchema, planQuestionId: claimText }) },
+        scope: object({ variants: { oneOf: [{ const: "common" }, { type: "array", minItems: 1, items: refSchema }] },
+          region: claimText, asOf: claimText }, ["region", "asOf"]),
+        basis: { type: "object" },
+        contradicts: { type: "array", items: { $ref: "#/$defs/claimAddress" } },
+        refutedBy: { type: "array", items: { $ref: "#/$defs/claimAddress" } },
+        supersedes: { oneOf: [{ type: "null" }, { $ref: "#/$defs/claimAddress" }] },
+      },
+      oneOf: V7_CLAIM_KINDS.map(kind => ({ properties: { kind: { const: kind }, basis: claimBasisSchemas[kind] } })),
+    } },
+  },
+  $defs: { claimAddress: claimAddressSchema },
+};
+export const V7_CLAIMS_INSTRUCTION = 'For an answer to the current plan-question, use '
+  + '{action:"answer",question:subject.planQuestionId,value:{type:"submitted",contract:"discovery-claims/v7",value:{claims:[...]}},citations:[]}. '
+  + 'discoveryClaims.schema specifies the complete submitted value; question.schema specifies the outer attempt end. '
+  + 'All objects are closed: required lists name mandatory fields, only listed properties are allowed. Claim ids must be unique within the attempt. '
+  + 'Every claim must include the exact current subject.planAnswer and subject.planQuestionId in planQuestions. '
+  + 'scope.variants is "common" or exact saved variant Refs from the material, never guessed ids. '
+  + 'fact requires a pinned source, limitation and asOf; inference requires saved ClaimAddress premises and reasoning; '
+  + 'hypothesis requires howToVerify; unknown requires the full ND-02 fields including closeCriterion and a listed moment; '
+  + 'owner-decision requires a saved authority Ref, not the model\'s permission. '
+  + 'Copy a fact basis.source from discoveryClaims.sources after a read_source: ref is the exact saved Source, '
+  + 'range is the actually served half-open UTF-16 range with 0 <= start < end, and valueHash is hashJson of its served text '
+  + '(SHA-256 of the UTF-8 canonical JSON string), not source.hash or a raw-text checksum. For another fragment, read it first. '
+  + 'Never invent refs, ranges or hashes, dates, versions, authority or accepted premises. If evidence is unavailable, record an honest unknown or hypothesis. '
+  + 'ClaimAddress links (basis.from, contradicts, refutedBy, supersedes) name existing saved containers of this project: '
+  + 'copy project/container/containerKind/pointer/claimId from material; pointer is /claims/<zero-based index>. '
+  + 'A new sibling claim has no saved ClaimAddress yet. Use only proven accepted premises for inference; these links and fact contents remain subject to the common semantic checks. '
+  + 'Optional supersedes may be null. Submission records research material; it does not accept claims or close the stage.';
+
 /** What the claims check needs from the attempt it belongs to. */
 export interface V7ClaimsContext {
   /** Every declared Ref and every ClaimAddress names a record of this project. */

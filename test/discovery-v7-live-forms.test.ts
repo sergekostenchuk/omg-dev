@@ -1,11 +1,13 @@
 import {configureReaderPilot} from '../src/discovery/reader-pilot.js';
 import test from 'node:test';
+import {Ajv} from 'ajv';
+import {hashJson} from '../src/canonical.js';
 import assert from 'node:assert/strict';
 import {readFileSync, writeFileSync} from 'node:fs';
 import {join} from 'node:path';
 import {discoveryFixture, planQuestion, validFrame, validPlan, questionOf} from './discovery-v7-fixture.js';
 import {answerDiscoveryFixture} from './product-fixture.js';
-import {createPartialV7Draft} from '../src/discovery/v7-contracts.js';
+import {checkV7Claims, V7_CLAIMS_SCHEMA, V7_AXES, V7_ATTEMPT_KIND, createPartialV7Draft} from '../src/discovery/v7-contracts.js';
 import {type DiscoveryDraft, type Question} from '../src/discovery/discovery.js';
 import {ProductEngine} from '../src/product/engine.js';
 import {parseCommand} from '../src/product/commands.js';
@@ -14,7 +16,7 @@ import {researchCall} from '../src/discovery/research-protocol.js';
 import {reference, type Ref} from '../src/pipeline/contracts.js';
 import {readResearchConsumerIntent, readResearchConsumerTurn, type ResearchConsumerIntent} from '../src/discovery/response-recovery.js';
 import {RESEARCH_READ_INSTRUCTION, RESEARCH_READ_SCHEMAS} from '../src/discovery/research-read-contract.js';
-import {continuationPrompt} from '../src/discovery/continuation-packet.js';
+import {continuationPrompt, planClaimsContract} from '../src/discovery/continuation-packet.js';
 import {researchAction} from '../src/discovery/research-consumer-transition.js';
 import {stopRun} from '../src/om/run-control.js';
 import type {Store} from '../src/storage/store.js';
@@ -176,6 +178,7 @@ test('forms: the actual v7 planning request delivers full read contracts without
   assert.equal(f.refused.value.kind,'reading-planner');
   for(const token of ['UTF-16','read_source','additionalProperties','required','read_bundle','read_context']) assert.ok(request.includes(token),token);
   assert.ok(request.includes('Choose what to read'));
+  assert.deepEqual(f.wires()[0].subject.discoveryClaims.schema,V7_CLAIMS_SCHEMA);
   await assert.rejects(Promise.resolve().then(()=>f.engine.execute(f.commandRetry)),{code:'research_plan_retry_invalid'});
   assert.equal(f.wires().length,1);
 });
@@ -209,4 +212,69 @@ test('LIVE-FORMS-01: need_owner correction keeps its pending turn without purcha
   assert.equal(ordinary.value.status,'needs_owner',JSON.stringify(ordinary.value));
   assert.equal(f.wires().length,3);assert.equal(f.store.list('model-call').length,before+2);
   await cold.execute(f.commandRetry);assert.equal(f.wires().length,3);
+});
+
+
+test('claims delivery: all five closed basis forms match the existing structural validator',()=>{
+  const ref={id:'saved',revision:1,hash:'a'.repeat(64)};
+  const link={project:'p',container:ref,containerKind:V7_ATTEMPT_KIND,pointer:'/claims/0',claimId:'prior'};
+  const bases={fact:{source:{ref,range:{start:0,end:4},valueHash:hashJson('text')},limit:'Only the read fragment',asOf:'2026-10-29'},
+    inference:{from:[link],reasoning:'Follows from the saved premise'},hypothesis:{howToVerify:'Measure actual usage'},
+    unknown:{origin:'Plan research',unknownId:'u-1',question:'Which jurisdiction?',affects:['rules'],consumer:'concept',
+      blocksCurrentStage:true,moment:'feasibility',closeCriterion:'Owner names the actual operating jurisdiction'},
+    'owner-decision':{authority:ref}};
+  const validate=new Ajv({strict:true}).compile(V7_CLAIMS_SCHEMA as object);
+  const context={project:'p',planAnswer:ref,planQuestionId:'industry',projectRef:(r:Ref)=>r.id===ref.id&&r.hash===ref.hash&&r.revision===1};
+  const branch=(V7_CLAIMS_SCHEMA as any).properties.claims.items.oneOf;
+  assert.deepEqual(branch.map((b:any)=>b.properties.kind.const),Object.keys(bases));
+  assert.deepEqual((V7_CLAIMS_SCHEMA as any).properties.claims.items.properties.axis.enum,[...V7_AXES]);
+  for(const [kind,basis] of Object.entries(bases)) {
+    const claim:any={id:kind,kind,text:'Research result',axis:'industry',planQuestions:[{planAnswer:ref,planQuestionId:'industry'}],
+      scope:{variants:'common'},basis,contradicts:[],refutedBy:[],supersedes:null};
+    assert.equal(validate({claims:[claim]}),true,JSON.stringify(validate.errors));checkV7Claims([claim],context);
+    for(const field of Object.keys(basis)) {
+      const absent=structuredClone(claim);delete absent.basis[field];
+      assert.equal(validate({claims:[absent]}),false,kind+'.basis.'+field);
+      assert.throws(()=>checkV7Claims([absent],context),{code:'attempt_invalid'});
+    }
+    for(const field of ['planQuestions','scope','basis']) {
+      const absent=structuredClone(claim);delete absent[field];
+      assert.equal(validate({claims:[absent]}),false,kind+'.'+field);
+      assert.throws(()=>checkV7Claims([absent],context),{code:'attempt_invalid'});
+    }
+    const extra=structuredClone(claim);extra.basis.invented=true;
+    assert.equal(validate({claims:[extra]}),false);assert.throws(()=>checkV7Claims([extra],context),{code:'attempt_invalid'});
+  }
+  assert.equal(validate({claims:[]}),false);assert.throws(()=>checkV7Claims([],context),{code:'attempt_claims_empty'});
+});
+
+test('claims delivery: the actual continuation carries full forms and real source pins; ordinary submitted records unknown and fact',async t=>{
+  const f=await world(t);
+  const oldRefusal=f.store.history(f.refused.id);
+  assert.deepEqual(f.wires()[0].subject.discoveryClaims.schema,V7_CLAIMS_SCHEMA);
+  assert.deepEqual(f.wires()[0].subject.discoveryClaims.sources,[]);
+  await f.engine.execute(f.commandRetry);
+  const subject=f.refused.value.cursor.subject!;
+  const common={axis:'industry',planQuestions:[{planAnswer:subject.planAnswer,planQuestionId:'industry'}],scope:{variants:'common'}};
+  const claims=[{...common,id:'jurisdiction',kind:'unknown',text:'Operating jurisdiction remains unknown',
+    basis:{origin:'Owner mandate',unknownId:'jurisdiction',question:'Where will the product operate?',affects:['rules'],
+      consumer:'concept',blocksCurrentStage:true,moment:'feasibility',closeCriterion:'Owner provides the operating jurisdiction'}},
+    {...common,id:'industry-fact',kind:'fact',text:'The supplied mandate mentions construction materials',
+      basis:{source:{ref:reference(f.source),range:{start:0,end:f.source.value.content.length},valueHash:hashJson(f.source.value.content)},
+        limit:'Describes only the saved mandate, not independent market evidence',asOf:'2026-10-29'}}];
+  f.reply({action:'answer',question:'industry',value:{type:'submitted',contract:'discovery-claims/v7',value:{claims}},citations:[]});
+  await f.engine.execute({type:'research-draft',project:'p',draftId:f.draft.id,maxTurns:1});
+  assert.equal(f.wires().length,3);
+  const request=f.wires()[2],form=request.subject.discoveryClaims;
+  assert.ok(form,JSON.stringify(request.subject).slice(0,700));
+  assert.deepEqual(form.schema,V7_CLAIMS_SCHEMA);assert.deepEqual(form.subject,subject);
+  assert.deepEqual(form.sources,[claims[1]!.basis.source]);
+  for(const field of ['planQuestions','valueHash','closeCriterion','howToVerify','UTF-16'])
+    assert.ok(JSON.stringify(request).includes(field),field);
+  const attempts=f.store.list<any>(V7_ATTEMPT_KIND);assert.equal(attempts.length,1);
+  assert.deepEqual(attempts[0]!.value.end,{type:'submitted',contract:'discovery-claims/v7',value:{claims}});
+  assert.deepEqual(f.store.history(f.refused.id),oldRefusal);
+  const read=f.store.list<any>('research-turn').find(row=>row.value.action.action==='read_source')!;
+  const forged=structuredClone(read.value);forged.observation.value='Not the actual source';
+  assert.throws(()=>planClaimsContract(f.store,'p',subject,[forged]),{code:'research_claim_source_invalid'});
 });

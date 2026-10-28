@@ -10,12 +10,12 @@ import { proveAttemptPacket, checkProgressBaseline } from './v7-attempt-assessme
 import { V7_ATTEMPT_PACKET_CONTRACT, V7_PROGRESS_BASELINE_CONTRACT, type V7AttemptPacket, type V7ProgressBaseline } from './research-model.js';
 import { planSubjectOf, sameSubject, callAddressesSubject, type V7PlanSubject } from './v7-managed-attempt.js';
 import { provePlanQuestions } from './v7-plan-questions.js';
-import { DISCOVERY_CLAIMS_CONTRACT, V7_ATTEMPT_END_CODES, isDiscoveryV7Draft } from './v7-contracts.js';
+import { DISCOVERY_CLAIMS_CONTRACT, V7_ATTEMPT_END_CODES, V7_CLAIMS_SCHEMA, V7_CLAIMS_INSTRUCTION, isDiscoveryV7Draft } from './v7-contracts.js';
 import { contextTable } from './context-tables.js';
 import { readArchiveBody } from './request-parts.js';
 import { decodeVariantSubject, type VariantSubject } from './discovery-variants.js';
 import { variantStateId } from './variant-decision.js';
-import { Evidence, type Source } from "../evidence/evidence.js";
+import { Evidence, projectSourceReading, type Source, type SourceReading } from "../evidence/evidence.js";
 import type { Store, Revision, Write, ReadGuard, TransactionGuard } from '../storage/store.js';
 import type { DiscoveryDraft, Question } from './discovery.js';
 import type { ModelCall } from '../runtime/model-usage.js';
@@ -592,6 +592,31 @@ export function planQuestionContract(store: Store, draft: Revision<DiscoveryDraf
     {type:'object',additionalProperties:false,required:['type','of'],properties:{type:{const:'duplicate'},of:refSchema}}
   ] };
   return { ...structuredClone(selected.question as Record<string, any>), id: subject.planQuestionId, schema };
+}
+
+/** Additive delivery keeps the historical question schema unchanged. Pins are
+ * re-derived from exact served source bytes, never from a model-supplied hash. */
+export function planClaimsContract(store: Store, project: string, subject: V7PlanSubject, history: readonly any[]) {
+  const sources = new Map<string, { ref: Ref; range: { start: number; end: number }; valueHash: string }>();
+  for (const turn of history) {
+    if (turn?.status !== 'completed' || turn.error || turn.action?.action !== 'read_source') continue;
+    const observed = turn.observation as SourceReading;
+    const ref = turn.action.source;
+    const saved = isRef(ref) ? store.get<Source>(ref.id, ref.revision) : null;
+    requireCondition(saved?.kind === 'source' && saved.hash === ref.hash && saved.value.projectId === project
+      && observed && observed.projectId === project, 'research_claim_source_invalid',
+    'Claim source pins require the exact saved source of this project');
+    const reading = projectSourceReading(project, ref, saved.value,
+      { start: turn.action.start, end: turn.action.end }, observed.contract);
+    requireCondition(canonical(reading) === canonical(observed), 'research_claim_source_invalid',
+      'Claim source pins require the actual served reading');
+    if (reading.served && typeof reading.value === 'string' && reading.value.length > 0) {
+      const pin = { ref, range: reading.served, valueHash: hashJson(reading.value) };
+      sources.set(canonical(pin), pin);
+    }
+  }
+  return { contract: DISCOVERY_CLAIMS_CONTRACT, schema: V7_CLAIMS_SCHEMA,
+    instruction: V7_CLAIMS_INSTRUCTION, subject, sources: [...sources.values()] };
 }
 
 /** Project-wide foundation, not the current question's small response contract.
