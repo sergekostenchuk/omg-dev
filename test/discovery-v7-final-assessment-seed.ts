@@ -19,6 +19,7 @@ import { readDiscoveryFinalAssessmentExecutionAt, readDiscoveryFinalAssessmentPa
   runDiscoveryFinalAssessmentExecution, type DiscoveryFinalAssessmentPaidResult } from '../src/discovery/discovery-final-assessment-execution.js';
 import type { DiscoveryFinalPaidResult } from '../src/discovery/discovery-final-execution.js';
 import { finalPaid, type FinalOutcome, type FinalSeedForm, type FinalSeedRoute } from './discovery-v7-final-paid-seed.js';
+import { builderContext, sharedWorld } from './discovery-v7-paid-world-cache.js';
 
 export interface FinalAssessmentSeedOptions {
   verdict?: 'supported' | 'return';
@@ -40,9 +41,11 @@ type SeedData = {
 type Snapshot = { root: string; data: SeedData };
 const seeds = new Map<string, Promise<Snapshot>>();
 
+/** `entry` is a catalog entry of this run (test/discovery-v7-paid-world-cache.ts): the snapshot is made in place at `entry/world`
+ * and the catalog, not this process, owns it until the run ends. Without one it is this process's own temporary directory. */
 async function build(options: Required<Omit<FinalAssessmentSeedOptions, 'conditions' | 'form'>>
-  & { conditions?: unknown; form?: FinalSeedForm }): Promise<Snapshot> {
-  const f = await finalPaid(lifetime, options.outcome, options.route, options.conditions, options.form);
+  & { conditions?: unknown; form?: FinalSeedForm }, entry?: string): Promise<Snapshot> {
+  const f = await finalPaid(builderContext(entry, lifetime), options.outcome, options.route, options.conditions, options.form);
   const packet = await prepareDiscoveryFinalAssessmentSubject(f.store, 'p', f.d6, f.result.value.projection.result.bundle);
   // A real independent reviewer measurement is part of the first caller's
   // work. No consumer or copied world has to calibrate or buy this again.
@@ -66,7 +69,7 @@ async function build(options: Required<Omit<FinalAssessmentSeedOptions, 'conditi
   const paid = await runDiscoveryFinalAssessmentExecution(f.store, 'p', f.paidResult, reference(prepared), { profile: f.profile });
   assert.ok(paid.output && paid.result);
   assert.equal(paid.result.verdict, options.verdict);
-  const root = mkdtempSync(join(tmpdir(), 'omg-final-assessment-snapshot-'));
+  const root = entry === undefined ? mkdtempSync(join(tmpdir(), 'omg-final-assessment-snapshot-')) : join(entry, 'world');
   const database = new Set([f.path, `${f.path}-wal`, `${f.path}-shm`]);
   cpSync(f.root, root, { recursive: true, filter: path => !database.has(path) });
   const db = new DatabaseSync(f.path);
@@ -76,7 +79,7 @@ async function build(options: Required<Omit<FinalAssessmentSeedOptions, 'conditi
   // historical Refs. Each plant will configure its own current environment.
   const script = readFileSync(join(root, 'adapter.mjs'), 'utf8');
   writeFileSync(join(root, 'adapter.mjs'), script.replaceAll(f.root, root));
-  cleanups.push(() => rmSync(root, { recursive: true, force: true }));
+  if (entry === undefined) cleanups.push(() => rmSync(root, { recursive: true, force: true }));
   return { root, data: structuredClone({ final: { d6: f.d6, packet: f.packet, prepared: f.prepared,
     execution: f.execution, paidResult: f.paidResult }, prepared: reference(prepared),
     execution: reference(paid.session), paidResult: reference(paid.output) }) };
@@ -133,6 +136,10 @@ export async function finalAssessmentPaid(t: TestContext, options: FinalAssessme
   const key = `${selected.route}:${selected.outcome}:${selected.verdict}${conditions === undefined ? '' : `:${canonical(conditions as never)}`}`
     + (form === undefined ? '' : `:${form}`);
   let pending = seeds.get(key);
-  if (!pending) { pending = build(selected); seeds.set(key, pending); pending.catch(() => seeds.delete(key)); }
+  if (!pending) {
+    // The run's catalog tells worlds apart by exactly this key, which carries every parameter and the one snapshot of the conditions.
+    pending = sharedWorld('assessment', key, entry => build(selected, entry));
+    seeds.set(key, pending); pending.catch(() => seeds.delete(key));
+  }
   return plant(t, await pending);
 }

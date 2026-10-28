@@ -34,6 +34,7 @@ export type FinalSeedForm = typeof V8_FINAL_CONTRACT | typeof V9_FINAL_CONTRACT;
 import { prepareDiscoveryFinalSession } from '../src/discovery/discovery-final-session.js';
 import { readDiscoveryFinalExecutionAt, runDiscoveryFinalExecution } from '../src/discovery/discovery-final-execution.js';
 import { researchCall } from '../src/discovery/research-protocol.js';
+import { builderContext, rootsOf, sharedWorld, withRootsOf } from './discovery-v7-paid-world-cache.js';
 
 export type FinalOutcome = 'go' | 'conditional' | 'no_go' | 'insufficient_evidence';
 export type FinalSeedRoute = 'owner' | 'model' | 'partial';
@@ -43,14 +44,16 @@ process.once('exit', () => { for (const cleanup of cleanups.reverse()) cleanup()
 const lifetime = { after: (cleanup: () => void) => cleanups.push(cleanup), diagnostic: () => {} } as unknown as TestContext;
 type Snapshot<T> = { root: string; data: T };
 
-function snapshot<T>(root: string, path: string, data: T): Snapshot<T> {
-  const parent = mkdtempSync(join(tmpdir(), 'omg-final-paid-snapshot-')), target = join(parent, 'world');
+/** `entry` is a catalog entry of this run (test/discovery-v7-paid-world-cache.ts): the snapshot is made in place there and the
+ * catalog, not this process, owns it until the run ends. Without one it is this process's own temporary directory. */
+function snapshot<T>(root: string, path: string, data: T, entry?: string): Snapshot<T> {
+  const parent = entry ?? mkdtempSync(join(tmpdir(), 'omg-final-paid-snapshot-')), target = join(parent, 'world');
   const database = new Set([path, `${path}-wal`, `${path}-shm`]);
   cpSync(root, target, { recursive: true, filter: source => !database.has(source) });
   const db = new DatabaseSync(path);
   try { db.prepare('VACUUM INTO ?').run(join(target, 'state.sqlite')); } finally { db.close(); }
   chmodSync(join(target, 'state.sqlite'), 0o400);
-  cleanups.push(() => rmSync(parent, { recursive: true, force: true }));
+  if (entry === undefined) cleanups.push(() => rmSync(parent, { recursive: true, force: true }));
   return { root: target, data: structuredClone(data) };
 }
 
@@ -63,11 +66,12 @@ function profileFor(store: Store, engine: ProductEngine, environment: Revision<E
     physicalLimits: { maxRequestChars: 12_000_000, maxReplyChars: 100000, basis: 'Full local dossier delivery' } }, previous?.revision ?? 0);
 }
 
-async function buildDossier(route: FinalSeedRoute) {
+async function buildDossier(route: FinalSeedRoute, entry?: string) {
   // The dependency supplies the genuine paid broad sweep. Its original variant
   // generation predates a brief, so a new real generation fixes the accepted
   // assignment in its own historical draft; old Refs are never rewritten.
-  const f = await paid(lifetime, undefined, true);
+  const t = builderContext(entry, lifetime), f = await withRootsOf(t, () => paid(t, undefined, true));
+  assert.ok(f.root.startsWith(rootsOf(t)), 'the seed root is made in the roots of its builder');
   const draft = f.store.get<DiscoveryDraft>(f.v.draft.id)!;
   const brief = draft.value.questions.map(id => f.store.get<Question>(id)!).find(q => q.value.spec.field === 'brief')!;
   const source = f.discovery.evidence.document('p', 'final-seed-assignment', `PREFIX${FINAL_SEED_BRIEF}SUFFIX`, 'text/plain', 0);
@@ -207,18 +211,18 @@ const paidSeeds = new Map<string, Promise<Snapshot<PaidData>>>();
 async function dossierBaseline(route: FinalSeedRoute) {
   let pending = dossierSeeds.get(route);
   if (!pending) {
-    pending = (async () => {
-      const f = await buildDossier(route);
+    pending = sharedWorld('dossier', route, async entry => {
+      const f = await buildDossier(route, entry);
       return snapshot(f.root, f.path, { d6: reference(f.d6), packet: f.packet,
-        calibration: { draft: reference(f.calibration.draft), question: reference(f.calibration.question) } });
-    })();
+        calibration: { draft: reference(f.calibration.draft), question: reference(f.calibration.question) } }, entry);
+    });
     dossierSeeds.set(route, pending); pending.catch(() => dossierSeeds.delete(route));
   }
   return pending;
 }
 
 function plant<T extends DossierData>(t: TestContext, seed: Snapshot<T>) {
-  const root = mkdtempSync(join(tmpdir(), 'omg-final-paid-copy-')), path = join(root, 'state.sqlite');
+  const root = mkdtempSync(join(rootsOf(t), 'omg-final-paid-copy-')), path = join(root, 'state.sqlite');
   cpSync(seed.root, root, { recursive: true }); chmodSync(path, 0o600);
   const stores: Store[] = [], open = () => { const store = new Store(path); stores.push(store); return store; };
   let store = open();
@@ -238,8 +242,8 @@ function plant<T extends DossierData>(t: TestContext, seed: Snapshot<T>) {
     wires: (): unknown[] => readFileSync(join(root, 'wire.ndjson'), 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line)) };
 }
 
-async function buildPaid(outcome: FinalOutcome, route: FinalSeedRoute, conditions?: unknown, form?: FinalSeedForm): Promise<Snapshot<PaidData>> {
-  const f = plant(lifetime, await dossierBaseline(route)), { packet, d6, calibration } = f.data;
+async function buildPaid(outcome: FinalOutcome, route: FinalSeedRoute, conditions?: unknown, form?: FinalSeedForm, entry?: string): Promise<Snapshot<PaidData>> {
+  const t = builderContext(entry, lifetime), f = plant(t, await dossierBaseline(route)), { packet, d6, calibration } = f.data;
   // A different command is deliberately uncalibrated; pay a genuine same-role
   // measurement on this copy rather than borrowing the seed's old command.
   f.reply({ action: 'answer', question: 'reader', value: { type: 'impossible', code: 'source_unavailable', evidence: [], text: 'Calibration' }, citations: [] });
@@ -254,7 +258,7 @@ async function buildPaid(outcome: FinalOutcome, route: FinalSeedRoute, condition
   assert.ok(paid.output && paid.result);
   assert.equal(paid.result.result.bundle.verdict.outcome, outcome);
   return snapshot(f.root, f.path, { d6, packet, calibration, prepared: reference(prepared),
-    execution: reference(paid.session), paidResult: reference(paid.output) });
+    execution: reference(paid.session), paidResult: reference(paid.output) }, entry);
 }
 
 /** Lazy, genuinely paid D6→D7 baseline. No test registration or named-test
@@ -271,7 +275,11 @@ export async function finalPaid(t: TestContext, outcome: FinalOutcome = 'go', ro
   const given = conditions === undefined ? undefined : JSON.parse(canonical(conditions as never)) as unknown;
   const key = (given === undefined ? `${route}:${outcome}` : `${route}:${outcome}:${canonical(given as never)}`) + (form ? `:${form}` : '');
   let pending = paidSeeds.get(key);
-  if (!pending) { pending = buildPaid(outcome, route, given, form); paidSeeds.set(key, pending); pending.catch(() => paidSeeds.delete(key)); }
+  if (!pending) {
+    // The run's catalog tells worlds apart by exactly this key, which carries every parameter and the one snapshot of the conditions.
+    pending = sharedWorld('paid', key, entry => buildPaid(outcome, route, given, form, entry));
+    paidSeeds.set(key, pending); pending.catch(() => paidSeeds.delete(key));
+  }
   const f = plant(t, await pending), { packet, prepared, execution, paidResult, d6 } = f.data;
   const exact = <T>(ref: Ref): Revision<T> => {
     const row = f.store.get<T>(ref.id, ref.revision);
