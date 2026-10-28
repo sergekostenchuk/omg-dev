@@ -36,6 +36,7 @@ function reply(packet: DossierAssessmentPacket, verdict: 'supported' | 'return')
     return: verdict === 'return' ? { targets: packet.subject.root.kind === 'partial' ? [{ partialReason: 0 }] : [{ axis: 'market' }],
       reason: 'Collect the missing exact basis', bases } : null };
 }
+// One physical call tests the D6 boundary; further allowance now admits the separate D7 step.
 for (const route of ['owner', 'model'] as const) test(`${route} selected D6 reaches a paid supported assessment through Researcher.run`, async t => {
   const f = await completed(t, route);
   const selected = produceSelectedDossier(f.store, 'p', f.input);
@@ -43,7 +44,7 @@ for (const route of ['owner', 'model'] as const) test(`${route} selected D6 reac
   wideDelivery(f);
   f.reply(reply(packet, 'supported'));
   const run = await new Researcher(f.store, f.discovery, f.engine.environments)
-    .run('p', f.v.draft.id, 8, undefined, { producerPolicy: { discovery: 7 } });
+    .run('p', f.v.draft.id, 1, undefined, { producerPolicy: { discovery: 7 } });
   assert.equal(run.value.pauseCode, 'research_dossier_ready', run.value.error!);
   assert.equal(run.value.status, 'paused');
   const proven = await readRunnerDossierAssessmentAt(f.store, 'p', reference(run));
@@ -77,7 +78,7 @@ test('nonempty no_variants partial remains partial and returns addressed paid ta
   wideDelivery(f);
   f.reply(reply(packet, 'return'));
   const run = await new Researcher(f.store, f.discovery, f.engine.environments)
-    .run('p', f.v.draft.id, 8, undefined, { producerPolicy: { discovery: 7 } });
+    .run('p', f.v.draft.id, 1, undefined, { producerPolicy: { discovery: 7 } });
   assert.equal(run.value.pauseCode, 'research_dossier_return', run.value.error!);
   const proven = await readRunnerDossierAssessmentAt(f.store, 'p', reference(run));
   assert.equal(proven.assessment.value.result.completeness, 'partial');

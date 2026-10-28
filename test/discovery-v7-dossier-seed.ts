@@ -74,10 +74,18 @@ const generation = () => ({ action: 'variants', variants: [1, 2].map(i => ({ key
 
 /** The real paid line of 4B.1/4O.2: two assessed plan questions, the variant snapshot, real project modes and the real
  * paid generation of a two-member set with its first state. */
-export async function paid(t: TestContext, answer: unknown = generation(), withMaterial = false) {
+export async function paid(t: TestContext, answer: unknown = generation(), withMaterial = false, brief?: string) {
   if (typeof t.diagnostic === 'function') costs(t);   // the seed builds its own world under a stand-in context that prints nothing
   const f = await researchSetup(t, { adapter: 'reply', prefix: 'omg-dossier-seed-' }), project = 'p', runs = new Map<string, string>();
   await f.engine.execute({ type: 'create-project', project, title: 'Selected variant scope' });
+  if (brief !== undefined) {
+    assert.equal(typeof brief, 'string');
+    const draft = f.store.get<DiscoveryDraft>(f.v.draft.id)!;
+    const question = draft.value.questions.map(id => f.store.get<Question>(id)!).find(row => row.value.spec.field === 'brief')!;
+    assert.ok(question, 'the original brief needs its real question');
+    const source = f.discovery.evidence.document(project, 'dossier-seed-original-brief', brief, 'text/plain', 0);
+    f.discovery.fact(question.id, question.revision, reference(source), { kind: 'text-range', start: 0, end: brief.length });
+  }
   const prepare = (selected = f.subject()) => {
     const context = { history: [], readings: [] };
     const draft = f.store.get<DiscoveryDraft>(f.v.draft.id)!, question = f.store.get<Question>(f.v.plan.id)!;
@@ -245,8 +253,8 @@ export async function fixedPoint(f: Paid, store: Store, block: () => Promise<voi
   assert.equal(all(store), history); assert.deepEqual(money(store), calls); assert.deepEqual(f.wires(), wires);
   spent.dumps += 2; spent.dumpMs += Math.round(ready - started + performance.now() - acted);
 }
-async function setup(t: TestContext, model = false) {
-  const f = await paid(t);
+async function setup(t: TestContext, model = false, brief?: string) {
+  const f = await paid(t, undefined, false, brief);
   const decision = model ? await modelChoose(f) : selected(f).act.decision;
   const scope = publishVariantScope(f.store, 'p', reference(decision)).scope;
   return { ...f, scopeRecord: scope, input: { scope: reference(scope), plan: f.v.planAnswer } };
@@ -322,16 +330,16 @@ interface SeedData {
 }
 interface Seed { database: string; data: SeedData }
 
-const seeds = new Map<Route, Promise<Seed>>(), cleanups: (() => void)[] = [];
+const seeds = new Map<string, Promise<Seed>>(), cleanups: (() => void)[] = [];
 process.once('exit', () => { for (const cleanup of cleanups.reverse()) { try { cleanup(); } catch { /* the process is ending */ } } });
 
 const entryData = (entry: Entry): EntryData => ({ attempt: reference(entry.result.attempt), binding: reference(entry.result.binding),
   claims: structuredClone(entry.claims), question: entry.question });
 
-async function buildSeed(route: Route): Promise<Seed> {
+async function buildSeed(route: Route, brief?: string): Promise<Seed> {
   // The seed owns its root until the process ends: the callbacks the fixture registers for a test run at exit instead.
   const owner = { after: (cleanup: () => void) => { cleanups.push(cleanup); } } as unknown as TestContext;
-  const f = await setup(owner, route === 'model'), entries = await complete(f);
+  const f = await setup(owner, route === 'model', brief), entries = await complete(f);
   const data: SeedData = { adapter: readFileSync(join(f.root, 'adapter.mjs'), 'utf8'), settings: f.settings, wire: join(f.root, 'wire.ndjson'), prompt: f.prompt,
     v: { draft: reference(f.v.draft), plan: reference(f.v.plan), planAnswer: f.v.planAnswer, frameRef: f.v.frameRef },
     calibration: { draft: reference(f.calibration.draft), question: reference(f.calibration.question) },
@@ -346,12 +354,14 @@ async function buildSeed(route: Route): Promise<Seed> {
 }
 
 /** A completed selected world of the route: its own database copy, adapter, reply and wire files, Environment revision and Stores. */
-export async function completed(t: TestContext, route: Route): Promise<Completed> {
+const seedBuilder = hashJson(readFileSync(new URL(import.meta.url), 'utf8'));
+export async function completed(t: TestContext, route: Route, brief?: string): Promise<Completed> {
   costs(t);
   const started = Date.now();
-  let seed = seeds.get(route);
+  const key = canonical({ builder: seedBuilder, route, brief: brief === undefined ? { present: false } : { present: true, text: brief } });
+  let seed = seeds.get(key);
   const built = seed === undefined;
-  if (!seed) { seed = buildSeed(route); seeds.set(route, seed); seed.catch(() => seeds.delete(route)); }
+  if (!seed) { seed = buildSeed(route, brief); seeds.set(key, seed); seed.catch(() => seeds.delete(key)); }
   const ready = await seed, planted = Date.now(), world = await plant(t, ready);
   t.diagnostic(`dossier world ${route}: seed ${built ? `built in ${planted - started} ms` : 'reused'}, copy planted in ${Date.now() - planted} ms`);
   return world;

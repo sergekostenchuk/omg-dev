@@ -58,6 +58,8 @@ export interface ResearchRun {
   owner: { pid: number; started: string }; requestChars: number;
   /** Exact paid D6 continuation; supported is readiness for D7, not acceptance. */
   dossierAssessment?: ResearchRunDossierAssessment;
+  /** Exact late D7 state; its paid reader derives outcome and acceptance separately. */
+  finalization?: Ref | null;
 }
 export interface ResearchRunDossierAssessment {
   contract: 'research-run-dossier-assessment/v1'; origin: Ref; root: Ref; manifest: Ref; assessment: Ref;

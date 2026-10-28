@@ -359,6 +359,8 @@ const RECORD_REFERENCE_SEMANTICS: readonly RecordReferenceSemantics[] = [
     ...finalSubjectRefs(["context", "finalContinuation", "subject"]),
     ["context", "resultCapacity", "mandatory", "archive", "record"],
     ["context", "contextWorkspace", INDEX, "record"]] },
+  { kind: "discovery-finalization", contract: "discovery-finalization/v1", data: [], refs: [
+    ["origin"], ["return"], ["prepared"], ["final"], ["assessmentPrepared"], ["assessment"], ["accepted"], ["declined"]] },
   { kind: "discovery-final-paid-result", contract: "discovery-final-paid-result/v1", data: [], refs: [
     ["prepared"], ...finalSubjectRefs(["subject"]), ["session"], ["application"], ["call"], ["request"], ["response"]] },
   // Final assessment binds a paid D7 source and the whole candidate, but

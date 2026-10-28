@@ -1,3 +1,4 @@
+import { runDiscoveryFinalization, readRunnerFinalizationAt, nextRunnerFinalReturn } from './discovery-finalization-runner.js';
 import { variantResearchReturn, assessDeepResearchReturns, readResearchReturnAt } from './discovery-research-return.js';
 import type { ModelCall } from '../runtime/model-usage.js';
 import { variantSnapshotReadiness, produceVariantSnapshot, readVariantSnapshot } from "./variant-snapshot.js";
@@ -1953,8 +1954,27 @@ export class Researcher {
       "research_consumer_intent_invalid", "The research run belongs to another draft");
     requireCondition(run?.value.status !== "running" || processStart(run.value.owner.pid) !== run.value.owner.started,
       "research_busy", "This draft already has an active researcher");
-    // B2 may reopen only an addressed, independently assessed return. An old
-    // dossier remains historical; without new contradictory evidence its fixed point is unchanged.
+    // The existing D6 physical remainder is shared with every late child page and assessment.
+    const initialCalls = new Set(this.store.list<ModelCall>('model-call')
+      .filter(call => call.value.projectId === project && call.value.draftId === draftId).map(call => call.id));
+    const remaining = () => Math.max(0, limit - Math.max(used, this.store.list<ModelCall>('model-call')
+      .filter(call => call.value.projectId === project && call.value.draftId === draftId && !initialCalls.has(call.id)).length));
+    const finishFinalization = async (restore = false): Promise<Revision<ResearchRun>> => {
+      requireCondition(run, 'discovery_finalization_invalid', 'The late continuation needs its original run');
+      const dossier = await readRunnerDossierAssessmentAt(this.store, project, reference(run));
+      if (dossier.result.verdict !== 'supported') return run;
+      const previous = run.value.finalization ? await readRunnerFinalizationAt(this.store, project, reference(run)) : null;
+      const returned = previous ? await nextRunnerFinalReturn(this.store, project, previous) : null;
+      const allowance = remaining();
+      const restoreOnly = restore || options.restoreOnly === true || producerContractEra('discovery', options.producerPolicy) !== 7;
+      const work = () => runDiscoveryFinalization(this.store, project, reference(run!),
+        { allowance, restoreOnly, signal, researchReturn: returned });
+      const final = await work();
+      if (final && canonical(run.value.finalization ?? null) !== canonical(reference(final.record)))
+        run = this.save(run, { finalization: reference(final.record) }, [reference(final.record)]);
+      return run;
+    };
+    // B2's D4/D5 handling remains independent of late finalization and explicit D7 returns.
     if (run && !run.value.researchReturn && Object.hasOwn(run.value, 'dossierAssessment')) {
       await assessDeepResearchReturns(this.store, project,
         !options.restoreOnly && producerContractEra('discovery', options.producerPolicy) === 7,
@@ -1967,21 +1987,14 @@ export class Researcher {
         'discovery_research_return_invalid', 'The continuing run needs its proved addressed return');
     }
     if (run && !run.value.researchReturn && (Object.hasOwn(run.value, 'dossierAssessment')
-      || ['research_dossier_ready', 'research_dossier_return'].includes(run.value.pauseCode ?? ''))) {
-      await readRunnerDossierAssessmentAt(this.store, project, reference(run));
-      return run;
-    }
-    // Managed turns may contain both analyst and reviewer calls. D6 must share
-    // the invocation's physical allowance rather than receiving another turn budget.
-    const initialCalls = new Set(this.store.list<ModelCall>('model-call')
-      .filter(call => call.value.projectId === project && call.value.draftId === draftId).map(call => call.id));
+      || ['research_dossier_ready', 'research_dossier_return'].includes(run.value.pauseCode ?? '')))
+      return finishFinalization();
     let dossierOperation = false;
     const finishDossier = async (restoreOnly = false): Promise<Revision<ResearchRun>> => {
       requireCondition(run, 'research_dossier_result_invalid', 'The dossier needs its original run');
       dossierOperation = true;
       const settled = await runRunnerDossierAssessment(this.store, project, reference(run), {
-        allowance: Math.max(0, limit - Math.max(used, this.store.list<ModelCall>('model-call')
-          .filter(call => call.value.projectId === project && call.value.draftId === draftId && !initialCalls.has(call.id)).length)),
+        allowance: remaining(),
         restoreOnly: restoreOnly || options.restoreOnly === true || producerContractEra('discovery', options.producerPolicy) !== 7,
         ...(signal ? { signal } : {}),
       });
@@ -1990,9 +2003,9 @@ export class Researcher {
       run = this.save(run, { status: 'paused', owner, pauseCode: code,
         error: canonical({ code, dossier: settled.result.manifest, assessment: settled.result.assessment,
           return: settled.result.return, next: settled.result.verdict === 'supported' ? 'discovery-final' : 'addressed-research' }),
-        dossierAssessment: settled.result, ...(run.value.researchReturn ? { researchReturn: null } : {}) },
+        dossierAssessment: settled.result, ...(run.value.researchReturn ? { researchReturn: null, finalization: null } : {}) },
       [reference(settled.origin), settled.result.root, settled.result.manifest, settled.result.assessment]);
-      return run;
+      return finishFinalization(restoreOnly);
     };
     // The pause carries exact durable addresses. Its historical replay precedes today's
     // selection and cannot activate a new paid step after a mode or plan revision.

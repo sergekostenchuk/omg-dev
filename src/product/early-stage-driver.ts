@@ -131,6 +131,26 @@ export class EarlyStageDriver {
         ? this.#savedDraft(project, current.stage, current.artifact, request.draftId,
           inspected && 'binding' in inspected ? inspected.refs : []).draft : null;
       const run = draft ? readResearchRun(this.engine.store, project, draft.id) : null;
+      if (draft && run?.value.finalization && !run.value.researchReturn) {
+        const { readRunnerFinalizationAt, nextRunnerFinalReturn } = await import('../discovery/discovery-finalization-runner.js');
+        const { provenAcceptanceMode } = await import('../discovery/discovery-acceptance.js');
+        const restored = await this.engine.researcher.run(project, draft.id, 1, undefined, { restoreOnly: true });
+        const proof = await readRunnerFinalizationAt(this.engine.store, project, reference(restored));
+        const returned = await nextRunnerFinalReturn(this.engine.store, project, proof);
+        const newReturn = canonical(returned) !== canonical(proof.record.value.return)
+          && maxTurns > 0 && maxCalls > 0
+          && executionAdmission(this.engine.store, draft, 'new-research', this.#producerPolicy).admitted;
+        if (!newReturn && (['accepted','declined','returned'].includes(proof.status)
+          || proof.status === 'needs_owner' && provenAcceptanceMode(this.engine.store, project).mode === 'questions')) {
+          const reason = { code: `discovery_finalization_${proof.status}`, target: proof.view.record.id,
+            message: proof.correction?.reason ?? `Discovery continuation: ${proof.view.next ?? proof.outcome}` };
+          const early = await this.#stageOutcome(project, 'discovery', reference(draft), {
+            status: proof.status === 'needs_owner' ? 'needs_owner' : 'paused', stage: current?.artifact ? reference(current.artifact) : null,
+            research: reference(restored), feedback: null, findings: [reason], reason, turnsUsed: 0, finalization: proof.view });
+          return this.#result(project, early.end, early.stage, early.draft, early.candidates, early.stageResult,
+            early.reason, 0, maxTurns, maxCalls, 0, null);
+        }
+      }
       if (draft?.value.projectId === project && draft.value.stage === 'discovery' && isCurrentEra('discovery', draft.value.contractVersion, { discovery: 7 })
         && (run?.value.pauseCode === 'research_dossier_assessment_unavailable' || run?.value.pauseCode === 'research_partial_dossier_pending'
           || run?.value.pauseCode === SELECTED_DOSSIER_PAUSE || run?.value.pauseCode === SELECTED_DOSSIER_PENDING)) {
@@ -148,7 +168,9 @@ export class EarlyStageDriver {
           const reenter = restored.value.pauseCode === 'research_dossier_assessment_unavailable'
             && this.budgetReentry && maxTurns > 0 && maxCalls > 0
             && await this.budgetReentry.eligible(this.engine.store, project, draft, restored);
-          if (!reenter) return this.#result(project, early.end, early.stage, early.draft, early.candidates, early.stageResult,
+          const assess = maxTurns > 0 && maxCalls > 0
+            && executionAdmission(this.engine.store, draft, 'new-research', this.#producerPolicy).admitted;
+          if (!reenter && !assess) return this.#result(project, early.end, early.stage, early.draft, early.candidates, early.stageResult,
             early.reason, 0, maxTurns, maxCalls, 0, null);
         }
       }
@@ -688,6 +710,23 @@ export class EarlyStageDriver {
   }
 
   async #stageOutcome(project: string, stage: UpstreamStage, draft: Ref, result: StageResearchResult): Promise<EarlyResult> {
+    if (stage === 'discovery' && result.finalization && result.research) {
+      const { readRunnerFinalizationAt } = await import('../discovery/discovery-finalization-runner.js');
+      const proof = await readRunnerFinalizationAt(this.engine.store, project, result.research);
+      requireCondition(canonical(proof.view) === canonical(result.finalization), 'discovery_finalization_invalid',
+        'The driver result differs from its proven finalization');
+      const end: EarlyStageEnd = result.status === 'stopped' ? 'stopped' : proof.status === 'needs_owner' ? 'needs_owner'
+        : proof.status !== 'accepted' ? 'stage_paused' : proof.outcome === 'no_go' ? 'no_go'
+        : proof.outcome === 'insufficient_evidence' ? 'insufficient_evidence'
+        : proof.accepted!.conditions.open.length ? 'conditional' : 'stage_paused';
+      const { readDiscoveryFinalSummaryAt } = await import('../discovery/discovery-final-summary.js');
+      const value = proof.record.value;
+      const summaryRequest = value.accepted ? { manifest: value.accepted } : value.assessment ? { assessment: value.assessment }
+        : value.final ? { paid: value.final } : null;
+      const finalSummary = summaryRequest ? await readDiscoveryFinalSummaryAt(this.engine.store, project, summaryRequest) : null;
+      return { ...this.#base(project, end, stage, draft, [], { ...result, finalSummary }, result.reason ?? null),
+        turnsUsed: result.turnsUsed ?? 0, handoff: false };
+    }
     const state = result.discovery?.state;
     const end: EarlyStageEnd = result.status === "stopped" ? "stopped"
       : state === "no_go" ? "no_go"

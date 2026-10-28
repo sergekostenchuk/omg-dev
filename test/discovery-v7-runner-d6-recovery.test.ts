@@ -38,7 +38,7 @@ async function world(t: test.TestContext) {
     maxCalls: 100, maxReportedTokens: 100000,
     physicalLimits: { maxRequestChars: 3000000, maxReplyChars: 100000, basis: 'Full local dossier delivery' } }, 0);
   f.reply(terminal);
-  const run = (store = f.store, restoreOnly = false, limit = 8) => {
+  const run = (store = f.store, restoreOnly = false, limit = 1) => {
     const engine = new ProductEngine(store);
     return new Researcher(store, engine.discovery, engine.environments).run('p', f.v.draft.id, limit, undefined,
       { producerPolicy: { discovery: 7 }, restoreOnly });

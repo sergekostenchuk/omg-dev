@@ -1,3 +1,4 @@
+import { readRunnerFinalizationAt, type DiscoveryFinalizationView } from '../discovery/discovery-finalization-runner.js';
 import type { ProductEngine, StageContent } from "./engine.js";
 import {
   contractEraOf, discoveryOutcome, executionAdmission, isPostPreparationForm,
@@ -13,6 +14,9 @@ import { runAssessmentRefusalDoor, type AssessmentRefusalDoor } from "../discove
 import type { Revision } from "../storage/store.js";
 
 export interface StageResearchResult {
+  finalization?: DiscoveryFinalizationView;
+  /** Read-only owner summary added by the Driver from the exact saved late result. */
+  finalSummary?: import('../discovery/discovery-final-summary.js').DiscoveryFinalSummary | null;
   status: "accepted" | "paused" | "needs_owner" | "blocked" | "stopped";
   discovery?: Omit<DiscoveryOutcome, "guards" | "findings">;
   stage: Ref | null; research: Ref | null; feedback: Ref | null; findings: Finding[];
@@ -42,6 +46,16 @@ export class StageResearch {
     requireCondition(draft?.kind === "discovery-draft" && draft.value.projectId === project
       && UPSTREAM_STAGES.includes(draft.value.stage as UpstreamStage), "discovery_foreign", "Stage research needs this project's upstream draft");
     const stage = draft.value.stage as UpstreamStage;
+    const lateResult = async (run: Revision<ResearchRun>, stopped = false): Promise<StageResearchResult | null> => {
+      if (stage !== 'discovery' || run.value.researchReturn || !run.value.finalization) return null;
+      const proof = await readRunnerFinalizationAt(store, project, reference(run));
+      const target = proof.view.next === 'owner-final-acceptance' ? proof.view.assessment!.id : proof.view.record.id;
+      const reason = { code: `discovery_finalization_${proof.status}`, target,
+        message: proof.correction?.reason ?? (proof.view.next ? `Discovery continuation: ${proof.view.next}` : `Discovery outcome: ${proof.outcome}`) };
+      return { status: stopped ? 'stopped' : proof.status === 'needs_owner' ? 'needs_owner' : 'paused',
+        stage: artifact ? reference(artifact) : null, research: reference(run), feedback: null,
+        findings: [reason], reason, turnsUsed: 0, finalization: proof.view };
+    };
     let artifact = readStageArtifact<StageArtifact>(store, stageId(project, stage));
     if (artifact?.value.status === "accepted") {
       requireCondition((artifact.value.content as unknown as StageContent).draft?.id === draftId,
@@ -69,6 +83,9 @@ export class StageResearch {
     };
     if (options.restoreOnly) {
       const restored = await restorePaid();
+      const control = readRunControl(store, { project });
+      const late = restored ? await lateResult(restored, !control.ok || control.value.stopped) : null;
+      if (late) return late;
       return { status: 'stopped', stage: artifact ? reference(artifact) : null,
         research: restored ? reference(restored) : null, feedback: null,
         findings: [stoppedFinding], turnsUsed: 0, reason: stoppedFinding };
@@ -100,6 +117,8 @@ export class StageResearch {
       const previous = readResearchRun(store, project, draftId)?.value.turns ?? 0;
       const run = await researcher.run(project, draftId, maxTurns, undefined,
         producerPolicy ? { producerPolicy } : {});
+      const late = await lateResult(run);
+      if (late) return { ...late, turnsUsed: Math.max(0, run.value.turns - previous) };
       const why = run.value.pauseCode ? { code: run.value.pauseCode, target: run.value.ownerQuestion?.question ?? draftId,
         message: run.value.error ?? 'Discovery research is paused' } : null;
       return { status: run.value.status === 'needs_owner' ? 'needs_owner' : 'paused',
