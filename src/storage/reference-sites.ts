@@ -386,6 +386,14 @@ const RECORD_REFERENCE_SEMANTICS: readonly RecordReferenceSemantics[] = [
     ["inventory", "states", INDEX], ["inventory", "accounts", INDEX]] },
   // DR2b 2b.1-F: the interpretations set declares its exact grounds and links only — the brief source, the
   // frame proposal revision and the previous set; meanings, consequences and support selectors are data.
+  {kind:'interpretation-execution',contract:'interpretation-execution/v1',data:[['result'],['workspace','entries',INDEX,'result','value']],refs:[
+    ['prepared'],['generation'],['decision'],['mode'],['draft'],['question'],['previous'],['workspace','entries',INDEX,'result','record'],['workspace','deliveryCoverage',INDEX,'record']]},
+  {kind:'interpretation-decision',contract:'interpretation-decision/v1',data:[],refs:[['generation'],['origin','execution'],['origin','session'],
+    ['choice','mandate','source'],['choice','frame'],['choice','previous'],['choice','set','value','brief','source'],['choice','set','value','frame'],['choice','set','value','previousSet']]},
+  {kind:'interpretation-application',contract:'interpretation-application/v1',data:[],refs:[['generation'],['decision'],['proposal'],['before'],['opened']]},
+  {kind:'interpretation-ready',contract:'interpretation-ready/v1',data:[],refs:[['generation'],['application'],['draft'],['frame']]},
+  {kind:'owner-session-grant',contract:'interpretation-choice-grant/v1',data:[],refs:[['scope','generation']]},
+  {kind:'owner-session',contract:'interpretation-choice-session/v1',data:[],refs:[['grant'],['scope','generation']]},
   { kind: "frame-interpretations", contract: "frame-interpretations/v1", data: [], refs: [
     ["brief", "source"], ["frame"], ["previousSet"]] },
   // DR2b 2b-GEN: the prepared generation session names exactly its bound grounds — the mandate Source,

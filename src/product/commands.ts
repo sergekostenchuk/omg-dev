@@ -16,6 +16,9 @@ import type { ClaimAddress } from '../discovery/claim-address.js';
 
 export type ProductCommand =
   | ({ type: 'discovery-research-return' } & ResearchReturnInput)
+  | {type:'interpret-discovery-frame';project:string;draft:Ref;frame:Ref;allowance:number;restoreOnly:boolean}
+  | {type:'read-interpretation-ready';project:string;basis:Ref}
+  | {type:'choose-frame-interpretation';project:string;generation:Ref;interpretation:string;justification:string}
   | { type: 'discovery-final-decision'; project: string; assessment: Ref; decision: 'accept' | 'decline'; reason: string }
   | { type: 'discovery-final-accepted'; project: string; manifest: Ref }
   | { type: 'discovery-final-condition'; project: string; manifest: Ref; conditionId: string; optionId: string; reason: string }
@@ -133,6 +136,9 @@ const schema = { oneOf: [
   command('discovery-research-return', { project, scope: ref, plan: ref, question: text, axis: text,
     grounds: { type: 'array', minItems: 1, items: object({project,container:ref,containerKind:text,pointer:string,claimId:text}) },
     destination: {enum:['D4','D5','D7']}, final: {anyOf:[ref,{type:'null'}]}, reason:text, requiredResult:text }),
+  command('interpret-discovery-frame', {project,draft:ref,frame:ref,allowance:{type:'integer',minimum:0,maximum:100},restoreOnly:{type:'boolean'}}),
+  command('read-interpretation-ready', {project,basis:ref}),
+  command('choose-frame-interpretation', {project,generation:ref,interpretation:text,justification:text}),
   command('discovery-final-decision', { project, assessment: ref, decision: { enum: ['accept', 'decline'] }, reason: text }),
   command('discovery-final-accepted', { project, manifest: ref }),
   command('discovery-final-condition', { project, manifest: ref, conditionId: text, optionId: text, reason: text }),

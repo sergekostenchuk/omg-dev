@@ -1,4 +1,6 @@
 import { returnDiscoveryResearch } from '../discovery/discovery-research-return.js';
+import { advanceInterpretationFlow, readInterpretationFlowReadyAt } from '../discovery/interpretation-flow.js';
+import { chooseInterpretation } from './interpretation-authority.js';
 import { answerDiscoveryCondition } from '../discovery/discovery-decision.js';
 import { runIntegrityCheck } from "../om/integrity.js";
 import { listBypassDecisions } from "../om/addressing.js";
@@ -283,6 +285,13 @@ export class ProductEngine {
         return returnDiscoveryResearch(this.store, input).then(result => ({ return: reference(result.record),
           destination: result.destination, reason: result.reason, requiredResult: result.requiredResult, final: result.final }));
       }
+      case 'interpret-discovery-frame':
+        return advanceInterpretationFlow(this.store,{project:command.project,draft:command.draft,frame:command.frame},
+          {allowance:command.allowance,restoreOnly:command.restoreOnly});
+      case 'read-interpretation-ready': return readInterpretationFlowReadyAt(this.store,command.project,command.basis);
+      case 'choose-frame-interpretation':
+        return chooseInterpretation(this.store,{project:command.project,generation:command.generation,
+          interpretation:command.interpretation,justification:command.justification},undefined);
       case 'discovery-final-decision':
         return acceptDiscoveryFinal(this.store, { projectId: command.project, assessment: command.assessment,
           decision: command.decision, reason: command.reason }).then(discoveryDecisionOutput);

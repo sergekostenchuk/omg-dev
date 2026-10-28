@@ -36,6 +36,24 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
   }
   // Only these local owner doors mint scoped authority. JSON commands and
   // HTTP can name a decision, but cannot supply or mint its authority.
+  if (command === 'owner-frame-interpretation') {
+    const { parseCommand } = await import('./product/commands.js');
+    const { issueInterpretationChoiceInvitation, InterpretationChoiceSessions, chooseInterpretation } = await import('./product/interpretation-authority.js');
+    const store = new Store(resolve(database)), sessions = new InterpretationChoiceSessions(store);
+    let bearer: string | null = null, output: unknown;
+    try {
+      const request = parseCommand(JSON.parse(readFileSync(0,'utf8')));
+      if (request.type !== 'choose-frame-interpretation') throw new EngineError('command_invalid','This door accepts only an exact interpretation choice');
+      const scope = {project:request.project,generation:request.generation,interpretation:request.interpretation,justification:request.justification};
+      const login = sessions.exchange(issueInterpretationChoiceInvitation(store,scope)); bearer = login.bearer;
+      output = chooseInterpretation(store,scope,login.authority);
+    } finally {
+      try { if (bearer !== null) sessions.revoke(bearer); }
+      catch (error) { if (error instanceof EngineError) throw error; throw new EngineError('owner_session_cleanup_failed','The scoped interpretation session could not be closed'); }
+      finally { store.close(); }
+    }
+    console.log(JSON.stringify(output)); return;
+  }
   if (command === 'owner-final-acceptance' || command === 'owner-final-condition') {
     const { parseCommand } = await import('./product/commands.js');
     const { FinalAcceptanceSessions, issueFinalAcceptanceInvitation, acceptDiscoveryFinal,

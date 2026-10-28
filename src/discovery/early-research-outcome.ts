@@ -438,7 +438,9 @@ export function researchResultFailure(saved: unknown, payload: unknown): EngineE
     && capacity.forms.every(form => form && typeof form.kind === 'string'),
   'research_capacity_invalid', 'The producer lost its declared result forms');
   const response = payload as Record<string, any> | null;
-  const kind = capacity.actionMode === 'final-result-preflight'
+  const kind = capacity.purpose === 'frame-interpretation-request' && response?.contract === 'frame-interpretations/v1'
+    ? 'frame-interpretations' : capacity.purpose === 'frame-interpretation-choice' && response?.contract === 'frame-interpretation-choice/v1'
+    ? 'frame-interpretation-choice' : capacity.actionMode === 'final-result-preflight'
     ? response?.contract === 'discovery-final-result/v1' ? 'discovery_final' : response?.action
     : capacity.actionMode === 'final-assessment-preflight'
     ? response?.contract === 'discovery-final-assessment-result/v1' ? 'discovery_final_assessment' : response?.action

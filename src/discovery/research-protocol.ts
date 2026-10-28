@@ -1,3 +1,4 @@
+import { isInterpretationConsumer, requireInterpretationConsumer, requireInterpretationNewDispatch } from './interpretation-execution.js';
 import { dossierSessionTransport, dossierTransportDelivery, packetDossierSubject, requireDossierTransportContext } from './continuation-packet.js';
 import { prepareDossierContextPacker } from './working-context.js';
 import { requireDossierTransportArchive } from './continuation-packet.js';
@@ -463,7 +464,7 @@ function buildResearchEnvelope(role: RoleBinding, environment: Environment, prom
   const packetState = (!dossier || managedDossier) && audit?.questionId && draft ? continuationState(audit.store, environment.projectId, audit.draftId,
     audit.questionId, audit.purpose, role.actor, planSubject, assessmentSubject, variantSubject, deepPreparation,
       managedDossier?{subject:dossier!.packet.subject,session:managedDossier.session.id}:undefined,
-      final ? (context as any).finalContinuation : undefined) : null;
+      final ? (context as any).finalContinuation : undefined, (context as any)?.interpretationExecution?.id) : null;
   const consolidating = (context as any)?.dispatchMode === 'consolidation';
   const controls = (context as any)?.contextControls;
   const finalizing = !consolidating && controls?.mode === 'finalization';
@@ -613,6 +614,15 @@ async function dispatchResearchCall(role: RoleBinding, environment: Environment,
   // 4T.3 (№11174 4T3-02): the variant branch and its purpose are told apart before EVERY early return — a paid consumer
   // intent, a paid assessment application and a paid variant replay alike. The checks are pure: a free replay of a
   // historical identity needs no head of today's mode or state.
+  const interpretation = (context as any)?.interpretationExecution;
+  if (interpretation !== undefined || audit?.purpose === 'frame-interpretation-request' || audit?.purpose === 'frame-interpretation-choice') {
+    requireCondition(audit?.consumerIntent && isRef(interpretation), 'interpretation_execution_invalid',
+      'Interpretations travel only through their exact managed execution');
+    const own = readResearchConsumerIntent(audit.store, audit.consumerIntent);
+    requireCondition(isInterpretationConsumer(own.value) && own.value.kind === audit.purpose
+      && canonical(own.value.owner) === canonical(interpretation), 'interpretation_execution_invalid', 'Foreign interpretation dispatch');
+    requireInterpretationConsumer(audit.store, own.value);
+  }
   const contextVariant = packetVariantSubject(context);
   // 5.3: the deep step is its own analyst branch — no assessment reservation, no virtual producer, no variant mixing.
   const contextDeep = packetDeepPreparation(context);
@@ -840,6 +850,7 @@ async function dispatchResearchCall(role: RoleBinding, environment: Environment,
   if (recovered) { audit?.onContext?.(recovered.subject); return recovered.research; }
   if (assessment?.kind === 'replay-only') applicationAuditInvalid('The operator recovery did not consume its selected response');
   interceptResearchPreview(input,{limit:requestLimit,draft:audit?.draftId??'',question:audit?.questionId??'',purpose:audit?.purpose??''});
+  requireInterpretationNewDispatch();
   // Budget admission is only for a NEW send: every paid-return path above is free.
   const originalDraft = audit && draft ? audit.store.get<DiscoveryDraft>(draft.id, 1) : null;
   const stageV7 = isDiscoveryV7Draft(draft?.value) || isDiscoveryV7Draft(originalDraft?.value);
@@ -873,12 +884,13 @@ async function dispatchResearchCall(role: RoleBinding, environment: Environment,
       try { stageEstimate=estimateCliCall(audit.store,environment.projectId,role,audit.purpose,input.length,
         packetState?.initial===false?'continuation':'initial'); }
       catch(error) {
-        if((assessment?.kind!=='dossier' && assessment?.kind!=='final' && assessment?.kind!=='final-assessment')
+        if((!consumerIntent || !isInterpretationConsumer(consumerIntent.value)) && (assessment?.kind!=='dossier' && assessment?.kind!=='final' && assessment?.kind!=='final-assessment')
           || !(error instanceof EngineError) || error.code!=='budget_estimate_missing') throw error;
-        stageEstimate=estimateCliCall(audit.store,environment.projectId,role,'assessor',input.length,
+        stageEstimate=estimateCliCall(audit.store,environment.projectId,role,consumerIntent && isInterpretationConsumer(consumerIntent.value) ? 'analyst' : 'assessor',input.length,
           packetState?.initial===false?'continuation':'initial');
         stageEstimate={...stageEstimate,explanation:
-          `Managed ${assessment.kind === 'final' ? 'final' : assessment.kind === 'final-assessment' ? 'final assessment' : 'dossier'} bootstrap from measured assessor calls. `
+          (consumerIntent && isInterpretationConsumer(consumerIntent.value) ? 'Managed interpretation bootstrap from measured analyst calls. '
+            : `Managed ${assessment?.kind === 'final' ? 'final' : assessment?.kind === 'final-assessment' ? 'final assessment' : 'dossier'} bootstrap from measured assessor calls. `)
           + stageEstimate.explanation};
       }
     }
@@ -982,6 +994,7 @@ async function dispatchResearchCall(role: RoleBinding, environment: Environment,
       ...(progress?{progressKey:progress.key}:{}),
       ...(assessmentSubject?{assessmentKey:assessmentSubjectKey(assessmentSubject)}:{}),
       ...(variantSubject?{variantSubject}:{}),
+      ...(interpretation ? {interpretationExecution:interpretation.id} : {}),
       ...(contextDeep?{deepPreparation:contextDeep}:{}),
       ...(dossier?{dossierSubject:dossier,managedDossier:dossierSessionTransport(context)}:{}),
       ...(ownership ?? {}),

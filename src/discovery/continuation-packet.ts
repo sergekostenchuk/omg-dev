@@ -620,6 +620,7 @@ interface ContinuationState { finalContinuation?: FinalResearchContinuation; dos
 export interface ContinuationPacketState {
   dossier?: DossierContinuation;
   finalContinuation?: FinalResearchContinuation;
+  interpretation?: string;
   initial: boolean; state: Revision<ContinuationState> | null; id: string; priorCalls: number;
   basis: Ref | null; latest: Ref | null; callGuards: ReadGuard[]; attempts: number;
   projectId: string; question: Revision<Question>; draft: Revision<DiscoveryDraft>; purpose: string; actor: string; subject: V7PlanSubject | null; assessmentSubject: AssessmentTransportSubject | null; variantSubject?: VariantSubject | null; deepPreparation?: Ref | null;
@@ -631,8 +632,8 @@ export function continuationState(store: Store, projectId: string, draftId: stri
 export function continuationState(store: Store, projectId: string, draftId: string, questionId: string, purpose: string,
   actor: string, subject: V7PlanSubject | null, assessmentSubject: AssessmentTransportSubject | null,
   variantSubject: VariantSubject | null, deepPreparation?: Ref | null, dossier?: DossierContinuation,
-  finalContinuation?: FinalResearchContinuation): ContinuationPacketState;
-export function continuationState(store: Store, projectId: string, draftId: string, questionId: string, purpose: string, actor: string, subject: V7PlanSubject | null = null, assessmentSubject: AssessmentTransportSubject | null = null, variantSubject: VariantSubject | null = null, deepPreparation: Ref | null = null, dossier?: DossierContinuation, finalContinuation?: FinalResearchContinuation): ContinuationPacketState {
+  finalContinuation?: FinalResearchContinuation, interpretation?: string): ContinuationPacketState;
+export function continuationState(store: Store, projectId: string, draftId: string, questionId: string, purpose: string, actor: string, subject: V7PlanSubject | null = null, assessmentSubject: AssessmentTransportSubject | null = null, variantSubject: VariantSubject | null = null, deepPreparation: Ref | null = null, dossier?: DossierContinuation, finalContinuation?: FinalResearchContinuation, interpretation?: string): ContinuationPacketState {
   const draft=store.get<DiscoveryDraft>(draftId),question=store.get<Question>(questionId);
   requireCondition(draft?.kind==='discovery-draft' && question?.kind==='question' && draft.value.projectId===projectId
     && question.value.projectId===projectId && question.value.draftId===draftId && draft.value.questions.includes(questionId),
@@ -652,7 +653,10 @@ export function continuationState(store: Store, projectId: string, draftId: stri
   'continuation_foreign','A final continuation needs its own exact immutable subject and origin');
   requireCondition(!['discovery-final', 'discovery-final-assessment'].includes(purpose) || finalContinuation, 'continuation_foreign',
     'A final call needs its own continuation identity');
-  const id=`continuation-state:${hashJson(finalContinuation ? [purpose === 'discovery-final' ? 'discovery-final/v1' : 'discovery-final-assessment/v1',projectId,finalContinuation,actor] : dossier ? ['dossier/v1',projectId,dossier,actor] : variantSubject ? ['variant/v1',projectId,reference(draft),reference(question),variantSubject,purpose,actor] : assessmentSubject ? [projectId,assessmentSubject,purpose,actor] : subject ? (deep ? [projectId,subject,purpose,actor,'deep/v1',deep] : [projectId,subject,purpose,actor]) : [projectId,questionId,purpose,actor])}`;
+  requireCondition(!interpretation || (purpose==='frame-interpretation-request' || purpose==='frame-interpretation-choice')
+    && !dossier && !finalContinuation && !subject && !assessmentSubject && !variantSubject && !deep,
+    'interpretation_execution_invalid','Interpretations have their own exact continuation identity');
+  const id=`continuation-state:${hashJson(interpretation ? ['interpretation/v1',projectId,interpretation,purpose,actor] : finalContinuation ? [purpose === 'discovery-final' ? 'discovery-final/v1' : 'discovery-final-assessment/v1',projectId,finalContinuation,actor] : dossier ? ['dossier/v1',projectId,dossier,actor] : variantSubject ? ['variant/v1',projectId,reference(draft),reference(question),variantSubject,purpose,actor] : assessmentSubject ? [projectId,assessmentSubject,purpose,actor] : subject ? (deep ? [projectId,subject,purpose,actor,'deep/v1',deep] : [projectId,subject,purpose,actor]) : [projectId,questionId,purpose,actor])}`;
   const state=store.get<ContinuationState>(id);
   const calls=(deep ? deepIdentityCalls(store,deep,purpose,actor) : store.list<ModelCall>('model-call')).filter(c=>
     (!finalContinuation || c.value !== null && typeof c.value === 'object' && !Array.isArray(c.value)) && c.value.projectId===projectId
@@ -660,6 +664,7 @@ export function continuationState(store: Store, projectId: string, draftId: stri
     && callAddressesSubject(c.value as unknown as Record<string,unknown>, reference(question), subject) && c.value.purpose===purpose
     && (finalContinuation ? c.value.requested?.actor : c.value.requested.actor)===actor
     && canonical(packetVariantSubject(c.value)) === canonical(variantSubject)
+    && ((c.value as any).interpretationExecution ?? null) === (interpretation ?? null)
     && canonical(packetDeepPreparation(c.value)) === canonical(deep)
     && canonical(packetDossierSubject(c.value))===canonical(dossier?.subject??null)
     && (!dossier || (c.value as any).managedDossier?.session?.id===dossier.session)
@@ -701,7 +706,7 @@ export function continuationState(store: Store, projectId: string, draftId: stri
       &&canonical(packetDossierSubject(readArchiveBody(store,original).body))===canonical(dossier?.subject??null)
       &&(!finalContinuation || canonical(readArchiveBody(store,original).body.finalContinuation??null)===canonical(finalContinuation)),'continuation_foreign','Delivered foundation belongs to another question');
   }
-  return {...(dossier?{dossier}:{}),...(finalContinuation?{finalContinuation}:{}),initial:delivered.length===0,state,id,priorCalls:delivered.length,attempts:calls.length,
+  return {...(interpretation?{interpretation}:{}),...(dossier?{dossier}:{}),...(finalContinuation?{finalContinuation}:{}),initial:delivered.length===0,state,id,priorCalls:delivered.length,attempts:calls.length,
     basis:archives[0]??null,latest:archives.at(-1)??null,callGuards:calls.map(reference),projectId,question,draft,purpose,actor,subject,assessmentSubject,...(variantSubject?{variantSubject}:{}) ,...(deep?{deepPreparation:deep}:{})};
 }
 export function continuationDispatch(state: LegacyContinuationPacketState, callId: string): {writes: Write[]; guards: ReadGuard[]};
