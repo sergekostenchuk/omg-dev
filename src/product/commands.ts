@@ -24,6 +24,7 @@ export type ProductCommand =
   | { type: 'discovery-accepted-projection'; project: string; manifest: Ref }
   | { type: 'discovery-final-condition'; project: string; manifest: Ref; conditionId: string; optionId: string; reason: string }
   | { type: 'discovery-final-condition'; project: string; manifest: Ref; conditionId: string; claims: ClaimAddress[]; reason: string }
+  | { type: 'discovery-final-condition'; project: string; manifest: Ref; conditionId: string; evidence: Ref; reason: string }
   | {type:'recover-research-response';project:string;call:Ref;session:Ref}
   | ({type:'declare-adapter-lineage';project:string} & AdapterLineageDeclaration)
   | {type:'observe-runtime';project:string;scope:Ref;obligation:string;key:string}
@@ -146,6 +147,8 @@ const schema = { oneOf: [
   command('discovery-final-condition', { project, manifest: ref, conditionId: text, optionId: text, reason: text }),
   command('discovery-final-condition', { project, manifest: ref, conditionId: text, reason: text,
     claims: { type: 'array', minItems: 1, items: object({ project, container: ref, containerKind: text, pointer: string, claimId: text }) } }),
+  // OMG-V7-B3: an evidence condition closes only through its exact paid evidence assessment.
+  command('discovery-final-condition', { project, manifest: ref, conditionId: text, evidence: ref, reason: text }),
   omStart, omContinue, command("om-state", { project }), command("environment-readiness", { project }), command("om-spend", { project }), command("om-stop", { project }), command("om-fsck", { project }),
   command("om-decisions", { project }),
   // RL3 (№4205): the owner's explicit reopening of a completed pass's accepted L3 by the AT1 door.

@@ -615,7 +615,15 @@ export interface FinalAssessmentContinuation {
   prepared: Ref;
   execution: Ref;
 }
-type FinalResearchContinuation = FinalContinuation | FinalAssessmentContinuation;
+/** OMG-V7-B3 (codex-omg2 №16516): the evidence assessment of one condition has its own continuation namespace; its
+ * subject fixes the exact condition, criterion and material, its source the exact accepted edition. */
+export interface ConditionEvidenceContinuation {
+  subject: import('./discovery-condition-evidence-subject.js').ConditionEvidenceSubject;
+  source: Ref;
+  prepared: Ref;
+  execution: Ref;
+}
+type FinalResearchContinuation = FinalContinuation | FinalAssessmentContinuation | ConditionEvidenceContinuation;
 interface ContinuationState { finalContinuation?: FinalResearchContinuation; dossier?: DossierContinuation; projectId: string; question: string; purpose: string; actor: string; activeCall: string; attempts: number; subject?: V7PlanSubject; assessmentKey?: string; variantSubject?: VariantSubject; draft?: Ref; questionRef?: Ref; deepPreparation?: Ref }
 export interface ContinuationPacketState {
   dossier?: DossierContinuation;
@@ -649,14 +657,17 @@ export function continuationState(store: Store, projectId: string, draftId: stri
       && Object.keys(finalContinuation).sort().join(',')==='execution,prepared,subject'
       || purpose==='discovery-final-assessment' && finalContinuation.subject.contract==='discovery-final-assessment-subject/v1'
       && 'source' in finalContinuation && isRef(finalContinuation.source)
+      && Object.keys(finalContinuation).sort().join(',')==='execution,prepared,source,subject'
+      || purpose==='discovery-condition-evidence' && finalContinuation.subject.contract==='discovery-condition-evidence-subject/v1'
+      && 'source' in finalContinuation && isRef(finalContinuation.source)
       && Object.keys(finalContinuation).sort().join(',')==='execution,prepared,source,subject'),
   'continuation_foreign','A final continuation needs its own exact immutable subject and origin');
-  requireCondition(!['discovery-final', 'discovery-final-assessment'].includes(purpose) || finalContinuation, 'continuation_foreign',
+  requireCondition(!['discovery-final', 'discovery-final-assessment', 'discovery-condition-evidence'].includes(purpose) || finalContinuation, 'continuation_foreign',
     'A final call needs its own continuation identity');
   requireCondition(!interpretation || (purpose==='frame-interpretation-request' || purpose==='frame-interpretation-choice')
     && !dossier && !finalContinuation && !subject && !assessmentSubject && !variantSubject && !deep,
     'interpretation_execution_invalid','Interpretations have their own exact continuation identity');
-  const id=`continuation-state:${hashJson(interpretation ? ['interpretation/v1',projectId,interpretation,purpose,actor] : finalContinuation ? [purpose === 'discovery-final' ? 'discovery-final/v1' : 'discovery-final-assessment/v1',projectId,finalContinuation,actor] : dossier ? ['dossier/v1',projectId,dossier,actor] : variantSubject ? ['variant/v1',projectId,reference(draft),reference(question),variantSubject,purpose,actor] : assessmentSubject ? [projectId,assessmentSubject,purpose,actor] : subject ? (deep ? [projectId,subject,purpose,actor,'deep/v1',deep] : [projectId,subject,purpose,actor]) : [projectId,questionId,purpose,actor])}`;
+  const id=`continuation-state:${hashJson(interpretation ? ['interpretation/v1',projectId,interpretation,purpose,actor] : finalContinuation ? [purpose === 'discovery-final' ? 'discovery-final/v1' : purpose === 'discovery-condition-evidence' ? 'discovery-condition-evidence/v1' : 'discovery-final-assessment/v1',projectId,finalContinuation,actor] : dossier ? ['dossier/v1',projectId,dossier,actor] : variantSubject ? ['variant/v1',projectId,reference(draft),reference(question),variantSubject,purpose,actor] : assessmentSubject ? [projectId,assessmentSubject,purpose,actor] : subject ? (deep ? [projectId,subject,purpose,actor,'deep/v1',deep] : [projectId,subject,purpose,actor]) : [projectId,questionId,purpose,actor])}`;
   const state=store.get<ContinuationState>(id);
   const calls=(deep ? deepIdentityCalls(store,deep,purpose,actor) : store.list<ModelCall>('model-call')).filter(c=>
     (!finalContinuation || c.value !== null && typeof c.value === 'object' && !Array.isArray(c.value)) && c.value.projectId===projectId

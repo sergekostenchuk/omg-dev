@@ -59,7 +59,7 @@ import { modelUsage } from "../runtime/model-usage.js";
 import { configureReaderPilot, assertPilotBoundary } from "../discovery/reader-pilot.js";
 import { configureSavedSynthesis, configureV7SavedSynthesis } from "../discovery/saved-synthesis.js";
 import { OwnerSessions, issueOwnerInvitation, type OwnerAuthority, acceptDiscoveryFinal, resolveDiscoveryCondition,
-  type DiscoveryAcceptanceOutcome, type ConditionResolutionOutcome } from "./owner-authority.js";
+  type DiscoveryAcceptanceOutcome, type AnyConditionOutcome } from "./owner-authority.js";
 import { readAcceptedDiscoveryManifestAt, type AcceptedDiscovery } from '../discovery/discovery-acceptance.js';
 import { listOwnerQuestions, writeOwnerResult, type OwnerReaders } from "../om/owner-result.js";
 import { readOmInput } from "../om/input.js";
@@ -79,10 +79,11 @@ export function discoveryDecisionOutput(result: DiscoveryAcceptanceOutcome) {
   return { decision: result.decision, act: result.act ? reference(result.act) : null,
     accepted: result.accepted ? acceptedDiscoveryOutput(result.accepted) : null, repeated: result.repeated };
 }
-export function discoveryConditionOutput(result: ConditionResolutionOutcome) {
+export function discoveryConditionOutput(result: AnyConditionOutcome) {
   // 7b.3 (codex-omg2 №16299): resolved/unresolved name the chosen condition; conditionStatus is the proven state of all
   // conditions of the latest edition — closing every condition permits no further stage by itself.
-  return { choice: result.choice, act: reference(result.resolution), edition: result.edition ? acceptedDiscoveryOutput(result.edition) : null,
+  // OMG-V7-B3: a returned evidence assessment saves no act; evidence names the paid assessment the outcome rests on.
+  return { choice: result.choice, act: result.resolution ? reference(result.resolution) : null, ...(result.choice === 'evidence' ? { evidence: result.evidence } : {}), edition: result.edition ? acceptedDiscoveryOutput(result.edition) : null,
     resolved: result.resolved, unresolved: !result.resolved, reason: result.unproven, route: result.route,
     conditionStatus: result.conditions, repeated: result.repeated };
 }
@@ -302,7 +303,8 @@ export class ProductEngine {
         return readAcceptedDiscoveryManifestAt(this.store, command.project, command.manifest).then(acceptedDiscoveryOutput);
       case 'discovery-final-condition':
         return resolveDiscoveryCondition(this.store, { projectId: command.project, manifest: command.manifest,
-          conditionId: command.conditionId, ...('optionId' in command ? { optionId: command.optionId } : { claims: command.claims }),
+          conditionId: command.conditionId, ...('optionId' in command ? { optionId: command.optionId }
+            : 'evidence' in command ? { evidence: command.evidence } : { claims: command.claims }),
           reason: command.reason }).then(discoveryConditionOutput);
       case 'recover-research-response': this.#project(command.project); return recoverResearchResponse(this.store, this.environments, command.project, command.call, command.session, this.actor);
       case 'declare-adapter-lineage': this.#project(command.project); return declareAdapterLineage(this.store, command.project, command, this.actor);

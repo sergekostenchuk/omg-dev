@@ -114,6 +114,11 @@ const finalSubjectRefs = (prefix: readonly PathPatternSegment[]): PathPattern[] 
 const finalAssessmentSubjectRefs = (prefix: readonly PathPatternSegment[]): PathPattern[] => [
   [...prefix, 'candidate', 'dossier'], ...finalSubjectRefs([...prefix, 'subject']),
 ];
+/** OMG-V7-B3: an evidence subject names its edition, its saved bundle, the container of each offered claim and the
+ * grounds of the paid D7 whose subject it carries; the condition, the criterion and the claim payloads are data. */
+const conditionEvidenceSubjectRefs = (prefix: readonly PathPatternSegment[]): PathPattern[] => [
+  [...prefix, 'manifest'], [...prefix, 'bundle'], [...prefix, 'claims', INDEX, 'container'], ...finalSubjectRefs([...prefix, 'final']),
+];
 const contextData = (prefix: readonly PathPatternSegment[]): PathPattern[] => [
   ...contextBodyData(prefix), ...capacityData([...prefix, 'resultCapacity'])
 ];
@@ -369,6 +374,19 @@ const RECORD_REFERENCE_SEMANTICS: readonly RecordReferenceSemantics[] = [
     ["context", "resultCapacity", "mandatory", "archive", "record"], ["context", "contextWorkspace", INDEX, "record"]] },
   { kind: "discovery-final-assessment-paid-result", contract: "discovery-final-assessment-paid-result/v1", data: [], refs: [
     ["source"], ["prepared"], ...finalAssessmentSubjectRefs(["subject"]), ["session"], ["application"], ["call"], ["request"], ["response"]] },
+  // OMG-V7-B3: the evidence assessment of one condition — its cursor, application and paid result bind the exact edition
+  // as source and the whole evidence subject.
+  { kind: "discovery-condition-evidence-execution", contract: "discovery-condition-evidence-execution/v1", data: [], refs: [
+    ["source"], ["prepared"], ...conditionEvidenceSubjectRefs(["subject"]), ["binding", "draft"], ["binding", "question"],
+    ["binding", "environment"], ["binding", "inputs", INDEX], ["profile"], ["previous"], ["result"],
+    ["workspace", "entries", INDEX, "result", "record"], ["workspace", "deliveryCoverage", INDEX, "record"]] },
+  { kind: "discovery-condition-evidence-application", contract: "discovery-condition-evidence-application/v1", data: [], refs: [
+    ["session"], ["profile"], ["guards", INDEX], ["call"], ["received"], ["after"],
+    ["context", "finalContinuation", "source"], ["context", "finalContinuation", "prepared"],
+    ["context", "finalContinuation", "execution"], ...conditionEvidenceSubjectRefs(["context", "finalContinuation", "subject"]),
+    ["context", "resultCapacity", "mandatory", "archive", "record"], ["context", "contextWorkspace", INDEX, "record"]] },
+  { kind: "discovery-condition-evidence-paid-result", contract: "discovery-condition-evidence-paid-result/v1", data: [], refs: [
+    ["source"], ["prepared"], ...conditionEvidenceSubjectRefs(["subject"]), ["session"], ["application"], ["call"], ["request"], ["response"]] },
   { kind: "model-call", contract: null, data: [["finalContinuation", "subject", "candidate", "verdict", "conditions"]] },
   { kind: "continuation-state", contract: null, data: [["finalContinuation", "subject", "candidate", "verdict", "conditions"]] },
   // DR6 6.1/6.2: the structural dossier snapshot declares its exact references only — the draft, the accepted frame
@@ -431,6 +449,9 @@ const RECORD_REFERENCE_SEMANTICS: readonly RecordReferenceSemantics[] = [
   { kind: "discovery-condition-resolution", contract: "discovery-condition-resolution/v2", data: [], refs: [
     ["predecessor"], ["bundle"], ["scope", "predecessor"], ["scope", "bundle"], ["authority", "grant"], ["authority", "session"],
     ["grounds", "draft"], ["grounds", "paid"], ["grounds", "assessment"]] },
+  // OMG-V7-B3: the evidence resolution names its edition, its bundle and the paid supported evidence assessment.
+  { kind: "discovery-condition-resolution", contract: "discovery-condition-resolution/v3", data: [], refs: [
+    ["predecessor"], ["bundle"], ["evidence"]] },
   { kind: "discovery-manifest-successor", contract: "discovery-manifest-successor/v1", data: [], refs: [
     ["predecessor"], ["successor"], ["resolution"]] },
   // OMG-V7-KEEPER-PREPARED-SESSION (codex-worker2 №16291): the keeper archive names exactly its request parts; the prepared

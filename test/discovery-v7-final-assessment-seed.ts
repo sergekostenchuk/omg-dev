@@ -37,6 +37,8 @@ type FinalWorld = Awaited<ReturnType<typeof finalPaid>>;
 type SeedData = {
   final: Pick<FinalWorld, 'd6' | 'packet' | 'prepared' | 'execution' | 'paidResult'>;
   prepared: Ref; execution: Ref; paidResult: Ref;
+  /** OMG-V7-B3: the calibration draft and question of the paid D7 world, for a planted copy's own reviewer measurement. */
+  calibration: { draft: Ref; question: Ref };
 };
 type Snapshot = { root: string; data: SeedData };
 const seeds = new Map<string, Promise<Snapshot>>();
@@ -82,7 +84,8 @@ async function build(options: Required<Omit<FinalAssessmentSeedOptions, 'conditi
   if (entry === undefined) cleanups.push(() => rmSync(root, { recursive: true, force: true }));
   return { root, data: structuredClone({ final: { d6: f.d6, packet: f.packet, prepared: f.prepared,
     execution: f.execution, paidResult: f.paidResult }, prepared: reference(prepared),
-    execution: reference(paid.session), paidResult: reference(paid.output) }) };
+    execution: reference(paid.session), paidResult: reference(paid.output),
+    calibration: f.data.calibration }) };
 }
 
 function plant(t: TestContext, seed: Snapshot) {

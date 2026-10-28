@@ -26,12 +26,15 @@ import { FINAL_ACCEPTANCE_ACTION, FINAL_ACCEPTANCE_ACT_CONTRACT, FINAL_ACCEPTANC
   type FinalAcceptanceSession, type FinalAcceptanceSessionGrant, type FinalMachineAdmission,
   CONDITION_CHOICE_ACTION, CONDITION_CHOICE_GRANT_CONTRACT, CONDITION_CHOICE_GRANT_LIFETIME_MS, CONDITION_CHOICE_GRANT_PREFIX,
   CONDITION_CHOICE_SESSION_CONTRACT, CONDITION_CHOICE_SESSION_LIFETIME_MS, CONDITION_RESOLUTION_CONTRACT, CONDITION_RESOLUTION_POSITIVE_CONTRACT, conditionChoiceSessionId,
-  conditionResolutionId, conditionResolutionWrites, extendAcceptedEdition, manifestSuccessorId, provenConditionClass, readAcceptedDiscoveryBasisAt,
-  readEditionView, readManifestSuccessor, readSavedResolution, type AcceptedDiscoveryBasis, type ConditionAct, type EditionView, offeredConditionOption, proveConditionResolution,
+  CONDITION_RESOLUTION_EVIDENCE_CONTRACT, conditionResolutionId, conditionResolutionWrites, extendAcceptedEdition, manifestSuccessorId,
+  proveEvidenceResolution, provenConditionClass, readAcceptedDiscoveryBasisAt,
+  readEditionView, readManifestSuccessor, readSavedResolution, type AcceptedDiscoveryBasis, type ConditionAct, type EditionView,
+  type EvidenceConditionResolution, offeredConditionOption, proveConditionResolution,
   readConditionChoiceGrant, readConditionChoiceSession, requireConditionChoiceScope, type ConditionChoiceGrant,
   type ConditionChoiceScope, type ConditionChoiceSession } from "../discovery/discovery-acceptance.js";
 import { delivered, isPlainObject, isText, refused, type OmResult, type Refusal, type Sealed } from "../om/refusal.js";
 import { proveClaimAddress, type ClaimAddress } from "../discovery/claim-address.js";
+import { readConditionEvidencePaidResultAt } from "../discovery/discovery-condition-evidence-execution.js";
 import { isClassedFinalContract, type FinalConditionClass } from "../discovery/v7-final-contracts.js";
 
 /**
@@ -1700,7 +1703,8 @@ export interface ConditionChoiceRoute {
 }
 /** Why an accepting act resolves nothing inside the accepted bundle: the old contract proves no class, or the proven
  * class is a boundary or a risk, which need a new D7. */
-export type ConditionUnresolvedReason = 'condition_class_unproven' | 'condition_class_boundary' | 'condition_class_risk';
+export type ConditionUnresolvedReason = 'condition_class_unproven' | 'condition_class_boundary' | 'condition_class_risk'
+  | 'condition_evidence_unsupported';
 export interface ConditionResolutionOutcome {
   choice: 'accept' | 'decline';
   /** The saved owner act or positive resolution, proven on the edition it was made on. */
@@ -1717,20 +1721,25 @@ export interface ConditionResolutionOutcome {
   repeated: boolean;
 }
 type ChoiceRequest = { projectId: string; manifest: Ref; conditionId: string; reason: string }
-  & ({ optionId: string; claims?: undefined } | { claims: ClaimAddress[]; optionId?: undefined });
+  & ({ optionId: string; claims?: undefined; evidence?: undefined } | { claims: ClaimAddress[]; optionId?: undefined; evidence?: undefined }
+    | { evidence: Ref; optionId?: undefined; claims?: undefined });
 function choiceRequest(value: unknown): ChoiceRequest {
   const input = acceptanceSnapshot(value, 'request');
   const keys = shape(input) ? Object.keys(input).sort().join(',') : '';
-  if (!shape(input) || !['conditionId,manifest,optionId,projectId,reason', 'claims,conditionId,manifest,projectId,reason'].includes(keys)
-    || !isText(input.projectId) || !isRef(input.manifest) || !shape(input.manifest) || Object.keys(input.manifest).sort().join(',') !== 'hash,id,revision'
+  const exactShape = (value: unknown) => isRef(value) && shape(value) && Object.keys(value).sort().join(',') === 'hash,id,revision';
+  if (!shape(input) || !['conditionId,manifest,optionId,projectId,reason', 'claims,conditionId,manifest,projectId,reason',
+    'conditionId,evidence,manifest,projectId,reason'].includes(keys)
+    || !isText(input.projectId) || !exactShape(input.manifest)
     || !isText(input.conditionId) || !isText(input.reason) || !(input.reason as string).trim()
-    || (Object.hasOwn(input, 'optionId') ? !isText(input.optionId) : !Array.isArray(input.claims) || input.claims.length === 0))
+    || (Object.hasOwn(input, 'optionId') ? !isText(input.optionId) : Object.hasOwn(input, 'evidence') ? !exactShape(input.evidence)
+      : !Array.isArray(input.claims) || input.claims.length === 0))
     throw new EngineError('discovery_condition_resolution_invalid',
-      'A resolution names projectId, the exact accepted edition, the condition, the offered option or the claims, and a reason only',
+      'A resolution names projectId, the exact accepted edition, the condition, the offered option, the claims or the paid evidence, and a reason only',
       { door: 'owner-final-condition' });
   const base = { projectId: input.projectId as string, manifest: exactRef(input.manifest as Ref), conditionId: input.conditionId as string,
     reason: input.reason as string };
-  return Object.hasOwn(input, 'optionId') ? { ...base, optionId: input.optionId as string } : { ...base, claims: input.claims as ClaimAddress[] };
+  return Object.hasOwn(input, 'optionId') ? { ...base, optionId: input.optionId as string }
+    : Object.hasOwn(input, 'evidence') ? { ...base, evidence: exactRef(input.evidence as Ref) } : { ...base, claims: input.claims as ClaimAddress[] };
 }
 /** An evidence condition with accepted claims: every claim is proven accepted in this project, and still the condition stays
  * open — an accepted claim is no proof that it meets the criterion of this exact bundle; that is the paid conformance
@@ -1750,8 +1759,86 @@ function refuseEvidence(store: Store, accepted: EditionView, input: ChoiceReques
     proveClaimAddress(store, claim);
   }
   throw new EngineError('discovery_condition_evidence_unproven',
-    'Accepted claims do not prove the criterion of this condition; the paid conformance assessment decides it',
+    'Accepted claims do not prove the criterion of this condition; the paid evidence assessment of these claims decides it',
     { conditionId: input.conditionId, claims: input.claims.length, door: 'owner-final-condition' });
+}
+/** OMG-V7-B3: the outcome of an evidence condition through its exact paid evidence assessment. A supported assessment is
+ * saved as the evidence resolution with the next edition; a returned one saves nothing (resolution and edition null) and
+ * the condition stays open with condition_evidence_unsupported. */
+export interface EvidenceResolutionOutcome extends Omit<ConditionResolutionOutcome, 'choice' | 'resolution'> {
+  choice: 'evidence';
+  resolution: Revision<EvidenceConditionResolution> | null;
+  evidence: Ref;
+}
+export type AnyConditionOutcome = ConditionResolutionOutcome | EvidenceResolutionOutcome;
+/** OMG-V7-B3 (codex-omg2 №16508): the evidence branch of the producer. The exact paid evidence assessment of this evidence
+ * condition on this exact accepted edition is the whole ground: supported, it is saved as the evidence resolution with
+ * the next edition and the one successor record of the predecessor in one write, under the guards of the project, the
+ * paid assessment and the absent successor; returned, nothing is written and the condition stays open with the
+ * assessor's explanation in its paid result. No owner authority, bypass or model answer stands for it. */
+async function resolveEvidenceCondition(store: Store, project: Revision<unknown>, view: EditionView,
+  input: ChoiceRequest & { evidence: Ref }): Promise<EvidenceResolutionOutcome> {
+  const projectId = input.projectId, door = 'owner-final-condition';
+  const conditions = (view.bundle.value as { bundle?: { verdict?: { conditions?: unknown } } }).bundle?.verdict?.conditions;
+  const condition = Array.isArray(conditions) ? conditions.find(item => shape(item) && item.id === input.conditionId) as Record<string, unknown> | undefined : undefined;
+  if (!condition) throw new EngineError('discovery_condition_resolution_invalid', 'The condition is not one of this accepted bundle', { conditionId: input.conditionId, door });
+  if (condition.kind !== 'evidence')
+    throw new EngineError('discovery_condition_resolution_invalid', 'Only an evidence condition rests on a paid evidence assessment', { conditionId: input.conditionId, door });
+  const basis = await readAcceptedDiscoveryBasisAt(store, projectId, input.manifest), predecessor = basis.accepted;
+  const resolutionId = conditionResolutionId(projectId, predecessor.manifest.value.bundle, input.conditionId);
+  const saved = async (repeated: boolean): Promise<EvidenceResolutionOutcome | null> => {
+    const found = readSavedResolution(store, resolutionId);
+    if (!found) return null;
+    let base = basis;
+    while (!sameScope(reference(base.accepted.manifest), found.predecessor) && base.accepted.manifest.value.previous)
+      base = await readAcceptedDiscoveryBasisAt(store, projectId, base.accepted.manifest.value.previous);
+    const proven = proveEvidenceResolution(store, projectId, reference(found.row), base.accepted);
+    if (!sameScope(proven.value.evidence, input.evidence))
+      throw new EngineError('discovery_condition_resolution_conflict', 'The condition is already resolved by another paid evidence assessment',
+        { project: projectId, conditionId: input.conditionId, door });
+    const successor = readManifestSuccessor(store, projectId, proven.value.predecessor);
+    if (!successor || !sameScope(successor.value.resolution, reference(proven)))
+      throw new EngineError('discovery_acceptance_invalid', 'An evidence resolution is saved without its edition', { project: projectId, door });
+    const edition = (await extendAcceptedEdition(store, projectId, base, successor.value.successor)).accepted;
+    return { choice: 'evidence', resolution: structuredClone(proven), evidence: exactRef(proven.value.evidence), edition, resolved: true,
+      unproven: null, route: null, conditions: structuredClone(edition.conditions), repeated };
+  };
+  const before = await saved(true);
+  if (before) return before;
+  const paid = await readConditionEvidencePaidResultAt(store, projectId, input.evidence);
+  const projection = paid.result;
+  if (!paid.output || !projection || !sameScope(reference(paid.output), input.evidence)
+    || !sameScope(projection.subject.manifest, reference(predecessor.manifest)) || !sameScope(projection.subject.bundle, predecessor.manifest.value.bundle)
+    || projection.subject.condition.id !== input.conditionId)
+    throw new EngineError('discovery_condition_resolution_invalid',
+      'The paid evidence assessment is not about this exact condition of this exact edition', { conditionId: input.conditionId, door });
+  if (projection.verdict !== 'supported')
+    return { choice: 'evidence', resolution: null, evidence: exactRef(input.evidence), edition: null, resolved: false,
+      unproven: 'condition_evidence_unsupported', route: null, conditions: structuredClone(predecessor.conditions), repeated: false };
+  const stale = () => new EngineError('discovery_condition_resolution_stale', 'The edition gained a successor before the evidence resolution was written',
+    { project: projectId, door });
+  // A successor written meanwhile is either this very resolution by a concurrent caller or another edition.
+  if (store.get(manifestSuccessorId(input.manifest))) {
+    const winner = await saved(true);
+    if (winner) return winner;
+    throw stale();
+  }
+  const act: EvidenceConditionResolution = { contract: CONDITION_RESOLUTION_EVIDENCE_CONTRACT, database: store.databaseId, projectId,
+    predecessor: exactRef(reference(predecessor.manifest)), bundle: exactRef(predecessor.manifest.value.bundle), conditionId: input.conditionId,
+    kind: 'evidence', evidence: exactRef(input.evidence) };
+  const guards = uniqueTransactionGuards([reference(project), exactRef(input.evidence), { id: manifestSuccessorId(act.predecessor), absent: true }]);
+  try { store.writeMany(conditionResolutionWrites(projectId, predecessor, act).writes, guards); }
+  catch (error) {
+    if (error instanceof EngineError && ['revision_conflict', 'input_stale'].includes(error.code)) {
+      const winner = await saved(true);
+      if (winner) return winner;
+      throw stale();
+    }
+    throw error;
+  }
+  const written = await saved(false);
+  if (!written) throw new EngineError('owner_authority_internal', 'The evidence resolution was not saved');
+  return written;
 }
 /**
  * DR7 7b.3 (codex-omg2 №16169, №16299): the single producer of the owner's act on one condition of an accepted bundle.
@@ -1760,10 +1847,14 @@ function refuseEvidence(store: Store, accepted: EditionView, input: ChoiceReques
  * An accepting option of a condition whose class is proven choice is a positive resolution: it is saved atomically with
  * the next edition and the one successor record of its predecessor. Every other act resolves nothing — an accepting
  * one returns its reason (no proven class in the legacy form, or a boundary/risk class) with the address of a new D7, a
- * declining one is the owner's refusal; no edition is published. An evidence condition is refused without a write until
- * 7b.3e. A saved act with the same option is returned proven again; another option is a conflict.
+ * declining one is the owner's refusal; no edition is published. An evidence condition is resolved only through its paid
+ * evidence assessment (resolveEvidenceCondition, B3); claims alone are refused without a write. A saved act with the same
+ * option is returned proven again; another option is a conflict.
  */
-export async function resolveDiscoveryCondition(store: Store, request: unknown, authority?: unknown): Promise<ConditionResolutionOutcome> {
+export async function resolveDiscoveryCondition(store: Store, request: { optionId: string }, authority?: unknown): Promise<ConditionResolutionOutcome>;
+export async function resolveDiscoveryCondition(store: Store, request: { evidence: Ref }, authority?: unknown): Promise<EvidenceResolutionOutcome>;
+export async function resolveDiscoveryCondition(store: Store, request: unknown, authority?: unknown): Promise<AnyConditionOutcome>;
+export async function resolveDiscoveryCondition(store: Store, request: unknown, authority?: unknown): Promise<AnyConditionOutcome> {
   requireCondition(store instanceof Store, 'discovery_condition_resolution_invalid', 'An owner choice needs a Store');
   const input = choiceRequest(request), projectId = input.projectId;
   const project = store.get(`project:${projectId}`);
@@ -1773,6 +1864,7 @@ export async function resolveDiscoveryCondition(store: Store, request: unknown, 
   // paid grounds are proven again; a choice is written only over the proven predecessor below.
   const view = readEditionView(store, projectId, input.manifest);
   if (input.claims) return refuseEvidence(store, view, input);
+  if (input.evidence) return resolveEvidenceCondition(store, project, view, input);
   offeredConditionOption(view, input.conditionId, input.optionId);
   const basis = await readAcceptedDiscoveryBasisAt(store, projectId, input.manifest), predecessor = basis.accepted;
   const offered = offeredConditionOption(predecessor, input.conditionId, input.optionId);
@@ -1781,14 +1873,14 @@ export async function resolveDiscoveryCondition(store: Store, request: unknown, 
    * unconfirmed class of the versioned form is a typed refusal, never the legacy case. */
   const classOver = (over: AcceptedDiscoveryBasis): FinalConditionClass | null => isClassedFinalContract(over.accepted.grounds.bundle.contract)
     ? provenConditionClass(over.accepted.grounds.bundle, over.review, input.conditionId).class : null;
-  const outcome = (proven: Revision<ConditionAct>, base: AcceptedDiscoveryBasis, repeated: boolean): ConditionResolutionOutcome => {
+  const outcome = async (proven: Revision<ConditionAct>, base: AcceptedDiscoveryBasis, repeated: boolean): Promise<ConditionResolutionOutcome> => {
     const accept = proven.value.option.choice === 'accept';
     if (proven.value.contract === CONDITION_RESOLUTION_POSITIVE_CONTRACT) {
       const successor = readManifestSuccessor(store, projectId, proven.value.predecessor);
       if (!successor || !sameScope(successor.value.resolution, reference(proven)))
         throw new EngineError('discovery_acceptance_invalid', 'A positive resolution is saved without its edition',
           { project: projectId, conditionId: input.conditionId, door: 'owner-final-condition' });
-      const edition = extendAcceptedEdition(store, projectId, base, successor.value.successor).accepted;
+      const edition = (await extendAcceptedEdition(store, projectId, base, successor.value.successor)).accepted;
       return { choice: 'accept', resolution: structuredClone(proven), edition, resolved: true, unproven: null, route: null,
         conditions: structuredClone(edition.conditions), repeated };
     }
@@ -1811,12 +1903,15 @@ export async function resolveDiscoveryCondition(store: Store, request: unknown, 
     let base = basis;
     while (!sameScope(reference(base.accepted.manifest), found.predecessor) && base.accepted.manifest.value.previous)
       base = await readAcceptedDiscoveryBasisAt(store, projectId, base.accepted.manifest.value.previous);
+    if ((found.row.value as { contract?: unknown }).contract === CONDITION_RESOLUTION_EVIDENCE_CONTRACT)
+      throw new EngineError('discovery_condition_resolution_invalid', 'An evidence condition is resolved by its paid evidence assessment only',
+        { project: projectId, conditionId: input.conditionId, door: 'owner-final-condition' });
     const proven = proveConditionResolution(store, projectId, reference(found.row), base.accepted);
     // Only a compatible saved act is this result; another option is an explicit conflict, never the old act as success.
     if (proven.value.option.optionId !== input.optionId)
       throw new EngineError('discovery_condition_resolution_conflict', 'The owner has already chosen another option on this condition',
         { project: projectId, conditionId: input.conditionId, chosen: proven.value.option.optionId, door: 'owner-final-condition' });
-    return outcome(proven, base, repeated);
+    return await outcome(proven, base, repeated);
   };
   const before = await saved(true);
   if (before) return before;
