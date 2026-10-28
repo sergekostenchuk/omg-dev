@@ -2,6 +2,8 @@ import {configureReaderPilot} from '../src/discovery/reader-pilot.js';
 import test from 'node:test';
 import {Ajv} from 'ajv';
 import {hashJson} from '../src/canonical.js';
+import {readDiscoveryAssessment} from '../src/discovery/research-assessment.js';
+import {checkDiscoveryAssessmentForm} from '../src/discovery/v7-attempt-assessment.js';
 import assert from 'node:assert/strict';
 import {readFileSync, writeFileSync} from 'node:fs';
 import {join} from 'node:path';
@@ -27,17 +29,44 @@ function policy(store:Store, discovery:6|7, previous:Ref|null=null) {
   try {return setProjectProducerPolicy(store,scope,session.authority).record;}
   finally {sessions.revoke(session.bearer);}
 }
-async function world(t:test.TestContext, tokens=10, planning=false, readFirst=false) {
+async function world(t:test.TestContext, tokens=10, planning=false, readFirst=false, assessor: false|'supported'|'return'|'fact-unknown'=false) {
   const f=discoveryFixture(t,'omg-live-forms-',true);
   f.engine.execute({type:'create-project',project:'p',title:'Forms'});
   const wire=join(f.root,'wire'),settings=join(f.root,'reply.json'),adapter=join(f.root,'adapter.mjs');
   writeFileSync(wire,'');
-  const reply=(action:unknown,usage=10)=>writeFileSync(settings,JSON.stringify({action,usage}));
+  const reply=(action:unknown,usage=10)=>writeFileSync(settings,JSON.stringify({action,usage,assessmentVerdict:assessor}));
   reply({action:'pause',reason:'Calibration'});
   writeFileSync(adapter,`import {readFileSync,appendFileSync} from 'node:fs';
 const r=JSON.parse(readFileSync(0,'utf8')),s=JSON.parse(readFileSync(${JSON.stringify(settings)},'utf8'));
 appendFileSync(${JSON.stringify(wire)},JSON.stringify(r)+'\\n');
-console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research:s.action,
+let action=s.action;
+if(s.assessmentVerdict && r.subject.assessmentSubject) {
+ const packet=r.subject.assessmentSubject.packet;
+ const attempts=packet.entries.map(e=>({attempt:e.attempt,reason:'Reviewed the exact paid attempt'}));
+ const claims=(r.subject.value?.attempts??[]).flatMap(e=>e.end.type==='submitted'?e.end.value.claims.map((claim,i)=>({
+  claim:{project:packet.project,container:e.attempt,containerKind:'research-attempt',pointer:'/claims/'+i,claimId:claim.id},reason:'Classified the explicit unknown'})):[]);
+ const supported=s.assessmentVerdict!=='return';
+ action={verdict:supported?'supported':'return',reasons:['The stated uncertainty is explicit'],return:supported?null:{target:{claim:claims[0].claim},reason:'Obtain the missing regional evidence'},
+ novelty:{attempts,accepted:supported?claims:[],rejected:supported?[]:claims,newContent:supported?claims:[],duplicates:[],noProgress:supported?[]:attempts,transition:null},
+ methodology:{contract:'assessment-methodology/v1',policy:'assessment-methodology-policy/v2',facts:[]}};
+ if(s.assessmentVerdict==='fact-unknown') {
+  action.novelty.transition={outcome:'unknown',bases:claims.map(row=>({claim:row.claim})),reason:'The mandate is documented but jurisdiction is unknown',
+   consequence:'Concept must retain the unresolved jurisdiction constraint',nextAction:'Obtain the operating jurisdiction from the owner'};
+  action.methodology.facts=(r.subject.value?.attempts??[]).flatMap(e=>e.end.type==='submitted'?e.end.value.claims.flatMap((fact,i)=>{
+   if(fact.kind!=='fact')return [];
+   const pin=fact.basis.source,evidence={source:pin.ref,selector:{kind:'text-range',...pin.range}};
+   return [{claim:{project:packet.project,container:e.attempt,containerKind:'research-attempt',pointer:'/claims/'+i,claimId:fact.id},
+    significance:{kind:'blocking',reason:'The plan question is blocking'},sources:[{source:pin.ref,role:'primary',reason:'Original owner mandate',
+     evidence:[evidence],original:pin.ref,originalReason:'The saved mandate is its own original',limitation:'Only the mandate is evidenced',
+     publicationDate:{status:'unknown',reason:'No publication date supplied'},eventDate:{status:'unknown',reason:'No event date supplied'},
+     version:{status:'unknown',reason:'No version stated'},retrievedAt:null}],
+    temporalApplicability:{status:'limited',scope:'The supplied mandate',reason:'Dates are not evidenced',evidence:[]},
+    corroboration:{status:'single_confirmation',reason:'Only the primary mandate is supplied',limitation:'No independent confirmation'},
+    refutation:{status:'not_performed',reason:'No refutation search performed',traces:[],counterarguments:[],limitations:['Refutation remains open']}}];
+  }):[]);
+ }
+}
+console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research:action,
 usage:{inputTokens:s.usage,outputTokens:1,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
   const command={executable:process.execPath,args:[adapter]};
   const environment=f.engine.environments.configure('p',{workspace:f.root,
@@ -46,6 +75,8 @@ usage:{inputTokens:s.usage,outputTokens:1,cachedInputTokens:0,reasoningOutputTok
   const probe=f.discovery.create('p','discovery','R0','concept',[{field:'probe',kind:'fact',prompt:'Calibrate',risk:'unknown',schema:{type:'string'}}],[],6);
   await researchCall(environment.value.implementer,environment.value,'Calibrate',{},undefined,
     {store:f.store,draftId:probe.id,questionId:probe.value.questions[0]!,purpose:'analyst'});
+  if(assessor) await researchCall(environment.value.reviewer,environment.value,'Calibrate assessor',{},undefined,
+    {store:f.store,draftId:probe.id,questionId:probe.value.questions[0]!,purpose:'assessor'});
   if(planning) {
     await researchCall(environment.value.implementer,environment.value,'Calibrate planner',{dispatchMode:'planning'},undefined,
       {store:f.store,draftId:probe.id,questionId:probe.value.questions[0]!,purpose:'reading-planner'});
@@ -277,4 +308,95 @@ test('claims delivery: the actual continuation carries full forms and real sourc
   const read=f.store.list<any>('research-turn').find(row=>row.value.action.action==='read_source')!;
   const forged=structuredClone(read.value);forged.observation.value='Not the actual source';
   assert.throws(()=>planClaimsContract(f.store,'p',subject,[forged]),{code:'research_claim_source_invalid'});
+});
+
+
+for(const verdict of ['supported','return'] as const)
+test(`assessment forms: actual ${verdict} wire delivers closed novelty rows and target, then the common reader proves the result`,async t=>{
+  const f=await world(t,10,false,false,verdict);
+  await f.engine.execute(f.commandRetry);
+  const subject=f.refused.value.cursor.subject!;
+  const claim={id:'unknown-region',kind:'unknown',text:'The operating region needs evidence',axis:'industry',
+    planQuestions:[{planAnswer:subject.planAnswer,planQuestionId:'industry'}],scope:{variants:'common'},
+    basis:{origin:'Plan research',unknownId:'region',question:'Which operating region?',affects:['rules'],consumer:'concept',
+      blocksCurrentStage:true,moment:'feasibility',closeCriterion:'Owner supplies the actual operating region'}};
+  f.reply({action:'answer',question:'industry',value:{type:'submitted',contract:'discovery-claims/v7',value:{claims:[claim]}},citations:[]});
+  const result=await f.engine.execute({type:'research-draft',project:'p',draftId:f.draft.id,maxTurns:1}) as any;
+  const attempt=f.store.list<any>(V7_ATTEMPT_KIND)[0]!;assert.ok(attempt);
+  const address={project:'p',container:reference(attempt),containerKind:V7_ATTEMPT_KIND,pointer:'/claims/0',claimId:claim.id};
+  const attemptRow={attempt:reference(attempt),reason:'Reviewed the exact paid attempt'},claimRow={claim:address,reason:'Classified the explicit unknown'};
+  const reply={verdict,reasons:['The stated uncertainty is explicit'],return:verdict==='supported'?null:{target:{claim:address},reason:'Obtain the missing regional evidence'},
+    novelty:{attempts:[attemptRow],accepted:verdict==='supported'?[claimRow]:[],rejected:verdict==='return'?[claimRow]:[],
+      newContent:verdict==='supported'?[claimRow]:[],duplicates:[],noProgress:verdict==='return'?[attemptRow]:[],transition:null},
+    methodology:{contract:'assessment-methodology/v1',policy:'assessment-methodology-policy/v2',facts:[]}};
+  const wires=f.wires().filter(w=>w.subject.assessmentSubject);assert.equal(wires.length,1,JSON.stringify(result.value));
+  const wire=wires[0],form=wire.subject.assessmentClassification;
+  assert.equal(form.contract,'discovery-assessment-classification/v1');
+  const validate=new Ajv({strict:true}).compile(form.schema);
+  assert.equal(validate(reply),true,JSON.stringify(validate.errors));
+  const full=new Ajv({strict:true}).compile(wire.subject.question.schema);
+  assert.equal(full(reply),true,JSON.stringify(full.errors));
+  assert.deepEqual(form.schema.$defs.claim,wire.subject.question.schema.$defs.claim);
+  assert.deepEqual(form.schema.$defs.claimRow.required,['claim','reason']);
+  assert.deepEqual(form.schema.$defs.attemptRow.required,['attempt','reason']);
+  const duplicate={...reply,novelty:{...reply.novelty,duplicates:[{...claimRow,of:address}]}};
+  assert.equal(validate(duplicate),true);
+  delete (duplicate.novelty.duplicates[0] as any).of;assert.equal(validate(duplicate),false);
+  const missing=structuredClone(reply);delete (missing.novelty.attempts[0] as any).reason;assert.equal(validate(missing),false);
+  assert.equal(validate({...reply,return:{target:reference(attempt),reason:'Bare target'}}),false);
+  assert.equal(validate({...reply,return:{target:{attempt:reference(attempt)},reason:'Exact attempt'}}),true);
+  const saved=f.store.list<any>('discovery-assessment');assert.equal(saved.length,1,JSON.stringify(result.value));
+  const proven=readDiscoveryAssessment(f.open(),'p',reference(saved[0]!));
+  assert.equal(proven.value.verdict,verdict);
+  const calls=f.wires().length;
+  assert.deepEqual(readDiscoveryAssessment(f.open(),'p',reference(saved[0]!)),proven);
+  assert.equal(f.wires().length,calls);
+});
+
+
+test('LIVE-ASSESS-FORMS-01: blocking fact and unknown receive a real unknown assessment with primary-source methodology',async t=>{
+  const f=await world(t,10,false,false,'fact-unknown');
+  await f.engine.execute(f.commandRetry);
+  const subject=f.refused.value.cursor.subject!;
+  const common={axis:'industry',planQuestions:[{planAnswer:subject.planAnswer,planQuestionId:'industry'}],scope:{variants:'common'}};
+  const claims=[{...common,id:'mandate-fact',kind:'fact',text:'The mandate names construction materials',
+    basis:{source:{ref:reference(f.source),range:{start:0,end:f.source.value.content.length},valueHash:hashJson(f.source.value.content)},
+      limit:'Only the supplied mandate is evidenced',asOf:'Undated supplied mandate'}},
+    {...common,id:'unknown-region',kind:'unknown',text:'The operating jurisdiction is unknown',
+      basis:{origin:'Owner mandate',unknownId:'jurisdiction',question:'Which jurisdiction?',affects:['rules'],consumer:'concept',
+        blocksCurrentStage:true,moment:'feasibility',closeCriterion:'Owner names the actual operating jurisdiction'}}];
+  f.reply({action:'answer',question:'industry',value:{type:'submitted',contract:'discovery-claims/v7',value:{claims}},citations:[]});
+  const result=await f.engine.execute({type:'research-draft',project:'p',draftId:f.draft.id,maxTurns:1}) as any;
+  const wires=f.wires().filter(w=>w.subject.assessmentSubject);assert.equal(wires.length,1,JSON.stringify(result.value));
+  const form=wires[0].subject.assessmentClassification;
+  for(const condition of ['class=blocking','transition.outcome=unknown','both consequence and nextAction',
+    'forbidden for every outcome other than unknown','significance.kind must be blocking','original must equal source'])
+    assert.ok(form.instruction.includes(condition),condition);
+  const records=f.store.list<any>('discovery-assessment');assert.equal(records.length,1,JSON.stringify(result.value));
+  const paid=readDiscoveryAssessment(f.open(),'p',reference(records[0]!)),value=paid.value as any;
+  assert.equal(value.verdict,'supported');assert.equal(value.novelty.accepted.length,2);
+  assert.equal(value.novelty.transition.outcome,'unknown');
+  assert.ok(value.novelty.transition.consequence);assert.ok(value.novelty.transition.nextAction);
+  assert.equal(value.methodology.facts.length,1);assert.equal(value.methodology.facts[0].significance.kind,'blocking');
+  const source=value.methodology.facts[0].sources[0];
+  assert.deepEqual(source.source,reference(f.source));assert.deepEqual(source.original,source.source);assert.equal(source.role,'primary');
+  const response={verdict:value.verdict,reasons:value.reasons,return:value.return,novelty:value.novelty,methodology:value.methodology};
+  const validate=new Ajv({strict:true}).compile(form.schema);
+  assert.equal(validate(response),true,JSON.stringify(validate.errors));
+  const full=new Ajv({strict:true}).compile(wires[0].subject.question.schema);
+  assert.equal(full(response),true,JSON.stringify(full.errors));
+  for(const outcome of ['open','closed']) for(const field of ['consequence','nextAction']) {
+    const changed=structuredClone(response);changed.novelty.transition={outcome,bases:response.novelty.transition.bases,reason:'Changed outcome',[field]:'Not an unknown'};
+    assert.equal(validate(changed),false,`${outcome}.${field}`);
+  }
+  const mutate=(change:(value:any)=>void)=>{const copy=structuredClone(value);change(copy);
+    assert.throws(()=>checkDiscoveryAssessmentForm(f.store,copy),{code:'discovery_novelty_invalid'});};
+  for(const field of ['consequence','nextAction']) mutate(copy=>{delete copy.novelty.transition[field];});
+  mutate(copy=>{copy.novelty.transition.outcome='open';});
+  mutate(copy=>{copy.methodology.facts[0].significance.kind='material';});
+  mutate(copy=>{copy.methodology.facts[0].sources[0].original=null;});
+  mutate(copy=>{delete copy.methodology.facts[0].sources[0].original;});
+  const otherSource=f.discovery.evidence.document('p','other-original','A different original source','text/plain',0);
+  mutate(copy=>{copy.methodology.facts[0].sources[0].original=reference(otherSource);});
+  assert.deepEqual(readDiscoveryAssessment(f.open(),'p',reference(records[0]!)),paid);
 });

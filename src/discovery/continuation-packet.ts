@@ -519,6 +519,49 @@ export function assessmentResponseContract(subject: AssessmentTransportSubject |
     return requirementsResponseContract ??= buildRequirementsResponseContract();
   return subject?.assessment ? (methodologyResponseContract ??= buildMethodologyResponseContract()) : ATTEMPTS_ASSESSMENT_RESPONSE;
 }
+/** Additional shape for fields left abstract by the historical paid question.
+ * It is applied together with question.schema; its methodology and v3
+ * transition contract remain the ones already delivered by that question. */
+export function assessmentClassificationContract(subject: AssessmentTransportSubject) {
+  const base = assessmentResponseContract(subject);
+  const definitions = '$defs' in base ? base.$defs : buildMethodologyResponseContract().$defs;
+  const claim = { $ref: '#/$defs/claim' };
+  const attemptRow = { type: 'array', items: { $ref: '#/$defs/attemptRow' } };
+  const claimRow = { type: 'array', items: { $ref: '#/$defs/claimRow' } };
+  return { contract: 'discovery-assessment-classification/v1',
+    schema: { type: 'object', required: ['return', 'novelty'], properties: {
+      return: { anyOf: [{ type: 'null' }, methodObject({ target: { oneOf: [
+        methodObject({ attempt: methodRef }), methodObject({ claim })] }, reason: methodText })] },
+      novelty: { type: 'object', required: ['attempts', 'accepted', 'rejected', 'newContent', 'duplicates', 'noProgress'],
+        properties: { attempts: attemptRow, accepted: claimRow, rejected: claimRow, newContent: claimRow,
+          duplicates: { type: 'array', items: methodObject({ claim, reason: methodText, of: claim }) }, noProgress: attemptRow,
+          transition: { anyOf: [{ type: 'null' },
+            { type: 'object', required: ['outcome'], properties: { outcome: { const: 'unknown' },
+              consequence: methodText, nextAction: methodText } },
+            { type: 'object', required: ['outcome'], properties: { outcome: { enum: ['open', 'closed'] },
+              consequence: false, nextAction: false } }] } } },
+    }, $defs: { ref: definitions.ref, claim: definitions.claim,
+      attemptRow: methodObject({ attempt: methodRef, reason: methodText }),
+      claimRow: methodObject({ claim, reason: methodText }) } },
+    instruction: 'The same assessment response must satisfy both question.schema and assessmentClassification.schema. '
+      + 'question.schema supplies the complete verdict/reasons/methodology and transition form (including v3 sufficiency); '
+      + 'this additional schema supplies exact novelty rows and return.target. Do not wrap the response in these delivery contracts. '
+      + 'novelty.attempts lists every exact packet.entries[i].attempt once as {attempt:Ref,reason:string}. '
+      + 'Each submitted claim appears exactly once in accepted or rejected as {claim:ClaimAddress,reason:string}. '
+      + 'Use the saved attempt Ref as container, containerKind="research-attempt", project from the packet, '
+      + 'pointer="/claims/<index>" and the actual claim id from its submitted value. Read addressed packet material when needed; never invent links. '
+      + 'Each accepted claim appears exactly once in newContent or duplicates. A duplicates row adds of:ClaimAddress, '
+      + 'which must name an accepted baseline material or an earlier accepted claim in this packet. '
+      + 'noProgress uses {attempt:Ref,reason:string} for exactly those packet attempts with neither newContent nor a constraint used by transition. '
+      + 'supported requires return:null. A return accepts no claim, classifies all submitted claims as rejected, has transition:null '
+      + 'and gives return:{target:{attempt:Ref}|{claim:ClaimAddress},reason:string} for one actual packet member. '
+      + 'For a plan-question with class=blocking and transition.outcome=unknown, both consequence and nextAction must be nonempty strings. '
+      + 'consequence and nextAction are forbidden for every outcome other than unknown (including open and closed). '
+      + 'For every accepted fact of a class=blocking question, methodology.facts[].significance.kind must be blocking; material or supporting is forbidden. '
+      + 'For every methodology source with role=primary, original must equal source as the same exact Ref (id, revision and hash), never null or another revision. '
+      + 'Never substitute a bare Ref for target, add fields to a row, omit a classification, or emit computed novelty keys, streak/N or authority.' };
+}
+
 export const ATTEMPTS_ASSESSMENT_INSTRUCTION = 'Assess exactly assessmentSubject.packet against assessmentSubject.baseline. '
   + 'Return verdict supported or return, nonempty reasons, return (null for supported), and mandatory novelty with '
   + 'attempts, accepted, rejected, newContent, duplicates, noProgress and transition. Classify every packet attempt and '
