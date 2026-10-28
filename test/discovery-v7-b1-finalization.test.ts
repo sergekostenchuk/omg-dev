@@ -11,7 +11,7 @@ import { B1_BRIEF, dossierWorld, finalizationWorld, finalizationAdapter as adapt
 import { all, completed, money } from './discovery-v7-dossier-seed.js';
 import { readProjectMode } from '../src/product/project-mode.js';
 import { canonical, hashJson, type Json } from '../src/canonical.js';
-import { storeView } from '../src/storage/store-view.js';
+import { whileHidden } from './hidden-record.js';
 import { EngineError } from '../src/errors.js';
 
 function stamp(f: World) { return { history: all(f.store), event: f.store.lastEvent(), money: money(f.store), wires: f.wires() }; }
@@ -122,9 +122,9 @@ test('B1 recovery: malformed and mixed saved state fails typed without writes, m
     { ...row.value, final: f.d6 }, { ...row.value, prepared: row.value.assessmentPrepared }];
   for (const body of mutations) {
     const changed = { ...row, value: body as Json, hash: hashJson(body as never) };
-    const view = storeView(f.store, { write: () => { throw new Error('Reader wrote'); },
-      get: (id, revision) => id === row.id && (revision === undefined || revision === row.revision) ? changed : undefined });
-    await assert.rejects(readDiscoveryFinalizationAt(view, 'p', reference(changed)), (error: unknown) => error instanceof EngineError);
+    // The genuine Store answers with the changed row for the time of one read, so its proofs are kept; that nothing was written is the stamp below.
+    await whileHidden(f.store, { id: row.id, revision: row.revision }, changed, () =>
+      assert.rejects(readDiscoveryFinalizationAt(f.store, 'p', reference(changed)), (error: unknown) => error instanceof EngineError));
   }
   assert.deepEqual(stamp(f), before);
   assert.equal(canonical((await readRunnerFinalizationAt(f.open(), 'p', reference(value))).view), canonical(proof.view));
