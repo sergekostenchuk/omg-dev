@@ -1,3 +1,5 @@
+import { discoveryConsumerForDraft, requireDiscoveryHandoff, hasDiscoveryHandoff, withDiscoveryHandoffAt, type DiscoveryHandoffBinding } from '../discovery/discovery-handoff.js';
+import { consumerPreparationFields, readDiscoveryConsumerProjectionAt, type DiscoveryConsumerProjection } from '../discovery/discovery-consumer-projection.js';
 import { isWebDocumentSource } from '../evidence/evidence.js';
 import { canonical, canonicalSorted, digest, hashJson, type Json } from "../canonical.js";
 import { EngineError } from "../errors.js";
@@ -57,12 +59,13 @@ export type InputResult<T> = OmResult<T, InputCode>;
 const refuse = localRefusals(INPUT_LOCAL_CODES);
 // Annotated explicitly: only a declared `never` makes a bare call end the control flow for tsc.
 const raise: (code: InputErrorCode, message: string, details?: unknown) => never = localErrors(INPUT_ERROR_CODES);
-export interface InputStage { ref: Ref; contractVersion: number | null; fields: Record<string, Json> }
+export interface InputStage { ref: Ref; contractVersion: number | null; fields: Record<string, Json>; sourceKind?: 'accepted-manifest'; discoveryHandoff?: DiscoveryHandoffBinding }
 export type InputStages = Record<UpstreamStage, InputStage>;
-export interface InputOptions { inventory?: Ref | null; nodesRequiredSince?: number | null }
+export interface InputOptions { inventory?: Ref | null; nodesRequiredSince?: number | null; discovery?: DiscoveryConsumerProjection }
 export interface InputGap { code: string; target: string; field: string; consumer: Json; message: string; source: Ref | null }
 export interface OmInput {
-  sources: (Ref & { stage: UpstreamStage; contractVersion: number | null })[];
+  discovery?: { contract: 'discovery-om-handoff/v1'; manifest: Ref; bundle: Ref; unknowns: DiscoveryConsumerProjection['material']['unknowns'] };
+  sources: (Ref & { stage: UpstreamStage; contractVersion: number | null; sourceKind?: 'accepted-manifest' })[];
   inventory: Ref | null;
   requirements: { id: string; section: string }[];
   criteria: { id: string; requirement: string; checkKind: string | null }[];
@@ -70,7 +73,8 @@ export interface OmInput {
     success: string[]; failures: string[]; forbiddenEffects: string[]; state: Record<string, Json>; proof: string }[];
   features: { index: number; title: string; outcome: string; behaviorIndexes: number[]; requirementIds: string[]; contracts: string[] }[];
   questions: { id: string; question: string; consumer: string; kind: Json; blocks: boolean; source: Ref;
-    moment?: typeof QUESTION_MOMENTS[number]; addressedBy?: Ref; originalConsumer?: string; readiness?: ReadinessCause }[];
+    moment?: typeof QUESTION_MOMENTS[number]; origin?: DiscoveryConsumerProjection['material']['unknowns'][number]['origin'];
+    sourcePointer?: string; affects?: string[]; closeCriterion?: string; addressedBy?: Ref; originalConsumer?: string; readiness?: ReadinessCause }[];
   facts?: AppliedInputFact[];
   /** OWN1 (№3711): predecessor questions the model decided in the bypass, each with its F5.3 decision; no longer asked. */
   decided?: DecidedInputQuestion[];
@@ -169,6 +173,13 @@ export function readOmAdmissionGuards(value: unknown, gate: string, unit: "G1" |
 }
 
 /** Pure normalization; persistence independently resolves and checks the saved source records. */
+/** A bound consumer is proved before this pure builder; no dossier internals are exposed. */
+export async function buildOmInputFromDiscovery(store: Store, project: string, manifest: Ref, stages: InputStages,
+  options: Omit<InputOptions, 'discovery'> = {}): Promise<Sealed<BuiltOmInput>> {
+  requireInputRequest(store, { project, stages: {} as InputRequest['stages'], expected: 0 });
+  const snapshot = copy({ stages, options });
+  return buildOmInput(snapshot.stages, { ...snapshot.options, discovery: await readDiscoveryConsumerProjectionAt(store, project, manifest, 'om-g2') });
+}
 export function buildOmInput(stages: InputStages, options: InputOptions = {}): Sealed<BuiltOmInput> {
   if (!object(stages)) invalid("stages");
   if (!object(options) || (options.inventory !== undefined && options.inventory !== null && !isRef(options.inventory))
@@ -190,6 +201,14 @@ export function buildOmInput(stages: InputStages, options: InputOptions = {}): S
   const finish = (input: OmInput | null): Sealed<BuiltOmInput> => sealed({ input: refusals.length ? null : input,
     hash: refusals.length || !input ? null : hashJson(input), refusals: sorted(refusals), gaps: sorted(gaps) });
   if (refusals.length) return finish(null);
+  if (options.discovery !== undefined) {
+    const d = options.discovery;
+    if (!object(d) || d.contract !== 'discovery-consumer-projection/v1' || d.consumer !== 'om-g2'
+      || !isRef(d.manifest) || !isRef(d.bundle) || !object(d.preparation) || !object(d.material)
+      || !Array.isArray(d.material.unknowns) || !d.material.unknowns.every(object)) invalid('discovery');
+    stages = { ...stages, discovery: { ...stages.discovery,
+      fields: { ...stages.discovery.fields, ...consumerPreparationFields(d) } } };
+  }
   // Check the new mandatory field before JSON normalization, including explicit undefined.
   for (const stage of ["discovery", "features"] as const) {
     if (!questionMomentRequired(stages[stage].contractVersion)) continue;
@@ -304,7 +323,13 @@ export function buildOmInput(stages: InputStages, options: InputOptions = {}): S
     if (!text(raw.consumer)) { fail("question_consumer_missing", stage, `${id}.consumer`, "A question must have its producer's consumer"); return; }
     if (typeof raw.blocksCurrentStage !== "boolean") fail("input_field_missing", stage, `${id}.blocksCurrentStage`, "The producer must specify whether the question blocks its stage");
     questions.push({ id, question: wording, consumer: raw.consumer, kind: Object.hasOwn(raw, "kind") ? raw.kind : null,
-      blocks: raw.blocksCurrentStage === true, source: stages[stage].ref,
+      blocks: raw.blocksCurrentStage === true, source: stage === 'discovery' && options.discovery ? options.discovery.bundle : stages[stage].ref,
+      ...(stage === 'discovery' && options.discovery ? (() => {
+        const unknown = options.discovery!.material.unknowns.find(item => item.id === raw.id);
+        if (!unknown) invalid('discovery.unknowns');
+        return { origin: structuredClone(unknown.origin), sourcePointer: unknown.source.pointer, affects: [...unknown.affects],
+          closeCriterion: unknown.closeCriterion, moment: unknown.moment };
+      })() : {}),
       ...(questionMomentRequired(stages[stage].contractVersion) ? { moment: raw.moment } : {}) });
   };
   for (const [index, raw] of unknowns.entries()) question(raw, `discovery:${requiredText(raw.id, "discovery", `unknowns[${index}].id`)}`, "discovery");
@@ -331,8 +356,10 @@ export function buildOmInput(stages: InputStages, options: InputOptions = {}): S
     fail("feature_preparation_foreign", "features", `featurePreparation[${index}]`, "Preparation belongs to no feature with this title and outcome");
   if (!options.inventory) gaps.push({ code: "inventory_missing", target: "repo-inventory", field: "inventory",
     consumer: { mechanism: "M6", uses: ["code-answer", "project-question-package"] }, message: "Repository inventory is unavailable", source: null });
-  return finish({ sources: INPUT_STAGES.map(stage => ({ stage, id: stages[stage].ref.id, revision: stages[stage].ref.revision,
-    hash: stages[stage].ref.hash, contractVersion: stages[stage].contractVersion })),
+  return finish({ ...(options.discovery ? { discovery: { contract: 'discovery-om-handoff/v1' as const, manifest: structuredClone(options.discovery.manifest),
+    bundle: structuredClone(options.discovery.bundle), unknowns: structuredClone(options.discovery.material.unknowns) } } : {}), sources: INPUT_STAGES.map(stage => ({ stage, id: stages[stage].ref.id, revision: stages[stage].ref.revision,
+    hash: stages[stage].ref.hash, contractVersion: stages[stage].contractVersion,
+    ...(stages[stage].sourceKind ? { sourceKind: stages[stage].sourceKind } : {}) })),
     inventory: options.inventory ?? null, requirements: sorted(requirements), criteria: sorted(criteria), contracts: sorted(contracts),
     features, questions: sorted(questions), map: mapIds });
 }
@@ -362,6 +389,21 @@ function requireInputRequest(store: Store, request: InputRequest): void {
 // An accepted historical snapshot is checked against its saved proof closure. A later source revision or file edit
 // is not a reason to rerun old acceptance against today's evidence or to substitute a current draft for its source.
 function loadSources(store: Store, request: InputRequest, prefix: readonly UpstreamStage[] = INPUT_STAGES): InputResult<Sealed<InputStages>> {
+  const conceptRef = request.stages.concept;
+  const concept = isRef(conceptRef) ? store.get<StageArtifact>(conceptRef.id, conceptRef.revision) : null;
+  const conceptContent = concept?.value.content as unknown as { draft?: Ref; discoveryHandoff?: DiscoveryHandoffBinding };
+  const root = conceptContent?.discoveryHandoff && concept?.value.inputs.length === 1
+    && canonical(concept.value.inputs[0]) === canonical(conceptContent.discoveryHandoff.manifest) ? conceptContent : null;
+  let rootHandoff: ReturnType<typeof requireDiscoveryHandoff> | null = null;
+  if (root) {
+    const draft = isRef(root.draft) ? store.get<DiscoveryDraft>(root.draft.id, root.draft.revision) : null;
+    if (!draft || canonical(reference(draft)) !== canonical(root.draft))
+      return refuse('stage_not_accepted', 'The manifest-root concept lost its exact draft', at(concept!.id, 'content.draft'), 'producer');
+    rootHandoff = requireDiscoveryHandoff(store, draft.value);
+    if (canonical(rootHandoff.source.manifest) !== canonical(request.stages.discovery))
+      return refuse('stage_not_accepted', 'OM must use the manifest pinned by its concept', at(concept!.id, 'inputs'), 'producer');
+    prefix = prefix.filter(stage => stage !== 'discovery');
+  }
   const stages = new Map<UpstreamStage, Revision<StageArtifact>>();
   for (const stage of prefix) {
     const result = readRecord<StageArtifact>(store, request.stages[stage], { unit: "G1", target: stageId(request.project, stage),
@@ -372,6 +414,12 @@ function loadSources(store: Store, request: InputRequest, prefix: readonly Upstr
     stages.set(stage, result.value as Revision<StageArtifact>);
   }
   const sources: Partial<InputStages> = {};
+  if (rootHandoff) {
+    const material = discoveryConsumerForDraft(store, store.get<DiscoveryDraft>(rootHandoff.binding.draft, 1)!.value, 'om-g2')!;
+    // This is normalized input material with an explicit manifest source, never a fabricated accepted StageArtifact.
+    sources.discovery = { ref: rootHandoff.source.manifest, sourceKind: 'accepted-manifest', contractVersion: 9,
+      fields: consumerPreparationFields(material) };
+  }
   for (const [index, stage] of prefix.entries()) {
     const record = stages.get(stage)!;
     const bad = (field: string, message: string): never => {
@@ -386,8 +434,8 @@ function loadSources(store: Store, request: InputRequest, prefix: readonly Upstr
         "status", "The exact stage must belong to this project and be accepted");
       check(Array.isArray(value.inputs) && value.inputs.every(isRef) && Array.isArray(value.proofs) && value.proofs.every(isRef),
         "proofs", "Accepted stage inputs and proofs must be explicit exact references");
-      const predecessor = index > 0 ? stages.get(INPUT_STAGES[index - 1]!)! : null;
-      check(canonical(value.inputs) === canonical(predecessor ? [reference(predecessor)] : []), "inputs", "The stage must bind the supplied exact predecessor");
+      const predecessor = index > 0 ? stages.get(prefix[index - 1]!)! : null;
+      check(canonical(value.inputs) === canonical(predecessor ? [reference(predecessor)] : rootHandoff ? [rootHandoff.source.manifest] : []), "inputs", "The stage must bind the supplied exact predecessor");
       const content: unknown = value.content;
       check(object(content) && isRef(content.draft) && object(content.fields) && Object.hasOwn(content, "graph"),
         "content", "The stage must bind its exact research draft and fields");
@@ -411,12 +459,19 @@ function loadSources(store: Store, request: InputRequest, prefix: readonly Upstr
         check(found && found.kind === kind, "proofs", `Acceptance has no ${kind} proof: ${id}`);
         return proof(reference(found), kind);
       };
-      for (const input of value.inputs) proof(input, "stage");
+      for (const input of value.inputs) proof(input, rootHandoff && stage === 'concept' ? undefined : "stage");
       const draftRecord = proof(content.draft, "discovery-draft"), draft = draftRecord.value;
       check(draftRecord.id.startsWith(`discovery:${request.project}:`) && draft.projectId === request.project && draft.stage === stage
         && object(draft.fields) && canonical(draft.fields) === canonical(content.fields), "content.draft", "The exact draft must belong to this stage and preserve its fields");
+      if (rootHandoff) check(Object.hasOwn(draft, 'discoveryHandoff'), 'content.discoveryHandoff', 'A manifest-root chain cannot lose its binding');
       const eraInfo = explicitContractEraOf(draft);
       const version = eraInfo.present ? eraInfo.version : null;
+      if (hasDiscoveryHandoff(store, draft as unknown as DiscoveryDraft)) {
+        check(canonical(content.discoveryHandoff ?? null) === canonical(draft.discoveryHandoff), 'content.discoveryHandoff', 'Stage must preserve its draft manifest');
+        const h = requireDiscoveryHandoff(store, draft as unknown as DiscoveryDraft);
+        check(!rootHandoff || canonical(h.source.manifest) === canonical(rootHandoff.source.manifest), 'content.discoveryHandoff', 'Every stage must inherit the same exact manifest');
+        proof(h.source.manifest); proof(h.source.bundle);
+      }
       check(version === null || typeof version === "number" && Number.isSafeInteger(version) && version > 0, "contractVersion", "The exact draft version is malformed");
       check(inputResearchRequirements(version), "contractVersion", "The draft uses an unknown historical contract");
       check(Array.isArray(draft.questions) && draft.questions.every(text) && Array.isArray(draft.inputs) && draft.inputs.every(isRef),
@@ -511,12 +566,14 @@ function loadSources(store: Store, request: InputRequest, prefix: readonly Upstr
         check(canonical(unique(dependencies)) === canonical(sorted(layer.inputs)), "content.graph.inputs", "Layer inputs must cover all field and layer evidence");
         for (const input of layer.inputs) proof(input);
         if (requiresMapDesignReconstruction(version)) {
-          const initial = sources.discovery!.fields, concept = sources.concept!.fields;
+          const handoff = discoveryConsumerForDraft(store, draft as unknown as DiscoveryDraft, 'operation-map');
+          const initial = handoff ? consumerPreparationFields(handoff) : sources.discovery!.fields, concept = sources.concept!.fields;
           const proposed = buildL1(projection.id, projection.title, content.fields.mapDesign, initial, concept);
           check(canonical(projectGraph(proposed, 1)) === canonical(projection), "content.graph", "The exact map must derive from its saved stage fields");
         }
       } else check(content.graph === null, "content.graph", "Only the operation map binds its own L1 projection");
-      sources[stage] = { ref: reference(record), contractVersion: version ?? null, fields: content.fields as Record<string, Json> };
+      sources[stage] = { ref: reference(record), contractVersion: version ?? null, fields: content.fields as Record<string, Json>,
+        ...(draft.discoveryHandoff ? { discoveryHandoff: draft.discoveryHandoff as DiscoveryHandoffBinding } : {}) };
     } catch (error) {
       return refuse("stage_not_accepted", error instanceof Error ? error.message : "Saved acceptance proof is invalid",
         error instanceof EngineError && error.code === "stage_not_accepted" ? error.details as ReturnType<typeof at>
@@ -524,6 +581,11 @@ function loadSources(store: Store, request: InputRequest, prefix: readonly Upstr
     }
   }
   const result = sources as InputStages;
+  const bound = [...prefix].reverse().map(stage => result[stage]?.discoveryHandoff).find(Boolean);
+  const boundDraft = bound ? store.get<DiscoveryDraft>(bound.draft, 1) : null;
+  const handoff = boundDraft ? discoveryConsumerForDraft(store, boundDraft.value, 'om-g2') : null;
+  const catalogueFor = () => boundDraft ? requireDiscoveryHandoff(store, boundDraft.value).catalogue
+    : discoveryBasisCatalogue({ ref: result.discovery.ref, fields: result.discovery.fields });
   const behaviors = result.specification?.fields['behavior'], features = result.features?.fields['features'];
   if (Array.isArray(behaviors) && Array.isArray(features)) {
     const covered = new Set(features.flatMap((feature: unknown) => object(feature) && Array.isArray(feature.requirements) ? feature.requirements : []));
@@ -532,7 +594,7 @@ function loadSources(store: Store, request: InputRequest, prefix: readonly Upstr
   }
   if (result.concept && isBasisApplicationEra(result.concept.contractVersion)) {
     try {
-      const catalogue = discoveryBasisCatalogue({ ref: result.discovery.ref, fields: result.discovery.fields });
+      const catalogue = catalogueFor();
       const applications = conceptApplicationFindings(result.concept.fields['conceptSections'] ?? null, catalogue);
       if (applications.length) return refuse('stage_not_accepted',
         `${applications[0]!.code}: ${applications[0]!.message}`,
@@ -545,7 +607,7 @@ function loadSources(store: Store, request: InputRequest, prefix: readonly Upstr
   }
   if (result.specification && isBasisApplicationEra(result.specification.contractVersion)) {
     try {
-      const catalogue = discoveryBasisCatalogue({ ref: result.discovery.ref, fields: result.discovery.fields });
+      const catalogue = catalogueFor();
       const applications = specificationApplicationFindings(result.specification.fields['behaviorContracts'] ?? null,
         result.concept.fields['conceptSections'] ?? null, catalogue);
       if (applications.length) return refuse('stage_not_accepted',
@@ -560,7 +622,7 @@ function loadSources(store: Store, request: InputRequest, prefix: readonly Upstr
   const outcomes = (result['operation-map']?.fields['mapDesign'] as Row)?.artifacts;
   if (Array.isArray(outcomes) || prefix.length < INPUT_STAGES.length) for (const stage of prefix) {
     if (isLegacyEra(contractEraOf(result[stage]))) continue;
-    const findings = preparationFindings(stage, result[stage].fields, name => result[name as UpstreamStage]?.fields ?? null,
+    const findings = preparationFindings(stage, result[stage].fields, name => name === 'discovery' && handoff ? consumerPreparationFields(handoff) : result[name as UpstreamStage]?.fields ?? null,
       Array.isArray(outcomes) ? outcomes.map((artifact: Row) => artifact.id) : []);
     if (findings.length) return refuse("stage_not_accepted", findings[0]!.message,
       at(result[stage].ref.id, findings[0]!.field ?? findings[0]!.target, result[stage].ref), "producer");
@@ -592,6 +654,12 @@ export function readAcceptedUpstreamStageAt(store: Store, project: string, stage
       || (i > 0 && !isRef(row.value.inputs[0])))
       throw new EngineError('stage_history_invalid', 'The saved accepted stage has a foreign, missing or mixed predecessor', { ref: next });
     refs[current] = next; rows.push(row);
+    if (current === 'concept') {
+      const content = row.value.content as unknown as { discoveryHandoff?: DiscoveryHandoffBinding };
+      if (content.discoveryHandoff && canonical(content.discoveryHandoff.manifest) === canonical(row.value.inputs[0])) {
+        refs.discovery = structuredClone(content.discoveryHandoff.manifest); break;
+      }
+    }
     if (i > 0) next = row.value.inputs[0]!;
   }
   const proven = loadSources(store, { project: input.project, stages: refs, expected: 0 }, prefix);
@@ -608,7 +676,11 @@ function deriveInputRecord(store: Store, request: InputRequest): InputResult<Sea
     const read = readRecord(store, inventory, { unit: "G1", target: inventory.id, id: `repo-inventory:${request.project}`, kind: "repo-inventory" });
     if (!read.ok) return transfer("refs", read);
   }
-  const result = buildOmInput(sources.value as InputStages, { inventory });
+  const stages = sources.value as InputStages;
+  const binding = stages.features.discoveryHandoff;
+  const draft = binding ? store.get<DiscoveryDraft>(binding.draft, 1) : null;
+  const discovery = draft ? discoveryConsumerForDraft(store, draft.value, 'om-g2') : null;
+  const result = buildOmInput(stages, { inventory, ...(discovery ? { discovery } : {}) });
   if (result.refusals.length) return { ok: false, refusal: result.refusals[0]! };
   if (!result.input || !result.hash) invalid("result");
   return delivered({ projectId: request.project, input: result.input as OmInput, hash: result.hash, gaps: result.gaps as InputGap[] });
@@ -674,6 +746,16 @@ function currentAcceptance(store: Store, request: InputRequest): InputResult<Sea
       return refuse("input_stale", error.message, error.details as ReturnType<typeof at>, "producer");
     throw error;
   }
+}
+
+export async function prepareOmInputAt(store: Store, request: InputRequest): Promise<InputResult<Sealed<PreparedOmInput<TransactionGuard>>>> {
+  requireInputRequest(store, request); request = copy(request);
+  if (!isRef(request.stages.features)) invalid('stages.features');
+  const row = store.get<StageArtifact>(request.stages.features.id, request.stages.features.revision);
+  const content = row?.value.content as unknown as { draft?: Ref; discoveryHandoff?: DiscoveryHandoffBinding };
+  return content?.discoveryHandoff && content.draft
+    ? withDiscoveryHandoffAt(store, request.project, content.draft, () => prepareOmInput(store, request))
+    : prepareOmInput(store, request);
 }
 
 export function prepareOmInput(store: Store, request: InputRequest): InputResult<Sealed<PreparedOmInput<TransactionGuard>>> {

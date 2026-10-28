@@ -1,3 +1,4 @@
+import { scopedDiscoveryProjection } from './discovery-handoff.js';
 import { EngineError, requireCondition } from "../errors.js";
 import { readVariantGeneration, readVariantModelDecision } from "./variant-session.js";
 import { readVariantOwnerDecision } from "./discovery-decision.js";
@@ -416,6 +417,8 @@ export function stageFields(view: RecordView, projectId: string, stage: string):
 /** Акторы сохранённой подготовки Discovery-стадии проекта
  * (content.fields.preparation.actors); [] когда подготовки нет. */
 export function discoveryActors(view: RecordView, projectId: string): readonly { id: string }[] {
+  const accepted = scopedDiscoveryProjection(view as RecordView & { databaseId?: string }, projectId);
+  if (accepted && 'actors' in accepted.projection.value) return accepted.projection.value.actors;
   const preparation = stageFields(view, projectId, "discovery")?.["preparation"] as { actors?: { id: string }[] } | undefined;
   return preparation?.actors ?? [];
 }

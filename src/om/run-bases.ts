@@ -1,7 +1,9 @@
 import { canonical, hashJson, type Json } from "../canonical.js";
 import { EngineError } from "../errors.js";
 import { UPSTREAM_STAGES, type UpstreamStage } from "../discovery/requirements.js";
-import { reference, type Ref } from "../pipeline/contracts.js";
+import { hasDiscoveryHandoff, requireDiscoveryHandoff } from "../discovery/discovery-handoff.js";
+import type { DiscoveryDraft } from "../discovery/discovery.js";
+import { isRef, reference, type Ref, type StageArtifact } from "../pipeline/contracts.js";
 import { Store, type Revision, type TransactionGuard, type Write } from "../storage/store.js";
 import { prepareHorizon, prepareHorizonIssuance, type HorizonRequest } from "./horizon.js";
 import { prepareOmInput, type OmInputRecord } from "./input.js";
@@ -149,7 +151,20 @@ function livePass(store: Store, project: string, outcomes: readonly string[] | u
 /** B1 over today's accepted stages through the common G1: existing, refreshed or first — never a rebuilt "clean" input. */
 function inputStage(store: Store, project: string, mode: Mode): Revision<OmInputRecord> {
   const stages = {} as Record<UpstreamStage, Ref>;
+  const features = store.get<StageArtifact>(`stage:${project}:features`);
+  const content = features && object(features.value) ? features.value.content : null;
+  const draftRef = object(content) ? content.draft : null;
+  const row = isRef(draftRef) ? store.get<DiscoveryDraft>(draftRef.id, draftRef.revision) : null;
+  const draft = row?.kind === 'discovery-draft' && object(row.value) ? row : null;
+  let manifest: Ref | null = null;
+  if ((object(content) && Object.hasOwn(content, 'discoveryHandoff')) || (draft && hasDiscoveryHandoff(store, draft.value))) {
+    if (!draft) fail('stage_not_accepted', features!.id, 'content.draft', 'The bound features need their exact downstream draft');
+    // Select only the source pinned by these features, never an unrelated operation-local C1 scope.
+    // Common G1 below proves the exact draft, acceptance and every predecessor back to this manifest.
+    manifest = requireDiscoveryHandoff(store, draft.value).source.manifest;
+  }
   for (const stage of UPSTREAM_STAGES) {
+    if (stage === 'discovery' && manifest) { stages.discovery = manifest; continue; }
     const head = store.get(`stage:${project}:${stage}`);
     if (!head) fail("record_missing", `stage:${project}:${stage}`, "stages", "The machine bases need every upstream stage of the project");
     stages[stage] = reference(head);

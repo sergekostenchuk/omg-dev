@@ -43,6 +43,7 @@ export interface DiscoveryDraft {
   basisContract?: 'typed-v1';
   obligationContract?: 'evidence-v1';
   derivations?: Derivation[];
+  discoveryHandoff?: import('./discovery-handoff.js').DiscoveryHandoffBinding;
 }
 export interface Question {
   projectId: string; draftId: string; stage: Stage; level: ResearchLevel; consumer: string;
@@ -169,12 +170,12 @@ export class Discovery {
   readonly evidence: Evidence;
   constructor(private readonly store: Store) { this.evidence = new Evidence(store); }
   forStage(projectId: string, stage: UpstreamStage, consumer: string, inputs: Ref[] = [],
-    policy?: ProducerPolicy): Revision<DiscoveryDraft> {
+    policy?: ProducerPolicy, manifest?: Ref): Revision<DiscoveryDraft> {
     requireCondition(Object.hasOwn(REQUIREMENTS, stage), "stage_contract_missing", "No research contract for this stage");
     return this.create(projectId, stage, "R0", consumer, producerRequirements(stage, policy), inputs,
-      producerContractEra(stage, policy));
+      producerContractEra(stage, policy), manifest);
   }
-  create(projectId: string, stage: Stage, level: ResearchLevel, consumer: string, specs: FieldSpec[], inputs: Ref[] = [], contractVersion?: number): Revision<DiscoveryDraft> {
+  create(projectId: string, stage: Stage, level: ResearchLevel, consumer: string, specs: FieldSpec[], inputs: Ref[] = [], contractVersion?: number, manifest?: Ref): Revision<DiscoveryDraft> {
     requireCondition(STAGES.includes(stage) && ["R0", "R1", "R2", "R3"].includes(level) && typeof consumer === "string"
       && consumer.trim() && Array.isArray(specs) && specs.length > 0,
       "question_unbound", "Discovery needs a level, consumer and explicit questions");
@@ -199,7 +200,8 @@ export class Discovery {
     requireCondition(Array.isArray(inputs) && inputs.every(isRef), "research_context_invalid", "Research context must contain exact input references");
     const draft: DiscoveryDraft = { projectId, createdAt: Date.now(), stage, level, consumer, inputs: uniqueRefs(inputs), ...(contractVersion === undefined ? {} : { contractVersion }),
       ...(typedBasis ? { basisContract: 'typed-v1' as const } : {}), ...(obligationEvidence ? { obligationContract: 'evidence-v1' as const } : {}),
-      fields: Object.fromEntries(specs.map(spec => [spec.field, null])), questions };
+      fields: Object.fromEntries(specs.map(spec => [spec.field, null])), questions,
+      ...(manifest ? { discoveryHandoff: { contract: 'discovery-handoff/v1' as const, project: projectId, stage, draft: id, manifest: structuredClone(manifest) } } : {}) };
     const questionWrites = specs.map((spec, i) => ({ id: questions[i]!, kind: "question", expected: 0,
       value: { projectId, draftId: id, stage, level, consumer, spec, beforeHash: hashJson(null), status: "open", answer: null } satisfies Question }));
     const closure: DiscoveryPrefixClosure = { contract: DISCOVERY_PREFIX_CLOSURE_CONTRACT, projectId,

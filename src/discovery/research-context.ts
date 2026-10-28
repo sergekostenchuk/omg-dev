@@ -1,3 +1,5 @@
+import { requireDiscoveryHandoff, hasDiscoveryHandoff, discoveryConsumerForDraft, withDiscoveryHandoffAt, type AcceptedDiscoveryBasisCatalogue } from './discovery-handoff.js';
+import { consumerPreparationFields, type DiscoveryConsumerProjection } from './discovery-consumer-projection.js';
 import { readV7PlanBasis } from './v7-plan-assessment.js';
 import { hasV7PlanCoverage, isDiscoveryV7Draft } from './v7-contracts.js';
 import type { Revision, Store } from "../storage/store.js";
@@ -19,12 +21,16 @@ import type { BasisAddress } from './basis-application.js';
 
 export interface DiscoveryBasisMaterial {
   source: Ref;
-  catalogue: DiscoveryBasisCatalogue;
+  catalogue: DiscoveryBasisCatalogue | AcceptedDiscoveryBasisCatalogue;
   guards: Ref[];
 }
 
 /** Read the one accepted Discovery stage named by this draft, never the current stage head. */
 export function readDiscoveryBasisMaterial(store: Store, draft: DiscoveryDraft): DiscoveryBasisMaterial {
+  if (hasDiscoveryHandoff(store, draft)) {
+    const h = requireDiscoveryHandoff(store, draft);
+    return { source: h.source.manifest, catalogue: h.catalogue, guards: [h.source.manifest, h.source.bundle] };
+  }
   const project = typeof draft?.projectId === 'string' && draft.projectId ? draft.projectId : null;
   const id = project === null ? 'discovery' : stageId(project, 'discovery');
   const fail = (field: string, message: string): never => {
@@ -73,17 +79,20 @@ function operationMapMaterial(store: Store, draft: DiscoveryDraft, proposal?: In
       return fail(id, "inputs", "Map material needs the exact accepted stage of this project");
     return record;
   };
-  const discovery = accepted("discovery"), concept = accepted("concept");
-  if (!concept.value.inputs.some(ref => canonical(ref) === canonical(reference(discovery))))
+  const handoff = discoveryConsumerForDraft(store, draft, 'operation-map');
+  const discovery = handoff ? null : accepted("discovery"), concept = accepted("concept");
+  const discoveryRef = handoff?.manifest ?? reference(discovery!);
+  if (discovery && !concept.value.inputs.some(ref => canonical(ref) === canonical(discoveryRef)))
     return fail(concept.id, "inputs", "The concept and Discovery must belong to the same accepted stage chain");
   const object = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === "object" && !Array.isArray(value);
-  const fields = (record: typeof discovery) => {
+  const fields = (record: Revision<StageArtifact>) => {
     const content = record.value.content;
     if (!object(content) || !object(content['fields'])) return fail(record.id, "content.fields", "Map material needs the accepted stage fields");
     return content['fields'];
   };
-  const preparation = fields(discovery)['preparation'];
-  if (!object(preparation)) return fail(discovery.id, "preparation", "Map material needs Discovery preparation");
+  const discoveryFields = handoff ? consumerPreparationFields(handoff) : fields(discovery!);
+  const preparation = discoveryFields['preparation'];
+  if (!object(preparation)) return fail(discoveryRef.id, "preparation", "Map material needs Discovery preparation");
   const list = (value: unknown, target: string, field: string): Record<string, unknown>[] => {
     if (!Array.isArray(value) || !value.every(object)) return fail(target, field, "Map material needs its explicit accepted list");
     return value;
@@ -92,14 +101,14 @@ function operationMapMaterial(store: Store, draft: DiscoveryDraft, proposal?: In
     if (typeof value !== "string" || !value.trim()) return fail(target, field, "Map identities must be nonempty accepted strings");
     return value;
   };
-  const address = (record: typeof discovery, pointer: string) => ({ record: reference(record), pointer });
-  const outcomes = list(preparation['outcomes'], discovery.id, "preparation.outcomes").map((value, index) => ({
-    id: text(value['id'], discovery.id, `preparation.outcomes.${index}.id`),
-    source: address(discovery, `/content/fields/preparation/outcomes/${index}`),
+  const address = (record: Revision<StageArtifact>, pointer: string) => ({ record: reference(record), pointer });
+  const outcomes = list(preparation['outcomes'], discoveryRef.id, "preparation.outcomes").map((value, index) => ({
+    id: text(value['id'], discoveryRef.id, `preparation.outcomes.${index}.id`),
+    source: handoff ? { record: handoff.bundle, pointer: `/bundle/projection/outcomes/${index}` } : address(discovery!, `/content/fields/preparation/outcomes/${index}`),
   }));
-  const actors = list(preparation['actors'], discovery.id, "preparation.actors").map((value, index) => ({
-    id: text(value['id'], discovery.id, `preparation.actors.${index}.id`),
-    source: address(discovery, `/content/fields/preparation/actors/${index}`),
+  const actors = list(preparation['actors'], discoveryRef.id, "preparation.actors").map((value, index) => ({
+    id: text(value['id'], discoveryRef.id, `preparation.actors.${index}.id`),
+    source: handoff ? { record: handoff.bundle, pointer: `/bundle/projection/actors/${index}` } : address(discovery!, `/content/fields/preparation/actors/${index}`),
   }));
   const requirements = list(fields(concept)['conceptSections'], concept.id, "conceptSections").flatMap((section, sectionIndex) =>
     list(section['requirements'], concept.id, `conceptSections.${sectionIndex}.requirements`).map((value, index) => ({
@@ -107,11 +116,12 @@ function operationMapMaterial(store: Store, draft: DiscoveryDraft, proposal?: In
       outcome: text(value['outcome'], concept.id, `conceptSections.${sectionIndex}.requirements.${index}.outcome`),
       source: address(concept, `/content/fields/conceptSections/${sectionIndex}/requirements/${index}`),
     })));
-  list(preparation['externalSystems'], discovery.id, "preparation.externalSystems");
-  const original = { contract: "operation-map-material/v1", sources: { discovery: reference(discovery), concept: reference(concept) },
+  list(preparation['externalSystems'], discoveryRef.id, "preparation.externalSystems");
+  const original = { contract: "operation-map-material/v1", sources: { discovery: discoveryRef, concept: reference(concept) },
     catalogue: { outcomes, actors, requirements }, engineRules: { origin: "engine-rule", rules: [...MAP_RULES] } };
   if (draft.contractVersion !== 6) return original;
-  const grounds = acceptedConceptGrounds(reference(discovery), fields(discovery), reference(concept), fields(concept));
+  const grounds = acceptedConceptGrounds(discoveryRef, discoveryFields, reference(concept), fields(concept),
+    handoff ? requireDiscoveryHandoff(store, draft).catalogue : undefined);
   const acceptedRequirements = acceptedDraftField(store, draft, 'operationRequirements');
   const coverage = (acceptedRequirements as Record<string, unknown> | null)?.['conceptCoverage'];
   if (proposal?.field === 'mapDesign' && (!object(proposal.value) || !Array.isArray(proposal.value['nodes'])))
@@ -166,8 +176,8 @@ function acceptedDraftField(store: Store, draft: DiscoveryDraft, field: string):
 }
 
 function acceptedConceptGrounds(discovery: Ref, discoveryFields: Record<string, unknown>, concept: Ref,
-  conceptFields: Record<string, unknown>) {
-  const catalogue = discoveryBasisCatalogue({ ref: discovery, fields: discoveryFields as Record<string, Json> });
+  conceptFields: Record<string, unknown>, supplied?: AcceptedDiscoveryBasisCatalogue) {
+  const catalogue = supplied ?? discoveryBasisCatalogue({ ref: discovery, fields: discoveryFields as Record<string, Json> });
   const sections = conceptFields['conceptSections'];
   const finding = conceptApplicationFindings(sections as Json, catalogue)[0];
   if (finding) inheritanceFailure('conceptSections', finding.target, finding.message);
@@ -258,11 +268,14 @@ function featureBasisMaterial(store: Store, draft: DiscoveryDraft, proposal?: In
       return inheritanceFailure(stage, '/content/fields', `Features lost their accepted ${stage} fields`);
     return { record, fields: content['fields'] };
   };
-  const discovery = read('discovery'), concept = read('concept'), map = read('operation-map'), specification = read('specification');
-  for (const [child, parent] of [[concept, discovery], [map, concept], [specification, map]] as const)
+  const handoff = discoveryConsumerForDraft(store, draft, 'features');
+  const discovery = handoff ? null : read('discovery'), concept = read('concept'), map = read('operation-map'), specification = read('specification');
+  for (const [child, parent] of [...(discovery ? [[concept, discovery] as const] : []), [map, concept], [specification, map]] as const)
     if (!child.record.value.inputs.some(ref => canonical(ref) === canonical(reference(parent.record))))
       return inheritanceFailure(child.record.value.stage, '/inputs', 'Feature sources must be one accepted stage chain');
-  const grounds = acceptedConceptGrounds(reference(discovery.record), discovery.fields, reference(concept.record), concept.fields);
+  const grounds = acceptedConceptGrounds(handoff?.manifest ?? reference(discovery!.record),
+    handoff ? consumerPreparationFields(handoff) : discovery!.fields, reference(concept.record), concept.fields,
+    handoff ? requireDiscoveryHandoff(store, draft).catalogue : undefined);
   const contracts = specification.fields['behaviorContracts'];
   const finding = specificationApplicationFindings(contracts as Json, concept.fields['conceptSections'] as Json, grounds.catalogue)[0];
   if (finding) return inheritanceFailure('behaviorContracts', finding.target, finding.message);
@@ -275,7 +288,7 @@ function featureBasisMaterial(store: Store, draft: DiscoveryDraft, proposal?: In
   const prepared = proposal?.field === 'featurePreparation' ? proposal.value
     : acceptedDraftField(store, draft, 'featurePreparation');
   const selected = selectedFeatures(prepared, rows);
-  return { contract: 'feature-basis-material/v1', sources: { discovery: reference(discovery.record),
+  return { contract: 'feature-basis-material/v1', sources: { discovery: handoff?.manifest ?? reference(discovery!.record),
     concept: reference(concept.record), map: reference(map.record), specification: reference(specification.record) },
     catalogue: grounds.catalogue, requirements: grounds.requirements, contracts: rows, selected,
     rule: 'A feature inherits only the grounds of its selected behaviorContracts and their exact requirement union; compare its proposed success, failures and interactions with those grounds.' };
@@ -354,6 +367,7 @@ interface ResearchPrerequisite {
   ref: Ref;
   stage: DiscoveryDraft['stage'];
   fields: Record<string, unknown>;
+  discoveryMaterial?: DiscoveryConsumerProjection;
   operationMapMaterial?: ReturnType<typeof operationMapMaterial>;
   featureBasisMaterial?: ReturnType<typeof featureBasisMaterial>;
   unknowns?: ReturnType<typeof discoveryUnknowns>;
@@ -377,7 +391,8 @@ export function researchPrerequisites(store: Store, draft: DiscoveryDraft, propo
   const latest = stages[0];
   const mapMaterial = draft.stage === "operation-map" ? operationMapMaterial(store, draft, proposal) : null;
   const featureMaterial = draft.stage === 'features' && draft.contractVersion === 6 ? featureBasisMaterial(store, draft, proposal) : null;
-  return stages.map(record => {
+  const handoff = hasDiscoveryHandoff(store, draft) && draft.stage !== 'concept' ? discoveryConsumerForDraft(store, draft) : null;
+  const inherited = stages.filter(record => !handoff || record.value.stage !== 'discovery').map(record => {
     const content = record.value.content as { fields?: Record<string, unknown> };
     const fields = content?.fields ?? {};
     const identities: Record<string, unknown> = {};
@@ -395,6 +410,17 @@ export function researchPrerequisites(store: Store, draft: DiscoveryDraft, propo
       ...(featureMaterial && record.value.stage === 'specification' ? { featureBasisMaterial: featureMaterial } : {}),
       ...(unknowns ? { unknowns } : {}) };
   });
+  return handoff ? [...inherited, { ref: handoff.manifest, stage: 'discovery', fields: consumerPreparationFields(handoff),
+    discoveryMaterial: handoff }] : inherited;
+}
+
+/** Cold entry for consumers outside an already proved product operation. */
+export async function researchPrerequisitesAt(store: Store, project: string, at: Ref, proposal?: InheritanceProposal): Promise<ResearchPrerequisite[]> {
+  const row = store.get<DiscoveryDraft>(at.id, at.revision);
+  if (!row || row.kind !== 'discovery-draft' || row.value.projectId !== project || canonical(reference(row)) !== canonical(at))
+    throw new EngineError('discovery_handoff_invalid', 'Expected the exact downstream draft');
+  return hasDiscoveryHandoff(store, row.value) ? withDiscoveryHandoffAt(store, project, at, () => researchPrerequisites(store, row.value, proposal))
+    : researchPrerequisites(store, row.value, proposal);
 }
 
 export function researchGraphContext(store: Store, draft: DiscoveryDraft) {

@@ -1,3 +1,5 @@
+import { prepareDiscoveryHandoff, withDiscoveryHandoffAt, hasDiscoveryHandoffScope, hasDiscoveryHandoff, discoveryConsumerForDraft } from '../discovery/discovery-handoff.js';
+import { consumerPreparationFields } from '../discovery/discovery-consumer-projection.js';
 import { readAcceptedDiscoveryProjectionAt } from '../discovery/discovery-accepted-projection.js';
 import { returnDiscoveryResearch } from '../discovery/discovery-research-return.js';
 import { advanceInterpretationFlow, readInterpretationFlowReadyAt } from '../discovery/interpretation-flow.js';
@@ -122,14 +124,34 @@ export class ProductEngine {
   #prepare(project: string, stage: UpstreamStage, entryInputs: Ref[]): Revision<DiscoveryDraft> {
     this.#project(project);
     const prior = predecessor(stage); const inputs: Ref[] = [];
-    if (prior) { const status = this.pipeline.inspect(project, prior); requireCondition(status.state === "accepted", "predecessor_not_ready", `${prior} must be accepted`); inputs.push(...status.guards); }
+    let manifest: Ref | undefined;
+    if (prior) { const status = this.pipeline.inspect(project, prior); requireCondition(status.state === "accepted", "predecessor_not_ready", `${prior} must be accepted`); inputs.push(...status.guards);
+      manifest = (status.artifact?.value.content as unknown as { discoveryHandoff?: { manifest: Ref } })?.discoveryHandoff?.manifest; }
     requireCondition(stage === "discovery" || entryInputs.length === 0, "research_context_invalid",
       "Only Discovery accepts the exact early-stage input basis");
     inputs.push(...entryInputs);
     const consumer = STAGES[STAGES.indexOf(stage) + 1]!;
-    return this.discovery.forStage(project, stage, consumer, inputs);
+    return this.discovery.forStage(project, stage, consumer, inputs, undefined, manifest);
   }
   prepare(project: string, stage: UpstreamStage): Revision<DiscoveryDraft> { return this.#prepare(project, stage, []); }
+  /** Pin the accepted manifest before preparing a downstream consumer. Existing stage admission remains in force. */
+  async prepareAcceptedConsumer(project: string, stage: 'concept' | 'operation-map' | 'specification' | 'features', manifest: Ref): Promise<Revision<DiscoveryDraft>> {
+    this.#project(project);
+    const prior = predecessor(stage)!;
+    const saved = this.store.get<StageArtifact>(stageId(project, prior));
+    const bound = (saved?.value.content as unknown as { draft?: Ref; discoveryHandoff?: { manifest: Ref } });
+    if (bound?.discoveryHandoff && bound.draft) {
+      requireCondition(canonical(bound.discoveryHandoff.manifest) === canonical(manifest), 'discovery_handoff_invalid',
+        'The next consumer must inherit the exact accepted manifest of its predecessor');
+      const row = this.store.get<DiscoveryDraft>(bound.draft.id, bound.draft.revision);
+      requireCondition(row, 'discovery_handoff_invalid', 'The predecessor draft is missing');
+      if (!hasDiscoveryHandoffScope(this.store, row.value))
+        return withDiscoveryHandoffAt(this.store, project, bound.draft, () => this.prepareAcceptedConsumer(project, stage, manifest));
+    }
+    const status = this.pipeline.inspect(project, prior);
+    requireCondition(status.state === 'accepted', 'predecessor_not_ready', `${prior} must be accepted`);
+    return prepareDiscoveryHandoff(this.store, { project, stage, manifest, inputs: status.guards });
+  }
   /** DRV1: prepare's one transaction carries the early executor's exact durable control. */
   prepareEarlyStage(project: string, stage: UpstreamStage, hold: RunControlHold, entryInputs: Ref[] = []): Revision<DiscoveryDraft> {
     return new ProductEngine(new RunControlGate(this.store, project, hold).view(), this.actor).#prepare(project, stage, entryInputs);
@@ -142,7 +164,9 @@ export class ProductEngine {
     requireCondition(executionAdmission(this.store, draft, 'stage-result').admitted, "research_contract_upgrade_required",
       "Prepare enriched research before creating a new stage result; previous accepted versions remain historical");
     const layer = stage === "operation-map" ? this.store.get(`graph-layer:${project}:1`) : null;
-    const content = { draft: reference(draft), fields: draft.value.fields, graph: layer ? reference(layer) : null };
+    if (hasDiscoveryHandoff(this.store, draft.value)) discoveryConsumerForDraft(this.store, draft.value);
+    const content = { draft: reference(draft), fields: draft.value.fields, graph: layer ? reference(layer) : null,
+      ...(draft.value.discoveryHandoff ? { discoveryHandoff: structuredClone(draft.value.discoveryHandoff) } : {}) };
     return this.pipeline.draft(project, stage, content as unknown as Json, expected);
   }
   projection(project: string) {
@@ -281,6 +305,20 @@ export class ProductEngine {
   }
   execute(input: unknown): unknown {
     const command = parseCommand(input);
+    // Re-enter existing commands only after proving the saved binding; the scope lasts for this operation, not the Store.
+    const raw = command as unknown as { project?: string; draftId?: string; question?: string; stage?: Stage };
+    let bound = raw.draftId ? readDraft(this.store, raw.draftId) : null;
+    if (!bound && raw.question) {
+      const q = readQuestion(this.store, raw.question); if (q) bound = readDraft(this.store, q.value.draftId);
+    }
+    if (!bound && raw.project && ['accept-stage', 'prepare-stage', 'project', 'om-start', 'om-continue'].includes(command.type)) {
+      const stage = command.type === 'prepare-stage' ? predecessor(raw.stage!) : raw.stage ?? 'features';
+      const artifact = stage ? this.store.get<StageArtifact>(stageId(raw.project, stage)) : null;
+      const at = (artifact?.value.content as unknown as { draft?: Ref })?.draft;
+      if (at) bound = this.store.get<DiscoveryDraft>(at.id, at.revision);
+    }
+    if (bound && hasDiscoveryHandoff(this.store, bound.value) && !hasDiscoveryHandoffScope(this.store, bound.value))
+      return withDiscoveryHandoffAt(this.store, bound.value.projectId, reference(bound), () => this.execute(command));
     switch (command.type) {
       case 'discovery-research-return': {
         const { type, ...input } = command;
@@ -446,7 +484,8 @@ export class ProductEngine {
           && canonical(orderedQuestions(this.store, draft.value).map(question => question!.value.spec))
             === canonical(REQUIREMENTS['operation-map']),
         "research_context_stale", "Map construction must use the current accepted concept and complete research contract");
-        const initial = stageFields(this.store, command.project, "discovery")!;
+        const handoff = discoveryConsumerForDraft(this.store, draft.value, 'operation-map');
+        const initial = handoff ? consumerPreparationFields(handoff) : stageFields(this.store, command.project, "discovery")!;
         const concept = stageFields(this.store, command.project, "concept")!;
         const existing = this.store.get<Graph>(`graph:${command.project}`);
         const graph = buildL1(existing?.value.id ?? `${command.project}:map`, project.value.title, draft.value.fields['mapDesign'], initial, concept);

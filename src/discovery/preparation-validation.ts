@@ -1,3 +1,4 @@
+import type { AcceptedDiscoveryBasisCatalogue } from './discovery-handoff.js';
 import { canonical, type Json } from "../canonical.js";
 import { isRef, type Finding, type Stage } from "../pipeline/contracts.js";
 import { EngineError } from '../errors.js';
@@ -17,12 +18,12 @@ export function selectedFeatureRequirements(contracts: { id: string; requirement
 }
 /** The catalogue is the exact accepted Discovery material supplied by the caller.
  * The same pure check is used before assessment and at stage admission. */
-export function conceptApplicationFindings(value: Json, catalogue: DiscoveryBasisCatalogue): Finding[] {
+export function conceptApplicationFindings(value: Json, catalogue: DiscoveryBasisCatalogue | AcceptedDiscoveryBasisCatalogue): Finding[] {
   const finding = (code: string, target: string, message: string): Finding =>
     ({ code, target, field: 'conceptSections', message });
   if (!Array.isArray(value)) return [finding('basis_application_invalid', '/conceptSections',
     'Concept applications need an explicit section list')];
-  if (catalogue?.contract !== 'discovery-basis-catalogue/v1' || !isRef(catalogue.source)
+  if (!['discovery-basis-catalogue/v1', 'discovery-basis-catalogue/v2'].includes(catalogue?.contract) || !isRef(catalogue.source)
     || !Array.isArray(catalogue.constraints)
     || !catalogue.variant) return [finding('basis_application_material_invalid', '/discoveryBasisCatalogue',
       'The exact accepted Discovery catalogue is required')];
@@ -51,7 +52,7 @@ export function conceptApplicationFindings(value: Json, catalogue: DiscoveryBasi
 }
 
 /** A contract inherits exactly the grounds of the accepted requirements it names. */
-export function specificationApplicationFindings(value: Json, concept: Json, catalogue: DiscoveryBasisCatalogue): Finding[] {
+export function specificationApplicationFindings(value: Json, concept: Json, catalogue: DiscoveryBasisCatalogue | AcceptedDiscoveryBasisCatalogue): Finding[] {
   const finding = (code: string, target: string, message: string): Finding =>
     ({ code, target, field: 'behaviorContracts', message });
   if (!Array.isArray(value)) return [finding('basis_application_invalid', '/behaviorContracts',

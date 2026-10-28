@@ -1,3 +1,5 @@
+import { discoveryConsumerForDraft, discoveryHandoffGrounds, requireDiscoveryHandoff, hasDiscoveryHandoff, withDiscoveryHandoffAt, type DiscoveryHandoffBinding } from '../discovery/discovery-handoff.js';
+import { consumerPreparationFields } from '../discovery/discovery-consumer-projection.js';
 import { discoveryBasisCatalogue } from '../discovery/discovery-outcome.js';
 import {
   artifactFields, contractEraOf, discoveryInspection, expectedRequirements,
@@ -39,7 +41,7 @@ export function stageResearchContract(stage: UpstreamStage, version: number, acc
 }
 
 export interface Project { id: string; title: string }
-export interface StageContent { draft: Ref; fields: Record<string, Json>; graph: Ref | null }
+export interface StageContent { draft: Ref; fields: Record<string, Json>; graph: Ref | null; discoveryHandoff?: DiscoveryHandoffBinding }
 
 function uniqueExternalChecks(checks: readonly StageExternalCheck[]): StageExternalCheck[] {
   return [...new Map(checks.map(check => [canonical(check), check])).values()];
@@ -67,8 +69,10 @@ export class StageChecks {
       // input.ts also consumes StageChecks for current admission. Load its existing historical proof only on demand,
       // after both modules are initialized; the common prefix/full-input validator remains a single implementation.
       const { readAcceptedUpstreamStageAt } = await import('../om/input.js');
-      return readAcceptedUpstreamStageAt(this.store, artifact.value.projectId,
+      const content = artifact.value.content as unknown as StageContent;
+      const read = () => readAcceptedUpstreamStageAt(this.store, artifact.value.projectId,
         artifact.value.stage as UpstreamStage, reference(artifact)).grounds;
+      return content.discoveryHandoff ? withDiscoveryHandoffAt(this.store, artifact.value.projectId, content.draft, read) : read();
     });
     this.environments = new Environments(store);
     this.refinement = new Refinement(store, this.discovery, this.graphs, this.environments, this.pipeline);
@@ -97,10 +101,16 @@ export class StageChecks {
     if (!UPSTREAM_STAGES.includes(stage as UpstreamStage)) return rejected("stage_not_available", "This execution-stage module is not connected yet");
     const content = context.content as unknown as StageContent;
     if (!content || typeof content !== "object" || !isRef(content.draft) || !content.fields
-      || !Object.hasOwn(content, "graph") || Object.keys(content).sort().join(",") !== "draft,fields,graph") return rejected("stage_content_invalid", "Stage content must bind a discovery result and its fields");
+      || !Object.hasOwn(content, "graph") || Object.keys(content).sort().join(",") !== (content.discoveryHandoff ? "discoveryHandoff,draft,fields,graph" : "draft,fields,graph")) return rejected("stage_content_invalid", "Stage content must bind a discovery result and its fields");
     const draft = readDraft(this.store, content.draft.id);
     if (!draft || draft.value.stage !== stage || draft.value.projectId !== context.projectId
       || canonical(draft.value.fields) !== canonical(content.fields)) return rejected("discovery_foreign", "Research does not belong to this stage or its fields changed");
+    let handoff: ReturnType<typeof discoveryConsumerForDraft> = null;
+    try {
+      if (canonical(content.discoveryHandoff ?? null) !== canonical(draft.value.discoveryHandoff ?? null))
+        return rejected('discovery_handoff_invalid', 'The stage must preserve its exact draft binding');
+      if (hasDiscoveryHandoff(this.store, draft.value) && stage !== 'concept') handoff = discoveryConsumerForDraft(this.store, draft.value);
+    } catch (error) { if (!(error instanceof EngineError)) throw error; return rejected(error.code, error.message); }
     let inspection: ReturnType<typeof discoveryInspection>;
     try { inspection = discoveryInspection(this.store, draft, () => this.discovery.gate(context.projectId, content.draft)); }
     catch (error) {
@@ -109,6 +119,7 @@ export class StageChecks {
     }
     const { outcome, gate: result } = inspection;
     result.findings.push(...outcome.findings); result.guards.push(...outcome.guards);
+    if (handoff) result.guards.push(...discoveryHandoffGrounds(this.store, draft.value));
     const version = contractEraOf(draft.value);
     const legacy = isLegacyEra(version);
     const contract = researchContract(stage as UpstreamStage, version, context.accepted === true);
@@ -120,7 +131,7 @@ export class StageChecks {
     if (!legacy && result.findings.length === 0) {
       const outcomes = this.store.get<{ projection: { artifacts: Graph['artifacts'] } }>(`graph-layer:${context.projectId}:1`);
       result.findings.push(...preparationFindings(stage, content.fields,
-        name => stageFields(this.store, context.projectId, name),
+        name => name === 'discovery' && handoff ? consumerPreparationFields(handoff) : stageFields(this.store, context.projectId, name),
         outcomes?.value.projection.artifacts.map(artifact => artifact.id) ?? []));
     }
     if (stage === 'concept' && isBasisApplicationEra(version)) {
@@ -153,6 +164,14 @@ export class StageChecks {
           && concept.value.projectId === context.projectId && concept.value.stage === 'concept'
           && concept.value.status === 'accepted', 'basis_application_material_invalid',
           `[${conceptRef.id}] Specification lost its accepted concept`);
+        if (handoff) {
+          const binding = (concept.value.content as unknown as StageContent).discoveryHandoff;
+          requireCondition(binding && canonical(binding.manifest) === canonical(handoff.manifest),
+            'discovery_handoff_invalid', 'Specification must inherit its concept manifest');
+          result.findings.push(...specificationApplicationFindings(content.fields['behaviorContracts'] ?? null,
+            artifactFields(concept)?.['conceptSections'] ?? null, requireDiscoveryHandoff(this.store, draft.value).catalogue));
+          result.guards.push(reference(concept), handoff.manifest, handoff.bundle);
+        } else {
         const discoveryRef = concept.value.inputs[0];
         requireCondition(concept.value.inputs.length === 1 && isRef(discoveryRef)
           && discoveryRef.id === stageId(context.projectId, 'discovery'),
@@ -165,10 +184,12 @@ export class StageChecks {
         const discoveryFields = artifactFields(discovery), conceptFields = artifactFields(concept);
         requireCondition(discoveryFields !== null && conceptFields !== null,
           'basis_application_material_invalid', '[behaviorContracts] Accepted source fields are missing');
-        const catalogue = discoveryBasisCatalogue({ ref: reference(discovery), fields: discoveryFields });
+        const catalogue = handoff ? requireDiscoveryHandoff(this.store, draft.value).catalogue
+          : discoveryBasisCatalogue({ ref: reference(discovery), fields: discoveryFields });
         result.findings.push(...specificationApplicationFindings(content.fields['behaviorContracts'] ?? null,
           conceptFields['conceptSections'] ?? null, catalogue));
         result.guards.push(reference(concept), reference(discovery));
+        }
       } catch (error) {
         if (!(error instanceof EngineError)) throw error;
         result.findings.push({ code: error.code, target: operation?.id ?? stageId(context.projectId, 'operation-map'),
@@ -182,7 +203,7 @@ export class StageChecks {
       else { const graphResult = this.graphs.layerGate(context.projectId, 1, content.graph); result.findings.push(...graphResult.findings); result.guards.push(...graphResult.guards); }
       if (contract.checkMapDesign && result.findings.length === 0) {
         const graph = this.store.get<Graph>(`graph:${context.projectId}`)!;
-        const initial = artifactFields(readStageArtifact<StageArtifact>(this.store, stageId(context.projectId, "discovery"))!);
+        const initial = handoff ? consumerPreparationFields(handoff) : artifactFields(readStageArtifact<StageArtifact>(this.store, stageId(context.projectId, "discovery"))!);
         const concept = artifactFields(readStageArtifact<StageArtifact>(this.store, stageId(context.projectId, "concept"))!);
         try {
           const proposed = buildL1(graph.value.id, graph.value.title, content.fields['mapDesign'], initial!, concept!);
