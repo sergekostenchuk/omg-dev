@@ -50,7 +50,13 @@ test('keeper artifact: one Ref snapshot; flags, narrowing pointer, missing conte
   for (const bad of [null, undefined, { ...ref, pointer: '/content/fields' }, { ...ref, accepted: true }, row.value,
     { ...ref, id: stageId('other', 'discovery') }, { ...ref, revision: 1 }, { ...ref, hash: '0'.repeat(64) }])
     await storeRefused(store, () => readKeeperArtifactSourceAt(store, 'p', bad), e => e instanceof EngineError);
-  const value = { projectId: 'p', stage: 'concept' as const, status: 'accepted' as const, content: null, inputs: [], proofs: [] };
-  const fake = store.write({ id: stageId('p', 'concept'), kind: 'stage', expected: store.get(stageId('p', 'concept'))!.revision, value });
-  await storeRefused(store, () => readKeeperArtifactSourceAt(store, 'p', reference(fake)), e => e instanceof EngineError);
+  const originalStages = ['discovery', 'concept', 'features'].map(stage => store.get<StageArtifact>(stageId('p', stage as StageArtifact['stage']))!);
+  const values = [{ projectId: 'p', stage: 'concept' as const, status: 'accepted' as const, content: null, inputs: [], proofs: [] },
+    ...originalStages.map(stage => ({ ...stage.value, content: null }))];
+  for (const value of values) {
+    const id = stageId('p', value.stage);
+    const invalid = store.write({ id, kind: 'stage', expected: store.get(id)!.revision, value });
+    await storeRefused(store, () => readKeeperArtifactSourceAt(store, 'p', reference(invalid)),
+      e => e instanceof EngineError && e.code === 'stage_history_invalid');
+  }
 });

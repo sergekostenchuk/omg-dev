@@ -139,7 +139,7 @@ export class ProductEngine {
     this.#project(project);
     const prior = predecessor(stage)!;
     const saved = this.store.get<StageArtifact>(stageId(project, prior));
-    const bound = (saved?.value.content as unknown as { draft?: Ref; discoveryHandoff?: { manifest: Ref } });
+    const bound = (saved?.value?.content as unknown as { draft?: Ref; discoveryHandoff?: { manifest: Ref } });
     if (bound?.discoveryHandoff && bound.draft) {
       requireCondition(canonical(bound.discoveryHandoff.manifest) === canonical(manifest), 'discovery_handoff_invalid',
         'The next consumer must inherit the exact accepted manifest of its predecessor');
@@ -309,15 +309,15 @@ export class ProductEngine {
     const raw = command as unknown as { project?: string; draftId?: string; question?: string; stage?: Stage };
     let bound = raw.draftId ? readDraft(this.store, raw.draftId) : null;
     if (!bound && raw.question) {
-      const q = readQuestion(this.store, raw.question); if (q) bound = readDraft(this.store, q.value.draftId);
+      const q = readQuestion(this.store, raw.question); if (q?.value?.draftId) bound = readDraft(this.store, q.value.draftId);
     }
     if (!bound && raw.project && ['accept-stage', 'prepare-stage', 'project', 'om-start', 'om-continue'].includes(command.type)) {
       const stage = command.type === 'prepare-stage' ? predecessor(raw.stage!) : raw.stage ?? 'features';
       const artifact = stage ? this.store.get<StageArtifact>(stageId(raw.project, stage)) : null;
-      const at = (artifact?.value.content as unknown as { draft?: Ref })?.draft;
+      const at = (artifact?.value?.content as unknown as { draft?: Ref })?.draft;
       if (at) bound = this.store.get<DiscoveryDraft>(at.id, at.revision);
     }
-    if (bound && hasDiscoveryHandoff(this.store, bound.value) && !hasDiscoveryHandoffScope(this.store, bound.value))
+    if (bound?.value && hasDiscoveryHandoff(this.store, bound.value) && !hasDiscoveryHandoffScope(this.store, bound.value))
       return withDiscoveryHandoffAt(this.store, bound.value.projectId, reference(bound), () => this.execute(command));
     switch (command.type) {
       case 'discovery-research-return': {

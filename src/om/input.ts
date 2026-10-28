@@ -391,7 +391,7 @@ function requireInputRequest(store: Store, request: InputRequest): void {
 function loadSources(store: Store, request: InputRequest, prefix: readonly UpstreamStage[] = INPUT_STAGES): InputResult<Sealed<InputStages>> {
   const conceptRef = request.stages.concept;
   const concept = isRef(conceptRef) ? store.get<StageArtifact>(conceptRef.id, conceptRef.revision) : null;
-  const conceptContent = concept?.value.content as unknown as { draft?: Ref; discoveryHandoff?: DiscoveryHandoffBinding };
+  const conceptContent = concept?.value?.content as unknown as { draft?: Ref; discoveryHandoff?: DiscoveryHandoffBinding };
   const root = conceptContent?.discoveryHandoff && concept?.value.inputs.length === 1
     && canonical(concept.value.inputs[0]) === canonical(conceptContent.discoveryHandoff.manifest) ? conceptContent : null;
   let rootHandoff: ReturnType<typeof requireDiscoveryHandoff> | null = null;
@@ -656,7 +656,7 @@ export function readAcceptedUpstreamStageAt(store: Store, project: string, stage
     refs[current] = next; rows.push(row);
     if (current === 'concept') {
       const content = row.value.content as unknown as { discoveryHandoff?: DiscoveryHandoffBinding };
-      if (content.discoveryHandoff && canonical(content.discoveryHandoff.manifest) === canonical(row.value.inputs[0])) {
+      if (content?.discoveryHandoff && canonical(content.discoveryHandoff.manifest) === canonical(row.value.inputs[0])) {
         refs.discovery = structuredClone(content.discoveryHandoff.manifest); break;
       }
     }
@@ -752,7 +752,7 @@ export async function prepareOmInputAt(store: Store, request: InputRequest): Pro
   requireInputRequest(store, request); request = copy(request);
   if (!isRef(request.stages.features)) invalid('stages.features');
   const row = store.get<StageArtifact>(request.stages.features.id, request.stages.features.revision);
-  const content = row?.value.content as unknown as { draft?: Ref; discoveryHandoff?: DiscoveryHandoffBinding };
+  const content = row?.value?.content as unknown as { draft?: Ref; discoveryHandoff?: DiscoveryHandoffBinding };
   return content?.discoveryHandoff && content.draft
     ? withDiscoveryHandoffAt(store, request.project, content.draft, () => prepareOmInput(store, request))
     : prepareOmInput(store, request);

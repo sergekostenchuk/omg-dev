@@ -72,7 +72,7 @@ export class StageChecks {
       const content = artifact.value.content as unknown as StageContent;
       const read = () => readAcceptedUpstreamStageAt(this.store, artifact.value.projectId,
         artifact.value.stage as UpstreamStage, reference(artifact)).grounds;
-      return content.discoveryHandoff ? withDiscoveryHandoffAt(this.store, artifact.value.projectId, content.draft, read) : read();
+      return content?.discoveryHandoff ? withDiscoveryHandoffAt(this.store, artifact.value.projectId, content.draft, read) : read();
     });
     this.environments = new Environments(store);
     this.refinement = new Refinement(store, this.discovery, this.graphs, this.environments, this.pipeline);
@@ -165,7 +165,7 @@ export class StageChecks {
           && concept.value.status === 'accepted', 'basis_application_material_invalid',
           `[${conceptRef.id}] Specification lost its accepted concept`);
         if (handoff) {
-          const binding = (concept.value.content as unknown as StageContent).discoveryHandoff;
+          const binding = (concept.value.content as unknown as StageContent | null)?.discoveryHandoff;
           requireCondition(binding && canonical(binding.manifest) === canonical(handoff.manifest),
             'discovery_handoff_invalid', 'Specification must inherit its concept manifest');
           result.findings.push(...specificationApplicationFindings(content.fields['behaviorContracts'] ?? null,
