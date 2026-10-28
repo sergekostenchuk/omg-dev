@@ -257,7 +257,7 @@ export function researchCapacityInput(input: {
       'discovery_assessment_subject_invalid', 'Capacity cannot substitute another packet or baseline');
   } else requireCondition(!Object.hasOwn(input.bindings,'assessmentSubject'),
     'discovery_assessment_subject_invalid', 'The capacity context lost its declared assessment subject');
-  const keys = ['assessmentSubject', 'discoveryContext', 'discoveryBasisCatalogue', 'assessmentContextContract', 'stageNeighbors',
+  const keys = ['assessmentSubject', 'discoveryContext', 'discoveryBasisCatalogue', 'assessmentContextContract', 'stageNeighbors', 'v7Frame',
     'allowedActions', 'allowedConsumers', 'gapFields', 'researchScope', 'graphBase', 'contextEncoding',
     'dispatchMode', 'savedOnly', 'scope', 'responseContract', 'access', 'deliveryRules', 'criteria',
     'contextControls', 'synthesisState', 'synthesisSession', 'previousProposalRef', 'consolidation'];

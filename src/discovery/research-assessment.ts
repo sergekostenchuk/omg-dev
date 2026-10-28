@@ -11,6 +11,7 @@ import { DISCOVERY_ASSESSMENT_CONTRACT_V2, DISCOVERY_ASSESSMENT_CONTRACT_V3, typ
 import { stageNeighbors, usesStageNeighbors, STAGE_NEIGHBOR_CONTEXT, STAGE_NEIGHBOR_INSTRUCTION } from './stage-neighbors.js';
 import { BASIS_APPLICATION_CONTRACT_ERA, contractEraOf, readDraft, readRecord, readStageArtifact } from './projection-reader.js';
 import { discoveryContext, requireDiscoveryProposal } from './discovery-outcome.js';
+import { v7FrameAssessment, v7FrameAssessmentBasis, V7_FRAME_ASSESSMENT_INSTRUCTION } from './v7-frame-assessment.js';
 import { Ajv } from "ajv";
 import { Store, type Revision, type TransactionGuard, type Write } from "../storage/store.js";
 import { historicalProof, historicalSourceOverGenuine } from "../history/proofs.js";
@@ -143,8 +144,10 @@ function materialPrefix(context: Record<string, any>, id: string): Ref[] | null 
   const neighbors = context.assessmentContextContract === STAGE_NEIGHBOR_CONTEXT ? context.stageNeighbors : undefined;
   const discovery = object(context.discoveryContext) ? context.discoveryContext : undefined;
   const catalogue = context.discoveryBasisCatalogue;
-  if (neighbors === undefined && discovery === undefined && catalogue === undefined) return null;
+  const frame = context.v7Frame;
+  if (neighbors === undefined && discovery === undefined && catalogue === undefined && frame === undefined) return null;
   const refs: Ref[] = [];
+  if (frame !== undefined) refs.push(...v7FrameAssessmentBasis(frame));
   if (catalogue !== undefined) {
     if (!object(catalogue) || catalogue.contract !== 'discovery-basis-catalogue/v1' || !isRef(catalogue.source))
       originInvalid(id, 'The saved assessor material lost its exact Discovery basis catalogue');
@@ -208,6 +211,10 @@ export function directAssessmentBasis(store: Store, assessment: Revision<Researc
 
 export async function assessAnswer(store: Store, question: Revision<Question>, action: Extract<ResearchAction, { action: "answer" }>,
   environment: Revision<Environment>, root: string, signal?: AbortSignal, pilot?: Revision<ReaderPilot>, managedPending?: Ref): Promise<Revision<ResearchAssessment>> {
+  if (question.value.stage === 'discovery' && question.value.spec.field === 'frame') {
+    try { action = JSON.parse(JSON.stringify(action)); }
+    catch { throw new EngineError('answer_invalid', 'The frame proposal must be a JSON snapshot'); }
+  }
   const priorOrigin = managedPending ? readAssessmentPaidOrigin(store, question.value.projectId, managedPending) : null;
   const originalPilot = priorOrigin?.value.profile
     ? exact<ReaderPilot>(store, priorOrigin.value.profile, 'reader-pilot') : undefined;
@@ -228,6 +235,12 @@ export async function assessAnswer(store: Store, question: Revision<Question>, a
     "answer_invalid", "Proposed research result does not satisfy its consumer contract");
   const draft = readDraft(inputStore, question.value.draftId);
   requireCondition(draft?.kind === "discovery-draft", "draft_missing", "The research context is missing");
+  // Only new evaluations require today's mandate. A paid origin replays its
+  // captured reads; an origin predating frame material retains its own era.
+  const frame = !priorOrigin || Object.hasOwn(priorOrigin.value.context, 'v7Frame')
+    ? v7FrameAssessment(inputStore, draft, question) : null;
+  if (priorOrigin && frame) requireCondition(same(frame.context, priorOrigin.value.context['v7Frame']),
+    'research_assessment_binding_invalid', 'The saved frame assessment lost its accepted mandate');
   const turn = managedPending ? managedTurn(store, managedPending, draft, question, action) : null;
   const canonicalRoot = priorOrigin ? priorOrigin.value.root : managedPending ? realpathSync(root) : root;
   if (turn && !priorOrigin) {
@@ -242,6 +255,8 @@ export async function assessAnswer(store: Store, question: Revision<Question>, a
   let proposalGraph: Ref | null = null;
   const evidence = new Evidence(readView?.store ?? store);
   const observations = action.citations.map(item => evidence.observe(question.value.projectId, item.source, item.selector));
+  if (frame && !observations.some(item => same(item, frame.context.brief.observation)))
+    observations.push(frame.context.brief.observation);
   requireCondition(environment.value.implementer.actor !== environment.value.reviewer.actor, "assessor_not_independent", "Research assessment requires a separate actor");
 
   // The runtime result and the admission material it derives from are one selection (№2141): a restore takes both from
@@ -336,6 +351,7 @@ export async function assessAnswer(store: Store, question: Revision<Question>, a
         ? inputStore : store, draft.value, proposedInheritance), operationMap: researchGraphContext(store, draft.value),
       consumerFeedback: consumerFeedback(store, draft.value) };
   if (computedContext && related.context) Object.assign(computedContext, { discoveryContext: related.context });
+  if (computedContext && frame) Object.assign(computedContext, { v7Frame: frame.context });
   if (computedContext && basisMaterial) Object.assign(computedContext, { discoveryBasisCatalogue: basisMaterial.catalogue });
   const direct = !managedPending && usesStageNeighbors(draft.value.stage) && computedContext
     ? readDirectAssessmentMaterials(store, draft, question, environment, computedContext,
@@ -355,17 +371,17 @@ export async function assessAnswer(store: Store, question: Revision<Question>, a
   if (computedContext && withNeighbors) Object.assign(computedContext,
     { assessmentContextContract: STAGE_NEIGHBOR_CONTEXT, stageNeighbors: neighbors.context });
   const context = priorOrigin?.value.context ?? direct?.context ?? computedContext!;
-  const prompt = priorOrigin?.value.prompt ?? direct?.prompt ?? assessmentPrompt(bases, question.value.spec.obligationContract,
+  const prompt = priorOrigin?.value.prompt ?? direct?.prompt ?? (assessmentPrompt(bases, question.value.spec.obligationContract,
     related.context !== null && question.value.spec.field === 'preparation', withNeighbors,
     requiresConceptApplications(draft.value, question.value), contractEraOf(draft.value) === BASIS_APPLICATION_CONTRACT_ERA
-      && draft.value.stage === 'specification');
+      && draft.value.stage === 'specification') + (frame ? V7_FRAME_ASSESSMENT_INSTRUCTION : ''));
   const paidOrigin: AssessmentPaidOriginInput | undefined = managedPending && assessmentReads
     ? { ...(withNeighbors ? { materialContract: STAGE_NEIGHBOR_CONTEXT } : {}), pending: managedPending, root: canonicalRoot, graph: proposalGraph, legacyPaths, reads: assessmentReads, runtime, runtimeAdmission: selection.admission }
     : undefined;
   // A direct call has no paid origin; its completed session still yields the exact proof of what its assessor saw.
   const delivered = await assessmentSessionWithProof(store, draft, question, environment, dispatch, pilot, context, prompt, signal,
     uniqueTransactionGuards([...runtimeGuards, ...related.guards, ...neighbors.guards,
-      ...(basisMaterial?.guards ?? []), ...(readView?.guards ?? [])]), paidOrigin);
+      ...(frame?.guards ?? []), ...(basisMaterial?.guards ?? []), ...(readView?.guards ?? [])]), paidOrigin);
   const response = delivered.result as { verdict?: unknown; reasons?: unknown } | null;
   requireCondition(response !== null && response !== undefined, 'assessment_invalid', 'Assessment returned no verdict');
   // ASM1.1 (№4791): a direct assessment on a prefixed material is bound to that exact material: its identity differs per
@@ -381,11 +397,11 @@ export async function assessAnswer(store: Store, question: Revision<Question>, a
   const existing = readRecord<ResearchAssessment>(store, id);
   if (!managedPending) {
     const guards = uniqueTransactionGuards([reference(question), reference(environment), ...draft.value.inputs,
-      ...observations.map(item => item.source), ...runtimeGuards, ...related.guards, ...neighbors.guards]);
+      ...observations.map(item => item.source), ...runtimeGuards, ...related.guards, ...neighbors.guards, ...(frame?.guards ?? [])]);
     if (existing) {
       // Returning an existing value is a current admission too: a second Store
       // may have changed the prefix after session selection or paid application.
-      if (direct || withNeighbors) store.writeMany([], guards);
+      if (direct || withNeighbors || frame) store.writeMany([], guards);
       return existing;
     }
     return store.writeMany<ResearchAssessment>([{ id, kind: "research-assessment", expected: 0, value }], guards)[0]!;
@@ -485,7 +501,13 @@ export function readResearchAssessmentAt(store: Store, projectId: string, turnId
   const capturedDraft = readDraft(view.store, question.value.draftId);
   requireCondition(capturedDraft && same(reference(capturedDraft), value.draft),
     'research_assessment_binding_invalid', `[${turnId}] The captured proposal uses another draft`);
+  const frame = Object.hasOwn(origin.value.context, 'v7Frame')
+    ? v7FrameAssessment(view.store, capturedDraft, question) : null;
+  if (frame) requireCondition(same(frame.context, outcome.context.v7Frame),
+    'research_assessment_binding_invalid', `[${turnId}] The assessor did not receive its exact accepted mandate`);
   const observations = action.citations.map(item => new Evidence(view.store).observe(projectId, item.source, item.selector));
+  if (frame && !observations.some(item => same(item, frame.context.brief.observation)))
+    observations.push(frame.context.brief.observation);
   const runtime = origin.value.runtime;
   if (draft.value.stage === 'om-g2' && ['R1', 'R2'].includes(draft.value.level)
     && (draft.value.consumer === 'compilation' || question.value.spec.field === 'layerDesign')) {
@@ -566,7 +588,7 @@ export function readResearchAssessmentAt(store: Store, projectId: string, turnId
     && outcome.prompt === assessmentPrompt(bases, question.value.spec.obligationContract,
       related.context !== null && question.value.spec.field === 'preparation', withNeighbors,
       requiresConceptApplications(capturedDraft.value, question.value), contractEraOf(capturedDraft.value) === BASIS_APPLICATION_CONTRACT_ERA
-        && capturedDraft.value.stage === 'specification'),
+        && capturedDraft.value.stage === 'specification') + (frame ? V7_FRAME_ASSESSMENT_INSTRUCTION : ''),
     'research_assessment_binding_invalid', `[${turnId}] The assessor context does not derive from the paid proposal and exact sources`);
   const projected = assessmentValue(question, action, environment, observations, bases, runtime.proofs,
     outcome.result as { verdict: unknown; reasons: unknown });

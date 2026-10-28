@@ -435,6 +435,7 @@ function packWorkingContext(store: Store, projectId: string, draftId: string, qu
     body = archivedBody;
   }
   const relatedResearch = body['discoveryContext'];
+  const frameMaterial = body['v7Frame'];
   const relatedCatalogue = body['discoveryBasisCatalogue'];
   const neighborMaterial = body['assessmentContextContract'] === STAGE_NEIGHBOR_CONTEXT
     ? { assessmentContextContract: STAGE_NEIGHBOR_CONTEXT, stageNeighbors: body['stageNeighbors'] } : null;
@@ -487,6 +488,11 @@ function packWorkingContext(store: Store, projectId: string, draftId: string, qu
         item.field === 'sourceCatalogue' && item.pointer === '/body/sourceCatalogue'
         && item.valueHash === hashJson(sourceNavigation)),
       'source_toc_undelivered', 'The packed request lost its exact structured source catalogue');
+    if (frameMaterial !== undefined) requireCondition(
+      packet.v7Frame !== undefined && canonical(packet.v7Frame) === canonical(frameMaterial)
+      || packet.working?.materialAddresses?.some((item: {field:string;valueHash:string}) =>
+        item.field === 'v7Frame' && item.valueHash === hashJson(frameMaterial)),
+    'context_frame_incomplete', `[${question.id}] The packed frame lost its accepted owner mandate`);
     if (relatedResearch !== undefined) requireCondition(
       packet.discoveryContext !== undefined && canonical(packet.discoveryContext) === canonical(relatedResearch)
       || packet.working?.materialAddresses?.some((item: {field:string;valueHash:string}) =>
@@ -604,7 +610,7 @@ function packWorkingContext(store: Store, projectId: string, draftId: string, qu
     const fullHistory = Object.hasOwn(initial, 'history') ? initial.history : undefined;
     if (fullHistory !== undefined) delete initial.history;
     const addressed = addressArchivedMaterials(initial, reference(archive),
-      exactArchivedFields(initial, ['dossierPacket', 'dossierReplyContract', 'dossierNotes', 'fields', 'discoveryContext', 'discoveryBasisCatalogue',
+      exactArchivedFields(initial, ['dossierPacket', 'dossierReplyContract', 'dossierNotes', 'fields', 'discoveryContext', 'discoveryBasisCatalogue', 'v7Frame',
         'prerequisites', 'operationMap', 'inventory', 'consumerFeedback', 'request', 'frameRequest', 'sourceCatalogue']),
       maxChars, materialRecord);
     packContextWorkspace(initial,maxChars,options.contextChars,undefined,
@@ -662,6 +668,7 @@ function packWorkingContext(store: Store, projectId: string, draftId: string, qu
     if (projectedQuestion) { body['question'] = projectedQuestion; if (Object.hasOwn(original, 'questions')) body['questions'] = [projectedQuestion]; }
     if(original['assessmentState'])body['value']=assessmentValue;
     if(relatedResearch !== undefined)body['discoveryContext']=relatedResearch;
+    if(frameMaterial !== undefined)body['v7Frame']=frameMaterial;
     if(relatedCatalogue !== undefined)body['discoveryBasisCatalogue']=relatedCatalogue;
     if(neighborMaterial)Object.assign(body,neighborMaterial);
     if(sourceNavigation) body['sourceCatalogue']=sourceNavigation;
@@ -720,6 +727,7 @@ function packWorkingContext(store: Store, projectId: string, draftId: string, qu
   const mandatory = [...(variantFields?Object.keys(variantFields):[]),"managedDossier","dossierNotes","dossierSubject","dossierPacket","dossierResultTransport","dossierReplyContract","assessmentDelivery","deepPreparation","deepCell","deepScope","variantSubject", "assessmentSubject", "resultCapacity", "assessmentContextContract", "stageNeighbors", "discoveryContext", "discoveryBasisCatalogue", "webResearch", "answerContext", "contextWorkspace", "savedEvidence", "conclusions", "conclusionCitations", "conclusionRefs", "conclusionUnresolved", "conclusionEncoding", "contextControls", "contextCorrection", "currentRead", "originals", "corrections", "request", "candidate", "proposalChanges", "purpose", "sources", "questions", "prerequisites", "operationMap", "researchMissing", "fields", "mapStatusFindings", "mapStatus", "researchScope", "role", "stage", "level", "consumer", "contextEncoding", "allowedConsumers", "gapFields", "graphBase",
     "core", "map", "draft", "question", "value", "representation", "consumerFeedback", "assessmentState", "openGaps", "failures", "unresolvedEvidence", "dispatchMode", "readPlanStatus", "sourceCatalogue", "sourceLocations", "bases", "runtimeProofs", "synthesisState", "synthesisNotes", "previousProposalRef"];
   if(body['assessmentState']) mandatory.splice(mandatory.indexOf("value"),1);
+  if(frameMaterial !== undefined) mandatory.push('v7Frame');
   const ordered = options.common && !options.continuation
     ? [...mandatory.filter(key=>FOUNDATION_FIELDS.includes(key as any)),...mandatory.filter(key=>!FOUNDATION_FIELDS.includes(key as any))] : mandatory;
   const packet: Record<string, any> = Object.fromEntries(ordered.filter(key => Object.hasOwn(body, key)).map(key => [key, body[key]]));
@@ -732,7 +740,7 @@ function packWorkingContext(store: Store, projectId: string, draftId: string, qu
   // Defaults preserve the action protocol's collection shapes, not completeness.
   Object.assign(packet, { readings: [], directReadings: [], history: [], observations: [], checkpoints: [] });
   const addressedCore = addressArchivedMaterials(packet, reference(archive),
-    exactArchivedFields(packet, ['dossierPacket', 'dossierReplyContract', 'dossierNotes', 'fields', 'discoveryContext', 'discoveryBasisCatalogue', 'stageNeighbors',
+    exactArchivedFields(packet, ['dossierPacket', 'dossierReplyContract', 'dossierNotes', 'fields', 'discoveryContext', 'discoveryBasisCatalogue', 'stageNeighbors', 'v7Frame',
       'prerequisites', 'operationMap', 'inventory', 'request', 'consumerFeedback',
       'answerContext', 'currentRead', 'originals', 'corrections', 'researchScope',
       'mapStatus', 'mapStatusFindings', 'readPlanStatus', 'openGaps', 'failures', 'sourceCatalogue',
