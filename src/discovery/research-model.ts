@@ -56,6 +56,13 @@ export interface ResearchRun {
   error: string | null;
   pauseCode?: string | null;
   owner: { pid: number; started: string }; requestChars: number;
+  /** Initial interpretation input survives application reopening the frame.
+   * Ready is a reference to D1's proof, never a locally invented verdict. */
+  entryInterpretation?: {
+    draft: Ref; frame: Ref;
+    ready: { draft: Ref; frame: Ref; basis: Ref } | null;
+    continuation?: import('./interpretation-flow.js').InterpretationContinuation;
+  };
   /** Exact paid D6 continuation; supported is readiness for D7, not acceptance. */
   dossierAssessment?: ResearchRunDossierAssessment;
   /** Exact late D7 state; its paid reader derives outcome and acceptance separately. */

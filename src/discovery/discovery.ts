@@ -20,6 +20,8 @@ import { Environments, uniqueTransactionGuards, transactionGuardsCurrent } from 
 import { obligationEvidenceFindings } from '../graph/obligation-evidence.js';
 import { collectRuntimeEvidence, runtimeEvidenceDependencies } from '../graph/runtime-evidence.js';
 import { readResearchAssessmentAt, assessmentBindingId, directAssessmentBasis } from './research-assessment.js';
+import { readAssessmentPaidOrigin } from './assessment-session.js';
+import { v7FrameAssessmentBasis } from './v7-frame-assessment.js';
 import { readResearchConsumerTurn, readResearchAcceptanceBinding, pinnedLayerDeltaStore } from './response-recovery.js';
 import { researchAction, projectAcceptanceBinding, acceptanceBindingId, managedAnswerId, managedAnswerTurn,
   type ManagedResearchTurn, type AcceptedPaidAnswerInputs, type ResearchAcceptanceBinding } from './research-consumer-transition.js';
@@ -441,7 +443,17 @@ export class Discovery {
     // ASM1.1 (№4791): a direct assessment judged on an accepted prefix is accepted on that same prefix only. Its exact
     // neighbors and grounds come from its own saved material through the common reader, must still stand, and guard the
     // acceptance write itself — a reopen between this check and the write refuses the whole transaction.
-    const prefix = managedPending === undefined ? directAssessmentBasis(this.store, assessment) ?? [] : [];
+    const managedFrame = managedPending !== undefined && draft?.value.stage === 'discovery'
+      && draft.value.contractVersion === 7 && question.value.spec.field === 'frame'
+      ? this.#managedAcceptance(question, assessment, managedPending) : undefined;
+    let prefix = managedPending === undefined ? directAssessmentBasis(this.store, assessment) ?? [] : [];
+    if (managedFrame) {
+      const binding = this.store.get<{ pending: Ref }>(managedFrame.assessmentProof.id, managedFrame.assessmentProof.revision)!;
+      const origin = readAssessmentPaidOrigin(this.store, question.value.projectId, binding.value.pending);
+      requireCondition(origin && Object.hasOwn(origin.value.context, 'v7Frame'), 'research_assessment_binding_invalid',
+        'The managed v7 frame assessment lost its accepted mandate');
+      prefix = v7FrameAssessmentBasis(origin.value.context.v7Frame);
+    }
     for (const ref of prefix) {
       const head = this.store.get(ref.id);
       if (!head || canonical(reference(head)) !== canonical(ref))
@@ -452,7 +464,7 @@ export class Discovery {
     const guards: TransactionGuard[] = [assessmentRef, assessment.value.environment,
       ...assessment.value.observations.map(item => item.source), ...runtimeGuards, ...prefix];
     if (managedPending === undefined) return this.#answer(question, answer.value, answer, "research-answer", guards);
-    const managed = this.#managedAcceptance(question, assessment, managedPending);
+    const managed = managedFrame ?? this.#managedAcceptance(question, assessment, managedPending);
     return this.#answer(question, answer.value, answer, "research-answer", guards, managed);
   }
   /** D8.4e (№2259 W2–W4): the acceptance already made for this exact managed

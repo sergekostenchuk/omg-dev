@@ -1,6 +1,7 @@
 import { runDiscoveryFinalization, readRunnerFinalizationAt, nextRunnerFinalReturn } from './discovery-finalization-runner.js';
 import { variantResearchReturn, assessDeepResearchReturns, readResearchReturnAt } from './discovery-research-return.js';
 import type { ModelCall } from '../runtime/model-usage.js';
+import { runResearchEntry, researchEntryState, researchEntryMaterial, requireEntryProgress, RESEARCH_ENTRY_READY, RESEARCH_ENTRY_INTERPRETATION } from './research-entry.js';
 import { variantSnapshotReadiness, produceVariantSnapshot, readVariantSnapshot } from "./variant-snapshot.js";
 import { prepareVariantSession, applyVariantSession, readVariantExecutionSession, readVariantGeneration, readVariantModelDecision,
   type ProvenVariantModelDecision, type ProvenVariantGeneration } from "./variant-session.js";
@@ -361,14 +362,26 @@ export class Researcher {
     let draft = this.store.get<DiscoveryDraft>(draftId);
     requireCondition(draft?.kind === "discovery-draft" && draft.value.projectId === project, "discovery_foreign", "Research draft must belong to this project");
     if (draft.value.stage === "discovery" && draft.value.contractVersion === 7)
-      return this.runPlanAttempts(project, draftId, limit, signal, options);
+      return runResearchEntry(this.store, project, draftId, limit,
+        remaining => this.runFields(project, draftId, remaining, signal, options, true),
+        remaining => this.runPlanAttempts(project, draftId, remaining, signal, options),
+        { restoreOnly: options.restoreOnly === true || producerContractEra('discovery', options.producerPolicy) !== 7,
+          ...(signal ? { signal } : {}) });
+    return this.runFields(project, draftId, limit, signal, options);
+  }
+  private async runFields(project: string, draftId: string, limit: number, signal: AbortSignal | undefined,
+    options: { restoreOnly?: boolean; producerPolicy?: ProducerPolicy }, entry = false): Promise<Revision<ResearchRun>> {
+    let draft = this.store.get<DiscoveryDraft>(draftId)!;
     const early = earlyResearchStage(draft.value.stage);
     const producerEra = producerContractEra(draft.value.stage as UpstreamStage, options.producerPolicy);
     const formerEarlyContract = early && typeof draft.value.contractVersion === 'number'
       && draft.value.contractVersion >= 4 && draft.value.contractVersion < producerEra;
-    const restoreOnly = options.restoreOnly === true || formerEarlyContract;
+    const entryDisabled = entry && producerEra !== 7;
+    const restoreOnly = options.restoreOnly === true || formerEarlyContract || entryDisabled;
     requireCondition(!restoreOnly || early, 'research_restore_invalid', 'Restore-only applies only to early-stage paid work');
-    const restoreComplete = formerEarlyContract
+    const restoreComplete = entryDisabled
+      ? { code: 'research_contract_upgrade_required', message: `[${draftId}] New Discovery v7 work needs the trusted v7 producer policy` }
+      : formerEarlyContract
       ? { code: 'research_contract_upgrade_required', message: `[${draftId}] Previous paid work is settled; prepare Discovery v${producerEra} before new work` }
       : { code: 'research_restore_complete', message: `[${draftId}] Saved paid work is settled; restoration cannot begin a new action` };
     const id = `research-run:${hashJson([project, draftId])}`;
@@ -610,7 +623,7 @@ export class Researcher {
       }
     }
     const checked = inspection.gate;
-    if (run?.value.status === "completed" && checked?.findings.length === 0
+    if (!entry && run?.value.status === "completed" && checked?.findings.length === 0
       && admitted?.findings.length===0) return run;
     if (restoreOnly && !outstanding && !forcedPendingTurn)
       throw new EngineError(restoreComplete.code, restoreComplete.message);
@@ -620,8 +633,29 @@ export class Researcher {
     else run = this.store.writeMany<ResearchRun>([{ id, kind: "research-run", expected: run?.revision ?? 0,
       value: { projectId: project, draftId, environment: reference(environment), status: "running", turns: run?.value.turns ?? 0,
         limit, inputs: uniqueRefs([...draft.value.inputs, ...effective.guards]), ownerQuestion: null, error: null, pauseCode: null, owner,
-        requestChars: run?.value.requestChars ?? 0 } }], [reference(draft), reference(environment), ...draft.value.inputs])[0]!;
+        requestChars: run?.value.requestChars ?? 0,
+        ...(entry && run?.value.entryInterpretation ? { entryInterpretation: run.value.entryInterpretation } : {}) } }],
+      [reference(draft), reference(environment), ...draft.value.inputs])[0]!;
     requireCondition(run, "research_consumer_intent_invalid", "The research run was not claimed");
+    const entryStop = (current: Revision<ResearchRun>): Revision<ResearchRun> | null => {
+      if (!entry) return null;
+      const selected = researchEntryState(this.store, this.store.get<DiscoveryDraft>(draftId)!);
+      if (selected.missing) {
+        const missing = selected.missing;
+        return this.save(current, { status: 'needs_owner', pauseCode: 'research_owner_input_missing',
+          error: `Accepted owner ${missing.value.spec.field} is missing`,
+          ownerQuestion: { question: missing.id, reason: `Accepted owner ${missing.value.spec.field} is missing`, searched: [] } }, selected.guards);
+      }
+      if (selected.questions.frame.value.status === 'answered' && !selected.ready
+        && canonical(current.value.entryInterpretation?.ready?.frame ?? null) !== canonical(selected.questions.frame.value.answer)) {
+        const latest = this.store.get<DiscoveryDraft>(draftId)!;
+        return this.save(current, { status: 'paused', ownerQuestion: null, pauseCode: RESEARCH_ENTRY_INTERPRETATION,
+          error: 'The accepted frame awaits its interpretation flow',
+          entryInterpretation: { draft: reference(latest), frame: selected.questions.frame.value.answer!, ready: null } }, selected.guards);
+      }
+      return selected.ready ? this.save(current, { status: 'paused', ownerQuestion: null,
+        pauseCode: RESEARCH_ENTRY_READY, error: 'The accepted frame and plan are ready for research' }, selected.guards) : null;
+    };
     try {
       if (admitted?.findings.length) return this.save(run, { status: 'paused', ownerQuestion: null,
         error: admitted.reason, pauseCode: admitted.findings[0]!.code }, admitted.guards);
@@ -663,7 +697,10 @@ export class Researcher {
             pilot ?? undefined, reference(forcedPendingTurn));
         }
       }
-      if (!restoreOnly && !outstanding && !forcedPendingTurn) reuseResearch(this.store, this.discovery, this.store.get<DiscoveryDraft>(draftId)!, reference(environment));
+      if (!outstanding && !forcedPendingTurn) {
+        const stopped = entryStop(run); if (stopped) return stopped;
+      }
+      if (!entry && !restoreOnly && !outstanding && !forcedPendingTurn) reuseResearch(this.store, this.discovery, this.store.get<DiscoveryDraft>(draftId)!, reference(environment));
       let resumedSent: Record<string, any> | undefined;
       for (let turn = 0; turn < limit; turn++) {
         if (restoreOnly) {
@@ -759,6 +796,7 @@ export class Researcher {
           continue;
         }
         draft = this.store.get<DiscoveryDraft>(draftId)!;
+        if (!forcedPendingTurn) { const stopped = entryStop(run); if (stopped) return stopped; }
         const inspection = forcedPendingTurn ? null : discoveryInspection(this.store, draft);
         const outcome = inspection?.outcome;
         if (outcome?.findings.length) return this.save(run, { status: 'paused', ownerQuestion: null,
@@ -892,6 +930,7 @@ export class Researcher {
         });
         const related = forcedPendingTurn ? { context: null, guards: [] }
           : discoveryContext(this.store, draft, pending[0]!);
+        const entryMaterial = entry && !forcedPendingTurn ? researchEntryMaterial(this.store, draft) : null;
         const conceptMaterial = draft.value.contractVersion === 6 && ['concept', 'specification'].includes(draft.value.stage)
           ? readDiscoveryBasisMaterial(this.store, draft.value) : null;
         const context = pilot ? { ...pilotContext(this.store, draft, pending[0]!),
@@ -941,6 +980,7 @@ export class Researcher {
             reference(failedIntent ?? failedTurn!), pending[0]!.value, webResearchCapability(draft.value.stage, 'analyst', dispatch), !mode)] });
         }
         if (related.context) Object.assign(context, { discoveryContext: related.context });
+        if (entryMaterial) Object.assign(context, { request: entryMaterial.context });
         if (conceptMaterial) Object.assign(context, { discoveryBasisCatalogue: conceptMaterial.catalogue });
         // WB1: only the Discovery analyst call that carries the web capability is offered web actions and the budget left.
         if (!mode && webResearchCapability(draft.value.stage, 'analyst', dispatch))
@@ -1045,7 +1085,7 @@ export class Researcher {
             const kind = mode === "planning" ? "reading-planner" as const : "analyst" as const;
             const number = run.value.turns + 1;
             const basis = uniqueRefs([...draft.value.inputs, ...currentContextHeads, ...(conceptMaterial?.guards ?? []), ...effective.guards,
-              ...(outcome?.guards ?? []), ...related.guards, ...turns.map(reference),
+              ...(outcome?.guards ?? []), ...related.guards, ...(entryMaterial?.guards ?? []), ...turns.map(reference),
               ...sources.list().map(reference)]);
             const layerGraph = draft.value.stage === 'om-g2' && pending[0]!.value.spec.field === 'layerDesign'
               ? this.store.get<Graph>(`graph:${project}`) : null;
@@ -1268,6 +1308,7 @@ export class Researcher {
                 value: expandLayerDelta(this.store, draft, question, action), citations: action.citations } : action;
               const managedPending = (pendingTurn.value as Partial<ManagedResearchTurn>).contract === 'research-consumer-turn/v1'
                 ? reference(pendingTurn) : undefined;
+              if (entry) requireEntryProgress(this.store, draft, question, proposal, turns, reference(pendingTurn));
               // №2000: assessAnswer itself derives the managed technical findings
               // on the captured/pinned read view before any paid dispatch and
               // throws PreparedManagedProposalRefusal; the refusal and its
@@ -1477,6 +1518,7 @@ export class Researcher {
       if (restoreOnly) return this.save(run, { status: "paused", ownerQuestion: null,
         error: restoreComplete.message, pauseCode: restoreComplete.code });
       draft = this.store.get<DiscoveryDraft>(draftId)!;
+      const entryResult = entryStop(run); if (entryResult) return entryResult;
       const { outcome, gate } = discoveryInspection(this.store, draft);
       if (outcome.findings.length) return this.save(run, { status: 'paused', ownerQuestion: null,
         error: outcome.reason, pauseCode: outcome.findings[0]!.code }, outcome.guards);

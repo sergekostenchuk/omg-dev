@@ -91,6 +91,18 @@ export type VariantSnapshotReadiness = VariantSnapshotReady | VariantSnapshotRef
 function planConsumerSubject(store: Store, row: Revision<ResearchConsumerIntent>, plan: Ref):
   { intent: Revision<ResearchConsumerIntent>; subject: V7PlanSubject } | null {
   const value = row.value;
+  // Producing the initial plan uses the same Question ID as later research,
+  // but its proven historical basis predates the accepted planAnswer.
+  if (!Object.hasOwn(value.cursor ?? {}, 'subject')) {
+    const producer = readResearchConsumerIntent(store, reference(row));
+    const original = exact<DiscoveryDraft>(store, producer.value.draft, 'discovery-draft');
+    const anchor = exact<Question>(store, producer.value.question, 'question');
+    if (original.value.projectId === producer.value.projectId && anchor.value.projectId === producer.value.projectId
+      && anchor.value.draftId === original.id && original.value.questions.includes(anchor.id)
+      && original.value.stage === 'discovery' && original.value.contractVersion === 7
+      && anchor.value.spec.field === 'plan' && anchor.value.status === 'open' && anchor.value.answer === null
+      && original.value.fields.plan === null) return null;
+  }
   let intent: Revision<ResearchConsumerIntent>, subject: V7PlanSubject | null;
   if (value.kind === 'escalation-assessor' || value.kind === 'reader') {
     intent = readResearchConsumerIntent(store, reference(row));
