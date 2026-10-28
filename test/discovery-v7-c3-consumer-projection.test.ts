@@ -15,7 +15,7 @@ import { researchCall } from '../src/discovery/research-protocol.js';
 import { CONDITION_EVIDENCE_RESULT, prepareConditionEvidenceSubject } from '../src/discovery/discovery-condition-evidence-subject.js';
 import { prepareConditionEvidenceSession } from '../src/discovery/discovery-condition-evidence-session.js';
 import { runConditionEvidenceExecution } from '../src/discovery/discovery-condition-evidence-execution.js';
-import { finalAssessmentPaid } from './discovery-v7-final-assessment-seed.js';
+import { acceptedAssessmentPaid, finalAssessmentPaid } from './discovery-v7-final-assessment-seed.js';
 import { modeOf } from './discovery-v7-dossier-seed.js';
 import { preparedField } from './preparation-fixture.js';
 import { enrichedGraph } from './enriched-graph-fixture.js';
@@ -26,9 +26,9 @@ function fixtureValue(field: string): Json {
   return JSON.parse(JSON.stringify(preparedField('p', field)).replaceAll('p-user', 'operator').replaceAll('p-result', 'record'));
 }
 async function world(t: test.TestContext) {
-  const f = await finalAssessmentPaid(t, { form: V9_FINAL_CONTRACT }); modeOf(f.store, 'bypass');
-  const accepted = await acceptDiscoveryFinal(f.store, { projectId: 'p', assessment: f.paidResult, decision: 'accept', reason: 'Use the assessed final' });
-  assert.ok(accepted.accepted); return { f, at: reference(accepted.accepted.manifest) };
+  // The accepted paid v9 product is a precondition here, so it is copied from the run's catalog (layer `accepted`), not accepted again.
+  const f = await acceptedAssessmentPaid(t, { form: V9_FINAL_CONTRACT });
+  return { f, at: f.data.accepted.manifest };
 }
 
 test('C3: paid accepted v9 drives the existing L1 builder without changing actor, outcome or journey identities', async t => {

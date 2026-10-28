@@ -30,7 +30,7 @@ export const PAID_WORLD_SEED = 1;
 export const PAID_WORLD_ATTEMPTS = 3;
 const POLL_MS = 150, IDENTITY_MS = 3_000, CLAIM_GRACE_MS = 5_000, WAIT_MS = 15 * 60_000;
 
-export type WorldLayer = 'dossier' | 'paid' | 'assessment';
+export type WorldLayer = 'dossier' | 'paid' | 'assessment' | 'accepted';
 /** A snapshot: a directory `root` which is never written, and the values that name its records. */
 export interface World<T> { root: string; data: T }
 interface Owner { pid: number; started: string }

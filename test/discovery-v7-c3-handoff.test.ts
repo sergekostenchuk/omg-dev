@@ -9,7 +9,7 @@ import { prepareDiscoveryHandoff, readDiscoveryHandoffAt, requireDiscoveryHandof
 import { researchPrerequisitesAt } from '../src/discovery/research-context.js';
 import type { DiscoveryDraft } from '../src/discovery/discovery.js';
 import { acceptDiscoveryFinal, ConditionChoiceSessions, issueConditionChoiceInvitation, resolveDiscoveryCondition } from '../src/product/owner-authority.js';
-import { finalAssessmentPaid } from './discovery-v7-final-assessment-seed.js';
+import { acceptedAssessmentPaid, finalAssessmentPaid } from './discovery-v7-final-assessment-seed.js';
 import { modeOf } from './discovery-v7-dossier-seed.js';
 import { storeUnchanged } from './store-unchanged.js';
 
@@ -17,8 +17,13 @@ const conditions = [{ id: 'channel', kind: 'owner_choice', class: 'choice', clas
   condition: 'Choose a channel', criterion: 'A channel is selected', options: [
     { optionId: 'web', label: 'Web', consequences: ['Web first'], choice: 'accept' },
     { optionId: 'none', label: 'None', consequences: ['Stop'], choice: 'decline' }] }];
-async function world(t: test.TestContext, conditional = false) {
-  const f = await finalAssessmentPaid(t, { form: V9_FINAL_CONTRACT, ...(conditional ? { outcome: 'conditional' as const, conditions } : {}) });
+// The accepted paid v9 product is a precondition of these tests, so it is copied from the run's catalog (layer `accepted`), not accepted again.
+async function world(t: test.TestContext) {
+  const f = await acceptedAssessmentPaid(t, { form: V9_FINAL_CONTRACT });
+  return { f, manifest: f.data.accepted.manifest };
+}
+async function conditionalWorld(t: test.TestContext) {
+  const f = await finalAssessmentPaid(t, { form: V9_FINAL_CONTRACT, outcome: 'conditional' as const, conditions });
   modeOf(f.store, 'bypass');
   const accepted = await acceptDiscoveryFinal(f.store, { projectId: 'p', assessment: f.paidResult, decision: 'accept', reason: 'Accept supported final' });
   assert.ok(accepted.accepted); return { f, accepted: accepted.accepted, manifest: reference(accepted.accepted.manifest) };
@@ -69,7 +74,7 @@ test('C3 handoff: changed, absent and foreign binding refuse, while exact initia
 });
 
 test('C3 handoff: open conditional writes nothing; a proved choice edition is pinned and does not release its predecessor', async t => {
-  const { f, accepted, manifest } = await world(t, true);
+  const { f, accepted, manifest } = await conditionalWorld(t);
   const prepare = (at: typeof manifest) => prepareDiscoveryHandoff(f.store, { project: 'p', stage: 'specification', manifest: at, inputs: [] });
   await storeUnchanged(f.store, async () => { await assert.rejects(prepare(manifest), (e: any) => e.code === 'discovery_projection_conditions_open'); });
   const request = { projectId: 'p', manifest, conditionId: 'channel', optionId: 'web', reason: 'Web first' };

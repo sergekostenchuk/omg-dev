@@ -18,7 +18,9 @@ import { DISCOVERY_FINAL_ASSESSMENT_RESULT } from '../src/discovery/discovery-fi
 import { readDiscoveryFinalAssessmentExecutionAt, readDiscoveryFinalAssessmentPaidResultAt,
   runDiscoveryFinalAssessmentExecution, type DiscoveryFinalAssessmentPaidResult } from '../src/discovery/discovery-final-assessment-execution.js';
 import type { DiscoveryFinalPaidResult } from '../src/discovery/discovery-final-execution.js';
+import { acceptDiscoveryFinal } from '../src/product/owner-authority.js';
 import { finalPaid, type FinalOutcome, type FinalSeedForm, type FinalSeedRoute } from './discovery-v7-final-paid-seed.js';
+import { modeOf } from './discovery-v7-dossier-seed.js';
 import { builderContext, sharedWorld } from './discovery-v7-paid-world-cache.js';
 
 export interface FinalAssessmentSeedOptions {
@@ -40,8 +42,24 @@ type SeedData = {
   /** OMG-V7-B3: the calibration draft and question of the paid D7 world, for a planted copy's own reviewer measurement. */
   calibration: { draft: Ref; question: Ref };
 };
-type Snapshot = { root: string; data: SeedData };
+type Snapshot<D extends SeedData = SeedData> = { root: string; data: D };
+/** The assessed world which the project mode `bypass` accepted: the refs of the accepted manifest and bundle come with it. */
+type AcceptedData = SeedData & { accepted: { manifest: Ref; bundle: Ref } };
 const seeds = new Map<string, Promise<Snapshot>>();
+const acceptedSeeds = new Map<string, Promise<Snapshot<AcceptedData>>>();
+
+/** Cut a world into `root`: its files except the database, then the database as one consistent read-only file. */
+function cutWorld(f: { root: string; path: string }, root: string): void {
+  const database = new Set([f.path, `${f.path}-wal`, `${f.path}-shm`]);
+  cpSync(f.root, root, { recursive: true, filter: path => !database.has(path) });
+  const db = new DatabaseSync(f.path);
+  try { db.prepare('VACUUM INTO ?').run(join(root, 'state.sqlite')); } finally { db.close(); }
+  chmodSync(join(root, 'state.sqlite'), 0o400);
+  // Rewrite only the runtime adapter of the copy, never stored commands or
+  // historical Refs. Each plant will configure its own current environment.
+  const script = readFileSync(join(root, 'adapter.mjs'), 'utf8');
+  writeFileSync(join(root, 'adapter.mjs'), script.replaceAll(f.root, root));
+}
 
 /** `entry` is a catalog entry of this run (test/discovery-v7-paid-world-cache.ts): the snapshot is made in place at `entry/world`
  * and the catalog, not this process, owns it until the run ends. Without one it is this process's own temporary directory. */
@@ -72,15 +90,7 @@ async function build(options: Required<Omit<FinalAssessmentSeedOptions, 'conditi
   assert.ok(paid.output && paid.result);
   assert.equal(paid.result.verdict, options.verdict);
   const root = entry === undefined ? mkdtempSync(join(tmpdir(), 'omg-final-assessment-snapshot-')) : join(entry, 'world');
-  const database = new Set([f.path, `${f.path}-wal`, `${f.path}-shm`]);
-  cpSync(f.root, root, { recursive: true, filter: path => !database.has(path) });
-  const db = new DatabaseSync(f.path);
-  try { db.prepare('VACUUM INTO ?').run(join(root, 'state.sqlite')); } finally { db.close(); }
-  chmodSync(join(root, 'state.sqlite'), 0o400);
-  // Rewrite only the runtime adapter of the copy, never stored commands or
-  // historical Refs. Each plant will configure its own current environment.
-  const script = readFileSync(join(root, 'adapter.mjs'), 'utf8');
-  writeFileSync(join(root, 'adapter.mjs'), script.replaceAll(f.root, root));
+  cutWorld(f, root);
   if (entry === undefined) cleanups.push(() => rmSync(root, { recursive: true, force: true }));
   return { root, data: structuredClone({ final: { d6: f.d6, packet: f.packet, prepared: f.prepared,
     execution: f.execution, paidResult: f.paidResult }, prepared: reference(prepared),
@@ -88,7 +98,7 @@ async function build(options: Required<Omit<FinalAssessmentSeedOptions, 'conditi
     calibration: f.data.calibration }) };
 }
 
-function plant(t: TestContext, seed: Snapshot) {
+function plant<D extends SeedData>(t: TestContext, seed: Snapshot<D>) {
   const root = mkdtempSync(join(tmpdir(), 'omg-final-assessment-copy-')), path = join(root, 'state.sqlite');
   cpSync(seed.root, root, { recursive: true }); chmodSync(path, 0o600);
   writeFileSync(join(root, 'adapter.mjs'), readFileSync(join(root, 'adapter.mjs'), 'utf8').replaceAll(seed.root, root));
@@ -123,11 +133,9 @@ function plant(t: TestContext, seed: Snapshot) {
     wires: (): unknown[] => readFileSync(join(root, 'wire.ndjson'), 'utf8').trim().split('\n').filter(Boolean).map(row => JSON.parse(row)) };
 }
 
-/** A lazily paid D7 assessment, built in the first consumer's test. Copies
- * preserve exact paid history while isolating database, values and runtime. */
-export async function finalAssessmentPaid(t: TestContext, options: FinalAssessmentSeedOptions = {}) {
-  // One JSON snapshot of explicit conditions before the first await: it keys both caches and builds the paid world.
-  // CONDITION-SEED-SNAPSHOT-01: the property is read once into a local value, and only that value is snapshotted.
+/** The parameters of a world and the key which tells it apart in the run's catalog. The conditions are snapshotted once, here, before
+ * any await (CONDITION-SEED-SNAPSHOT-01): the property is read once into a local value, and only that value is used. */
+function selection(options: FinalAssessmentSeedOptions) {
   const raw = options.conditions, form = options.form;
   const conditions = raw === undefined ? undefined : JSON.parse(canonical(raw as never)) as unknown;
   assert.ok(form === undefined || form === V8_FINAL_CONTRACT || form === V9_FINAL_CONTRACT, 'an explicit form is discovery-final/v8 or v9');
@@ -138,6 +146,13 @@ export async function finalAssessmentPaid(t: TestContext, options: FinalAssessme
   assert.ok(['owner', 'model', 'partial'].includes(selected.route));
   const key = `${selected.route}:${selected.outcome}:${selected.verdict}${conditions === undefined ? '' : `:${canonical(conditions as never)}`}`
     + (form === undefined ? '' : `:${form}`);
+  return { selected, key };
+}
+
+/** A lazily paid D7 assessment, built in the first consumer's test. Copies
+ * preserve exact paid history while isolating database, values and runtime. */
+export async function finalAssessmentPaid(t: TestContext, options: FinalAssessmentSeedOptions = {}) {
+  const { selected, key } = selection(options);
   let pending = seeds.get(key);
   if (!pending) {
     // The run's catalog tells worlds apart by exactly this key, which carries every parameter and the one snapshot of the conditions.
@@ -145,4 +160,27 @@ export async function finalAssessmentPaid(t: TestContext, options: FinalAssessme
     seeds.set(key, pending); pending.catch(() => seeds.delete(key));
   }
   return plant(t, await pending);
+}
+
+/** The same assessed world under the project mode `bypass`, accepted: the accepted manifest and bundle are in `data.accepted`. Built once
+ * per run in the catalog's layer `accepted` from a copy of the assessed world, so a consumer which needs the accepted product as a
+ * precondition copies it instead of accepting again. A test whose subject is the acceptance itself builds its own. */
+export async function acceptedAssessmentPaid(t: TestContext, options: FinalAssessmentSeedOptions = {}) {
+  const { selected, key } = selection(options);
+  let pending = acceptedSeeds.get(key);
+  if (!pending) {
+    pending = sharedWorld('accepted', key, entry => buildAccepted(selected, entry));
+    acceptedSeeds.set(key, pending); pending.catch(() => acceptedSeeds.delete(key));
+  }
+  return plant(t, await pending);
+}
+async function buildAccepted(options: Parameters<typeof build>[0], entry?: string): Promise<Snapshot<AcceptedData>> {
+  const f = await finalAssessmentPaid(lifetime, options);
+  modeOf(f.store, 'bypass');
+  const result = await acceptDiscoveryFinal(f.store, { projectId: 'p', assessment: f.paidResult, decision: 'accept', reason: 'Accept the assessed final under the bypass mode' });
+  assert.ok(result.accepted);
+  const root = entry === undefined ? mkdtempSync(join(tmpdir(), 'omg-accepted-snapshot-')) : join(entry, 'world');
+  cutWorld(f, root);
+  if (entry === undefined) cleanups.push(() => rmSync(root, { recursive: true, force: true }));
+  return { root, data: structuredClone({ ...f.data, accepted: { manifest: reference(result.accepted.manifest), bundle: reference(result.accepted.bundle) } }) };
 }
