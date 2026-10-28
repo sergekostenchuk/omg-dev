@@ -1,3 +1,4 @@
+import { producerDispatchPolicy, producerDispatchGuards } from './project-producer-policy.js';
 import { isInterpretationConsumer, requireInterpretationConsumer, requireInterpretationNewDispatch } from './interpretation-execution.js';
 import { dossierSessionTransport, dossierTransportDelivery, packetDossierSubject, requireDossierTransportContext } from './continuation-packet.js';
 import { prepareDossierContextPacker } from './working-context.js';
@@ -1036,9 +1037,11 @@ async function dispatchResearchCall(role: RoleBinding, environment: Environment,
         value:{projectId:environment.projectId,draftId:audit!.draftId,text:input}});
     }
   }
+  const permission = audit && draft && isDiscoveryV7Draft(draft.value)
+    ? producerDispatchPolicy(audit.store, environment.projectId, audit.draftId) : null;
   const ownership = audit ? physicalClaim() : null;
   const callWrite: Write = { id: callId, kind: "model-call", expected: 0,
-    value: { projectId: environment.projectId, draftId: audit?.draftId ?? "", purpose: audit?.purpose ?? "", requestId,
+    value: { ...(permission ? { producerPolicy: permission } : {}), projectId: environment.projectId, draftId: audit?.draftId ?? "", purpose: audit?.purpose ?? "", requestId,
       ...(stageSegment && stageEstimate ? { budget: { segment: reference(stageSegment),
         groups: [DISCOVERY_V7_STAGE_BUDGET_KEY], estimate: stageEstimate } } : {}),
       ...(progress?{progressKey:progress.key}:{}),
@@ -1077,7 +1080,7 @@ async function dispatchResearchCall(role: RoleBinding, environment: Environment,
     const writer = audit ? control?.view() ?? audit.store : null;
     call = writer ? writer.writeMany<ModelCall>([callWrite, ...reservation.writes,
       ...(application?.writes ?? []), ...(consumerReservation?.writes ?? [])],
-      [...reservation.guards, ...(application?.guards ?? []), ...(consumerReservation?.guards ?? []), ...(audit?.consumerDispatchGuards ?? [])])[0]! : null;
+      [...(audit ? producerDispatchGuards(audit.store, environment.projectId, permission) : []), ...reservation.guards, ...(application?.guards ?? []), ...(consumerReservation?.guards ?? []), ...(audit?.consumerDispatchGuards ?? [])])[0]! : null;
   } catch (error) {
     if (error instanceof RunControlLost) throw new EngineError(error.refusal.code, error.refusal.message, error.refusal.at);
     throw error;
@@ -1091,6 +1094,7 @@ async function executeResearchPhysicalCall(role:RoleBinding, environment:Environ
   control:RunControlGate|null, stageSegment:Revision<BudgetSegment>|null,
   consumerIntent:ReturnType<typeof readResearchConsumerIntent>|null) {
   const claimed = call ? reference(call) : null;
+  const permission = (call?.value as (ModelCall & {producerPolicy?: Ref}) | undefined)?.producerPolicy;
   let patch: Partial<ModelCall> = {};
   let rawResponse: string | null = null;
   let physicalResult: import('../runtime/process.js').ProcessResult | null = null;
@@ -1109,6 +1113,7 @@ async function executeResearchPhysicalCall(role:RoleBinding, environment:Environ
   try {
     researchControlScope(audit?.store, environment.projectId);
     control?.assertCurrent();
+    if (audit) producerDispatchGuards(audit.store, environment.projectId, permission);
     const result = await runProcess(role.command, environment.workspace, input, environment.timeoutMs, dispatchSignal, true, pid=>{
       spawnedPid = pid;
       try {
@@ -1137,6 +1142,14 @@ async function executeResearchPhysicalCall(role:RoleBinding, environment:Environ
             writer = storeView(controlled, { write: (writes, own) =>
               controlled.writeMany(writes, uniqueTransactionGuards([...own, ...guards])) });
           }
+          if (permission) {
+            const policyWriter = writer;
+            writer = storeView(policyWriter, {write: (writes, guards) => {
+              try { return policyWriter.writeMany(writes,
+                [...guards, ...producerDispatchGuards(audit.store, environment.projectId, permission)]); }
+              catch (error) { producerDispatchGuards(audit.store, environment.projectId, permission); throw error; }
+            }});
+          }
           call = authorizeModelDispatch(writer, reference(call), pid);
         }
         consumeInvocationAllowance();
@@ -1163,7 +1176,7 @@ async function executeResearchPhysicalCall(role:RoleBinding, environment:Environ
     // appended — no failed/finishedAt, no intent refusal, no finalization.
     if (isProcessStopRefusal(failure)) { stopRefusal = failure as EngineError; throw failure; }
     const dispatchRefused = failure instanceof EngineError
-      && ['run_stopped', 'run_control_changed'].includes(failure.code);
+      && ['run_stopped', 'run_control_changed', 'producer_policy_changed'].includes(failure.code);
     // A control refusal before authorization proves that no request crossed
     // stdin; other ownership failures still need the spawned-process witness.
     if (call && audit && spawnedPid !== null && executionOf(call.value)?.phase === 'claimed' && !dispatchRefused) {
