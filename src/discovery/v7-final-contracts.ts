@@ -3,6 +3,7 @@ import { EngineError } from "../errors.js";
 import { canonical, HASH_PATTERN, type Json } from "../canonical.js";
 import { isRef, type Ref } from "../pipeline/contracts.js";
 import { discoveryVerdictSchema } from "./preparation-contracts.js";
+import { FINAL_PROJECTION_SCHEMA, checkFinalProjectionLinks, type FinalProductProjection } from "./discovery-final-projection.js";
 
 /** DR7 7a.1 (codex-omg №9189, раздел DR7): the structural form of the Discovery
  * v7 D7 bundle — итог, проекция, конституция и вердикт — accepted later as one
@@ -46,9 +47,10 @@ export const V7_FINAL_CONSTITUTION_SCHEMA: Json = object({
 const verdictSchema = (outcomes: readonly string[], conditions: Json): Json =>
   object({ outcome: { enum: [...outcomes] }, reason: text, conditions });
 
-const positiveBundle = (outcome: V7FinalPositiveOutcome, conditions: Json, contract: string = V7_FINAL_CONTRACT): Json => object({
+const positiveBundle = (outcome: V7FinalPositiveOutcome, conditions: Json, contract: string = V7_FINAL_CONTRACT,
+  projection: Json = V7_FINAL_PROJECTION_SCHEMA): Json => object({
   contract: { const: contract }, dossier: refSchema, verdict: verdictSchema([outcome], conditions),
-  summary: V7_FINAL_POSITIVE_SUMMARY_SCHEMA, projection: V7_FINAL_PROJECTION_SCHEMA,
+  summary: V7_FINAL_POSITIVE_SUMMARY_SCHEMA, projection,
   constitution: V7_FINAL_CONSTITUTION_SCHEMA });
 
 /** The JSON schema of the D7 field: exactly one of the bundles — go has no
@@ -69,7 +71,11 @@ export const V7_FINAL_SCHEMA: Json = { oneOf: [
  * new D7. discovery-final/v7 stays its own historical contract: no class is added to it, and a missing class is never
  * read as a choice. The version of a bundle is fixed by its saved preparation, never by a model answer. */
 export const V8_FINAL_CONTRACT = "discovery-final/v8" as const;
-export const FINAL_BUNDLE_CONTRACTS = Object.freeze([V7_FINAL_CONTRACT, V8_FINAL_CONTRACT] as const);
+/** OMG-V7-A1 (codex-omg2 №16384, ndisc.d7.n7): the form discovery-final/v9 keeps the classed owner conditions of v8 and
+ * carries the full structural projection of the chosen product (discovery-final-projection.ts) instead of its five
+ * lists. v7 and v8 stay their own historical contracts. */
+export const V9_FINAL_CONTRACT = "discovery-final/v9" as const;
+export const FINAL_BUNDLE_CONTRACTS = Object.freeze([V7_FINAL_CONTRACT, V8_FINAL_CONTRACT, V9_FINAL_CONTRACT] as const);
 export type FinalBundleContract = typeof FINAL_BUNDLE_CONTRACTS[number];
 export const FINAL_CONDITION_CLASSES = Object.freeze(["choice", "boundary", "risk"] as const);
 export type FinalConditionClass = typeof FINAL_CONDITION_CLASSES[number];
@@ -86,20 +92,35 @@ export const V8_FINAL_SCHEMA: Json = { oneOf: [
     verdict: verdictSchema(V7_FINAL_NEGATIVE_OUTCOMES, { type: "array", maxItems: 0 }),
     summary: V7_FINAL_NEGATIVE_SUMMARY_SCHEMA, projection: { type: "null" }, constitution: { type: "null" } }),
 ] };
+/** The JSON schema of the D7 form with the full projection: the classed bundles of v8, the projection of v9. */
+export const V9_FINAL_SCHEMA: Json = { oneOf: [
+  positiveBundle("go", { type: "array", maxItems: 0 }, V9_FINAL_CONTRACT, FINAL_PROJECTION_SCHEMA),
+  positiveBundle("conditional", { type: "array", minItems: 1, items: { oneOf: [evidenceSchema, classedOwnerChoiceSchema] } },
+    V9_FINAL_CONTRACT, FINAL_PROJECTION_SCHEMA),
+  object({ contract: { const: V9_FINAL_CONTRACT }, dossier: refSchema,
+    verdict: verdictSchema(V7_FINAL_NEGATIVE_OUTCOMES, { type: "array", maxItems: 0 }),
+    summary: V7_FINAL_NEGATIVE_SUMMARY_SCHEMA, projection: { type: "null" }, constitution: { type: "null" } }),
+] };
 /** The schema of one D7 form version. */
 export function finalBundleSchema(contract: FinalBundleContract): Json {
-  return contract === V8_FINAL_CONTRACT ? V8_FINAL_SCHEMA : V7_FINAL_SCHEMA;
+  return contract === V9_FINAL_CONTRACT ? V9_FINAL_SCHEMA : contract === V8_FINAL_CONTRACT ? V8_FINAL_SCHEMA : V7_FINAL_SCHEMA;
+}
+/** The D7 forms whose owner conditions carry a class: exactly v8 and v9, never an unknown later version. */
+export function isClassedFinalContract(contract: unknown): contract is typeof V8_FINAL_CONTRACT | typeof V9_FINAL_CONTRACT {
+  return contract === V8_FINAL_CONTRACT || contract === V9_FINAL_CONTRACT;
 }
 
 // The same validator options as Discovery's field schemas: one rule set for the schema and the code check.
 const ajv = new Ajv({ strict: true, allowUnionTypes: true });
-const validators = { [V7_FINAL_CONTRACT]: ajv.compile(V7_FINAL_SCHEMA as object), [V8_FINAL_CONTRACT]: ajv.compile(V8_FINAL_SCHEMA as object) };
+const validators = { [V7_FINAL_CONTRACT]: ajv.compile(V7_FINAL_SCHEMA as object), [V8_FINAL_CONTRACT]: ajv.compile(V8_FINAL_SCHEMA as object),
+  [V9_FINAL_CONTRACT]: ajv.compile(V9_FINAL_SCHEMA as object) };
 
 export interface V7FinalVerdict<O extends string> { outcome: O; reason: string; conditions: Json[] }
 export interface V7FinalPositiveBundle {
   contract: FinalBundleContract; dossier: Ref; verdict: V7FinalVerdict<V7FinalPositiveOutcome>;
   summary: { what: string; forWhom: string; why: string; firstResult: string; successCriterion: string; nonGoals: string[] };
-  projection: { users: string[]; payers: string[]; rules: string[]; externalSystems: string[]; unresolved: string[] };
+  /** The five lists of v7/v8, or the full structural projection of v9. */
+  projection: { users: string[]; payers: string[]; rules: string[]; externalSystems: string[]; unresolved: string[] } | FinalProductProjection;
   constitution: { goal: string; consumers: string[]; nonGoals: string[]; successCriterion: string };
 }
 export interface V7FinalNegativeBundle {
@@ -147,7 +168,7 @@ export function checkFinalBundle(value: unknown, expected?: FinalBundleContract)
   if (expected !== undefined ? contract !== expected : !(FINAL_BUNDLE_CONTRACTS as readonly unknown[]).includes(contract))
     refuse("final.contract", expected !== undefined ? `only ${expected} is a known D7 form; another version is never read as this one`
       : `the D7 form version ${JSON.stringify(contract ?? null)} is unknown`);
-  const classed = contract === V8_FINAL_CONTRACT;
+  const classed = isClassedFinalContract(contract);
   exactKeys(value, ["contract", "dossier", "verdict", "summary", "projection", "constitution"], "final");
   if (!isRef(value["dossier"])) refuse("final.dossier", "the bundle names the exact Ref of its dossier snapshot");
   const verdict = value["verdict"];
@@ -184,7 +205,7 @@ export function checkFinalBundle(value: unknown, expected?: FinalBundleContract)
     if (classed) {
       const at = `final.verdict.conditions.${index}`;
       if (!(FINAL_CONDITION_CLASSES as readonly unknown[]).includes(entry["class"]))
-        refuse(`${at}.class`, `an owner condition of ${V8_FINAL_CONTRACT} has the class choice, boundary or risk`);
+        refuse(`${at}.class`, `an owner condition of ${String(contract)} has the class choice, boundary or risk`);
       if (!nonempty(entry["classReason"])) refuse(`${at}.classReason`, "the class of an owner condition states its reason");
     }
   });
@@ -194,7 +215,9 @@ export function checkFinalBundle(value: unknown, expected?: FinalBundleContract)
     textFields(summary, "final.summary", { nonGoals: 1 }, ["what", "forWhom", "why", "firstResult", "successCriterion"]);
     const projection = value["projection"], constitution = value["constitution"];
     if (!obj(projection)) refuse("final.projection", "a positive bundle carries the projection of the chosen product");
-    textFields(projection, "final.projection", { users: 1, payers: 0, rules: 0, externalSystems: 0, unresolved: 0 }, []);
+    // The full projection of v9 is checked by its schema below and then by its links; v7/v8 keep their five lists.
+    if (contract !== V9_FINAL_CONTRACT)
+      textFields(projection, "final.projection", { users: 1, payers: 0, rules: 0, externalSystems: 0, unresolved: 0 }, []);
     if (!obj(constitution)) refuse("final.constitution", "a positive bundle carries the constitution the keeper holds");
     textFields(constitution, "final.constitution", { consumers: 1, nonGoals: 1 }, ["goal", "successCriterion"]);
   } else {
@@ -206,5 +229,6 @@ export function checkFinalBundle(value: unknown, expected?: FinalBundleContract)
   // The schema is the same rule set, also for the condition forms and the exact Ref shape.
   const validate = validators[contract as FinalBundleContract];
   if (!validate(value)) refuse("final", `the bundle does not match the D7 form: ${JSON.stringify(validate.errors?.[0] ?? null)}`);
+  if (contract === V9_FINAL_CONTRACT && positive) checkFinalProjectionLinks(value["projection"] as Record<string, unknown>);
   return JSON.parse(canonical(value as Json)) as V7FinalBundle;
 }

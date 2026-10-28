@@ -4,7 +4,8 @@ import type { Ref } from '../pipeline/contracts.js';
 import type { Store, TransactionGuard, Write } from '../storage/store.js';
 import { DISCOVERY_FINAL_PACKET, requireDiscoveryFinalPacket, requireDiscoveryFinalSubject,
   type DiscoveryFinalPacket, type DiscoveryFinalSubject } from './discovery-final.js';
-import { FINAL_BUNDLE_CONTRACTS, V7_FINAL_CONTRACT, checkFinalBundle, finalBundleSchema, type FinalBundleContract,
+import { checkFinalProjectionGrounds } from './discovery-final-projection.js';
+import { FINAL_BUNDLE_CONTRACTS, V7_FINAL_CONTRACT, V9_FINAL_CONTRACT, checkFinalBundle, finalBundleSchema, type FinalBundleContract,
   type V7FinalBundle } from './v7-final-contracts.js';
 import { buildResearchResultCapacity, requireResearchResultCapacity, measureResearchResult,
   type ResearchResultCapacity, type ResearchResultCapacityInput } from './research-delivery.js';
@@ -112,6 +113,9 @@ export function projectDiscoveryFinal(packet: DiscoveryFinalPacket, reply: unkno
     'The result must name the complete exact final subject');
   const bundle = checkFinalBundle(reply.bundle, formOf(form));
   valid(same(bundle.dossier, packet.dossier.manifest.ref), 'The D7 bundle must name the exact dossier manifest');
+  // A1: the grounds of a full projection are claims of exactly this proven dossier, quoted verbatim.
+  if (bundle.contract === V9_FINAL_CONTRACT && bundle.projection)
+    checkFinalProjectionGrounds(bundle.projection as never, bundle.verdict.conditions as never, packet.dossier as never);
   const result: DiscoveryFinalResult = { contract: DISCOVERY_FINAL_RESULT,
     subject: structuredClone(packet.subject), bundle: structuredClone(bundle) };
   return { contract: DISCOVERY_FINAL_RESULT_PROJECTION, packet: structuredClone(packet), result };

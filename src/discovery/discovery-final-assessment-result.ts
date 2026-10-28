@@ -3,7 +3,7 @@ import { EngineError } from '../errors.js';
 import { isRef, type Ref } from '../pipeline/contracts.js';
 import type { Store } from '../storage/store.js';
 import type { ClaimAddress } from './claim-address.js';
-import { V8_FINAL_CONTRACT, checkFinalBundle, type FinalConditionClass, type V7FinalBundle } from './v7-final-contracts.js';
+import { checkFinalBundle, isClassedFinalContract, type FinalConditionClass, type V7FinalBundle } from './v7-final-contracts.js';
 import { requireDiscoveryFinalAssessmentSubject,
   type DiscoveryFinalAssessmentPacket, type DiscoveryFinalAssessmentSubject } from './discovery-final-assessment-subject.js';
 
@@ -140,7 +140,7 @@ function provenPacket(packet: DiscoveryFinalAssessmentPacket): void {
 /** The owner conditions whose class the assessor reviews: those of a classed candidate, in its order; null for a
  * candidate of an unclassed form, whose answer has no class review at all. */
 export function reviewedConditionClasses(candidate: V7FinalBundle): { conditionId: string; class: FinalConditionClass }[] | null {
-  if (candidate.contract !== V8_FINAL_CONTRACT) return null;
+  if (!isClassedFinalContract(candidate.contract)) return null;
   return candidate.verdict.conditions.filter(condition => object(condition) && condition.kind === 'owner_choice')
     .map(condition => ({ conditionId: (condition as { id: string }).id, class: (condition as { class: FinalConditionClass }).class }));
 }

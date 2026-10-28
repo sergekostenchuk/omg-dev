@@ -28,7 +28,9 @@ import { DOSSIER_ASSESSMENT_RESULT_CONTRACT, DOSSIER_QUALITY_DIMENSIONS } from '
 import { configureReaderPilot } from '../src/discovery/reader-pilot.js';
 import { prepareDiscoveryFinalSubject, type DiscoveryFinalPacket } from '../src/discovery/discovery-final.js';
 import { DISCOVERY_FINAL_RESULT } from '../src/discovery/discovery-final-result.js';
-import { V7_FINAL_CONTRACT, V8_FINAL_CONTRACT } from '../src/discovery/v7-final-contracts.js';
+import { V7_FINAL_CONTRACT, V8_FINAL_CONTRACT, V9_FINAL_CONTRACT } from '../src/discovery/v7-final-contracts.js';
+import { JOURNEY_VARIANTS } from '../src/discovery/preparation-contracts.js';
+export type FinalSeedForm = typeof V8_FINAL_CONTRACT | typeof V9_FINAL_CONTRACT;
 import { prepareDiscoveryFinalSession } from '../src/discovery/discovery-final-session.js';
 import { readDiscoveryFinalExecutionAt, runDiscoveryFinalExecution } from '../src/discovery/discovery-final-execution.js';
 import { researchCall } from '../src/discovery/research-protocol.js';
@@ -138,15 +140,43 @@ async function buildDossier(route: FinalSeedRoute) {
 
 /** The paid D7 reply; explicit conditions (7b.3, codex-omg2 №16161) replace the default evidence-1 of a conditional
  * bundle only when given, and are never defaulted when empty, null or malformed. */
-/** 7b.3-class (codex-omg2 №16183): an explicit form version (discovery-final/v8) only when given; v7 otherwise. */
-export function finalCandidate(packet: DiscoveryFinalPacket, outcome: FinalOutcome, conditions?: unknown, form?: typeof V8_FINAL_CONTRACT) {
+/** A1 (codex-omg2 №16384): the full structural projection of the chosen product over the exact paid dossier — linked
+ * actors, outcomes and journeys, constraints, an external system and a risk grounded verbatim in dossier claims, and an
+ * unknown whose origin is a dossier unknown or the evidence condition of the bundle. */
+export function finalProjection(packet: DiscoveryFinalPacket, conditions: unknown[]) {
+  const material = packet.dossier.materials[0]!, ground = { claim: material.address, content: (material.value as { text: string }).text };
+  const evidence = (conditions as { id: string; kind: string }[]).find(condition => condition.kind === 'evidence');
+  const dossierUnknown = packet.dossier.unknowns[0]?.unknown.claim;
+  const origin = dossierUnknown ? { claim: dossierUnknown } : evidence ? { condition: evidence.id } : null;
+  const scenario = { actor: 'operator', outcome: 'record', entry: 'Opens the ledger', steps: ['Adds a record'], success: ['The record is saved'],
+    failure: ['The record is rejected'], recovery: ['Retry the record'] };
+  return {
+    actors: [{ id: 'operator', role: 'Operator', benefit: 'Traceable records', channels: ['web'] },
+      { id: 'company', role: 'Payer', benefit: 'No missing record', channels: ['invoice'] }],
+    outcomes: [{ id: 'record', beneficiary: 'operator', result: 'A first record', success: ['No missing record'] }],
+    journeys: Object.fromEntries(JOURNEY_VARIANTS.map(name => [name, name === 'success'
+      ? { applicability: 'applicable', reason: 'The first record is the success path', scenarios: [scenario] }
+      : { applicability: 'not_applicable', reason: `The ${name} path is outside the first result`, scenarios: [] }])),
+    constraints: [{ id: 'policy', rule: 'Follow the saved policy', basis: [ground], scope: { variant: null, region: null, date: null } }],
+    externalSystems: [{ id: 'books', actor: 'company', purpose: 'Bookkeeping', inputs: ['records'], outputs: ['ledger entries'],
+      availability: { text: 'Documented in the dossier', basis: ground }, documents: [ground], environment: ['A bookkeeping account'] }],
+    risks: [{ id: 'lag', risk: 'Integration lag', basis: [ground], consequence: 'Records arrive late', affectedOutcome: { outcome: 'record' },
+      mitigation: origin ? { unknown: 'demand' } : { text: 'Retry the synchronisation' } }],
+    unknowns: origin ? [{ id: 'demand', origin, question: 'How many records a day?', affects: ['record'], consumer: 'concept',
+      blocksCurrentStage: false, moment: 'task-start', closeCriterion: 'A measured daily volume' }] : [],
+  };
+}
+/** 7b.3-class (codex-omg2 №16183): an explicit form version (discovery-final/v8, or v9 with the full projection, A1)
+ * only when given; v7 otherwise. */
+export function finalCandidate(packet: DiscoveryFinalPacket, outcome: FinalOutcome, conditions?: unknown, form?: FinalSeedForm) {
   if (conditions !== undefined) assert.equal(outcome, 'conditional', 'explicit conditions belong to a conditional bundle');
   const verdict = { outcome, reason: 'The saved final decision keeps its own reasons', conditions: conditions !== undefined ? conditions
     : outcome === 'conditional' ? [{ id: 'evidence-1', kind: 'evidence', condition: 'A source is available', criterion: 'A signed agreement' }] : [] };
   const bundle = outcome === 'go' || outcome === 'conditional'
     ? { contract: form ?? V7_FINAL_CONTRACT, dossier: packet.dossier.manifest.ref, verdict,
       summary: { what: 'Ledger', forWhom: 'Operators', why: 'Traceability', firstResult: 'A first record', successCriterion: 'No missing record', nonGoals: ['Payroll'] },
-      projection: { users: ['Operator'], payers: ['Company'], rules: ['Policy'], externalSystems: ['Books'], unresolved: ['Integration'] },
+      projection: form === V9_FINAL_CONTRACT ? finalProjection(packet, verdict.conditions as unknown[])
+        : { users: ['Operator'], payers: ['Company'], rules: ['Policy'], externalSystems: ['Books'], unresolved: ['Integration'] },
       constitution: { goal: 'Traceability', consumers: ['Operator'], nonGoals: ['Payroll'], successCriterion: 'No missing record' } }
     : { contract: form ?? V7_FINAL_CONTRACT, dossier: packet.dossier.manifest.ref, verdict,
       summary: { reasons: ['A bounded refusal'], found: ['Evidence'], needed: ['More evidence'] }, projection: null, constitution: null };
@@ -208,7 +238,7 @@ function plant<T extends DossierData>(t: TestContext, seed: Snapshot<T>) {
     wires: (): unknown[] => readFileSync(join(root, 'wire.ndjson'), 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line)) };
 }
 
-async function buildPaid(outcome: FinalOutcome, route: FinalSeedRoute, conditions?: unknown, form?: typeof V8_FINAL_CONTRACT): Promise<Snapshot<PaidData>> {
+async function buildPaid(outcome: FinalOutcome, route: FinalSeedRoute, conditions?: unknown, form?: FinalSeedForm): Promise<Snapshot<PaidData>> {
   const f = plant(lifetime, await dossierBaseline(route)), { packet, d6, calibration } = f.data;
   // A different command is deliberately uncalibrated; pay a genuine same-role
   // measurement on this copy rather than borrowing the seed's old command.
@@ -233,8 +263,8 @@ async function buildPaid(outcome: FinalOutcome, route: FinalSeedRoute, condition
  * paid result never dispatches or calibrates a model. First construction is
  * awaited here, so its cost remains inside the calling test/file. */
 export async function finalPaid(t: TestContext, outcome: FinalOutcome = 'go', route: FinalSeedRoute = 'owner', conditions?: unknown,
-  form?: typeof V8_FINAL_CONTRACT) {
-  assert.ok(form === undefined || form === V8_FINAL_CONTRACT, 'an explicit form is discovery-final/v8');
+  form?: FinalSeedForm) {
+  assert.ok(form === undefined || form === V8_FINAL_CONTRACT || form === V9_FINAL_CONTRACT, 'an explicit form is discovery-final/v8 or v9');
   assert.ok(['go', 'conditional', 'no_go', 'insufficient_evidence'].includes(outcome));
   assert.ok(['owner', 'model', 'partial'].includes(route));
   // One JSON snapshot of explicit conditions before the first await: it keys the cache and builds the paid world.

@@ -10,7 +10,7 @@ import { addressArchivedMaterials, requirePacketMaterialDelivery, serveArchivedM
 import { prepareResearchEnvelope } from './research-protocol.js';
 import { prepareDiscoveryFinalResultTransport } from './discovery-final-result.js';
 import type { DiscoveryFinalSubject } from './discovery-final.js';
-import { V7_FINAL_CONTRACT, V8_FINAL_CONTRACT } from './v7-final-contracts.js';
+import { V7_FINAL_CONTRACT, V8_FINAL_CONTRACT, V9_FINAL_CONTRACT } from './v7-final-contracts.js';
 
 /** A prepared request is not a paid result or an accepted Discovery stage. */
 export const DISCOVERY_FINAL_ENVELOPE = 'discovery-final-envelope/v1' as const;
@@ -21,7 +21,7 @@ const DELIVERY_INSTRUCTION = 'The full original request is retained in working.a
 export interface DiscoveryFinalEnvelopeInput {
   /** 7b.3-class: the D7 form version, present only for a form after discovery-final/v7; its absence is v7, so the
    * saved preparations and identities of v7 are unchanged. Fixed in the immutable preparation before any payment. */
-  form?: typeof V8_FINAL_CONTRACT;
+  form?: typeof V8_FINAL_CONTRACT | typeof V9_FINAL_CONTRACT;
   prompt: string;
   packetChars: number;
   limitChars: number;
@@ -63,7 +63,7 @@ function exactRef(value: unknown): value is Ref {
 export function decodeDiscoveryFinalEnvelopeInput(value: unknown): DiscoveryFinalEnvelopeInput {
   const base = ['prompt', 'packetChars', 'limitChars', 'resultLimitChars', 'environment', 'role'];
   valid(keys(value, base) || keys(value, [...base, 'form']), 'The final preparation needs its complete closed input');
-  valid(!Object.hasOwn(value, 'form') || value.form === V8_FINAL_CONTRACT,
+  valid(!Object.hasOwn(value, 'form') || value.form === V8_FINAL_CONTRACT || value.form === V9_FINAL_CONTRACT,
     'The final preparation names an unknown D7 form version; discovery-final/v7 is named by the absence of form');
   valid(typeof value.prompt === 'string' && value.prompt.trim().length > 0, 'The final instruction is required');
   for (const field of ['packetChars', 'limitChars', 'resultLimitChars'] as const)

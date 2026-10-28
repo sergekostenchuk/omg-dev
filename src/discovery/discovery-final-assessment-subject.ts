@@ -2,7 +2,8 @@ import { canonical, hashJson, type Json } from '../canonical.js';
 import { EngineError } from '../errors.js';
 import { isRef, type Ref } from '../pipeline/contracts.js';
 import type { Store } from '../storage/store.js';
-import { checkFinalBundle, type V7FinalBundle } from './v7-final-contracts.js';
+import { V9_FINAL_CONTRACT, checkFinalBundle, type V7FinalBundle } from './v7-final-contracts.js';
+import { checkFinalProjectionGrounds } from './discovery-final-projection.js';
 import { prepareDiscoveryFinalSubject, requireDiscoveryFinalSubject,
   type DiscoveryFinalPacket, type DiscoveryFinalSubject } from './discovery-final.js';
 
@@ -81,6 +82,9 @@ function bindDossier(candidate: V7FinalBundle, packet: DiscoveryFinalPacket): vo
   if (!same(candidate.dossier, packet.dossier.manifest.ref))
     invalid('dossier', 'The candidate dossier is not the exact manifest of the proven packet',
       'discovery_final_assessment_mismatch');
+  // A1: the grounds of a full projection are claims of exactly this proven dossier, quoted verbatim.
+  if (candidate.contract === V9_FINAL_CONTRACT && candidate.projection)
+    checkFinalProjectionGrounds(candidate.projection as never, candidate.verdict.conditions as never, packet.dossier as never);
 }
 
 /** Read-only D7 assessment input: proves the exact paid D6 once through the

@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { canonical } from '../src/canonical.js';
-import { V8_FINAL_CONTRACT } from '../src/discovery/v7-final-contracts.js';
+import { V8_FINAL_CONTRACT, V9_FINAL_CONTRACT } from '../src/discovery/v7-final-contracts.js';
 import { reference, type Ref } from '../src/pipeline/contracts.js';
 import { Store } from '../src/storage/store.js';
 import { ProductEngine } from '../src/product/engine.js';
@@ -18,7 +18,7 @@ import { DISCOVERY_FINAL_ASSESSMENT_RESULT } from '../src/discovery/discovery-fi
 import { readDiscoveryFinalAssessmentExecutionAt, readDiscoveryFinalAssessmentPaidResultAt,
   runDiscoveryFinalAssessmentExecution, type DiscoveryFinalAssessmentPaidResult } from '../src/discovery/discovery-final-assessment-execution.js';
 import type { DiscoveryFinalPaidResult } from '../src/discovery/discovery-final-execution.js';
-import { finalPaid, type FinalOutcome, type FinalSeedRoute } from './discovery-v7-final-paid-seed.js';
+import { finalPaid, type FinalOutcome, type FinalSeedForm, type FinalSeedRoute } from './discovery-v7-final-paid-seed.js';
 
 export interface FinalAssessmentSeedOptions {
   verdict?: 'supported' | 'return';
@@ -26,8 +26,8 @@ export interface FinalAssessmentSeedOptions {
   route?: FinalSeedRoute;
   /** Explicit conditions of a conditional paid D7 (7b.3); absent keeps the default evidence-1. */
   conditions?: unknown;
-  /** 7b.3-class: the explicit D7 form version discovery-final/v8; absent keeps discovery-final/v7. */
-  form?: typeof V8_FINAL_CONTRACT;
+  /** 7b.3-class / A1: the explicit D7 form version discovery-final/v8 or v9; absent keeps discovery-final/v7. */
+  form?: FinalSeedForm;
 }
 const cleanups: (() => void)[] = [];
 process.once('exit', () => { for (const cleanup of cleanups.reverse()) cleanup(); });
@@ -41,7 +41,7 @@ type Snapshot = { root: string; data: SeedData };
 const seeds = new Map<string, Promise<Snapshot>>();
 
 async function build(options: Required<Omit<FinalAssessmentSeedOptions, 'conditions' | 'form'>>
-  & { conditions?: unknown; form?: typeof V8_FINAL_CONTRACT }): Promise<Snapshot> {
+  & { conditions?: unknown; form?: FinalSeedForm }): Promise<Snapshot> {
   const f = await finalPaid(lifetime, options.outcome, options.route, options.conditions, options.form);
   const packet = await prepareDiscoveryFinalAssessmentSubject(f.store, 'p', f.d6, f.result.value.projection.result.bundle);
   // A real independent reviewer measurement is part of the first caller's
@@ -124,7 +124,7 @@ export async function finalAssessmentPaid(t: TestContext, options: FinalAssessme
   // CONDITION-SEED-SNAPSHOT-01: the property is read once into a local value, and only that value is snapshotted.
   const raw = options.conditions, form = options.form;
   const conditions = raw === undefined ? undefined : JSON.parse(canonical(raw as never)) as unknown;
-  assert.ok(form === undefined || form === V8_FINAL_CONTRACT, 'an explicit form is discovery-final/v8');
+  assert.ok(form === undefined || form === V8_FINAL_CONTRACT || form === V9_FINAL_CONTRACT, 'an explicit form is discovery-final/v8 or v9');
   const selected = { verdict: options.verdict ?? 'supported', outcome: options.outcome ?? 'go', route: options.route ?? 'owner',
     ...(conditions === undefined ? {} : { conditions }), ...(form === undefined ? {} : { form }) };
   assert.ok(['supported', 'return'].includes(selected.verdict));

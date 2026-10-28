@@ -32,7 +32,7 @@ import { FINAL_ACCEPTANCE_ACTION, FINAL_ACCEPTANCE_ACT_CONTRACT, FINAL_ACCEPTANC
   type ConditionChoiceScope, type ConditionChoiceSession } from "../discovery/discovery-acceptance.js";
 import { delivered, isPlainObject, isText, refused, type OmResult, type Refusal, type Sealed } from "../om/refusal.js";
 import { proveClaimAddress, type ClaimAddress } from "../discovery/claim-address.js";
-import { V8_FINAL_CONTRACT, type FinalConditionClass } from "../discovery/v7-final-contracts.js";
+import { isClassedFinalContract, type FinalConditionClass } from "../discovery/v7-final-contracts.js";
 
 /**
  * H2.0 (№1353, вариант Б; договор №2719): owner authority — the separately authenticated path that alone may produce
@@ -1779,7 +1779,7 @@ export async function resolveDiscoveryCondition(store: Store, request: unknown, 
   const resolutionId = conditionResolutionId(projectId, predecessor.manifest.value.bundle, input.conditionId);
   /** The class of the condition over a proven edition: null for the legacy discovery-final/v7 form only; a damaged or
    * unconfirmed class of the versioned form is a typed refusal, never the legacy case. */
-  const classOver = (over: AcceptedDiscoveryBasis): FinalConditionClass | null => over.accepted.grounds.bundle.contract === V8_FINAL_CONTRACT
+  const classOver = (over: AcceptedDiscoveryBasis): FinalConditionClass | null => isClassedFinalContract(over.accepted.grounds.bundle.contract)
     ? provenConditionClass(over.accepted.grounds.bundle, over.review, input.conditionId).class : null;
   const outcome = (proven: Revision<ConditionAct>, base: AcceptedDiscoveryBasis, repeated: boolean): ConditionResolutionOutcome => {
     const accept = proven.value.option.choice === 'accept';

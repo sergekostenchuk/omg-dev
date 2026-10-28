@@ -40,7 +40,8 @@ test('7b.3-class form: discovery-final/v8 requires a known class and its reason 
 });
 
 test('7b.3-class history: discovery-final/v7 keeps its own form, schema and door; versions never stand for one another', () => {
-  assert.deepEqual(FINAL_BUNDLE_CONTRACTS, [V7_FINAL_CONTRACT, V8_FINAL_CONTRACT]);
+  // A1 (codex-omg2 №16384) adds discovery-final/v9 with the full projection; an unknown later version stays refused.
+  assert.deepEqual(FINAL_BUNDLE_CONTRACTS, [V7_FINAL_CONTRACT, V8_FINAL_CONTRACT, 'discovery-final/v9']);
   assert.equal(finalBundleSchema(V7_FINAL_CONTRACT), V7_FINAL_SCHEMA); assert.equal(finalBundleSchema(V8_FINAL_CONTRACT), V8_FINAL_SCHEMA);
   assert.equal(canonical(V7_FINAL_SCHEMA as never).includes('classReason'), false, 'no class is added to the historical form');
   const legacy = bundle(V7_FINAL_CONTRACT, [evidence, owner()]);
@@ -48,19 +49,19 @@ test('7b.3-class history: discovery-final/v7 keeps its own form, schema and door
   refusal(() => checkV7Final(bundle(V7_FINAL_CONTRACT, [evidence, owner({ class: 'choice', classReason: 'Both options stay inside the bundle' })])), 'final');
   refusal(() => checkV7Final(bundle(V8_FINAL_CONTRACT, [evidence, owner({ class: 'choice', classReason: 'Both options stay inside the bundle' })])), 'final.contract');
   refusal(() => checkFinalBundle(legacy, V8_FINAL_CONTRACT), 'final.contract');
-  refusal(() => checkFinalBundle(bundle('discovery-final/v9', [evidence]), undefined), 'final.contract');
-  refusal(() => checkFinalBundle(bundle('discovery-final/v9', [evidence]), V8_FINAL_CONTRACT), 'final.contract');
+  refusal(() => checkFinalBundle(bundle('discovery-final/v10', [evidence]), undefined), 'final.contract');
+  refusal(() => checkFinalBundle(bundle('discovery-final/v10', [evidence]), V8_FINAL_CONTRACT), 'final.contract');
   // The assessor reviews classes exactly for a classed candidate.
   assert.equal(reviewedConditionClasses(checkFinalBundle(legacy)), null);
   assert.deepEqual(reviewedConditionClasses(checkFinalBundle(bundle(V8_FINAL_CONTRACT, [evidence, owner({ class: 'risk', classReason: 'Both options stay inside the bundle' })]))),
     [{ conditionId: 'pick', class: 'risk' }]);
 });
 
-test('7b.3-class preparation: the version is a closed input — absent is v7, only discovery-final/v8 may be named', () => {
+test('7b.3-class preparation: the version is a closed input — absent is v7, only a known later form may be named', () => {
   const input = { prompt: 'Build', packetChars: 10, limitChars: 20, resultLimitChars: 30, environment: ref, role: { model: 'm' } };
   assert.equal(Object.hasOwn(decodeDiscoveryFinalEnvelopeInput(input), 'form'), false);
   assert.equal(decodeDiscoveryFinalEnvelopeInput({ ...input, form: V8_FINAL_CONTRACT }).form, V8_FINAL_CONTRACT);
-  for (const form of [V7_FINAL_CONTRACT, 'discovery-final/v9', null, ''])
+  for (const form of [V7_FINAL_CONTRACT, 'discovery-final/v10', null, ''])
     assert.throws(() => decodeDiscoveryFinalEnvelopeInput({ ...input, form }),
       (error: unknown) => error instanceof EngineError && error.code === 'discovery_final_packing_invalid', String(form));
   assert.throws(() => decodeDiscoveryFinalEnvelopeInput({ ...input, form: V8_FINAL_CONTRACT, extra: 1 }),

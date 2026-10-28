@@ -7,7 +7,7 @@ import { readDiscoveryFinalAssessmentPaidResultAt } from './discovery-final-asse
 import type { DiscoveryFinalAssessmentSource } from './discovery-final-assessment-source.js';
 import { DISCOVERY_MANIFEST_CONTRACT, DISCOVERY_MANIFEST_KIND, discoveryManifestId, readDiscoveryManifestStructural,
   type DiscoveryManifest } from './discovery-manifest.js';
-import { V8_FINAL_CONTRACT, checkFinalBundle, type FinalConditionClass, type V7FinalBundle } from './v7-final-contracts.js';
+import { checkFinalBundle, isClassedFinalContract, type FinalConditionClass, type V7FinalBundle } from './v7-final-contracts.js';
 import type { DiscoveryFinalAssessmentClassReview, DiscoveryFinalAssessmentResult } from './discovery-final-assessment-result.js';
 
 /** DR7 7b.1+7b.2 (codex-omg2 №16106 п.1): the authoritative decision on one exact assessed D7 bundle and the atomic
@@ -221,7 +221,7 @@ export function provenConditionClass(bundle: V7FinalBundle, review: DiscoveryFin
   if (!condition) classRefuse('discovery_condition_class_invalid', 'conditionId', 'The condition is not one of this accepted bundle', conditionId);
   if (condition.kind !== 'owner_choice')
     classRefuse('discovery_condition_not_owner_choice', 'conditionId', 'An evidence condition is no owner choice and has no class', conditionId);
-  if (bundle.contract !== V8_FINAL_CONTRACT)
+  if (!isClassedFinalContract(bundle.contract))
     classRefuse('discovery_condition_class_unproven', 'bundle', `The owner condition of a ${bundle.contract} bundle has no class; it is never read as a choice`, conditionId);
   const found = review.classes?.find(item => item.conditionId === conditionId);
   if (!found || found.class !== condition.class || found.judgement !== 'confirmed')
