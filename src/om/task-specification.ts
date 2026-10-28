@@ -1,8 +1,10 @@
+import { readOmAcceptedMaterial } from './accepted-material.js';
+import { acceptedDiscoveryBasisCatalogue } from '../discovery/discovery-handoff.js';
+import { canonical, type Json } from '../canonical.js';
 import { EngineError } from '../errors.js';
-import { isRef, reference, stageId, type StageArtifact } from '../pipeline/contracts.js';
+import { isRef } from '../pipeline/contracts.js';
 import type { CompilerOmReaders, TaskSpecificationSelector } from '../compiler/om-readers.js';
 import { delivered, sealed } from './refusal.js';
-import { readRecord } from './refs.js';
 import { readOmInput, type OmInput } from './input.js';
 import { selectTaskSpecification } from './selected-specification.js';
 
@@ -17,16 +19,10 @@ export function taskSpecificationReader(select: TaskSpecificationSelector = sele
         { unit: 'V2', target: request?.input?.id ?? 'task-specification', field: 'request' });
     const read = readOmInput(store, request.project, request.input); if (!read.ok) return read;
     const input = structuredClone(read.value.value.input) as OmInput;
-    const accepted = [];
-    for (const source of input.sources) {
-      const row = readRecord<StageArtifact>(store, source, { unit: 'V2', target: request.input.id,
-        id: stageId(request.project, source.stage), kind: 'stage' });
-      if (!row.ok) return row;
-      // readOmInput has proved this exact accepted prefix; do not re-admit it against current heads.
-      const content = row.value.value.content as { fields: Record<string, import('../canonical.js').Json> };
-      accepted.push({ stage: source.stage, ref: reference(row.value), fields: structuredClone(content.fields) });
-    }
-    return delivered(sealed(select({ project: request.project, inputRef: request.input, input, accepted,
+    const material = readOmAcceptedMaterial(store, request.project, request.input);
+    return delivered(sealed(select({ project: request.project, inputRef: request.input, input, accepted: material.accepted,
+      ...(material.discovery ? { discovery: JSON.parse(canonical(material.discovery)) as Json,
+        discoveryCatalogue: acceptedDiscoveryBasisCatalogue(material.discovery) } : {}),
       requirements: request.requirements, nodes: request.nodes, ...(request.contract ? { contract: request.contract } : {}) })));
   };
 }

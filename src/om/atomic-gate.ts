@@ -18,7 +18,7 @@ import { noteUntracedRead, Store, type TransactionGuard, type Revision, type Wri
 import { provenReads, registerSourceOverlay } from '../storage/store-view.js';
 import { readCapacity as readCapacityOf } from './capacity.js';
 import { taskSpecificationReader } from './task-specification.js';
-import { hasBasisApplications } from './selected-specification.js';
+import { hasOmBasisApplications } from './accepted-material.js';
 import { readDeliveries as readDeliveriesOf } from './deliveries.js';
 import { prepareSettleCandidate as prepareSettleCandidateOf, readAcceptedFrame as readAcceptedFrameOf, readRejectedCandidate as readRejectedCandidateOf, type AcceptedFrameRequest } from './frame-accept.js';
 import type { CandidateRequest, FrameCandidateRecord } from './frame-candidate.js';
@@ -163,8 +163,7 @@ const gateId = (request: AtomicGateRequest) => `om-atomic-gate:${request.project
 function issuedRequest(store: Store, request: AtomicGateRequest): IssuedGateRequest {
   request = normalizedGateRequest(request);
   // New work derives the contract from its immutable B1 producers, never field presence.
-  const input = take(readOmInput(store, request.project, request.gaps.sources.input)).value.input;
-  const contract = hasBasisApplications(input.sources) ? BASIS_TASK_CONTEXT_CONTRACT : TASK_CONTEXT_CONTRACT;
+  const contract = hasOmBasisApplications(store, request.project, request.gaps.sources.input) ? BASIS_TASK_CONTEXT_CONTRACT : TASK_CONTEXT_CONTRACT;
   if (request.taskContextContract !== undefined && request.taskContextContract !== contract)
     invalid('taskContextContract');
   return { ...request, taskContextContract: contract };

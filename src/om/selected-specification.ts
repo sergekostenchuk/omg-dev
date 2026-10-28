@@ -4,7 +4,7 @@ import type { SpecificationBases, TaskSpecification, TaskSpecificationSelection 
 import { isRef, stageId, type Ref } from '../pipeline/contracts.js';
 import { resolveBasisApplications } from '../discovery/basis-application.js';
 import { discoveryBasisCatalogue } from '../discovery/discovery-outcome.js';
-import { hasBasisApplications } from '../discovery/projection-reader.js';
+import { hasBasisApplications, hasManifestBasisApplications } from '../discovery/projection-reader.js';
 
 /**
  * SP1 (№4714 §3): the accepted specification a consumer is given whole — the original behavior contracts, the feature
@@ -24,12 +24,15 @@ export interface SelectedSpecificationRequest {
   project: string;
   contract?: SpecificationContract;
   /** The exact stage sources of the B1 input the selection stands on. */
-  sources: readonly (Ref & { stage: string; contractVersion?: number | null })[];
+  sources: readonly (Ref & { stage: string; contractVersion?: number | null; sourceKind?: 'accepted-manifest' })[];
   accepted: readonly AcceptedStageFields[];
+  discoveryCatalogue?: SpecificationBases['catalogue'];
+  discovery?: Json;
   contracts: readonly string[];
   features: readonly { index: number; title: string; outcome: string }[];
 }
 interface SelectedSpecificationContent {
+  discovery?: Json;
   contracts: { source: Ref; index: number; pointer: string; value: Json }[];
   preparations: { source: Ref; index: number; pointer: string; featureIndex: number; value: Json }[];
   constraints: { source: Ref; pointer: string; value: Json };
@@ -89,7 +92,9 @@ export function selectSpecification(request: SelectedSpecificationRequest): Sele
     const { index, value } = matches[0]!;
     return { source: exact(features.ref), index, pointer: `${FIELDS}/featurePreparation/${index}`, featureIndex: feature.index, value: value as Json };
   }).sort((a, b) => a.index - b.index);
-  const content = { contracts, preparations: prepared,
+  if (request.discovery && request.contract !== BASIS_SPECIFICATION_CONTRACT)
+    failure('selected_specification_basis_invalid', request.project, 'contract', 'Manifest material requires the basis selection form');
+  const content = { ...(request.discovery ? { discovery: request.discovery } : {}), contracts, preparations: prepared,
     constraints: { source: exact(specification.ref), pointer: `${FIELDS}/constraints`, value: constraints as Json } };
   if (request.contract === BASIS_SPECIFICATION_CONTRACT)
     return structuredClone({ ...content, contract: BASIS_SPECIFICATION_CONTRACT, bases: selectedBases(request, content) });
@@ -111,7 +116,8 @@ export function selectTaskSpecification(request: TaskSpecificationSelection): Ta
   const features = input.features.filter(feature => feature.requirementIds.some(id => required.has(id))
     || feature.contracts.some(id => ids.has(id)));
   const selected = selectSpecification({ project, sources: input.sources, accepted,
-    contracts: [...ids], features, ...(request.contract ? { contract: request.contract } : {}) });
+    ...(request.discoveryCatalogue ? { discoveryCatalogue: request.discoveryCatalogue } : {}),
+    ...(request.discovery ? { discovery: request.discovery } : {}), contracts: [...ids], features, ...(request.contract ? { contract: request.contract } : {}) });
   return structuredClone({ ...selected, contracts: selected.contracts.map(row => {
     const id = (row.value as Row).id;
     const effective = contracts.filter(item => item.value.id === id);
@@ -125,11 +131,22 @@ export function selectTaskSpecification(request: TaskSpecificationSelection): Ta
 
 /** Resolve only the immutable catalogue; feature inheritance does not expand the selected assignment. */
 function selectedBases(request: SelectedSpecificationRequest, selected: SelectedSpecificationContent): SpecificationBases {
-  if (!hasBasisApplications(request.sources))
-    failure('selected_specification_basis_invalid', request.project, 'sources.contractVersion',
-      'Basis material requires v6 producers for Discovery, concept and specification');
-  const discovery = stage(request, 'discovery'), concept = stage(request, 'concept'), specification = stage(request, 'specification');
+  const manifest = request.sources.some(source => source.sourceKind === 'accepted-manifest');
+  const concept = stage(request, 'concept'), specification = stage(request, 'specification');
   const catalogue = (() => {
+    if (manifest) {
+      const c = request.discoveryCatalogue, d = request.discovery;
+      if (!c || c.contract !== 'discovery-basis-catalogue/v2' || !isRef(c.source)
+        || !hasManifestBasisApplications(request.sources, c.source) || !object(d)
+        || d.contract !== 'discovery-accepted-projection/v1' || d.project !== request.project
+        || !isRef(d.manifest) || canonical(d.manifest) !== canonical(c.source) || !isRef(d.bundle))
+        failure('selected_specification_basis_invalid', request.project, 'discovery', 'Manifest selection needs the exact complete C1 material and shared catalogue');
+      return c;
+    }
+    if (request.discoveryCatalogue || request.discovery || !hasBasisApplications(request.sources))
+      failure('selected_specification_basis_invalid', request.project, 'sources.contractVersion',
+        'Legacy basis material requires its original v6 producers');
+    const discovery = stage(request, 'discovery');
     try { return discoveryBasisCatalogue(discovery); }
     catch (error) {
       if (!(error instanceof EngineError)) throw error;

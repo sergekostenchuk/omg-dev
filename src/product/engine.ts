@@ -1,3 +1,6 @@
+import { withOmAcceptedMaterialAt } from '../om/accepted-material.js';
+import { readTaskContextBasis } from '../om/compiler-readers.js';
+import { readHorizon } from '../om/horizon.js';
 import { prepareDiscoveryHandoff, withDiscoveryHandoffAt, hasDiscoveryHandoffScope, hasDiscoveryHandoff, requireDiscoveryHandoff, discoveryConsumerForDraft } from '../discovery/discovery-handoff.js';
 import { consumerPreparationFields } from '../discovery/discovery-consumer-projection.js';
 import { readAcceptedDiscoveryProjectionAt } from '../discovery/discovery-accepted-projection.js';
@@ -243,6 +246,43 @@ export class ProductEngine {
   ownerDecision(authority: unknown, request: unknown) {
     return writeOwnerResult(this.store, authority, request, ENGINE_OWNER_READERS);
   }
+  /** Route by exact historical references, then prove the same M8/G5 input inside C1 before consuming it. */
+  #withOmMaterial<T>(project: string, feasibility: Ref, work: () => T): T | Promise<Awaited<T>> {
+    if (!feasibility.id.startsWith('om-feasibility:')) return work();
+    const saved = this.store.get<OmFeasibility>(feasibility.id, feasibility.revision);
+    requireCondition(saved?.kind === 'feasibility' && saved.hash === feasibility.hash
+      && saved.value?.projectId === project && isRef(saved.value.producer?.horizon),
+    'context_source_invalid', 'The command must bind an exact M8 source of its project');
+    const horizon = readHorizon(this.store, project, saved.value.producer.horizon);
+    if (!horizon.ok) throw new EngineError(horizon.refusal.code, horizon.refusal.message, horizon.refusal.at);
+    const input = structuredClone(horizon.value.horizon.value.request.input);
+    const checkedInput = readOmInput(this.store, project, input);
+    if (!checkedInput.ok) throw new EngineError(checkedInput.refusal.code, checkedInput.refusal.message, checkedInput.refusal.at);
+    const body = checkedInput.value.value?.input;
+    requireCondition(body && Array.isArray(body.sources), 'context_source_invalid', 'The saved M8 input must retain its sources');
+    if (!Object.hasOwn(body, 'discovery') && !body.sources.some(source => source.sourceKind === 'accepted-manifest')) return work();
+    return withOmAcceptedMaterialAt(this.store, project, input, () => {
+      const proved = readTaskContextBasis(this.store, { project, record: feasibility });
+      if (!proved.ok) throw new EngineError(proved.refusal.code, proved.refusal.message, proved.refusal.at);
+      requireCondition(canonical(proved.value.input) === canonical(input), 'context_source_invalid',
+        'The proved M8/G5 input must match the command source');
+      return work();
+    });
+  }
+  #withPlanMaterial<T>(project: string, ref: Ref, work: () => T): T | Promise<Awaited<T>> {
+    const plan = this.store.get<MachinePlan>(ref.id, ref.revision);
+    // Preserve the existing compiler's typed refusals for missing or forged plans, including legacy callers.
+    if (plan?.kind !== 'plan' || plan.hash !== ref.hash || plan.value?.projectId !== project
+      || !isRef(plan.value.feasibility)) return work();
+    return this.#withOmMaterial(project, structuredClone(plan.value.feasibility), work);
+  }
+  #compileWithMaterial(project: string) {
+    const stage = this.store.get<StageArtifact>(stageId(project, 'om-g2'));
+    const feasibility = (stage?.value?.content as unknown as { feasibility?: Ref } | null)?.feasibility;
+    if (!isRef(feasibility) || !feasibility.id.startsWith('om-feasibility:')) return this.compile(project);
+    const source = reference(stage!);
+    return this.#withOmMaterial(project, structuredClone(feasibility), () => this.compile(project, [source]));
+  }
   compile(project: string, extraGuards: TransactionGuard[] = []) { return this.checks.compile(project, extraGuards); }
   /** The first B1 is an immutable era boundary, independent of current stage or layer readiness. */
   #omProject(project: string): boolean { return this.checks.omProject(project); }
@@ -437,8 +477,14 @@ export class ProductEngine {
       // OWN1 (№3714): read only — the questions the pass decided in the bypass, with the model's choice and its alternatives.
       case "om-decisions": this.#project(command.project); return listBypassDecisions(this.store, { project: command.project });
       case "om-regate": this.#project(command.project); return regateRun(this.store, { project: command.project });
-      case "task-context": this.#project(command.project); return this.compiler.context(command.project, command.plan, command.task, command.maxChars);
-      case "task-detail": this.#project(command.project); return this.compiler.detail(command.project, command.plan, command.task, command.kind, command.selector, command.maxChars);
+      case "task-context": {
+        const request = structuredClone(command); this.#project(request.project);
+        return this.#withPlanMaterial(request.project, request.plan, () => this.compiler.context(request.project, request.plan, request.task, request.maxChars));
+      }
+      case "task-detail": {
+        const request = structuredClone(command); this.#project(request.project);
+        return this.#withPlanMaterial(request.project, request.plan, () => this.compiler.detail(request.project, request.plan, request.task, request.kind, request.selector, request.maxChars));
+      }
       case "assess": this.#project(command.project); return this.#assess(command.project, command.expected);
       case "draft-om": {
         this.#project(command.project);
@@ -447,7 +493,7 @@ export class ProductEngine {
             { unit: 'product', target: command.feasibility.id, field: 'feasibility' });
         return this.refinement.publish(command.project, command.feasibility, command.expected, []);
       }
-      case "compile": return this.compile(command.project);
+      case "compile": return this.#compileWithMaterial(command.project);
       case "draft-plan": {
         this.#project(command.project); assertPilotBoundary(this.store, command.project, "R3");
         // Route on the exact supplied revision. The publisher still proves the whole plan and its live admission.

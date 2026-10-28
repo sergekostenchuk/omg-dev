@@ -1,7 +1,8 @@
+import { readOmAcceptedMaterial, hasOmBasisApplications } from './accepted-material.js';
 import { BRIEF_PACKET_CONTRACT, WORKS_BRIEF_PACKET_CONTRACT, BRIEF_VERSION, WORKS_BRIEF_VERSION, BRIEF_CONTENT_CONTRACT, BRIEF_REOPEN_CONTRACT, NEIGHBOR_CONTRACT, BriefMemo, briefContract, briefMaterial, boundedBrief, briefRepairRule, packetPrompt, packetFingerprint, graphIndex, reopenedMaterial, resolveBriefAnswer, type BriefBasis, type BriefLabel,
   briefReadings, withReadings, type BriefReadings, type CarriedBasis, type CarriedEntry, type ReadingEntry, type ReadingOrigin, type ReadingSnapshot,
   IMPACT_BRIEF_CONTRACT, briefImpactForm, type BriefImpact, BRIEF_SELECTION_CONTRACT, BASIS_BRIEF_SELECTION_CONTRACT, type BriefSelectionContract } from './packet-brief.js';
-import { SELECTED_SPECIFICATION_CODES, hasBasisApplications } from './selected-specification.js';
+import { SELECTED_SPECIFICATION_CODES } from './selected-specification.js';
 import { IMPACT_BOUNDARY, IMPACT_GATE_CODES, impactParser, deriveTestMap, isRepository, readSnapshot, resolveSnapshot, transitionField } from './impact.js';
 import { IMPACT_SEMANTIC_CODES } from '../graph/semantics.js';
 import { CANDIDATE_REFUSAL_CODES } from './frame-candidate.js';
@@ -1294,7 +1295,7 @@ function selectionContract(store: Store, request: QuestionPacketRequest, contrac
   const chosen = saved ? saved.briefSelection : predecessors.length ? inherited : (() => {
     const routes = take(readRoutes(store, { project: request.project, record: request.routes }));
     const input = take(readOmInput(store, request.project, routes.record.value.request.gaps.sources.input));
-    return hasBasisApplications(input.value.input.sources) ? BASIS_BRIEF_SELECTION_CONTRACT : BRIEF_SELECTION_CONTRACT;
+    return hasOmBasisApplications(store, request.project, reference(input)) ? BASIS_BRIEF_SELECTION_CONTRACT : BRIEF_SELECTION_CONTRACT;
   })();
   if (saved && predecessors.length && chosen !== inherited)
     fail('packet_chain_invalid', target, 'briefSelection', 'A saved descendant preserves its proved root selection version');
@@ -1486,20 +1487,18 @@ function derivePacketOnce(store: Store, request: QuestionPacketRequest, current:
     const input = take(readOmInput(store, request.project, gaps.sources.input));
     const graph = take(readRecord<Graph>(store, gaps.sources.graph,
       { unit: 'E2', target: requestId, id: `graph:${request.project}`, kind: 'graph' }));
-    briefBasis = { ...(briefVersion ? { briefContract: briefVersion } : {}), ...(selection ? { selection } : {}), worksBindings: bindingsEra, wakeTests: wakeEra === true, project: request.project, node: batch.node ?? null, graph: graph.value as Graph,
+    const acceptedMaterial = readOmAcceptedMaterial(store, request.project, gaps.sources.input);
+    const historicalMaterial = acceptedMaterial.discovery ? [acceptedMaterial.discovery.bundle,
+      ...(acceptedMaterial.discovery.selectedVariant ? [acceptedMaterial.discovery.selectedVariant.member.address.container] : [])] : [];
+    briefBasis = { ...acceptedMaterial, ...(briefVersion ? { briefContract: briefVersion } : {}), ...(selection ? { selection } : {}), worksBindings: bindingsEra, wakeTests: wakeEra === true, project: request.project, node: batch.node ?? null, graph: graph.value as Graph,
       gaps: batch.items.map(item => ({ question: item.gap, target: item.target, field: item.field, ref: item.record,
         evidence: json(gaps.records.find(row => same(reference(row), item.record))!.value.gap.evidence) })),
-      contexts: unique([gaps.sources.input, gaps.sources.graph, ...input.value.input.sources.map(({ id, revision, hash }) => ({ id, revision, hash }))]),
-      input: json(input.value.input), accepted: input.value.input.sources.map(source => {
-        const row = take(readRecord<{ content: { fields: Record<string, Json> } }>(store, source,
-          { unit: 'E2', target: requestId, id: source.id, kind: 'stage' }));
-        return { stage: source.stage, ref: { id: source.id, revision: source.revision, hash: source.hash }, fields: json(row.value.content.fields) as Record<string, Json> };
-      // RB1 (№4293 п.3): a brief over reopened works may fill the whole request; the selection rules, not a budget, bound it.
-      }), material, materialBudget: briefVersion === BRIEF_REOPEN_CONTRACT ? capacity.maxRequestChars : Math.min(45000, Math.floor(capacity.maxRequestChars / 4)),
+      contexts: unique([...historicalMaterial, gaps.sources.input, gaps.sources.graph, ...input.value.input.sources.map(({ id, revision, hash }) => ({ id, revision, hash }))]),
+      input: json(input.value.input), material, materialBudget: briefVersion === BRIEF_REOPEN_CONTRACT ? capacity.maxRequestChars : Math.min(45000, Math.floor(capacity.maxRequestChars / 4)),
       codes: [...[...QUESTION_PACKET_CODES, ...ANSWER_FORM_CODES].map(code => ({ code, phase: 'answer' as const })),
         ...[...FRAME_REFUSAL_CODES, ...PROPOSAL_REFUSAL_CODES, ...CANDIDATE_REFUSAL_CODES].map(code => ({ code, phase: 'assembly' as const }))] };
     references.push(...briefBasis.contexts);
-    if (current) for (const ref of briefBasis.contexts) { head(store, ref); guards.push(ref); }
+    if (current) for (const ref of briefBasis.contexts.filter(ref => !historicalMaterial.some(saved => same(saved, ref)))) { head(store, ref); guards.push(ref); }
     if (priorBrief) {
       briefBasis.priorLabels = (priorBrief.value.packet as unknown as { brief: { labels: BriefLabel[] } }).brief.labels;
     }

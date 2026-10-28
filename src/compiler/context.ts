@@ -307,9 +307,19 @@ function requireSpecification(value: unknown, target: string, contract: TaskCont
     || !Number.isSafeInteger(entry['featureIndex']) || (entry['featureIndex'] as number) < 0) invalid('selectedSpecification.preparations', target);
   if (contract === BASIS_TASK_CONTEXT_CONTRACT) {
     const bases = value['bases'];
-    if (!object(bases) || !object(bases['catalogue']) || bases['catalogue']['contract'] !== 'discovery-basis-catalogue/v1'
+    if (!object(bases) || !object(bases['catalogue']) || !['discovery-basis-catalogue/v1', 'discovery-basis-catalogue/v2'].includes(String(bases['catalogue']['contract']))
       || !isRef(bases['catalogue']['source']) || !Array.isArray(bases['catalogue']['constraints'])
       || !Array.isArray(bases['selected'])) invalid('selectedSpecification.bases', target);
+    if (bases['catalogue']['contract'] === 'discovery-basis-catalogue/v2') {
+      const discovery = value['discovery'];
+      if (!object(discovery) || discovery['contract'] !== 'discovery-accepted-projection/v1'
+        || !isRef(discovery['manifest']) || !isRef(discovery['bundle'])
+        || canonical(discovery['manifest']) !== canonical(bases['catalogue']['source'])
+        || ['summary', 'projection', 'constitution'].some(key => !object(discovery[key])
+          || !object(discovery[key]['address']) || !isRef(discovery[key]['address']['container'])
+          || typeof discovery[key]['address']['pointer'] !== 'string' || !Object.hasOwn(discovery[key], 'value')))
+        invalid('selectedSpecification.discovery', target);
+    } else if (Object.hasOwn(value, 'discovery')) invalid('selectedSpecification.discovery', target);
     const address = (entry: unknown): boolean => object(entry) && isRef(entry['record']) && typeof entry['pointer'] === 'string';
     const entry = (item: unknown): boolean => object(item) && address(item['address']) && Object.hasOwn(item, 'value');
     if (!entry(bases['catalogue']['variant']) || !bases['catalogue']['constraints'].every(entry)

@@ -84,13 +84,15 @@ export interface OmFeasibilityView {
 export interface FeasibilityAdmission { readonly passed: true; readonly record: Ref; readonly guards: readonly TransactionGuard[]; readonly references: readonly Ref[] }
 export type TaskContextBasis = { contract: "omg-task-context/v2" | "omg-task-context/v3"; gate: Ref; horizon: Ref; input: Ref };
 export interface SpecificationBases {
-  catalogue: { contract: 'discovery-basis-catalogue/v1'; source: Ref;
+  catalogue: { contract: 'discovery-basis-catalogue/v1' | 'discovery-basis-catalogue/v2'; source: Ref;
     constraints: { address: { record: Ref; pointer: string }; value: Json }[];
     variant: { address: { record: Ref; pointer: string }; value: Json } };
   selected: { owner: { record: Ref; pointer: string };
     bases: { address: { record: Ref; pointer: string }; value: Json }[] }[];
 }
 interface TaskSpecificationContent {
+  /** Complete C1 material, retained only for the explicit manifest form. */
+  discovery?: Json;
   contracts: { source: Ref; index: number; pointer: string; value: Json;
     effective: { source: Ref; pointer: string; value: Json } }[];
   preparations: { source: Ref; index: number; pointer: string; featureIndex: number; value: Json }[];
@@ -103,10 +105,12 @@ export interface TaskSpecificationRequest { project: string; input: Ref; require
 /** Narrow selection input shared with the pure task selector in OM. */
 export interface TaskSpecificationSelection {
   project: string; inputRef: Ref; contract?: 'selected-specification/v1' | 'selected-specification/v2';
-  input: { sources: (Ref & { stage: string; contractVersion?: number | null })[];
+  input: { sources: (Ref & { stage: string; contractVersion?: number | null; sourceKind?: 'accepted-manifest' })[];
     contracts: { id: string; nodes: string[] | null; requirements: string[] }[];
     features: { index: number; title: string; outcome: string; requirementIds: string[]; contracts: string[] }[] };
   accepted: { stage: string; ref: Ref; fields: Record<string, Json> }[];
+  discoveryCatalogue?: SpecificationBases['catalogue'];
+  discovery?: Json;
   requirements: string[]; nodes: string[];
 }
 export type TaskSpecificationSelector = (request: TaskSpecificationSelection) => TaskSpecification;

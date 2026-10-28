@@ -292,6 +292,17 @@ export function hasBasisApplications(sources: readonly { stage: string; contract
   });
 }
 
+/** Explicit manifest form after the common C1/input resolver; version alone never selects this form. */
+export function hasManifestBasisApplications(sources: readonly (Ref & { stage: string; contractVersion?: number | null; sourceKind?: 'accepted-manifest' })[], manifest: Ref): boolean {
+  const roots = sources.filter(source => source.stage === 'discovery');
+  return roots.length === 1 && roots[0]!.sourceKind === 'accepted-manifest'
+    && roots[0]!.id === manifest.id && roots[0]!.revision === manifest.revision && roots[0]!.hash === manifest.hash
+    && ['concept', 'specification'].every(stage => {
+      const rows = sources.filter(source => source.stage === stage);
+      return rows.length === 1 && isBasisApplicationEra(rows[0]!.contractVersion);
+    });
+}
+
 // ---------------------------------------------------------------------------
 // Точечные чтения записей. Принимают минимальный вид чтения — его удовлетворяют
 // и Store, и сохранённые proof-view. Записи возвращаются как сохранены; проверка

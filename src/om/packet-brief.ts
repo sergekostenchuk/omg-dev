@@ -1,3 +1,5 @@
+import type { AcceptedDiscoveryProjection } from '../discovery/discovery-accepted-projection.js';
+import { acceptedDiscoveryBasisCatalogue } from '../discovery/discovery-handoff.js';
 import { posix } from 'node:path';
 import { types } from 'node:util';
 import { Ajv } from 'ajv';
@@ -329,6 +331,7 @@ export interface BriefBasis {
   project: string; graph: Graph; node: string | null; gaps: { question: string; target: string; field: string; ref: Ref; evidence: Json }[];
   /** MP2 (№2968 §2): the proved finished work of neighbouring roots — only in the form a packet issued after MP2 saves. */
   neighbors?: { contract: typeof NEIGHBOR_CONTRACT; works: Json[] };
+  discovery?: AcceptedDiscoveryProjection;
   contexts: Ref[]; input: Json; accepted: { stage: string; ref: Ref; fields: Record<string, Json> }[]; material: BriefMaterial; materialBudget: number;
   priorLabels?: readonly BriefLabel[];
   codes: { code: string; phase: 'answer' | 'assembly' | 'environment' }[];
@@ -571,6 +574,7 @@ function scopedInput(payload: Record<string, any>, basis: BriefBasis) {
   const behavior = (specification?.fields.behavior ?? []) as Json[];
   // SP1 (№4714 §2.5): the same scope, whole — the originals of the contracts and features selected above, never wider.
   const selected = basis.selection ? { ...selectSpecification({ project: basis.project, sources: input.sources ?? [], accepted: basis.accepted,
+    ...(basis.discovery ? { discoveryCatalogue: acceptedDiscoveryBasisCatalogue(basis.discovery), discovery: json(basis.discovery) } : {}),
     contract: basis.selection === BASIS_BRIEF_SELECTION_CONTRACT ? BASIS_SPECIFICATION_CONTRACT : SELECTED_SPECIFICATION_CONTRACT,
     contracts: contracts.map((row: { id: string }) => row.id),
     features: features.map((row: { index: number; title: string; outcome: string }) => ({ index: row.index, title: row.title, outcome: row.outcome })) }),

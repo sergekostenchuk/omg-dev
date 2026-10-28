@@ -200,10 +200,26 @@ export class Compiler {
         if (!checked.ok) throw new EngineError(checked.refusal.code, checked.refusal.message, checked.refusal.at);
         inputs = uniqueRefs([...inputs, ...checked.value.value.inputs, ...history]);
       }
+      const discoveryEvidence: Ref[] = [];
+      if (om && plan.value.taskContextContract === 'omg-task-context/v3') {
+        const selected = loadTaskContextSources(this.store, plan)?.specification?.tasks[task];
+        if (selected?.contract === 'selected-specification/v2' && selected.bases.catalogue.contract === 'discovery-basis-catalogue/v2') {
+          const catalogue = selected.bases.catalogue;
+          discoveryEvidence.push(catalogue.source, catalogue.variant.address.record,
+            ...catalogue.constraints.map(entry => entry.address.record),
+            ...selected.bases.selected.flatMap(entry => entry.bases.map(basis => basis.address.record)));
+          // Only exact records delivered by the common proved material reader enter the detail index.
+          const material = selected.discovery as { manifest?: unknown; bundle?: unknown } | undefined;
+          if (isRef(material?.manifest)) discoveryEvidence.push(material.manifest);
+          if (isRef(material?.bundle)) discoveryEvidence.push(material.bundle);
+        }
+      }
+      inputs = uniqueRefs([...inputs, ...discoveryEvidence]);
       const evidence = inputs.flatMap(ref => {
         const record = this.store.get(ref.id, ref.revision);
-        return record && record.hash === ref.hash && (record.value as { projectId?: string }).projectId === project
-          && ["source", "stage", "discovery-draft", "research-assessment", "task-run"].includes(record.kind)
+        return record && record.hash === ref.hash && (discoveryEvidence.some(source => source.id === ref.id
+          && source.revision === ref.revision && source.hash === ref.hash) || (record.value as { projectId?: string })?.projectId === project
+          && ["source", "stage", "discovery-draft", "research-assessment", "task-run"].includes(record.kind))
           ? [{ ref, kind: record.kind } satisfies EvidenceDetail] : [];
       });
       let value: unknown; let source = plan.value.graph;

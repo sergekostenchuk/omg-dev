@@ -1,3 +1,6 @@
+import type { Environment } from '../src/runtime/environment.js';
+import type { OmInputRecord } from '../src/om/input.js';
+import type { SettleCandidateRequest } from '../src/om/frame-accept.js';
 import assert from 'node:assert/strict';
 import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -12,7 +15,7 @@ import type { TaskObligationBinding } from '../src/graph/task-obligation-model.j
 import { reference, type Ref } from '../src/pipeline/contracts.js';
 import { UPSTREAM_STAGES, type UpstreamStage } from '../src/discovery/requirements.js';
 import { ProductEngine } from '../src/product/engine.js';
-import { Store, type Write } from '../src/storage/store.js';
+import { Store, type Revision, type Write } from '../src/storage/store.js';
 import { inputDecisionWrite, writeAddressing, type InputDecisionProposal } from '../src/om/addressing.js';
 import { settleCandidate } from '../src/om/frame-accept.js';
 import { writeCandidate } from '../src/om/frame-candidate.js';
@@ -25,7 +28,7 @@ import { writeOmInput } from '../src/om/input.js';
 import { runModelCycle, readPartAssembly, type ModelCallRequest } from '../src/om/model-call.js';
 import { normalizeOwnerGapAssignment, OM_OWNER_ASSIGNMENT_CONTRACT, OM_OWNER_ASSIGNMENT_KIND, writeOmObligations, type OmObligationHandoff } from '../src/om/obligations.js';
 import { writeQuestionPacket, readPartResult, type PartProposalBody, type QuestionPacketRequest } from '../src/om/question-packet.js';
-import type { OmResult } from '../src/om/refusal.js';
+import type { OmResult, Sealed } from '../src/om/refusal.js';
 import { writeRoutes } from '../src/om/routes.js';
 import { openSeries, type AttemptGoal } from '../src/om/series.js';
 import { closeAttempt, openAttempt, prepareManagedClaim } from '../src/om/repeat-gate.js';
@@ -73,8 +76,26 @@ export async function produceAtomicSeed(seedResources: AtomicSeedResources, with
   });
   let input = ok(writeOmInput(store, { project, expected: 0,
     stages: Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(store.get(`stage:${project}:${stage}`)!)])) as Record<UpstreamStage, Ref> }));
+  const result = await produceAtomicWorks({ root, database, store, project, input, desired, withForeign });
+  store.close();
+  return result;
+}
+
+/** Shared real E4 producer after upstream preparation. A supplied v7 input retains its own
+ * accepted stages and spending contracts; only the ordinary L2 accepting door is asynchronous. */
+export interface AtomicWorksInput {
+  root: string; database: string; store: Store; project: string; input: Sealed<Revision<OmInputRecord>>; desired: Graph;
+  withForeign?: boolean; outcome?: string; lateProof?: string | null;
+  settle?: (store: Store, request: SettleCandidateRequest) => ReturnType<typeof settleCandidate> | Promise<ReturnType<typeof settleCandidate>>;
+  environment?: (command: { executable: string; args: string[] }) => Revision<Environment>;
+}
+export async function produceAtomicWorks(options: AtomicWorksInput) {
+  const { root, database, store, project, desired } = options;
+  const engine = new ProductEngine(store), withForeign = options.withForeign ?? false;
+  const outcome = options.outcome ?? `${project}-result`, lateProof = options.lateProof === undefined ? 'atomic-proof' : options.lateProof;
+  let input = options.input;
   const initial = ok(writeHorizon(store, { project, input: reference(input), graph: reference(store.get(`graph:${project}`)!),
-    refinement: null, available: {}, choice: { choiceVersion: 'atomic-upper', features: [{ outcome: 'garden-result' }], excluded: [] } }));
+    refinement: null, available: {}, choice: { choiceVersion: 'atomic-upper', features: [{ outcome }], excluded: [] } }));
   const frame2: FrameRequest = { project, level: 2, graph: reference(store.get(`graph:${project}`)!), horizon: reference(initial.gate),
     layer: null, frame: null, upper: null };
   const prepared = ok(prepareFrame(store, frame2)), projected = projectGraph(desired, 2);
@@ -91,31 +112,31 @@ export async function produceAtomicSeed(seedResources: AtomicSeedResources, with
   const proposal = store.write({ id: `om-proposal:${project}:atomic-upper`, kind: 'layer-proposal', expected: 0, value: proposalValue });
   const candidate = ok(writeCandidate(store, { frame: frame2, proposals: [reference(proposal)] }));
   assert.equal(candidate.state, 'candidate'); if (candidate.state !== 'candidate') throw new Error('Missing upper candidate');
-  const accepted = ok(settleCandidate(store, { project, level: 2, candidate: reference(candidate.record), outcome: {
+  const accepted = ok(await (options.settle ?? settleCandidate)(store, { project, level: 2, candidate: reference(candidate.record), outcome: {
     gate: 'G3', candidate: reference(candidate.record), graphHash: candidate.record.value.graphHash, passed: true, codes: [] } }));
   const graph = reference(accepted.graph!), layer2 = reference(accepted.layer!), upperFrame = reference(accepted.frame!);
-  input = addressFixtureFields(store, project, reference(input), graph, [layer2], [{ target: 'discovery:atomic-proof', field: 'address',
-    value: { consumer: 'garden-produce-operation', kind: 'post-implementation-proof' } }]);
+  input = addressFixtureFields(store, project, reference(input), graph, [layer2], lateProof ? [{ target: `discovery:${lateProof}`, field: 'address',
+    value: { consumer: `${project}-produce-operation`, kind: 'post-implementation-proof' } }] : []);
   const horizon = ok(writeHorizon(store, { project, input: reference(input), graph, refinement: layer2, available: {},
-    choice: { choiceVersion: 'atomic-works', features: [{ outcome: 'garden-result' }], excluded: [] } }));
+    choice: { choiceVersion: 'atomic-works', features: [{ outcome }], excluded: [] } }));
   const sources: GapRequest = { project, input: reference(input), graph, horizon: reference(horizon.gate),
     operations: { proposals: [], frame: { ...frame2, graph, horizon: reference(horizon.gate), layer: layer2, frame: upperFrame } },
     works: { proposals: [], frame: { project, level: 3, graph, horizon: reference(horizon.gate), layer: null, frame: null,
       upper: { horizon: reference(horizon.gate), frame: upperFrame }, workZoneContract: "accepted-l2-v1" } } };
   const gaps = ok(writeGaps(store, sources)), gapRead = { sources: clone(gaps.sources) as GapRequest, records: gaps.records.map(reference) };
   const lines = ok(writeGapLines(store, { project, previous: null, pass: 1, gaps: gapRead, closures: [] }));
-  const late = gaps.records.find(row => row.value.gap.target === 'discovery:atomic-proof')!;
-  assert.ok(late); assert.equal(late.value.gap.consumers.length, 2);
-  const assignment = normalizeOwnerGapAssignment({ contract: OM_OWNER_ASSIGNMENT_CONTRACT, project, context: { gaps: gapRead, lines: reference(lines) },
-    gap: reference(late), assignments: late.value.gap.consumers.map(consumer => ({ responsibleNode: 'garden-produce-operation',
-      responsibleConsumer: consumer, reason: 'The concrete producer owes this proof to this consumer', returnCondition: `Prove result for ${consumer}`, wake: null })) });
-  const ledger = ok(writeOmObligations(store, { project, gaps: gapRead, lines: reference(lines), assignments: [{ pending: {
-    id: `om-owner-gap-assignment:${project}:${hashJson(assignment)}`, kind: OM_OWNER_ASSIGNMENT_KIND, expected: 0, value: assignment } }] }));
-  assert.equal(ledger.handoff.obligations.length, 2);
+  const late = gaps.records.find(row => row.value.gap.target === `discovery:${lateProof}`)!;
+  if (lateProof) { assert.ok(late); assert.equal(late.value.gap.consumers.length, 2); }
+  const assignment = lateProof ? normalizeOwnerGapAssignment({ contract: OM_OWNER_ASSIGNMENT_CONTRACT, project, context: { gaps: gapRead, lines: reference(lines) },
+    gap: reference(late), assignments: late.value.gap.consumers.map(consumer => ({ responsibleNode: `${project}-produce-operation`,
+      responsibleConsumer: consumer, reason: 'The concrete producer owes this proof to this consumer', returnCondition: `Prove result for ${consumer}`, wake: null })) }) : null;
+  const ledger = ok(writeOmObligations(store, { project, gaps: gapRead, lines: reference(lines), assignments: assignment ? [{ pending: {
+    id: `om-owner-gap-assignment:${project}:${hashJson(assignment)}`, kind: OM_OWNER_ASSIGNMENT_KIND, expected: 0, value: assignment } }] : [] }));
+  assert.equal(ledger.handoff.obligations.length, lateProof ? 2 : 0);
   const routes = ok(writeRoutes(store, { project, gaps: gapRead, tasks: [], catalog: { paths: [], records: [] }, previous: null }));
   const scenario = join(root, 'scenario.json'), trace = join(root, 'trace.jsonl');
   const command = { executable: process.execPath, args: [fixturePath, '--scenario', scenario, '--trace', trace] };
-  const environment = engine.environments.configure(project, { workspace: root,
+  const environment = options.environment ? options.environment(command) : engine.environments.configure(project, { workspace: root,
     implementer: { actor: 'atomic-producer', model: 'fixture', effort: 'high', command },
     reviewer: { actor: 'atomic-reviewer', model: 'fixture', effort: 'high', command },
     fullCheck: { executable: process.execPath, args: ['--version'] }, timeoutMs: 5000, requestCapacityChars: 200_000 }, 0);
@@ -139,7 +160,7 @@ export async function produceAtomicSeed(seedResources: AtomicSeedResources, with
     // A scoped operation requiring expansion must receive a real work, including a refusal operation.
     if (!work.code.length) {
       work.code = [{ path: `${work.id}.ts`, access: 'write', status: 'planned' }]; work.tests = [`${work.id}-test`];
-      const proof = clone(desired.tests.find(item => item.node === 'garden-consume-work')!);
+      const proof = clone(desired.tests.find(item => item.node === `${project}-consume-work`)!);
       proof.id = work.tests[0]!; proof.node = work.id; proof.covers = [];
       proof.contract!.entrypoint.path = work.code[0]!.path; proof.contract!.counterfactuals = [];
       tests.push(proof);
@@ -184,24 +205,24 @@ export async function produceAtomicSeed(seedResources: AtomicSeedResources, with
     // produce-operation batch feeds it through the realizes edge — item.consumers, not the parent, decides the
     // selection — so the cross-block obligations lawfully enter this attempt's original completion and bind to it.
     // A batch is paid once: the producer's own attempts declare only what the consume series does not claim.
-    const claimed = expansions.filter(batch => batch.items.every(item => item.consumers.includes('garden-consume-block')));
-    const selected = block === 'garden-consume-block' ? claimed : batches.filter(batch => !claimed.includes(batch));
+    const claimed = expansions.filter(batch => batch.items.every(item => item.consumers.includes(`${project}-consume-block`)));
+    const selected = block === `${project}-consume-block` ? claimed : batches.filter(batch => !claimed.includes(batch));
     const questions = [...new Set(selected.flatMap(batch => batch.items.map(item => gapLineKey(project, item.target, item.field))))].sort();
     const result = gapLineExpectedResult(project, selected[0]!.items[0]!.target, selected[0]!.items[0]!.field);
     const completion = { routes: reference(routes), batches: selected.map(batch => batch.id).sort() };
     let attempt: { series: Ref; ordinal: number };
-    if (block === 'garden-consume-block') {
+    if (block === `${project}-consume-block`) {
       const goal: AttemptGoal = { key: `atomic:${batches[0]!.node}`, questions, result };
       const series = ok(openAttempt(store, { project, block, line: 1, attempt: 1, goal, completion }));
       openGoal = { block, ordinal: 1, series: reference(series), goal };
       attempt = { series: openGoal.series, ordinal: 1 };
     } else {
-      if (block === 'garden-produce-block' && withForeign) {
+      if (block === `${project}-produce-block` && withForeign) {
         // G5: a D7 of ANOTHER request — the same D1 and D2 without the owner's assignment — issued on this block's
         // earlier managed attempt. The attempt's remaining batch asks the owner for a source, so the derived claim
         // closes the attempt 'awaiting-owner' before the next managed attempt opens. The foreign attempt keeps the
         // block's complete original plan — its own questions and its issued produce batch.
-        const foreignBatch = batches.find(batch => batch.node === 'garden-produce-operation')!;
+        const foreignBatch = batches.find(batch => batch.node === `${project}-produce-operation`)!;
         const waitingBatch = batches.find(batch => batch !== foreignBatch)!;
         const priorQuestions = [...new Set(batches.flatMap(batch => batch.items.map(item => gapLineKey(project, item.target, item.field))))].sort();
         const prior: AttemptGoal = { key: `atomic:${batches[0]!.node}:foreign`, questions: priorQuestions, result };
@@ -226,7 +247,7 @@ export async function produceAtomicSeed(seedResources: AtomicSeedResources, with
         ok(closeAttempt(store, { project, block, line: 1, attempt: 1, outcome: claim.outcome }));
       }
       const goal: AttemptGoal = { key: `managed:${block}`, questions, result };
-      const ordinal = block === 'garden-produce-block' && withForeign ? 2 : 1;
+      const ordinal = block === `${project}-produce-block` && withForeign ? 2 : 1;
       const series = ok(openAttempt(store, { project, block, line: 1, attempt: ordinal, goal, completion }));
       attempt = { series: reference(series), ordinal };
     }
@@ -237,11 +258,10 @@ export async function produceAtomicSeed(seedResources: AtomicSeedResources, with
       proposals.push(reference(assembly.proposal)); for (const item of bindings) transfers.set(item.id, item);
     }
   }
-  assert.ok(openGoal); assert.ok(results.length > 1); assert.equal(transfers.size, 2);
+  assert.ok(openGoal); assert.ok(results.length > 1); assert.equal(transfers.size, lateProof ? 2 : 0);
   const request = { project, results, environment: reference(environment), sources: [] as Ref[],
     binding: { series: openGoal.series, ordinal: openGoal.ordinal,
       obligations: [...new Set(byBlock.get(openGoal.block)!.flatMap(batch => batch.items.map(item => item.target)))].sort() } };
-  store.close();
   return { root, database, trace, scenario, traceBytes: readFileSync(trace, 'utf8'), data: {
     project, desired, environment, adapter, graph, layer2, upperFrame, input, gaps, gapRead, lines, ledger,
     routes, results, proposals, cycles, transfers: [...transfers.values()], openGoal, request, foreign } };
