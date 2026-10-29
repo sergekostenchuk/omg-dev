@@ -1,5 +1,7 @@
 import { pendingContextWorkspace } from './context-workspace.js';
 import { finalMaterialAdmission, finalMaterialProjection, finalMaterialEra, finalWorkspace, packFinalMaterial, recordFinalMaterialWorkspace, finalTechnicalLookup } from './final-material.js';
+import { correctingApplicationLeaf, latestResponseApplication, readApplicationResponseCorrection,
+  responseCorrectionApplicationWrite, type ApplicationResponseCorrection } from './application-response-correction.js';
 import { finalResponseContract } from './discovery-response-contract.js';
 import { canonical, hashJson } from '../canonical.js';
 import { EngineError, requireCondition } from '../errors.js';
@@ -75,6 +77,7 @@ export interface DiscoveryFinalAssessmentApplication {
   call: Ref | null;
   received: Ref | null;
   after: Ref | null;
+  responseCorrection?: ApplicationResponseCorrection;
 }
 
 export interface DiscoveryFinalAssessmentPaidResult {
@@ -151,7 +154,7 @@ function readAssessmentRequestArchive(store: Store, prepared: Revision<Discovery
 /** Synchronous physical leaf. It validates immutable associations, but is not
  * the public authority to send: admission separately proves paid D7 and the
  * prepared assessment before a reservation. */
-export function readDiscoveryFinalAssessmentDispatchLeaf(store: Store, applicationRef: Ref) {
+function readDiscoveryFinalAssessmentDispatchLeafOriginal(store: Store, applicationRef: Ref) {
   const application = exact<DiscoveryFinalAssessmentApplication>(store, applicationRef,
     DISCOVERY_FINAL_ASSESSMENT_APPLICATION_KIND);
   const app = application.value;
@@ -229,8 +232,16 @@ export function readDiscoveryFinalAssessmentDispatchLeaf(store: Store, applicati
 /** The only authority for a new physical send: reconstruct both the paid D7
  * source and the prepared assessment, then compare their complete subject and
  * candidate. A caller's cached projection is never an authority here. */
+export function readDiscoveryFinalAssessmentDispatchLeaf(store: Store, applicationRef: Ref): ReturnType<typeof readDiscoveryFinalAssessmentDispatchLeafOriginal> {
+  const application=exact<DiscoveryFinalAssessmentApplication>(store,applicationRef,DISCOVERY_FINAL_ASSESSMENT_APPLICATION_KIND);
+  return correctingApplicationLeaf(store,application,ref=>readDiscoveryFinalAssessmentDispatchLeafOriginal(store,ref))
+    ?? readDiscoveryFinalAssessmentDispatchLeafOriginal(store,applicationRef);
+}
+
 export async function readDiscoveryFinalAssessmentDispatchAdmission(store: Store, applicationRef: Ref) {
   const leaf = readDiscoveryFinalAssessmentDispatchLeaf(store, applicationRef);
+  if(leaf.application.value.responseCorrection)
+    await readDiscoveryFinalAssessmentResponseCorrection(store,leaf.session.value.projectId,leaf.application.value.responseCorrection.root);
   // A later cursor is authority only if every prior assessment page has its
   // exact physical proof. This admission is also called directly by resume,
   // which must not rely on the runner having performed that check first.
@@ -291,6 +302,7 @@ export function prepareDiscoveryFinalAssessmentContextPacker(store: Store,
         subject: structuredClone(session.value.subject), schema: structuredClone(context.schema), discoveryResponseContract,
         request: structuredClone(context.request), finalContinuation: structuredClone(context.finalContinuation),
         resultCapacity: structuredClone(context.resultCapacity), contextWorkspace: structuredClone(context.contextWorkspace),
+        ...(context.failures ? {failures:structuredClone(context.failures)} : {}),
         working: { archive, deliveryContract: 'research-delivery/v1',
           instruction: 'Read each exact omitted address with read_context and continue through every page before returning a final result.' } };
       if (finalMaterialEra(prepared.value.input))
@@ -330,7 +342,7 @@ async function physicalAssessmentOutcome(store: Store, project: string, applicat
 
 /** Application and historical reading share exactly this projector. Neither
  * an answer's own verdict nor a structural packet can impersonate payment. */
-async function projectAssessmentStep(store: Store, admission: ReturnType<typeof readDiscoveryFinalAssessmentDispatchLeaf>,
+async function projectAssessmentStepUnchecked(store: Store, admission: ReturnType<typeof readDiscoveryFinalAssessmentDispatchLeaf>,
   paid: Awaited<ReturnType<typeof physicalAssessmentOutcome>>['paid']) {
   const { session, application, draft, question } = admission;
   const materialEra = finalMaterialEra(admission.prepared.value.input);
@@ -370,6 +382,30 @@ async function projectAssessmentStep(store: Store, admission: ReturnType<typeof 
 
 /** Historical reader: prove the original paid D7, immutable preparation and
  * every physical assessment step. Today's heads and allowance are irrelevant. */
+export async function readDiscoveryFinalAssessmentResponseCorrection(store:Store,project:string,root:Ref) {
+  return readApplicationResponseCorrection(store,project,root,{
+    read:ref=>readDiscoveryFinalAssessmentDispatchLeaf(store,ref).application,
+    outcome:async application=>{
+      const head=store.get<ModelCall>(assessmentCallId(reference(application)));
+      if(!head || head.value.status==='running') return null;
+      return readDiscoveryFinalAssessmentResearchExecution(store,project,reference(head),reference(application)).paid;
+    },
+    project:async(application,paid)=>{
+      valid(paid.kind==='response','Only a paid response has a closed role form');
+      return projectAssessmentStepUnchecked(store,readDiscoveryFinalAssessmentDispatchLeaf(store,reference(application)),
+        paid as Awaited<ReturnType<typeof physicalAssessmentOutcome>>['paid']);
+    },
+    formCodes:['discovery_final_assessment_result_invalid','research_response_invalid','research_context_incomplete'],
+  });
+}
+
+async function projectAssessmentStep(store:Store,admission:ReturnType<typeof readDiscoveryFinalAssessmentDispatchLeaf>,
+  paid:Awaited<ReturnType<typeof physicalAssessmentOutcome>>['paid']) {
+  if(admission.application.value.responseCorrection)
+    await readDiscoveryFinalAssessmentResponseCorrection(store,admission.session.value.projectId,admission.application.value.responseCorrection.root);
+  return projectAssessmentStepUnchecked(store,admission,paid);
+}
+
 export async function readDiscoveryFinalAssessmentExecutionAt(store: Store, project: string, at: Ref) {
   const targetRef = snapshotRef(at);
   const target = exact<DiscoveryFinalAssessmentExecution>(store, targetRef, DISCOVERY_FINAL_ASSESSMENT_EXECUTION_KIND);
@@ -408,7 +444,7 @@ export async function readDiscoveryFinalAssessmentExecutionAt(store: Store, proj
       && same(applied.value.after, reference(after)) && same(applied.value, { ...application.value, state: 'applied',
         call: applied.value.call, received: applied.value.received, after: reference(after) }),
     'The assessment cursor is not its exact applied application');
-    if (revision === 2) valid(same(reference(application), reference(firstApplication)),
+    if (revision === 2) valid(same(application.value.responseCorrection?.root ?? reference(application), reference(firstApplication)),
       'The assessment execution does not use its origin application');
     const { admission, paid } = await physicalAssessmentOutcome(store, project, reference(application), applied.value.received);
     valid(same(reference(admission.session), reference(previous)), 'An assessment application belongs to another cursor');
@@ -456,6 +492,7 @@ export interface RunDiscoveryFinalAssessmentOptions {
   signal?: AbortSignal;
   restoreOnly?: boolean;
   allowance?: number;
+  responseCorrection?: Ref;
 }
 
 /** Start or restore one assessment of an exact paid D7. Its first origin,
@@ -511,8 +548,11 @@ export async function runDiscoveryFinalAssessmentExecution(store: Store, project
       createSession = { id, kind: DISCOVERY_FINAL_ASSESSMENT_EXECUTION_KIND, expected: 0, value };
       session = { ...pendingRef(createSession), kind: createSession.kind, value };
     }
-    const applicationId = session.value.application;
-    const existing = store.get<DiscoveryFinalAssessmentApplication>(applicationId, 1);
+    const originalApplication=store.get<DiscoveryFinalAssessmentApplication>(session.value.application,1);
+    const correction=options.responseCorrection ? await readDiscoveryFinalAssessmentResponseCorrection(store,project,options.responseCorrection) : null;
+    const correctionWrite=correction?.retry && !restoreOnly ? responseCorrectionApplicationWrite(correction) : null;
+    const existing=correctionWrite ? null : originalApplication ? latestResponseApplication(store,originalApplication) : null;
+    const applicationId=correctionWrite?.id ?? existing?.id ?? session.value.application;
     if (existing) {
       const application = exact<DiscoveryFinalAssessmentApplication>(store, reference(existing), DISCOVERY_FINAL_ASSESSMENT_APPLICATION_KIND);
       valid(historical, 'An assessment application cannot exist without its proven execution');
@@ -545,6 +585,7 @@ export async function runDiscoveryFinalAssessmentExecution(store: Store, project
         const winner = store.get<DiscoveryFinalAssessmentExecution>(id);
         if (!winner || winner.revision <= session.revision) throw error;
       }
+      if(options.responseCorrection) return readDiscoveryFinalAssessmentExecutionAt(store,project,pendingRef(after));
       continue;
     }
     if (restoreOnly && saved) return historical!;
@@ -573,8 +614,9 @@ export async function runDiscoveryFinalAssessmentExecution(store: Store, project
       dispatch: session.value.dispatch, profile: session.value.profile, guards,
       state: 'prepared', call: null, received: null, after: null };
     const application: Write = { id: applicationId, kind: DISCOVERY_FINAL_ASSESSMENT_APPLICATION_KIND, expected: 0, value };
+    if(correctionWrite) application.value=correctionWrite.value;
     try {
-      await researchCall(session.value.role, session.value.dispatch, session.value.prompt, context, signal,
+      await researchCall(session.value.role, session.value.dispatch, session.value.prompt, (application.value as DiscoveryFinalAssessmentApplication).context, signal,
         { store, draftId: draft.id, questionId: question.id, purpose: 'discovery-final-assessment',
           session: reference(session), application: pendingRef(application),
           finalAssessmentPending: { ...(createSession ? { session: createSession } : {}), application },
@@ -583,7 +625,7 @@ export async function runDiscoveryFinalAssessmentExecution(store: Store, project
     } catch (error) {
       if (!(error instanceof EngineError) || !['revision_conflict', 'input_stale'].includes(error.code)) throw error;
       const winner = store.get<DiscoveryFinalAssessmentApplication>(applicationId, 1);
-      if (!winner || !same(winner.value, value)) throw error;
+      if (!winner || !same(winner.value, application.value)) throw error;
     }
   }
 }

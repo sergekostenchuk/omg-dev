@@ -298,6 +298,7 @@ function replyFor(packet: DossierAssessmentPacket, verdict: 'supported' | 'retur
 
 import { runDossierAssessmentSession, readDossierAssessmentSessionAt,
   type DossierAssessmentSession, type DossierAssessmentApplication } from '../src/discovery/assessment-session.js';
+import {retryDiscoveryResponse} from '../src/discovery/discovery-response-retry.js';
 import { readResearchExecution, readResearchResponse } from '../src/discovery/response-recovery.js';
 import { estimateCliCall } from '../src/adapters/codex-estimate.js';
 import type { Environment } from '../src/runtime/environment.js';
@@ -391,6 +392,92 @@ async function refusePaidGrounds(f:Paid,store:Store,result:Awaited<ReturnType<ty
     await unchanged(f,store,()=>readDossierAssessmentSessionAt(mask(store,reference(session),fake),'p',reference(fake)),true);
   });
 }
+for(const transport of [false,true])test(`L30 dossier: exact paid refusal -> ${transport?'response-free transport retry -> ':''}one correction -> ordinary cold restoration`,async t=>{
+  const f=await partial(t),profile=wideDelivery(f);
+  liveAdapter(f,f.packet,'return',false);
+  const settings=JSON.parse(readFileSync(f.settings,'utf8'));settings.terminal={};
+  writeFileSync(f.settings,JSON.stringify(settings));
+  await assert.rejects(()=>runDossierAssessmentSession(f.store,'p',f.packet.subject,f.environment,profile),
+    error=>error instanceof EngineError && error.code==='discovery_dossier_result_invalid');
+  const failed=f.store.list<DossierAssessmentApplication>('assessment-application')
+    .find(row=>row.value.contract==='dossier-application/v1' && row.value.state==='running')!;
+  assert.ok(failed);const root=reference(f.store.get(failed.id,1)!),calls=f.wires().length;
+  const oldCall=readResearchExecution(f.store,'p',reference(f.store.get<ModelCall>(failed.value.call!.id)!),
+    f.store.get<DossierAssessmentSession>(failed.value.session.id,failed.value.session.revision)!,
+    f.store.get<DiscoveryDraft>(failed.value.context.dossierPacket.basis.draft.ref.id)!,
+    f.store.get<Question>((failed.value.context.dossierPacket.basis.plan.value as any).question)!,
+    failed.value.role,failed.value.profile);
+  assert.equal((await retryDiscoveryResponse(f.open(),'p',root,1,true)).kind,'pending');
+  assert.equal(f.wires().length,calls);
+  settings.terminal=replyFor(f.packet,'return');settings.terminal.return.targets=[{partialReason:0}];
+  if(transport) {
+    const adapter=f.root+'/adapter.mjs';
+    writeFileSync(adapter,readFileSync(adapter,'utf8').replace('const step=',
+      "if(s.providerFail){console.error('Selected model is at capacity');process.exit(1);}const step="));
+    writeFileSync(f.settings,JSON.stringify({...settings,providerFail:true}));
+    await assert.rejects(()=>retryDiscoveryResponse(f.open(),'p',root,1),
+      error=>error instanceof EngineError && ['research_provider_failed','research_consumer_execution_refused'].includes(error.code));
+    assert.equal(f.wires().length,calls+1);
+    assert.equal((await retryDiscoveryResponse(f.open(),'p',root,1,true)).kind,'pending');
+    assert.equal(f.wires().length,calls+1);
+  }
+  writeFileSync(f.settings,JSON.stringify(settings));
+  const corrected=await retryDiscoveryResponse(f.open(),'p',root,1);
+  assert.equal(corrected.kind,'applied');assert.equal(f.wires().length,calls+(transport?2:1));
+  assert.ok(JSON.stringify(f.wires().at(-1)).includes('discovery-response-correction/v1'));
+  const after=money(f.store);
+  assert.deepEqual(await retryDiscoveryResponse(f.open(),'p',root,1,true),corrected);
+  assert.deepEqual(await retryDiscoveryResponse(f.open(),'p',root,1),corrected);
+  assert.ok((await runDossierAssessmentSession(f.open(),'p',f.packet.subject)).result);
+  assert.equal(f.wires().length,calls+(transport?2:1));assert.deepEqual(money(f.store),after);
+  assert.deepEqual(f.store.get(oldCall.call.id,oldCall.call.revision),oldCall.call);
+});
+
+for(const repeatedCorrection of [false,true])test(`L43 dossier: delivered page refusal -> one ${repeatedCorrection?'terminal repeated read':'correcting answer'} with free cold repeat`,async t=>{
+  const f=await partial(t),profile=wideDelivery(f);
+  liveAdapter(f,f.packet,'return',false);
+  const adapter=f.root+'/adapter.mjs';
+  writeFileSync(adapter,readFileSync(adapter,'utf8').replace('research??=s.terminal;',
+    "if(s.repeatContext)research={action:'read_context',record:r.subject.working.archive,pointer:'/body/dossierPacket',page:{offset:0,limit:pageLimit,encoding:'canonical-json'}};research??=s.terminal;"));
+  const settings=JSON.parse(readFileSync(f.settings,'utf8'));
+  settings.repeatContext=true;writeFileSync(f.settings,JSON.stringify(settings));
+  const refuses=(error:unknown)=>error instanceof EngineError && error.code==='research_no_progress';
+  const initial=f.wires().length;
+  await assert.rejects(()=>runDossierAssessmentSession(f.store,'p',f.packet.subject,f.environment,profile),refuses);
+  assert.equal(f.wires().length,initial+2,'the first real read is delivered before its repeated request');
+  const failed=f.store.list<DossierAssessmentApplication>('assessment-application')
+    .find(row=>row.value.contract==='dossier-application/v1' && row.value.state==='running')!;
+  assert.ok(failed);const original=f.store.get(failed.id,1)!,root=reference(original),calls=f.wires().length;
+  const saved=money(f.store);
+  await assert.rejects(()=>runDossierAssessmentSession(f.open(),'p',f.packet.subject),refuses);
+  assert.equal((await retryDiscoveryResponse(f.open(),'p',root,1,true)).kind,'pending');
+  assert.equal(f.wires().length,calls);assert.deepEqual(money(f.store),saved);
+  const current=JSON.parse(readFileSync(f.settings,'utf8'));
+  current.repeatContext=repeatedCorrection;writeFileSync(f.settings,JSON.stringify(current));
+  const invoke=()=>retryDiscoveryResponse(f.open(),'p',root,1);
+  let corrected:Awaited<ReturnType<typeof retryDiscoveryResponse>>|undefined;
+  if(repeatedCorrection)await assert.rejects(invoke,refuses);
+  else {corrected=await invoke();assert.equal(corrected.kind,'applied');}
+  assert.equal(f.wires().length,calls+1);
+  const delivered=f.wires().at(-1).subject.failures.at(-1);
+  assert.equal(delivered.code,'research_no_progress');
+  assert.match(delivered.message,/already delivered/);
+  assert.match(delivered.instruction,/use the material already read/);
+  const after=money(f.store);
+  for(const restoreOnly of [false,true]) {
+    if(repeatedCorrection)await assert.rejects(()=>retryDiscoveryResponse(f.open(),'p',root,1,restoreOnly),refuses);
+    else assert.deepEqual(await retryDiscoveryResponse(f.open(),'p',root,1,restoreOnly),corrected);
+  }
+  if(repeatedCorrection) {
+    const successor=f.store.list<DossierAssessmentApplication>('assessment-application')
+      .find(row=>row.value.responseCorrection?.root.id===root.id)!;
+    await assert.rejects(()=>retryDiscoveryResponse(f.open(),'p',reference(f.store.get(successor.id,1)!),1),
+      error=>error instanceof EngineError && error.code==='research_response_retry_invalid');
+  } else assert.ok((await runDossierAssessmentSession(f.open(),'p',f.packet.subject)).result);
+  assert.equal(f.wires().length,calls+1);assert.deepEqual(money(f.store),after);
+  assert.deepEqual(f.store.get(original.id,original.revision),original);
+});
+
 for(const model of [false,true])test(`live dossier: real ${model?'model':'owner'} selected, read_context/checkpoint/terminal; exact paid history and free hot/cold repeat`,async t=>{
   const f=await completed(t,model);
   const packet=await prepareDossierAssessmentSubject(f.store,'p',reference(produceSelectedDossier(f.store,'p',f.input).record));

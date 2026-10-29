@@ -1,5 +1,8 @@
 import { DOSSIER_MATERIAL_CONTRACT, dossierMaterialEra, dossierMaterialProjection, pendingDossierWorkspace } from './dossier-material.js';
+import { readResponseCorrectionChain } from './response-correction.js';
 import { requireDossierAssessmentSubject } from './dossier-assessment.js';
+import { correctingApplicationLeaf, latestResponseApplication, readApplicationResponseCorrection,
+  responseCorrectionApplicationWrite, type ApplicationResponseCorrection } from './application-response-correction.js';
 import { requireDossierReplyCapacity, dossierSessionTransport, dossierTransportDelivery, DOSSIER_SESSION_TRANSPORT, DOSSIER_RESULT_TRANSPORT } from './continuation-packet.js';
 import { resumeDossierResearchCall, prepareDossierResearchEnvelope } from './research-protocol.js';
 import { readCapacityProjection, checkDossierResearchReply } from './early-research-outcome.js';
@@ -1059,7 +1062,7 @@ export function readDirectAssessmentMaterials(store: Store, draft: Revision<Disc
 
 async function assessmentSessionInternal(store: Store, draft: Revision<DiscoveryDraft>, question: Revision<Question>,
   environment: Revision<Environment>, dispatch: Environment, pilot: Revision<ReaderPilot> | undefined, context: Record<string, any>,
-  prompt: string, signal?: AbortSignal, extraGuards: TransactionGuard[] = [], paidInput?: AssessmentPaidOriginInput): Promise<{
+  prompt: string, signal?: AbortSignal, extraGuards: TransactionGuard[] = [], paidInput?: AssessmentPaidOriginInput, stopAfterPaid = false): Promise<{
     result: unknown; terminal: Ref | null; applied: Ref | null;
   }> {
   const savedOrigin = paidInput && draft?.value?.projectId
@@ -1302,7 +1305,7 @@ async function assessmentSessionInternal(store: Store, draft: Revision<Discovery
         ...(attempts ? [reference(call)] : [...app.guards, ...response.guards]),
         ...advanced.guards, ...recovered.guards]));
       markRecoveredSessionWritten(recovered);
-      if (terminal) return { result: nextValue.result, terminal: pendingRef(write), applied: pendingRef(applied) };
+      if (terminal || stopAfterPaid) return { result: nextValue.result, terminal: pendingRef(write), applied: pendingRef(applied) };
     } catch (error) {
       if (!(error instanceof EngineError) || !['revision_conflict', 'input_stale'].includes(error.code)) throw error;
       const latest = store.get<Application>(application.id), currentSession = store.get(id);
@@ -1332,6 +1335,84 @@ export async function assessmentSession(store: Store, draft: Revision<DiscoveryD
   prompt: string, signal?: AbortSignal, extraGuards: TransactionGuard[] = []): Promise<unknown> {
   return (await assessmentSessionInternal(store, draft, question, environment, dispatch, pilot, context, prompt,
     signal, extraGuards)).result;
+}
+
+/** The existing attempts carrier already saves native renewed applications
+ * and exact refusal feedback. The addressed door only limits that same chain;
+ * a successful page or a second malformed answer ends this correction. */
+export function readAttemptAssessmentResponseCorrection(store:Store,project:string,rootRef:Ref) {
+  const read=(ref:Ref):Revision<Application>=>{
+    const row=exact<Application>(store,ref,'assessment-application');
+    requireCondition(row.value.projectId===project && row.value.contract===APPLICATION,
+      'research_response_retry_invalid','Select an attempts application of this project');
+    const cursor=['applied','renewed'].includes(row.value.state)?row.value.after:row.value.session;
+    requireCondition(isRef(cursor),'research_response_retry_invalid','The assessment lost its exact native cursor');
+    return readApplication(store,exact<ApplicationSession>(store,cursor,'assessment-session'),ref);
+  };
+  const normalized=(ref:Ref):Revision<Application>=>{
+    const row=read(ref);
+    return row.value.state==='renewed'?read(reference(exact<Application>(store,
+      {id:row.id,revision:row.revision-1,hash:store.get(row.id,row.revision-1)?.hash??''},'assessment-application'))):row;
+  };
+  const root=read(rootRef);
+  requireCondition(root.value.state==='model-refused','research_response_retry_invalid',
+    'Select the original paid form refusal of the attempts assessor');
+  const outcome=(row:Revision<Application>)=>{
+    if(!row.value.call)return null;
+    const call=store.get<ModelCall>(row.value.call.id);
+    return !call || call.value.status==='running'?null:executionOutcome(store,row.value,reference(call));
+  };
+  const failure=(row:Revision<Application>):EngineError|null=>{
+    if(row.value.state!=='model-refused')return null;
+    const paid=outcome(row);if(paid?.kind!=='response')return null;
+    const before=exact<ApplicationSession>(store,row.value.session,'assessment-session'),binding=before.value.binding!;
+    return assessmentReplyFailure(store,row.value,paid.payload)??correctableAssessmentReply(
+      exact<DiscoveryDraft>(store,binding.draft,'discovery-draft'),exact<Question>(store,binding.question,'question'),
+      before.value,row.value.context,paid.subject,paid.payload);
+  };
+  const session=store.get<ApplicationSession>(root.value.session.id);
+  requireCondition(session?.kind==='assessment-session','research_response_retry_invalid','The native assessor session disappeared');
+  const current=readApplication(store,session,undefined,true)??pendingAttemptsContinuation(store,session).previous;
+  let latest=normalized(reference(current));
+  const descendants:Revision<Application>[]=[];
+  for(let row=latest;;) {
+    descendants.push(row);
+    if(row.id===root.id)break;
+    requireCondition(row.value.previous && descendants.every(prior=>prior.id!==row.value.previous!.id),
+      'research_response_retry_invalid','The selected refusal is not an ancestor of this assessor position');
+    row=normalized(row.value.previous);
+  }
+  // Ordinary continuation may have advanced after the paid correction. Its
+  // later applications cannot be bought or re-applied by this addressed door.
+  latest=descendants.reverse().slice(1).find(row=>outcome(row)?.kind==='response')??latest;
+  const chain=readResponseCorrectionChain(rootRef,{
+    read,latest:()=>latest,
+    previous:value=>value.previous?reference(normalized(value.previous)):null,
+    follows:(before,after)=>before.session.id===after.session.id && same(
+      [withoutResultCapacity(before.context),before.prompt,before.role,before.dispatch,before.profile],
+      [withoutResultCapacity(after.context),after.prompt,after.role,after.dispatch,after.profile]),
+    formFailure:failure,responseFreeFailure:row=>outcome(row)?.kind==='provider-failed',
+  });
+  return {...chain,latestFailure:failure(chain.latest)};
+}
+
+export async function retryAttemptAssessmentResponse(store:Store,project:string,root:Ref,restoreOnly:boolean) {
+  const correction=readAttemptAssessmentResponseCorrection(store,project,root),app=correction.latest.value;
+  if(!correction.retry) {
+    if(app.state==='model-refused')throw correction.latestFailure??correction.failure;
+    const terminal=app.after?exact<ApplicationSession>(store,app.after,'assessment-session').value.result:null;
+    return {kind:terminal?'applied' as const:'pending' as const,root,application:reference(correction.latest),session:app.after??app.session};
+  }
+  if(restoreOnly)return {kind:'pending' as const,root,application:reference(correction.latest),session:app.session};
+  const session=exact<ApplicationSession>(store,app.session,'assessment-session'),binding=session.value.binding!;
+  const environment=exact<Environment>(store,binding.environment,'environment');
+  const origin=app.origin?exact<AssessmentPaidOrigin>(store,app.origin,'assessment-paid-origin').value:undefined;
+  const result=await assessmentSessionInternal(store,exact<DiscoveryDraft>(store,binding.draft,'discovery-draft'),
+    exact<Question>(store,binding.question,'question'),environment,app.dispatch,
+    app.profile?exact<ReaderPilot>(store,app.profile,'reader-pilot'):undefined,app.context,app.prompt,undefined,
+    app.guards.filter(guard=>guard.id!==barrierGuard(project,binding.question).id),origin,true);
+  const updated=readAttemptAssessmentResponseCorrection(store,project,root).latest;
+  return {kind:result.result?'applied' as const:'pending' as const,root,application:reference(updated),session:updated.value.after??updated.value.session};
 }
 
 /** Prove one exact applied step; checkpoint and terminal steps share the same origin. */
@@ -1579,6 +1660,7 @@ export interface DossierAssessmentApplication {
   prompt:string; role:RoleBinding; dispatch:Environment; profile:Ref|null; guards:TransactionGuard[];
   state:'prepared'|'running'|'applied'; call:Ref|null; received:Ref|null; after:Ref|null;
   dispatchGuards?: TransactionGuard[];
+  responseCorrection?: ApplicationResponseCorrection;
 }
 const dossierSessionId=(subject:DossierAssessmentSubject)=>`dossier-session:v1:${hashJson([DOSSIER_SESSION,subject])}`;
 const dossierApplicationId=(session:Ref)=>`dossier-application:v1:${hashJson([session.id,session.revision])}`;
@@ -1598,7 +1680,7 @@ function dossierContext(session:Revision<DossierAssessmentSession>) {
     contextWorkspace:(dossierMaterialEra(session.value) ? pendingDossierWorkspace(session.value.workspace) : session.value.workspace).entries.map(entry=>entry.result)};
 }
 /** Leaf proof shared with the physical reader. It never calls that reader or the full session history. */
-export function readDossierDispatchAdmission(store:Store, applicationRef:Ref) {
+function readOriginalDossierDispatchAdmission(store:Store, applicationRef:Ref) {
   const application=dossierExact<DossierAssessmentApplication>(store,applicationRef,'assessment-application'),app=application.value;
   dossierRequire(application.revision===1 && app.contract===DOSSIER_APPLICATION && isRef(app.session),
     'The dossier application needs its immutable prepared origin');
@@ -1649,6 +1731,11 @@ export function readDossierDispatchAdmission(store:Store, applicationRef:Ref) {
   return {application,session,packet,draft,question,environment,profile,context:app.context,
     role:value.role,dispatch:value.dispatch,prompt:value.prompt};
 }
+export function readDossierDispatchAdmission(store:Store,applicationRef:Ref):ReturnType<typeof readOriginalDossierDispatchAdmission> {
+  const application=dossierExact<DossierAssessmentApplication>(store,applicationRef,'assessment-application');
+  return correctingApplicationLeaf(store,application,ref=>readOriginalDossierDispatchAdmission(store,ref))
+    ?? readOriginalDossierDispatchAdmission(store,applicationRef);
+}
 /** Saved new-send witnesses survive a caller retry without options. Historical proof
  * checks their form and binding, never their current heads. */
 export function readDossierReservationAt(store: Store, applicationRef: Ref) {
@@ -1682,7 +1769,7 @@ async function dossierPhysicalOutcome(store:Store, admission:Awaited<ReturnType<
   }
   return outcome;
 }
-async function advanceDossierSession(store:Store,admission:Awaited<ReturnType<typeof readDossierDispatchAdmission>>,
+async function projectDossierSession(store:Store,admission:Awaited<ReturnType<typeof readDossierDispatchAdmission>>,
   paid:Awaited<ReturnType<typeof dossierPhysicalOutcome>>) {
   const {session,application,draft,question}=admission,current=session.value;
   const checked=await checkDossierResearchReply(store,current.projectId,current.subject,application.value.context.resultCapacity,paid.payload);
@@ -1714,6 +1801,63 @@ async function advanceDossierSession(store:Store,admission:Awaited<ReturnType<ty
     application:result?application.id:dossierApplicationId({id:session.id,revision:session.revision+1,hash:''})} satisfies DossierAssessmentSession;
 }
 /** Historical proof of every application in the saved chain, using the same projector as live application. */
+async function advanceDossierSession(store:Store,admission:ReturnType<typeof readDossierDispatchAdmission>,
+  paid:Awaited<ReturnType<typeof dossierPhysicalOutcome>>) {
+  const root=admission.application.value.responseCorrection?.root;
+  if(root) await readDossierResponseCorrection(store,admission.session.value.projectId,root);
+  return projectDossierSession(store,admission,paid);
+}
+
+export async function readDossierResponseCorrection(store:Store,project:string,root:Ref) {
+  return readApplicationResponseCorrection(store,project,root,{
+    read:ref=>readDossierDispatchAdmission(store,ref).application,
+    outcome:async application=>{
+      const admission=readDossierDispatchAdmission(store,reference(application));
+      const running=store.get<DossierAssessmentApplication>(application.id,2);
+      if(!running) return null;
+      const reserved=readDossierReservationAt(store,reference(application));
+      const head=store.get<ModelCall>(reserved.running.value.call!.id);
+      dossierRequire(head,'The correcting dossier call disappeared');
+      if(head.value.status==='running') return null;
+      return readResearchExecution(store,project,reference(head),admission.session,admission.draft,
+        admission.question,admission.role,admission.session.value.profile);
+    },
+    project:async(application,paid)=>{
+      dossierRequire(paid.kind==='response','Only a paid response has a dossier form');
+      return projectDossierSession(store,readDossierDispatchAdmission(store,reference(application)),
+        paid as Awaited<ReturnType<typeof dossierPhysicalOutcome>>);
+    },
+    // The native projector also proves a paid read_context that repeats an
+    // already delivered page. This is one correcting reply, not a progress reset.
+    formCodes:['discovery_dossier_result_invalid','research_response_invalid','assessment_invalid','research_no_progress'],
+  });
+}
+
+export async function retryDossierResponse(store:Store,project:string,root:Ref,restoreOnly:boolean) {
+  const correction=await readDossierResponseCorrection(store,project,root);
+  const head=store.get<DossierAssessmentApplication>(correction.latest.id)!;
+  if(head.value.state==='applied') {
+    const result=await readDossierAssessmentSessionAt(store,project,head.value.after!);
+    return {kind:result.result?'applied' as const:'pending' as const,root,session:reference(result.session),
+      application:result.application};
+  }
+  if(correction.retry && restoreOnly) return {kind:'pending' as const,root,application:reference(correction.latest)};
+  if(correction.retry) {
+    const write=responseCorrectionApplicationWrite(correction);
+    try { store.writeMany([write],[correction.root.value.session,reference(correction.paid!.call),
+      {id:write.id,absent:true}]); }
+    catch(error) {
+      if(!(error instanceof EngineError) || !['input_stale','revision_conflict'].includes(error.code)
+        || !store.get(write.id)) throw error;
+    }
+  }
+  const session=dossierExact<DossierAssessmentSession>(store,correction.root.value.session,'assessment-session');
+  const result=await runDossierAssessmentSession(store,project,session.value.subject,undefined,undefined,undefined,
+    {restoreOnly,allowance:1,responseCorrection:root});
+  return {kind:result.result?'applied' as const:'pending' as const,root,session:reference(result.session),
+    application:result.application};
+}
+
 export async function readDossierAssessmentSessionAt(store:Store,project:string,sessionRef:Ref) {
   const session=dossierExact<DossierAssessmentSession>(store,sessionRef,'assessment-session');
   dossierRequire(session.value.projectId===project && session.value.contract===DOSSIER_SESSION
@@ -1768,6 +1912,8 @@ export async function readDossierAssessmentSessionAt(store:Store,project:string,
 }
 export async function proveDossierDispatchAdmission(store:Store,applicationRef:Ref) {
   const admission=readDossierDispatchAdmission(store,applicationRef);
+  if(admission.application.value.responseCorrection)
+    await readDossierResponseCorrection(store,admission.session.value.projectId,admission.application.value.responseCorrection.root);
   const packet=await requireDossierAssessmentSubject(store,admission.session.value.projectId,admission.session.value.subject);
   dossierRequire(same(packet,admission.packet),'The saved dossier packet differs from its producer');
   await readDossierAssessmentSessionAt(store,admission.session.value.projectId,reference(admission.session));
@@ -1775,7 +1921,7 @@ export async function proveDossierDispatchAdmission(store:Store,applicationRef:R
 }
 /** One public managed door. Saved positions restore before consulting today's role or profile. */
 export async function runDossierAssessmentSession(store:Store,project:string,subject:unknown,
-  environment?:Revision<Environment>,pilot?:Revision<ReaderPilot>,signal?:AbortSignal,options:{restoreOnly?:boolean;allowance?:number;admissionGuards?:TransactionGuard[]}={}) {
+  environment?:Revision<Environment>,pilot?:Revision<ReaderPilot>,signal?:AbortSignal,options:{restoreOnly?:boolean;allowance?:number;admissionGuards?:TransactionGuard[];responseCorrection?:Ref}={}) {
   const {restoreOnly,allowance,admissionGuards:additional}=options;
   const dispatchGuards=uniqueTransactionGuards(checkTransactionGuards(additional===undefined?[]:additional));
   const packet=await requireDossierAssessmentSubject(store,project,subject),id=dossierSessionId(packet.subject);
@@ -1810,6 +1956,12 @@ export async function runDossierAssessmentSession(store:Store,project:string,sub
       if(historical.result) return historical;
     }
     let application=store.get<DossierAssessmentApplication>(session.value.application);
+    if(application) {
+      const origin=dossierExact<DossierAssessmentApplication>(store,
+        {id:application.id,revision:1,hash:store.get(application.id,1)?.hash??''},'assessment-application');
+      const selected=latestResponseApplication(store,origin);
+      application=store.get<DossierAssessmentApplication>(selected.id)!;
+    }
     if(application) application=dossierExact<DossierAssessmentApplication>(store,reference(application),'assessment-application');
     if(restoreOnly && (!application || application.value.state==='prepared'
       || application.value.state==='running' && application.value.call && store.get<ModelCall>(application.value.call.id)?.value.status==='running'))
@@ -1867,5 +2019,6 @@ export async function runDossierAssessmentSession(store:Store,project:string,sub
     // Only the owned position and the selected physical receipt may race this application.
     store.writeMany([write,applied],uniqueTransactionGuards([reference(session),reference(application),reference(call),paid.request,
       paid.response!,paid.archive]));
+    if(options.responseCorrection) return readDossierAssessmentSessionAt(store,project,pendingRef(write));
   }
 }

@@ -1,4 +1,5 @@
 import { deliveredContract } from './discovery-response-contract-fixture.js';
+import {retryDiscoveryResponse} from '../src/discovery/discovery-response-retry.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { writeFileSync } from 'node:fs';
@@ -117,6 +118,19 @@ async function setup(t: test.TestContext, answer: unknown = generation) {
   return { ...g, project, saved, setMode, questions, reply, set, result, draft, state1, decisionInput, pay };
 }
 const membersOf = (f: Awaited<ReturnType<typeof setup>>) => f.set!.value.members.map(ref => f.store.get<DiscoveryVariant>(ref.id, ref.revision)!);
+
+for(const action of ['choose','reject_all'] as const)test(`L30 variant decision: correct ${action} uses the same paid set and cold repeats are free`,async t=>{
+  const f=await setup(t),bypass=f.setMode('bypass',reference(f.questions)),input=f.decisionInput(reference(bypass));
+  f.reply({action});const prepared=prepareVariantSession(f.store,input);
+  await assert.rejects(()=>runVariantSession(f.store,input),code('discovery_variant_answer_invalid'));
+  const root=reference(f.store.get<ResearchConsumerIntent>(prepared.intent.id)!),calls=f.wires().length;
+  f.reply(action==='choose'?choose('v1'):{action:'reject_all',reason:'Both variants exceed the bounded goal'});
+  const result=await retryDiscoveryResponse(f.open(),'p',root,1);
+  assert.equal(result.kind,'applied');assert.equal(f.wires().length,calls+1);
+  assert.deepEqual(await retryDiscoveryResponse(f.open(),'p',root,1,true),result);
+  assert.ok((await runVariantSession(f.open(),input)).value.result);
+  assert.equal(f.wires().length,calls+1);
+});
 
 test('4B.2: bypass buys one managed model decision over the exact proven set — the chosen member, not the recommendation, and the next state in one batch', async t => {
   const f = await setup(t), bypass = f.setMode('bypass', reference(f.questions));

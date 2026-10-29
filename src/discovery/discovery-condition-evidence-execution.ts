@@ -1,5 +1,7 @@
 import { pendingContextWorkspace } from './context-workspace.js';
 import { finalMaterialAdmission, finalMaterialProjection, finalMaterialEra, finalWorkspace, packFinalMaterial, recordFinalMaterialWorkspace, finalTechnicalLookup } from './final-material.js';
+import { correctingApplicationLeaf, latestResponseApplication, readApplicationResponseCorrection,
+  responseCorrectionApplicationWrite, type ApplicationResponseCorrection } from './application-response-correction.js';
 import { conditionEvidenceResponseContract } from './discovery-response-contract.js';
 import { canonical, hashJson } from '../canonical.js';
 import { EngineError, requireCondition } from '../errors.js';
@@ -74,6 +76,7 @@ export interface ConditionEvidenceApplication {
   call: Ref | null;
   received: Ref | null;
   after: Ref | null;
+  responseCorrection?: ApplicationResponseCorrection;
 }
 
 export interface ConditionEvidencePaidResult {
@@ -149,7 +152,7 @@ function readEvidenceRequestArchive(store: Store, prepared: Revision<ConditionEv
 
 /** Synchronous physical leaf. It validates immutable associations, but is not the public authority to send: admission
  * separately proves the whole evidence subject and the prepared session before a reservation. */
-export function readConditionEvidenceDispatchLeaf(store: Store, applicationRef: Ref) {
+function readConditionEvidenceDispatchLeafOriginal(store: Store, applicationRef: Ref) {
   const application = exact<ConditionEvidenceApplication>(store, applicationRef,
     CONDITION_EVIDENCE_APPLICATION_KIND);
   const app = application.value;
@@ -227,8 +230,16 @@ export function readConditionEvidenceDispatchLeaf(store: Store, applicationRef: 
 
 /** The only authority for a new physical send: prove the whole evidence subject again from its own input — the
  * edition, the saved bundle and condition, every offered claim — and the prepared session, then compare the request. */
+export function readConditionEvidenceDispatchLeaf(store: Store, applicationRef: Ref): ReturnType<typeof readConditionEvidenceDispatchLeafOriginal> {
+  const application=exact<ConditionEvidenceApplication>(store,applicationRef,CONDITION_EVIDENCE_APPLICATION_KIND);
+  return correctingApplicationLeaf(store,application,ref=>readConditionEvidenceDispatchLeafOriginal(store,ref))
+    ?? readConditionEvidenceDispatchLeafOriginal(store,applicationRef);
+}
+
 export async function readConditionEvidenceDispatchAdmission(store: Store, applicationRef: Ref) {
   const leaf = readConditionEvidenceDispatchLeaf(store, applicationRef);
+  if(leaf.application.value.responseCorrection)
+    await readConditionEvidenceResponseCorrection(store,leaf.session.value.projectId,leaf.application.value.responseCorrection.root);
   // A later cursor is authority only if every prior page has its exact physical proof; resume calls this directly.
   const history = leaf.session.revision > 1
     ? await readConditionEvidenceExecutionAt(store, leaf.session.value.projectId, reference(leaf.session))
@@ -282,6 +293,7 @@ export function prepareConditionEvidenceContextPacker(store: Store,
         subject: structuredClone(session.value.subject), schema: structuredClone(context.schema), discoveryResponseContract,
         request: structuredClone(context.request), finalContinuation: structuredClone(context.finalContinuation),
         resultCapacity: structuredClone(context.resultCapacity), contextWorkspace: structuredClone(context.contextWorkspace),
+        ...(context.failures ? {failures:structuredClone(context.failures)} : {}),
         working: { archive, deliveryContract: 'research-delivery/v1',
           instruction: 'Read each exact omitted address with read_context and continue through every page before returning a final result.' } };
       if (finalMaterialEra(prepared.value.input))
@@ -321,7 +333,7 @@ async function physicalEvidenceOutcome(store: Store, project: string, applicatio
 
 /** Application and historical reading share exactly this projector. Neither
  * an answer's own verdict nor a structural packet can impersonate payment. */
-async function projectEvidenceStep(store: Store, admission: ReturnType<typeof readConditionEvidenceDispatchLeaf>,
+async function projectEvidenceStepUnchecked(store: Store, admission: ReturnType<typeof readConditionEvidenceDispatchLeaf>,
   paid: Awaited<ReturnType<typeof physicalEvidenceOutcome>>['paid']) {
   const { session, application, draft, question } = admission;
   const materialEra = finalMaterialEra(admission.prepared.value.input);
@@ -361,6 +373,30 @@ async function projectEvidenceStep(store: Store, admission: ReturnType<typeof re
 
 /** Historical reader: prove the exact evidence subject, the immutable preparation and
  * every physical assessment step. Today's heads and allowance are irrelevant. */
+export async function readConditionEvidenceResponseCorrection(store:Store,project:string,root:Ref) {
+  return readApplicationResponseCorrection(store,project,root,{
+    read:ref=>readConditionEvidenceDispatchLeaf(store,ref).application,
+    outcome:async application=>{
+      const head=store.get<ModelCall>(evidenceCallId(reference(application)));
+      if(!head || head.value.status==='running') return null;
+      return readConditionEvidenceResearchExecution(store,project,reference(head),reference(application)).paid;
+    },
+    project:async(application,paid)=>{
+      valid(paid.kind==='response','Only a paid response has a closed role form');
+      return projectEvidenceStepUnchecked(store,readConditionEvidenceDispatchLeaf(store,reference(application)),
+        paid as Awaited<ReturnType<typeof physicalEvidenceOutcome>>['paid']);
+    },
+    formCodes:['discovery_condition_evidence_result_invalid','research_response_invalid','research_context_incomplete'],
+  });
+}
+
+async function projectEvidenceStep(store:Store,admission:ReturnType<typeof readConditionEvidenceDispatchLeaf>,
+  paid:Awaited<ReturnType<typeof physicalEvidenceOutcome>>['paid']) {
+  if(admission.application.value.responseCorrection)
+    await readConditionEvidenceResponseCorrection(store,admission.session.value.projectId,admission.application.value.responseCorrection.root);
+  return projectEvidenceStepUnchecked(store,admission,paid);
+}
+
 export async function readConditionEvidenceExecutionAt(store: Store, project: string, at: Ref) {
   const targetRef = snapshotRef(at);
   const target = exact<ConditionEvidenceExecution>(store, targetRef, CONDITION_EVIDENCE_EXECUTION_KIND);
@@ -399,7 +435,7 @@ export async function readConditionEvidenceExecutionAt(store: Store, project: st
       && same(applied.value.after, reference(after)) && same(applied.value, { ...application.value, state: 'applied',
         call: applied.value.call, received: applied.value.received, after: reference(after) }),
     'The assessment cursor is not its exact applied application');
-    if (revision === 2) valid(same(reference(application), reference(firstApplication)),
+    if (revision === 2) valid(same(application.value.responseCorrection?.root ?? reference(application), reference(firstApplication)),
       'The assessment execution does not use its origin application');
     const { admission, paid } = await physicalEvidenceOutcome(store, project, reference(application), applied.value.received);
     valid(same(reference(admission.session), reference(previous)), 'An assessment application belongs to another cursor');
@@ -447,6 +483,7 @@ export interface RunConditionEvidenceOptions {
   signal?: AbortSignal;
   restoreOnly?: boolean;
   allowance?: number;
+  responseCorrection?: Ref;
 }
 
 /** Start or restore one evidence assessment of an exact edition. Its first origin,
@@ -501,8 +538,11 @@ export async function runConditionEvidenceExecution(store: Store, project: strin
       createSession = { id, kind: CONDITION_EVIDENCE_EXECUTION_KIND, expected: 0, value };
       session = { ...pendingRef(createSession), kind: createSession.kind, value };
     }
-    const applicationId = session.value.application;
-    const existing = store.get<ConditionEvidenceApplication>(applicationId, 1);
+    const originalApplication=store.get<ConditionEvidenceApplication>(session.value.application,1);
+    const correction=options.responseCorrection ? await readConditionEvidenceResponseCorrection(store,project,options.responseCorrection) : null;
+    const correctionWrite=correction?.retry && !restoreOnly ? responseCorrectionApplicationWrite(correction) : null;
+    const existing=correctionWrite ? null : originalApplication ? latestResponseApplication(store,originalApplication) : null;
+    const applicationId=correctionWrite?.id ?? existing?.id ?? session.value.application;
     if (existing) {
       const application = exact<ConditionEvidenceApplication>(store, reference(existing), CONDITION_EVIDENCE_APPLICATION_KIND);
       valid(historical, 'An assessment application cannot exist without its proven execution');
@@ -535,6 +575,7 @@ export async function runConditionEvidenceExecution(store: Store, project: strin
         const winner = store.get<ConditionEvidenceExecution>(id);
         if (!winner || winner.revision <= session.revision) throw error;
       }
+      if(options.responseCorrection) return readConditionEvidenceExecutionAt(store,project,pendingRef(after));
       continue;
     }
     if (restoreOnly && saved) return historical!;
@@ -563,8 +604,9 @@ export async function runConditionEvidenceExecution(store: Store, project: strin
       dispatch: session.value.dispatch, profile: session.value.profile, guards,
       state: 'prepared', call: null, received: null, after: null };
     const application: Write = { id: applicationId, kind: CONDITION_EVIDENCE_APPLICATION_KIND, expected: 0, value };
+    if(correctionWrite) application.value=correctionWrite.value;
     try {
-      await researchCall(session.value.role, session.value.dispatch, session.value.prompt, context, signal,
+      await researchCall(session.value.role, session.value.dispatch, session.value.prompt, (application.value as ConditionEvidenceApplication).context, signal,
         { store, draftId: draft.id, questionId: question.id, purpose: CONDITION_EVIDENCE_PURPOSE,
           session: reference(session), application: pendingRef(application),
           conditionEvidencePending: { ...(createSession ? { session: createSession } : {}), application },
@@ -573,7 +615,7 @@ export async function runConditionEvidenceExecution(store: Store, project: strin
     } catch (error) {
       if (!(error instanceof EngineError) || !['revision_conflict', 'input_stale'].includes(error.code)) throw error;
       const winner = store.get<ConditionEvidenceApplication>(applicationId, 1);
-      if (!winner || !same(winner.value, value)) throw error;
+      if (!winner || !same(winner.value, application.value)) throw error;
     }
   }
 }

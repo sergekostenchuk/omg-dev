@@ -12,6 +12,8 @@ import {issueInterpretationChoiceInvitation,InterpretationChoiceSessions,chooseI
 import {ProjectModeSessions,issueProjectModeInvitation} from '../src/product/owner-authority.js';
 import {setProjectMode} from '../src/product/project-mode.js';
 import {discoveryFixture,questionOf,validFrame} from './discovery-v7-fixture.js';
+import {retryDiscoveryResponse} from '../src/discovery/discovery-response-retry.js';
+import type {ResearchConsumerIntent} from '../src/discovery/response-recovery.js';
 
 async function world(t:TestContext,outcome:'material'|'no_divergence'='material',mode:'questions'|'bypass'='questions', large=false) {
   const f=discoveryFixture(t,'omg-d1-paid-',true), project='p';
@@ -43,8 +45,12 @@ outcome:c.outcome,reason:'The mandate has distinct delivery consequences',interp
 {id:'central',meaning:'One central inventory',consequences:[{affects:'boundaries',text:'All sites share one accounting boundary'}],support:[q.brief.selector]},
 {id:'local',meaning:'Independent site inventories',consequences:[{affects:'acceptance',text:'Reconciliation is verified at every site'}],support:[q.brief.selector]}]:[]};}
 if(s.interpretationPhase==='choose')research={action:'choose',interpretation:'local',justification:'The per-site reconciliation best fits the mandate'};
-if(s.interpretationPhase==='frame')research={action:'frame',decision:s.decisionRef,value:{...s.frameRequest.subject.frame.record.value.value,scale:'Independent inventory and reconciliation at every site'}};
+if(s.interpretationPhase==='frame'){
+research={action:'frame',decision:s.decisionRef,value:{...s.frameRequest.subject.frame.record.value.value,scale:'Independent inventory and reconciliation at every site'}};
+if(c.invalidFrame==='empty')research.value={};
+if(c.invalidFrame==='missing-axis')delete research.value.axes.market;}
 if(nextRead)research=nextRead;
+if(c.reply)research=c.reply;
 console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,usage:{inputTokens:c.tokens??10,outputTokens:2,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
   f.engine.execute({type:'create-project',project,title:'Interpretations'});
   const command={executable:process.execPath,args:[adapter]};
@@ -80,6 +86,72 @@ console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,u
 function ready(r:InterpretationFlowResult):asserts r is Extract<InterpretationFlowResult,{kind:'ready'}> {
   assert.equal(r.kind,'ready',JSON.stringify(r));
 }
+
+test('L30 interpretations: one exact correction applies the original role and ordinary cold flow continues for free',async t=>{
+  const f=await world(t,'no_divergence');
+  writeFileSync(f.settings,JSON.stringify({outcome:'no_divergence',reply:{outcome:'no_divergence'}}));
+  const failed=await f.run(f.store,1);assert.equal(failed.kind,'refused',JSON.stringify(failed));
+  const root=f.store.list<ResearchConsumerIntent>('research-consumer-intent')
+    .find(row=>row.value.kind==='frame-interpretation-request')!;
+  assert.ok(root);const before=f.sent().length;
+  const pending=await retryDiscoveryResponse(f.open(),'p',reference(root),1,true);
+  assert.equal(pending.kind,'pending');assert.equal(f.sent().length,before);
+  writeFileSync(f.settings,JSON.stringify({outcome:'no_divergence'}));
+  const corrected=await retryDiscoveryResponse(f.open(),'p',reference(root),1);
+  assert.equal(corrected.kind,'applied');assert.equal(f.sent().length,before+1);
+  assert.ok(JSON.stringify(f.sent().at(-1)).includes('discovery-response-correction/v1'));
+  assert.deepEqual(await retryDiscoveryResponse(f.open(),'p',reference(root),1,true),corrected);
+  const done=await f.run(f.open(),0,true);ready(done);assert.equal(f.sent().length,before+1);
+});
+
+for(const [invalidFrame,repeatInvalid] of [['empty',false],['missing-axis',false],['empty',true]] as const)
+test(`L30 frame: generate -> choose -> ${invalidFrame} value -> ${repeatInvalid?'terminal second refusal':'one correction and ordinary application'}`,async t=>{
+  const f=await world(t,'material','bypass'),initial=f.sent().length;
+  const generatedAndChosen=await f.run(f.store,2);
+  assert.equal(generatedAndChosen.kind,'pending');assert.equal(f.sent().length,initial+2);
+  assert.equal(f.store.list('interpretation-decision').length,1);
+  writeFileSync(f.settings,JSON.stringify({outcome:'material',invalidFrame}));
+  const failed=await f.run(f.open(),1);assert.ok(failed.kind==='refused');assert.equal(failed.code,'answer_invalid');
+  const rejectedFrame=f.sent().at(-1);assert.equal(rejectedFrame.subject.request.interpretationPhase,'frame');
+  const intent=f.store.list<ResearchConsumerIntent>('research-consumer-intent')
+    .find(row=>row.value.state==='running' && f.store.get<any>(row.value.owner.id,row.value.owner.revision)?.value.phase==='frame')!;
+  assert.ok(intent);const root=reference(intent),before=f.sent().length;
+  const expense=()=>({calls:f.store.list('model-call').flatMap(row=>f.store.history(row.id)),
+    ledger:f.store.list('research-budget-ledger').flatMap(row=>f.store.history(row.id))});
+  const originalExpense=expense();
+  assert.equal((await retryDiscoveryResponse(f.open(),'p',root,1,true)).kind,'pending');
+  assert.equal(f.sent().length,before);assert.deepEqual(expense(),originalExpense);
+  writeFileSync(f.settings,JSON.stringify({outcome:'material',...(repeatInvalid?{invalidFrame}:{})}));
+  let corrected:Awaited<ReturnType<typeof retryDiscoveryResponse>>|undefined;
+  if(repeatInvalid)await assert.rejects(()=>retryDiscoveryResponse(f.open(),'p',root,1),{code:'answer_invalid'});
+  else {corrected=await retryDiscoveryResponse(f.open(),'p',root,1);assert.equal(corrected.kind,'applied');}
+  assert.equal(f.sent().length,before+1,'correction buys only the frame role, never its independent assessor');
+  const sent=f.sent().at(-1),feedback=sent.subject.failures.at(-1);
+  assert.equal(sent.subject.request.interpretationPhase,'frame');
+  assert.deepEqual(sent.subject.request.decisionRef,rejectedFrame.subject.request.decisionRef);
+  assert.equal(feedback.code,'answer_invalid');assert.equal(feedback.message,failed.reason);
+  assert.equal(feedback.previousResponse.action,'frame');
+  assert.deepEqual(feedback.previousResponse.decision,rejectedFrame.subject.request.decisionRef);
+  if(invalidFrame==='empty')assert.deepEqual(feedback.previousResponse.value,{});
+  else {assert.equal(feedback.previousResponse.value.axes.market,undefined);
+    assert.equal(feedback.previousResponse.value.scale,'Independent inventory and reconciliation at every site');}
+  const after=expense();
+  for(const restoreOnly of [false,true]) {
+    if(repeatInvalid)await assert.rejects(()=>retryDiscoveryResponse(f.open(),'p',root,1,restoreOnly),{code:'answer_invalid'});
+    else assert.deepEqual(await retryDiscoveryResponse(f.open(),'p',root,1,restoreOnly),corrected);
+  }
+  assert.equal(f.sent().length,before+1);assert.deepEqual(expense(),after);
+  assert.deepEqual(f.store.get(intent.id,intent.revision),intent);
+  if(repeatInvalid) {
+    const successor=f.store.list<ResearchConsumerIntent>('research-consumer-intent')
+      .find(row=>row.value.cursor.responseCorrection?.id===root.id)!;
+    await assert.rejects(()=>retryDiscoveryResponse(f.open(),'p',reference(successor),1),{code:'research_response_retry_invalid'});
+  } else {
+    const restored=await f.run(f.open(),0,true);assert.equal(restored.kind,'pending');assert.equal(f.sent().length,before+1);
+    const applied=await f.run(f.open(),1);ready(applied);assert.equal(f.sent().length,before+2);
+    ready(await f.run(f.open(),0,true));assert.equal(f.sent().length,before+2);
+  }
+});
 
 test('D1 recovery: single-call invocations keep the same paid generation, choice and frame through cold reopen',async t=>{
   const f=await world(t,'material','bypass');const before=f.sent().length;

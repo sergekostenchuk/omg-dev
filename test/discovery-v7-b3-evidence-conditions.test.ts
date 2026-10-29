@@ -1,3 +1,5 @@
+import { retryDiscoveryResponse } from '../src/discovery/discovery-response-retry.js';
+import { answerBeforeContext } from './discovery-response-correction-fixture.js';
 import { deliveredContract } from './discovery-response-contract-fixture.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -215,4 +217,35 @@ test('B3 race: two Stores resolving with the same paid assessment publish one re
   assert.equal(results.filter(row => !row.repeated).length <= 1, true);
   assert.equal(f.store.list(CONDITION_RESOLUTION_KIND).length, 1); assert.equal(f.store.list(MANIFEST_SUCCESSOR_KIND).length, 1);
   assert.equal(money(f.store), calls, 'resolving pays nothing');
+});
+
+for(const incomplete of [false,true]) test(`L30 condition evidence: ${incomplete?'early context answer':'malformed answer'} has one correcting assessment and free repeat`,async t=>{
+  const {f,first,material}=await world(t);
+  const manifest=reference(first.manifest);
+  const accepted=f.packet.final.dossier.materials.map(item=>item.address).filter(address=>{
+    try {proveClaimAddress(f.store,address);return true;}catch {return false;}
+  });
+  const claims=incomplete?[...new Map(accepted.map(address=>[canonical(address),address])).values()]:[material];
+  const packet=prepareConditionEvidenceSubject(f.store,'p',{manifest,conditionId:'evidence-1',claims});
+  const prepared=prepareConditionEvidenceSession(f.store,'p',packet.subject,{prompt:'Address one paid evidence refusal',
+    packetChars:incomplete?36_000:8_000_000,limitChars:incomplete?80_000:9_000_000,resultLimitChars:10_000_000,
+    environment:reference(f.environment),role:f.environment.value.reviewer});
+  assert.equal(prepared.value.input.materialContract,'discovery-final-material/v1');
+  f.reply(incomplete?answer(packet.subject,'supported',material):{});
+  const restore=incomplete?answerBeforeContext(f.root):()=>{};
+  await assert.rejects(()=>runConditionEvidenceExecution(f.store,'p',manifest,reference(prepared),{profile:f.profile}),
+    error=>error instanceof EngineError && error.code===(incomplete?'research_context_incomplete':'discovery_condition_evidence_result_invalid'));
+  if(incomplete) assert.ok((f.wires().at(-1) as any).subject.working.materialAddresses.some((a:any)=>a.field==='finalMaterial'));
+  restore();
+  const application=f.store.list<any>('discovery-condition-evidence-application').find(row=>row.value.state==='prepared')!;
+  assert.ok(application);const root=reference(f.store.get(application.id,1)!),old=f.store.history(application.id),before=f.wires().length;
+  assert.equal((await retryDiscoveryResponse(f.open(),'p',root,1,true)).kind,'pending');assert.equal(f.wires().length,before);
+  f.reply(answer(packet.subject,'supported',material));
+  const result=await retryDiscoveryResponse(f.open(),'p',root,1);
+  assert.equal(result.kind,incomplete?'pending':'applied');assert.equal(f.wires().length,before+1);
+  await quiet(f,f.store,async()=>{
+    assert.deepEqual(await retryDiscoveryResponse(f.open(),'p',root,1),result);
+    assert.deepEqual(await retryDiscoveryResponse(f.open(),'p',root,1,true),result);
+  });
+  assert.deepEqual(f.store.history(application.id),old);
 });

@@ -1,3 +1,4 @@
+import { retryDiscoveryResponse } from '../discovery/discovery-response-retry.js';
 import { withOmAcceptedMaterialAt } from '../om/accepted-material.js';
 import { readTaskContextBasis } from '../om/compiler-readers.js';
 import { readHorizon } from '../om/horizon.js';
@@ -397,6 +398,7 @@ export class ProductEngine {
           .then(summary => ({ summary: summary.final, text: renderStageSummary(summary) }));
       }
       case 'retry-plan-response': this.#project(command.project); return this.researcher.retryPlanResponse(command.project, command.intent, command.limit, command.restoreOnly);
+      case 'retry-discovery-response': this.#project(command.project); return retryDiscoveryResponse(this.store, command.project, command.refusal, command.limit, command.restoreOnly);
       case 'recover-research-response': this.#project(command.project); return recoverResearchResponse(this.store, this.environments, command.project, command.call, command.session, this.actor);
       case 'declare-adapter-lineage': this.#project(command.project); return declareAdapterLineage(this.store, command.project, command, this.actor);
       case 'observe-runtime': this.#project(command.project); return observeRuntime(this.store,command.project,command);

@@ -566,6 +566,7 @@ export function assessmentClassificationContract(subject: AssessmentTransportSub
       + 'consequence and nextAction are forbidden for every outcome other than unknown (including open and closed). '
       + 'For every accepted fact of a class=blocking question, methodology.facts[].significance.kind must be blocking; material or supporting is forbidden. '
       + 'For every methodology source with role=primary, original must equal source as the same exact Ref (id, revision and hash), never null or another revision. '
+      + 'For a web source (origin.kind=web), retrievedAt must equal its exact Source.origin.fetchedAt; for every non-web source retrievedAt must be null. Never substitute publicationDate, eventDate or the current time for the capture time. '
       + 'Never substitute a bare Ref for target, add fields to a row, omit a classification, or emit computed novelty keys, streak/N or authority.' };
 }
 

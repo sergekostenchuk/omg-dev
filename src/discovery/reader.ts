@@ -11,6 +11,7 @@ import { prepareResearchConsumerIntent, prepareResearchConsumerApplication,
   findResearchConsumerIntent, listResearchConsumerIntentsByRoot, researchConsumerIntentId,
   readResearchConsumerExecution, readResearchConsumerIntent, readResearchConsumerTurn, captureResearchConsumerRetryPermits,
   resumeResearchConsumerExecution, refuseResearchConsumerIntent, consumerCapacityFailure, consumerCapacityCorrection, retryableResearchConsumerRefusal,
+  managedCorrectionBaseContext,
   type ResearchConsumerIntent, type ResearchConsumerIntentInput, type ResearchConsumerExecution } from "./response-recovery.js";
 import { canonical, digest, hashJson } from "../canonical.js";
 import { requireCondition, EngineError } from "../errors.js";
@@ -622,7 +623,7 @@ function readerCursor(store: Store, intent: Revision<ResearchConsumerIntent>, ro
     ? consumerCapacityCorrection(store, readResearchConsumerIntent(store, intent.value.previous)) : null;
   const context = { role: 'reader' as const, purpose, ...(correction ? { failures: [correction] } : {}), sources: expected.map((source, sourceIndex) => ({
     ...readerSourcePacket(source, cursor.covered.filter(item => canonical(item.source) === canonical(source.ref))), sourceIndex })) };
-  requireCondition(canonical(cursor.context) === canonical(context),
+  requireCondition(canonical(managedCorrectionBaseContext(store,intent.value)) === canonical(context),
     'reader_intent_context_invalid', 'The saved paid packet differs from its exact child sources');
   return cursor;
 }
@@ -666,7 +667,11 @@ export function readerResumeStep(store: Store, project: string, question: Ref, p
       const previous = generations[index - 1];
       requireCondition(intent.value.generation === index
         && (index === 0 ? intent.value.previous === null
-          : retryableResearchConsumerRefusal(store, previous!)
+          : (retryableResearchConsumerRefusal(store, previous!)
+            // readerCursor proved the original form failure and frozen context.
+            // Only that exact root can add a single content correction.
+            || isRef(intent.value.cursor.responseCorrection)
+              && canonical(intent.value.cursor.responseCorrection) === canonical(reference(previous!)))
             && canonical(intent.value.previous) === canonical(reference(previous!))),
       'research_consumer_intent_invalid', 'A reader child needs one complete exact generation chain');
     }

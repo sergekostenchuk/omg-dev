@@ -1,5 +1,7 @@
 import { pendingContextWorkspace } from './context-workspace.js';
 import { finalMaterialAdmission, finalMaterialProjection, finalMaterialEra, finalWorkspace, packFinalMaterial, recordFinalMaterialWorkspace, finalTechnicalLookup } from './final-material.js';
+import { correctingApplicationLeaf, latestResponseApplication, readApplicationResponseCorrection,
+  responseCorrectionApplicationWrite, type ApplicationResponseCorrection } from './application-response-correction.js';
 import { finalResponseContract } from './discovery-response-contract.js';
 import { canonical, hashJson } from '../canonical.js';
 import { EngineError, requireCondition } from '../errors.js';
@@ -90,6 +92,7 @@ export interface DiscoveryFinalApplication {
   call: Ref | null;
   received: Ref | null;
   after: Ref | null;
+  responseCorrection?: ApplicationResponseCorrection;
 }
 
 const same = (a: unknown, b: unknown) => canonical(a) === canonical(b);
@@ -150,7 +153,7 @@ function readFinalRequestArchive(store: Store, prepared: Revision<DiscoveryFinal
 
 /** Historical leaf admission. Current heads and budget are deliberately not
  * read here: a paid response must remain provable after they have moved. */
-export function readDiscoveryFinalDispatchLeaf(store: Store, applicationRef: Ref) {
+function readDiscoveryFinalDispatchLeafOriginal(store: Store, applicationRef: Ref) {
   const application = exact<DiscoveryFinalApplication>(store, applicationRef, DISCOVERY_FINAL_APPLICATION_KIND);
   const app = application.value;
   valid(application.revision === 1 && object(app) && app.contract === DISCOVERY_FINAL_APPLICATION && isRef(app.session),
@@ -221,8 +224,16 @@ export function readDiscoveryFinalDispatchLeaf(store: Store, applicationRef: Ref
 
 /** The leaf authenticates the physical association; the producer additionally
  * proves the original paid D6 and full result declaration before using it. */
+export function readDiscoveryFinalDispatchLeaf(store: Store, applicationRef: Ref): ReturnType<typeof readDiscoveryFinalDispatchLeafOriginal> {
+  const application=exact<DiscoveryFinalApplication>(store,applicationRef,DISCOVERY_FINAL_APPLICATION_KIND);
+  return correctingApplicationLeaf(store,application,ref=>readDiscoveryFinalDispatchLeafOriginal(store,ref))
+    ?? readDiscoveryFinalDispatchLeafOriginal(store,applicationRef);
+}
+
 export async function readDiscoveryFinalDispatchAdmission(store: Store, applicationRef: Ref) {
   const leaf = readDiscoveryFinalDispatchLeaf(store, applicationRef);
+  if(leaf.application.value.responseCorrection)
+    await readDiscoveryFinalResponseCorrection(store,leaf.session.value.projectId,leaf.application.value.responseCorrection.root);
   // A later cursor's historical reader already re-proves the same prepared
   // session while checking every prior paid step. Do that once; an origin
   // without prior steps still uses the session reader directly.
@@ -287,6 +298,7 @@ export function prepareDiscoveryFinalContextPacker(store: Store,
         finalContinuation: structuredClone(context.finalContinuation),
         resultCapacity: structuredClone(context.resultCapacity),
         contextWorkspace: structuredClone(context.contextWorkspace),
+        ...(context.failures ? {failures:structuredClone(context.failures)} : {}),
         working: { archive, deliveryContract: 'research-delivery/v1',
           instruction: 'Read each exact omitted address with read_context and continue through every page before returning a final result.' },
       };
@@ -386,7 +398,7 @@ async function physicalFinalOutcome(store: Store, project: string, application: 
 
 /** One projector is used both when applying an answer and when checking every
  * historical cursor revision. It never treats a paid result as acceptance. */
-async function projectFinalStep(store: Store, admission: ReturnType<typeof readDiscoveryFinalDispatchLeaf>,
+async function projectFinalStepUnchecked(store: Store, admission: ReturnType<typeof readDiscoveryFinalDispatchLeaf>,
   paid: Awaited<ReturnType<typeof physicalFinalOutcome>>['paid']) {
   const { session, application, draft, question } = admission;
   const materialEra = finalMaterialEra(admission.prepared.value.input);
@@ -427,6 +439,30 @@ async function projectFinalStep(store: Store, admission: ReturnType<typeof readD
   return { after, output };
 }
 
+export async function readDiscoveryFinalResponseCorrection(store:Store,project:string,root:Ref) {
+  return readApplicationResponseCorrection(store,project,root,{
+    read:ref=>readDiscoveryFinalDispatchLeaf(store,ref).application,
+    outcome:async application=>{
+      const head=store.get<ModelCall>(finalCallId(reference(application)));
+      if(!head || head.value.status==='running') return null;
+      return readDiscoveryFinalResearchExecution(store,project,reference(head),reference(application)).paid;
+    },
+    project:async(application,paid)=>{
+      valid(paid.kind==='response','Only a paid response has a closed role form');
+      return projectFinalStepUnchecked(store,readDiscoveryFinalDispatchLeaf(store,reference(application)),
+        paid as Awaited<ReturnType<typeof physicalFinalOutcome>>['paid']);
+    },
+    formCodes:['discovery_final_result_invalid','research_response_invalid','research_context_incomplete'],
+  });
+}
+
+async function projectFinalStep(store:Store,admission:ReturnType<typeof readDiscoveryFinalDispatchLeaf>,
+  paid:Awaited<ReturnType<typeof physicalFinalOutcome>>['paid']) {
+  if(admission.application.value.responseCorrection)
+    await readDiscoveryFinalResponseCorrection(store,admission.session.value.projectId,admission.application.value.responseCorrection.root);
+  return projectFinalStepUnchecked(store,admission,paid);
+}
+
 /** Prove the complete paid chain against its immutable origins, without
  * consulting today's heads, allowances, current budget or runtime. */
 export async function readDiscoveryFinalExecutionAt(store: Store, project: string, at: Ref) {
@@ -461,7 +497,7 @@ export async function readDiscoveryFinalExecutionAt(store: Store, project: strin
       && isRef(applied.value.call) && isRef(applied.value.received) && same(applied.value.after, reference(after))
       && same(applied.value, { ...application.value, state: 'applied', call: applied.value.call,
         received: applied.value.received, after: reference(after) }), 'The final cursor is not its exact application');
-    if (revision === 2) valid(same(reference(application), reference(firstApplication)),
+    if (revision === 2) valid(same(application.value.responseCorrection?.root ?? reference(application), reference(firstApplication)),
       'The final execution does not use its exact origin application');
     const { admission, paid } = await physicalFinalOutcome(store, project, reference(application), applied.value.received);
     valid(same(reference(admission.session), reference(previous)), 'A final application belongs to another cursor');
@@ -485,6 +521,7 @@ export interface RunDiscoveryFinalOptions {
   signal?: AbortSignal;
   restoreOnly?: boolean;
   allowance?: number;
+  responseCorrection?: Ref;
 }
 
 /** Start or restore exactly one paid D7 execution. New claim/session/application
@@ -534,8 +571,11 @@ export async function runDiscoveryFinalExecution(store: Store, project: string, 
       createSession = { id, kind: DISCOVERY_FINAL_EXECUTION_KIND, expected: 0, value };
       session = { ...pendingRef(createSession), kind: createSession.kind, value };
     }
-    const applicationId = session.value.application;
-    const existing = store.get<DiscoveryFinalApplication>(applicationId, 1);
+    const originalApplication=store.get<DiscoveryFinalApplication>(session.value.application,1);
+    const correction=options.responseCorrection ? await readDiscoveryFinalResponseCorrection(store,project,options.responseCorrection) : null;
+    const correctionWrite=correction?.retry && !restoreOnly ? responseCorrectionApplicationWrite(correction) : null;
+    const existing=correctionWrite ? null : originalApplication ? latestResponseApplication(store,originalApplication) : null;
+    const applicationId=correctionWrite?.id ?? existing?.id ?? session.value.application;
     if (existing) {
       const application = exact<DiscoveryFinalApplication>(store, reference(existing), DISCOVERY_FINAL_APPLICATION_KIND);
       // The historical reader immediately above already re-proved this exact
@@ -578,6 +618,7 @@ export async function runDiscoveryFinalExecution(store: Store, project: string, 
         const winner = store.get<DiscoveryFinalExecution>(id);
         if (!winner || winner.revision <= session.revision) throw error;
       }
+      if(options.responseCorrection) return readDiscoveryFinalExecutionAt(store,project,pendingRef(after));
       continue;
     }
     if (restoreOnly && saved) return readDiscoveryFinalExecutionAt(store, project, reference(session));
@@ -614,8 +655,9 @@ export async function runDiscoveryFinalExecution(store: Store, project: string, 
       dispatch: session.value.dispatch, profile: session.value.profile, guards,
       state: 'prepared', call: null, received: null, after: null };
     const application: Write = { id: applicationId, kind: DISCOVERY_FINAL_APPLICATION_KIND, expected: 0, value };
+    if(correctionWrite) application.value=correctionWrite.value;
     try {
-      await researchCall(session.value.role, session.value.dispatch, session.value.prompt, context, signal,
+      await researchCall(session.value.role, session.value.dispatch, session.value.prompt, (application.value as DiscoveryFinalApplication).context, signal,
         { store, draftId: draft.id, questionId: question.id, purpose: 'discovery-final',
           session: reference(session), application: pendingRef(application),
           finalPending: { ...(createSession ? { session: createSession } : {}), application },
@@ -624,7 +666,7 @@ export async function runDiscoveryFinalExecution(store: Store, project: string, 
     } catch (error) {
       if (!(error instanceof EngineError) || !['revision_conflict', 'input_stale'].includes(error.code)) throw error;
       const winner = store.get<DiscoveryFinalApplication>(applicationId, 1);
-      if (!winner || !same(winner.value, value)) throw error;
+      if (!winner || !same(winner.value, application.value)) throw error;
     }
   }
 }

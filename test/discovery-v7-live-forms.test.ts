@@ -1,3 +1,4 @@
+import { retryDiscoveryResponse } from '../src/discovery/discovery-response-retry.js';
 import { compactResponseSchema } from '../src/discovery/research-action-contract.js';
 import { deliveredContract } from './discovery-response-contract-fixture.js';
 import {configureReaderPilot} from '../src/discovery/reader-pilot.js';
@@ -404,7 +405,8 @@ test('LIVE-ASSESS-FORMS-01: blocking fact and unknown receive a real unknown ass
   const wires=f.wires().filter(w=>w.subject.assessmentSubject);assert.equal(wires.length,1,JSON.stringify(result.value));
   const form=wires[0].subject.assessmentClassification;
   for(const condition of ['class=blocking','transition.outcome=unknown','both consequence and nextAction',
-    'forbidden for every outcome other than unknown','significance.kind must be blocking','original must equal source'])
+    'forbidden for every outcome other than unknown','significance.kind must be blocking','original must equal source',
+    'retrievedAt must equal its exact Source.origin.fetchedAt','non-web source retrievedAt must be null'])
     assert.ok(form.instruction.includes(condition),condition);
   const records=f.store.list<any>('discovery-assessment');assert.equal(records.length,1,JSON.stringify(result.value));
   const paid=readDiscoveryAssessment(f.open(),'p',reference(records[0]!)),value=paid.value as any;
@@ -414,6 +416,7 @@ test('LIVE-ASSESS-FORMS-01: blocking fact and unknown receive a real unknown ass
   assert.equal(value.methodology.facts.length,1);assert.equal(value.methodology.facts[0].significance.kind,'blocking');
   const source=value.methodology.facts[0].sources[0];
   assert.deepEqual(source.source,reference(f.source));assert.deepEqual(source.original,source.source);assert.equal(source.role,'primary');
+  assert.equal(source.retrievedAt,null);
   const response={verdict:value.verdict,reasons:value.reasons,return:value.return,novelty:value.novelty,methodology:value.methodology};
   const validate=new Ajv({strict:true}).compile(form.schema);
   assert.equal(validate(response),true,JSON.stringify(validate.errors));
@@ -428,6 +431,7 @@ test('LIVE-ASSESS-FORMS-01: blocking fact and unknown receive a real unknown ass
   for(const field of ['consequence','nextAction']) mutate(copy=>{delete copy.novelty.transition[field];});
   mutate(copy=>{copy.novelty.transition.outcome='open';});
   mutate(copy=>{copy.methodology.facts[0].significance.kind='material';});
+  mutate(copy=>{copy.methodology.facts[0].sources[0].retrievedAt='2026-10-29T00:00:00Z';});
   mutate(copy=>{copy.methodology.facts[0].sources[0].original=null;});
   mutate(copy=>{delete copy.methodology.facts[0].sources[0].original;});
   const otherSource=f.discovery.evidence.document('p','other-original','A different original source','text/plain',0);
@@ -537,4 +541,26 @@ test('LIVE-FORMS-02: a substituted transport receipt cannot authorize a generati
     value:{...latest.value,refusal:{...latest.value.refusal!,response:reference(f.source)}}});
   await assert.rejects(Promise.resolve().then(()=>f.engine.execute(f.commandRetry)),{code:'research_plan_retry_invalid'});
   assert.equal(f.wires().length,2);
+});
+
+test('L30 escalation: one original-role correction leaves ordinary application and never buys a child',async t=>{
+  const f=await world(t,10,false,true);
+  f.reply({action:'need_owner',question:'industry',reason:'Choose the jurisdiction',searched:[reference(f.source)]});
+  await f.engine.execute(f.commandRetry);
+  f.reply({necessary:true});
+  const paused=await f.engine.execute({type:'research-draft',project:'p',draftId:f.draft.id,maxTurns:1}) as any;
+  assert.equal(paused.value.pauseCode,'escalation_assessment_invalid');
+  const root=f.store.list<ResearchConsumerIntent>('research-consumer-intent').find(row=>row.value.kind==='escalation-assessor')!;
+  assert.ok(root);const before=f.wires().length,old=f.store.history(root.id);
+  assert.equal((await retryDiscoveryResponse(f.open(),'p',reference(root),1,true)).kind,'pending');
+  assert.equal(f.wires().length,before);
+  f.reply({necessary:true,reason:'The jurisdiction is an owner decision absent from the saved source'});
+  const result=await retryDiscoveryResponse(f.open(),'p',reference(root),1);
+  assert.equal(result.kind,'pending');assert.equal(f.wires().length,before+1);
+  const saved=f.store.list();
+  assert.deepEqual(await retryDiscoveryResponse(f.open(),'p',reference(root),1),result);
+  assert.deepEqual(await retryDiscoveryResponse(f.open(),'p',reference(root),1,true),result);
+  assert.deepEqual(f.store.list(),saved);assert.deepEqual(f.store.history(root.id),old);
+  const ordinary=await new ProductEngine(f.open()).execute({type:'research-draft',project:'p',draftId:f.draft.id,maxTurns:1}) as any;
+  assert.equal(ordinary.value.status,'needs_owner');assert.equal(f.wires().length,before+1);
 });

@@ -17,6 +17,7 @@ import { contextWorkspace, contextProgress, addContextLookup, requireCompleteCon
 import { readResearchContextOutcomeAt, findResearchConsumerIntent, prepareResearchConsumerIntent,
   readResearchConsumerIntent, readResearchConsumerExecution, resumeResearchConsumerExecution,
   prepareResearchConsumerApplication, type ResearchConsumerIntent, type ResearchConsumerExecution } from './response-recovery.js';
+import { managedCorrectionBaseContext } from './response-recovery.js';
 
 export const INTERPRETATION_EXECUTION = 'interpretation-execution/v1';
 export type InterpretationPhase = 'generate' | 'choose' | 'frame';
@@ -123,7 +124,7 @@ export function requireInterpretationConsumer(store: Store, intent: ResearchCons
     && intent.cursor.sessionId === row.id && intent.cursor.offset === v.step
     && sameInterpretation(intent.draft, v.draft) && sameInterpretation(intent.question, v.question)
     && sameInterpretation(intent.role, role) && sameInterpretation(intent.dispatch, environment.value)
-    && sameInterpretation(intent.cursor.context, interpretationContext(store, row))
+    && sameInterpretation(managedCorrectionBaseContext(store, intent), interpretationContext(store, row))
     && intent.cursor.prompt === promptFor(v, p.value),
     'interpretation_execution_invalid', 'The dispatch must retain its entire exact subject, role and original instruction');
   if (!current) return [];

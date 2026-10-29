@@ -1,3 +1,4 @@
+import { retryDiscoveryResponse } from '../src/discovery/discovery-response-retry.js';
 import { deliveredContract } from './discovery-response-contract-fixture.js';
 import { fixturePlanAxes, fixturePlanCoverage } from "./discovery-v7-fixture.js";
 import test from "node:test";
@@ -33,7 +34,7 @@ import { addressedWorkspace, workingSelections } from "../src/discovery/research
 import { PLANNING_INSTRUCTION } from "../src/discovery/reading-plan.js";
 import { digest, hashJson } from "../src/canonical.js";
 import { uniqueRefs } from "../src/pipeline/contracts.js";
-import { uniqueTransactionGuards } from "../src/runtime/environment.js";
+import { Environments, uniqueTransactionGuards } from "../src/runtime/environment.js";
 import type { ModelCall } from "../src/runtime/model-usage.js";
 import { EngineError } from "../src/errors.js";
 import type { Json } from "../src/canonical.js";
@@ -1301,4 +1302,45 @@ test("S5 круг 5 МАСКАРАД и версии (оркестратор №
   assert.equal(sessionOf(f.store, "q-market").value.blockedCode, "context_reference_foreign");
   // A's own paid step archive is A's lawful material.
   assert.deepEqual(await paidRun(f, A, [{ kind: "context", value: ownLookup }]), { ...endOf(ENDS.impossible), question: "q-supply" });
+});
+
+test('L30 synthesis: malformed native step -> one paid correction -> free ordinary application without a following call',async t=>{
+  const f=await paidPlanned(t,'s5-l30'),subject=subjectOf(f.p.planAnswer,'q-supply');
+  f.configure([{action:'answer_delta',question:'$q',upserts:[],citations:[]}]);
+  assert.equal(await code(()=>paidRun(f,subject,[])),'research_response_invalid');
+  const original=f.store.list<any>('research-consumer-intent').find(row=>row.value.kind==='synthesis' && row.value.state==='refused')!;
+  assert.ok(original);const root=reference(original),before=f.calls(),old=f.store.history(original.id);
+  assert.equal((await retryDiscoveryResponse(f.open(),f.p.project,root,1,true)).kind,'pending');assert.equal(f.calls(),before);
+  const reply=endOf(ENDS.refused);f.configure([...Array(f.calls()).fill(null),reply]);
+  const result=await retryDiscoveryResponse(f.open(),f.p.project,root,1);
+  assert.equal(result.kind,'pending');assert.equal(f.calls(),before+1);
+  assert.deepEqual(await retryDiscoveryResponse(f.open(),f.p.project,root,1),result);
+  assert.deepEqual(await retryDiscoveryResponse(f.open(),f.p.project,root,1,true),result);
+  assert.deepEqual(f.store.history(original.id),old);
+  const actual=await runIn(f,f.open(),subject,[]);
+  assert.equal(actual.action,'answer');assert.equal(f.calls(),before+1);
+  assert.equal((await retryDiscoveryResponse(f.open(),f.p.project,root,1,true)).kind,'applied');
+  assert.equal(f.calls(),before+1);
+});
+
+for(const planning of [false,true])test(`L30 ${planning?'reading-planner':'analyst'}: native form refusal resumes only its paid original role`,async t=>{
+  const kind=planning?'reading-planner':'analyst',f=await paidPlanned(t,`l30-${kind}`,undefined,{planning});
+  f.configure([{}]);
+  const enter=(restoreOnly=false)=> {
+    const store=f.open();
+    return new Researcher(store,new Discovery(store),new Environments(store))
+      .run(f.p.project,f.p.draft.id,1,undefined,{producerPolicy:{discovery:7},restoreOnly});
+  };
+  const paused=await enter();assert.equal(paused.value.pauseCode,'research_response_invalid');
+  const original=f.store.list<any>('research-consumer-intent').find(row=>row.value.kind===kind && row.value.state==='refused')!;
+  assert.ok(original);const root=reference(original),before=f.calls();
+  assert.equal((await retryDiscoveryResponse(f.open(),f.p.project,root,1,true)).kind,'pending');
+  assert.equal(f.calls(),before);
+  f.configure([...Array(before).fill(null),{action:'pause',reason:'The exact requested bound is unavailable'}]);
+  const corrected=await retryDiscoveryResponse(f.open(),f.p.project,root,1);
+  assert.equal(corrected.kind,'pending');assert.equal(f.calls(),before+1);
+  assert.deepEqual(await retryDiscoveryResponse(f.open(),f.p.project,root,1),corrected);
+  await enter(true);
+  assert.equal(f.calls(),before+1);
+  assert.equal((await retryDiscoveryResponse(f.open(),f.p.project,root,1,true)).kind,'applied');
 });

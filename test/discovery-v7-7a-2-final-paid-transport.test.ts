@@ -1,3 +1,4 @@
+import { answerBeforeContext } from './discovery-response-correction-fixture.js';
 import { fixtureApplicableAxes } from './discovery-v7-fixture.js';
 import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
@@ -589,6 +590,7 @@ async function preparePaidFinal(f: Paid, packet: DiscoveryFinalPacket) {
 
 import { discoveryFinalExecutionId, readDiscoveryFinalDispatchAdmission, readDiscoveryFinalExecutionAt,
   runDiscoveryFinalExecution, type DiscoveryFinalApplication, type DiscoveryFinalExecution } from '../src/discovery/discovery-final-execution.js';
+import {retryDiscoveryResponse} from '../src/discovery/discovery-response-retry.js';
 import { continuationMetadata, continuationState } from '../src/discovery/continuation-packet.js';
 import type { ModelCall } from '../src/runtime/model-usage.js';
 import { addContextLookup, contextLookupKey, contextWorkspace, packContextWorkspace,
@@ -1686,3 +1688,53 @@ test('final paid: exact physical bounds and stopped control refuse a new purchas
   });
 });
 
+
+test('L30 final: one correction of the exact paid malformed final restores through the native producer',async()=>{
+  await ownerWorld();await ensureOwnerSeed();restoreOwnerSeed();
+  const input={...finalInput(owner),prompt:finalInput(owner).prompt+' Addressed form correction.'};
+  const cell=await prepareDiscoveryFinalSession(owner.store,'p',ownerPacket.subject,input);
+  finalAdapter(owner,ownerPacket,'go');
+  const settings=JSON.parse(readFileSync(owner.settings,'utf8'));settings.terminal={};
+  writeFileSync(owner.settings,JSON.stringify(settings));
+  await assert.rejects(()=>runDiscoveryFinalExecution(owner.store,'p',reference(cell),{profile:ownerPilot}),
+    error=>error instanceof EngineError && error.code==='discovery_final_result_invalid');
+  const session=owner.store.get<DiscoveryFinalExecution>(discoveryFinalExecutionId(reference(cell)))!;
+  const application=owner.store.get<DiscoveryFinalApplication>(session.value.application,1)!,root=reference(application);
+  const wires=owner.wires().length,oldApplication=owner.store.history(application.id);
+  assert.equal((await retryDiscoveryResponse(owner.open(),'p',root,1,true)).kind,'pending');
+  assert.equal(owner.wires().length,wires);
+  const current=JSON.parse(readFileSync(owner.settings,'utf8'));current.terminal=candidate(ownerPacket,'go');
+  writeFileSync(owner.settings,JSON.stringify(current));
+  const corrected=await retryDiscoveryResponse(owner.open(),'p',root,1);
+  assert.equal(corrected.kind,'applied');assert.equal(owner.wires().length,wires+1);
+  assert.ok(JSON.stringify(owner.wires().at(-1)).includes('discovery-response-correction/v1'));
+  const paid=money(owner.store);
+  assert.deepEqual(await retryDiscoveryResponse(owner.open(),'p',root,1,true),corrected);
+  assert.deepEqual(await retryDiscoveryResponse(owner.open(),'p',root,1),corrected);
+  assert.ok((await runDiscoveryFinalExecution(owner.open(),'p',reference(cell),{restoreOnly:true})).result);
+  assert.deepEqual(owner.store.history(application.id),oldApplication);
+  assert.equal(owner.wires().length,wires+1);assert.deepEqual(money(owner.store),paid);
+});
+
+test('L30 final: an early terminal answer can read one remaining page, cold repeat buys no further page',async()=>{
+  await ownerWorld();await ensureOwnerSeed();restoreOwnerSeed();
+  const cell=await prepareDiscoveryFinalSession(owner.store,'p',ownerPacket.subject,
+    {...finalInput(owner),packetChars:64_000,limitChars:400_000,prompt:finalInput(owner).prompt+' Read the omitted page after an exact refusal.'});
+  assert.equal(cell.value.input.materialContract,'discovery-final-material/v1');
+  finalAdapter(owner,ownerPacket,'go');const restore=answerBeforeContext(owner.root);
+  await assert.rejects(()=>runDiscoveryFinalExecution(owner.store,'p',reference(cell),{profile:ownerPilot}),
+    error=>error instanceof EngineError && error.code==='research_context_incomplete');
+  assert.ok((owner.wires().at(-1) as any).subject.working.materialAddresses.some((a:any)=>a.field==='finalMaterial'));
+  restore();
+  const session=owner.store.get<DiscoveryFinalExecution>(discoveryFinalExecutionId(reference(cell)))!;
+  const application=owner.store.get<DiscoveryFinalApplication>(session.value.application,1)!,root=reference(application);
+  const before=owner.wires().length,old=owner.store.history(application.id);
+  assert.equal((await retryDiscoveryResponse(owner.open(),'p',root,1,true)).kind,'pending');
+  const result=await retryDiscoveryResponse(owner.open(),'p',root,1);
+  assert.equal(result.kind,'pending');assert.equal(owner.wires().length,before+1);
+  await unchanged(owner,owner.store,async()=>{
+    assert.deepEqual(await retryDiscoveryResponse(owner.open(),'p',root,1),result);
+    assert.deepEqual(await retryDiscoveryResponse(owner.open(),'p',root,1,true),result);
+  });
+  assert.deepEqual(owner.store.history(application.id),old);
+});

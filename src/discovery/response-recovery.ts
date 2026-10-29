@@ -1,11 +1,12 @@
 import { requireFinalMaterialDelivery, finalMaterialEra } from './final-material.js';
+import { readResponseCorrectionChain } from './response-correction.js';
 import { variantResearchReturn, readVariantResearchReturnAt, researchReturnMaterial } from './discovery-research-return.js';
 import { isInterpretationConsumer, requireInterpretationConsumer, interpretationApplication } from './interpretation-execution.js';
 import { historicalProof, withHistoricalReads } from '../history/proofs.js';
 import { genuineStore, provenStore } from '../storage/store-view.js';
 import { readDeepPreparation as proveDeepPreparation, requireCurrentDeepPreparation, type ProvenDeepPreparation } from './deep-research.js';
 import { deepPreparationRef, deepResearchCycle, projectPaidDeepResearch } from './research-consumer-transition.js';
-import { decodeVariantExecutionSession, decodeVariantSubject, readVariantNoneStructural, readVariantSetStructural,
+import { decodeVariantGeneration, decodeVariantDecisionAnswer, decodeVariantExecutionSession, decodeVariantSubject, readVariantNoneStructural, readVariantSetStructural,
   type VariantExecutionSession, type VariantPublication, type VariantPublicationRecord, type VariantSubject } from './discovery-variants.js';
 import { variantPublicationWrites, variantDecisionPublicationWrites, readVariantDecisionStructural, readVariantStateStructural,
   variantStateId, type VariantModelDecision } from './variant-decision.js';
@@ -383,6 +384,8 @@ export function readResearchConsumerIntent(store: Store, ref: Ref): Revision<Res
     readPreparationRecord(store, saved.value.preparation!, preparationBinding(saved.value, saved.id));
   if(isInterpretationConsumer(saved.value)) requireInterpretationConsumer(store, saved.value);
   if(isVariantConsumer(saved.value)) requireVariantConsumerBinding(store,saved.value,saved.id);
+  if(saved.value.cursor.responseCorrection!==undefined && !isInterpretationConsumer(saved.value))
+    managedCorrectionBaseContext(store,saved.value);
   return saved;
 }
 /** DRS1a2: the step a v2 preparation must be bound to — from the intent's own
@@ -1708,7 +1711,7 @@ export function prepareResearchConsumerIntent(store: Store, input: ResearchConsu
   permits: readonly Ref[] = [],
   /** DRS1a2: a trusted parameter of the calling code (never a context field)
    * selecting the compact v2 storage for an analyst call. */
-  options: { contextContract?: typeof CONTEXT_PREPARATION_CONTRACT } = {}): Revision<ResearchConsumerIntent> {
+  options: { contextContract?: typeof CONTEXT_PREPARATION_CONTRACT; responseCorrection?: Ref } = {}): Revision<ResearchConsumerIntent> {
   if (!object(input)) consumerInvalid('research-consumer-intent', 'A complete consumer admission is required');
   if (isVariantConsumer(input) && (!isRef(input.draft) || !isRef(input.question) || !isRef(input.owner)
     || typeof input.projectId !== 'string' || !input.projectId || typeof input.key !== 'string' || !input.key
@@ -1719,15 +1722,45 @@ export function prepareResearchConsumerIntent(store: Store, input: ResearchConsu
     consumerInvalid('research-consumer-intent', 'Retry permits must be exact saved terminal references');
   const scoped = earlyResearchStage(store.get<DiscoveryDraft>(input.draft.id, input.draft.revision)?.value.stage);
   const previous = findResearchConsumerIntent(store, input.projectId, input.kind, input.key, scoped ? input.draft.id : undefined);
+  const correction = options.responseCorrection
+    ? readManagedResponseCorrection(store, input.projectId, options.responseCorrection) : null;
+  const correctingResponse = !!correction && !!previous && correction.retry !== null
+    && canonical(correction.retry) === canonical(reference(previous));
+  if (correction) {
+    const original = correction.intent.value;
+    const { failures: _feedback, ...suppliedContext } = input.cursor.context;
+    const { failures: _originalFailures, ...originalContext } = consumerIntentContext(store, original, correction.intent.id);
+    const owner=store.get<Record<string,any>>(input.owner.id);
+    const sameOwner=canonical(input.owner)===canonical(original.owner);
+    const pausedRunner=owner?.kind==='research-run' && input.owner.id===original.owner.id
+      && canonical(reference(owner))===canonical(input.owner) && owner.value.projectId===input.projectId
+      && owner.value.draftId===input.draft.id && ['paused','running'].includes(owner.value.status)
+      && owner.value.turns===input.cursor.turn-(input.kind==='escalation-assessor'?0:1);
+    requireCondition(correctingResponse && (sameOwner || pausedRunner)
+      && input.kind === original.kind && input.key === original.rootKey
+      && canonical([input.draft,input.question,input.role,input.dispatch,input.profile,input.basis])
+        === canonical([original.draft,original.question,original.role,original.dispatch,original.profile,original.basis])
+      && canonical(suppliedContext) === canonical(originalContext)
+      && canonical(input.cursor.prompt ?? input.cursor.instruction) === canonical(original.cursor.prompt ?? original.cursor.instruction)
+      && canonical(input.cursor.responseCorrection) === canonical(options.responseCorrection)
+      && canonical(input.cursor.context.failures) === canonical([
+        ...(consumerIntentContext(store, original, correction.intent.id).failures ?? []), correction.failure]),
+    'research_response_retry_invalid', 'The correction must retain the original role, subject, request and exact refusal');
+  }
   const retryingRefusal = !!previous
     && permits.some(permit => canonical(permit) === canonical(reference(previous)))
-    && (retryableResearchConsumerRefusal(store, previous) || planResponseSyntaxFailure(store, previous) !== null);
+    && (retryableResearchConsumerRefusal(store, previous) || planResponseSyntaxFailure(store, previous) !== null)
+    || correctingResponse;
   const replacingDeep = !!previous && deepPreparationRef(input.cursor) !== null
     && staleUnpaidDeepAdmission(store, previous);
   const replacing = retryingRefusal || replacingDeep;
   let currentRefusedCall: Ref | null = null;
   if (retryingRefusal) {
-    const terminalRef = previous.value.refusal!.call;
+    // A role decoder can reject a paid response while its consumer remains
+    // running. Its claim is the initial reservation; guard the independently
+    // proven terminal receipt rather than comparing that reservation to it.
+    const terminalRef = previous.value.refusal?.call
+      ?? reference(readResearchConsumerExecutionFromIntent(store, input.projectId, previous).call);
     const terminal = store.get<ModelCall>(terminalRef.id, terminalRef.revision);
     const head = store.get<ModelCall>(terminalRef.id);
     const withoutRuntime = (value: ModelCall) => Object.fromEntries(
@@ -1891,6 +1924,7 @@ export function prepareResearchConsumerReservation(store: Store, intentRef: Ref,
     || deepRef && canonical((call.value as Record<string, unknown>).deepPreparation ?? null) !== canonical(deepRef))
     consumerInvalid(intent.id, 'The new call and admitted cursor must retain the same explicit deep identity');
   const runner = ['analyst', 'reading-planner', 'escalation-assessor'].includes(intent.value.kind);
+  const correctingRunner=runner && intent.value.cursor.responseCorrection!==undefined;
   const expectedOwnerTurns = intent.value.kind === 'escalation-assessor'
     ? intent.value.cursor.turn : intent.value.cursor.turn - 1;
   const owner = store.get<ResearchRun>(intent.value.owner.id);
@@ -1900,14 +1934,14 @@ export function prepareResearchConsumerReservation(store: Store, intentRef: Ref,
     || owner.value.projectId !== intent.value.projectId || owner.value.draftId !== intent.value.draft.id
     || owner.value.turns !== expectedOwnerTurns
     || deepRef && canonical(reference(owner)) !== canonical(intent.value.owner)
-    || owner.value.status !== 'running' && !(deepRef && owner.value.status === 'paused')))
+    || owner.value.status !== 'running' && !((deepRef || correctingRunner) && owner.value.status === 'paused')))
     consumerInvalid(intent.id, 'The resumed run no longer owns the exact admitted turn');
   const write: Write = { id: intent.id, kind: 'research-consumer-intent', expected: intent.revision,
     value: { ...intent.value, state: 'running', call: pendingRef(call), request, archive } satisfies ResearchConsumerIntent };
   // A linked deep position can resume a paused runner only in this same
   // reservation transaction. Failed current/preparation/frontier guards leave
   // the saved run paused and create neither a physical claim nor a payment.
-  const activation: Write[] = deepRef && owner.value.status === 'paused'
+  const activation: Write[] = (deepRef || correctingRunner) && owner.value.status === 'paused'
     ? [{ id: owner.id, kind: owner.kind, expected: owner.revision,
       value: { ...owner.value, status: 'running', error: null, pauseCode: null } satisfies ResearchRun }] : [];
   return { writes: [...activation, write], guards: uniqueTransactionGuards([...deepConsumerAdmission(store, intent.value), reference(intent), reference(owner),
@@ -2298,39 +2332,116 @@ function planCorrectionTransportFailure(store: Store, intent: Revision<ResearchC
     'research_plan_retry_invalid', 'The transport refusal does not name its proven failed execution');
   return true;
 }
+/** Closed variant replies are proved against their original paid payload. A
+ * model's valid no_variants/reject_all result is never a form failure. */
+export function managedResponseFormFailure(store: Store, intent: Revision<ResearchConsumerIntent>): EngineError | null {
+  if (!['running','refused'].includes(intent.value.state)) return null;
+  const paid = readResearchConsumerExecutionFromIntent(store, intent.value.projectId, intent);
+  if (paid.kind !== 'response') return null;
+  try {
+    if (intent.value.kind === 'variant-proposal') decodeVariantGeneration(paid.payload);
+    else if (intent.value.kind === 'variant-decision') decodeVariantDecisionAnswer(paid.payload);
+    else if(isInterpretationConsumer(intent.value)) interpretationApplication(store, intent, paid);
+    else if(['synthesis','consolidation'].includes(intent.value.kind))
+      projectSynthesisTransition(synthesisTransitionProofInput(store,intent,paid));
+    else if(intent.value.kind==='escalation-assessor') requireEscalationReply(paid.payload);
+    else if(intent.value.kind==='reader') {
+      const sources=consumerIntentContext(store,intent.value,intent.id).sources;
+      requireCondition(Array.isArray(sources),'research_response_retry_invalid','The reader lost its original sources');
+      projectReaderSelection(sources.map((source:any)=>({ref:source.ref,
+        lines:source.lines.map((line:[number,string])=>({line:line[0]}))})),paid.payload);
+    } else intentResponseAction(store,intent,paid.payload);
+  } catch (error) {
+    // The interpretation projector has already proved this exact execution.
+    // Its frame phase validates value with the shared v7 field validator;
+    // answer_invalid here is a paid form failure, not an assessor decision.
+    if (error instanceof EngineError && error.code === 'answer_invalid'
+      && isInterpretationConsumer(intent.value)
+      && store.get<{phase:unknown}>(intent.value.owner.id,intent.value.owner.revision)?.value.phase === 'frame') return error;
+    if (error instanceof EngineError && ['discovery_variant_answer_invalid', 'frame_interpretations_invalid',
+      'frame_choice_invalid', 'interpretation_choice_invalid', 'interpretation_frame_invalid',
+      'research_response_invalid','research_checkpoint_empty','escalation_assessment_invalid',
+      'reader_response_invalid','reader_response_empty','reader_selection_foreign',
+      'consolidation_response_invalid'].includes(error.code)) return error;
+    throw error;
+  }
+  return null;
+}
+/** A correction adds only its proven feedback to the frozen original context.
+ * The original role's subject proof continues to compare every original field. */
+export function managedCorrectionBaseContext(store: Store, value: ResearchConsumerIntent) {
+  const context = consumerIntentContext(store, value);
+  if (value.cursor.responseCorrection === undefined) return context;
+  requireCondition(isRef(value.cursor.responseCorrection), 'research_response_retry_invalid',
+    'The correction lost its exact original refusal');
+  // A leaf proves the immutable root, never selects today's generation. That
+  // lookup itself reads every interpretation leaf and would recurse through
+  // the correcting intent currently being proved.
+  const root=readResearchConsumerIntent(store,value.cursor.responseCorrection);
+  const original=root.value, originalContext=consumerIntentContext(store,original,root.id);
+  requireCondition(original.projectId===value.projectId && original.cursor.responseCorrection===undefined,
+    'research_response_retry_invalid','A correction needs its original non-correcting refusal');
+  const error=managedResponseFormFailure(store,root);
+  requireCondition(error,'research_response_retry_invalid','The original paid response must prove its form failure');
+  const failure=managedCorrectionFailure(store,root,error);
+  requireCondition(value.generation > original.generation && sameLogicalConsumerStep(original,value)
+    && canonical(context) === canonical({ ...originalContext,
+      failures: [...(originalContext.failures ?? []),failure] }),
+  'research_response_retry_invalid', 'The correcting role changed its original request or refusal feedback');
+  requireCondition(isRef(value.previous),'research_response_retry_invalid','The correction lost its predecessor');
+  const previous=store.get<ResearchConsumerIntent>(value.previous.id,value.previous.revision);
+  requireCondition(previous?.kind==='research-consumer-intent' && canonical(reference(previous))===canonical(value.previous)
+    && previous.value.generation+1===value.generation && sameLogicalConsumerStep(previous.value,value),
+  'research_response_retry_invalid','The correcting role lost its exact preceding generation');
+  if(previous.id!==root.id) {
+    requireCondition(canonical(previous.value.cursor.responseCorrection)===canonical(value.cursor.responseCorrection)
+      && planCorrectionTransportFailure(store,readResearchConsumerIntent(store,value.previous)),
+    'research_response_retry_invalid','Only a proved response-free failure may extend the correction');
+  } else requireCondition(canonical(value.previous)===canonical(reference(root)),
+    'research_response_retry_invalid','The correction changed the exact original refusal');
+  return originalContext;
+}
+function managedCorrectionFailure(store:Store,intent:Revision<ResearchConsumerIntent>,error:EngineError) {
+  const paid=readResearchConsumerExecutionFromIntent(store,intent.value.projectId,intent);
+  requireCondition(paid.kind==='response','research_response_retry_invalid','A correction needs its exact paid invalid response');
+  return {contract:'discovery-response-correction/v1',root:reference(intent),role:intent.value.kind,
+    call:reference(paid.call),request:paid.request,response:paid.response,code:error.code,message:error.message,
+    validation:error.details??null,previousResponse:paid.payload,
+    instruction:'Correct only the invalid response form for this exact original request and role. The original response and expense remain saved. Return the complete closed response form.'};
+}
+export function readManagedResponseCorrection(store: Store, project: string, intentRef: Ref) {
+  const intent = readResearchConsumerIntent(store, intentRef);
+  requireCondition(intent.value.projectId === project, 'research_response_retry_invalid', 'The refusal belongs to another project');
+  const result = readResponseCorrectionChain(intentRef, {
+    read: ref => readResearchConsumerIntent(store, ref),
+    latest: root => {
+      const found = findResearchConsumerIntent(store, project, root.value.kind, root.value.rootKey, root.value.draft.id);
+      requireCondition(found, 'research_response_retry_stale', 'The correction lost its original operation');
+      return found;
+    },
+    previous: value => value.previous,
+    follows: (before, after) => before.generation + 1 === after.generation && sameLogicalConsumerStep(before, after),
+    formFailure: record => managedResponseFormFailure(store, record),
+    responseFreeFailure: record => planCorrectionTransportFailure(store, record),
+  });
+  return { intent, ...result, failure: managedCorrectionFailure(store,intent,result.failure) };
+}
 export function readPlanResponseCorrection(store: Store, project: string, intentRef: Ref) {
   const intent = readResearchConsumerIntent(store, intentRef);
   requireCondition(intent.value.projectId === project, 'research_plan_retry_invalid', 'The refused intent belongs to another project');
-  const error = planResponseSyntaxFailure(store, intent);
-  requireCondition(error, 'research_plan_retry_invalid', 'Correction requires a proven paid plan analyst syntax refusal');
-  // A syntax refusal produced by this correction is its final outcome, not a
-  // fresh root that the same command can use to obtain another content attempt.
-  for (let ancestor = intent; ancestor.value.previous;) {
-    const previous = readResearchConsumerIntent(store, ancestor.value.previous);
-    requireCondition(previous.value.generation + 1 === ancestor.value.generation
-      && sameLogicalConsumerStep(previous.value, ancestor.value),
-      'research_plan_retry_stale', 'The correction root lost its logical generation chain');
-    requireCondition(!planResponseSyntaxFailure(store, previous), 'research_plan_retry_invalid',
-      'A correcting syntax refusal cannot open a second content correction');
-    ancestor = previous;
-  }
-  const latest = findResearchConsumerIntent(store, project, 'analyst', intent.value.rootKey, intent.value.draft.id)!;
-  const chain = [latest];
-  for (let child = latest; child.id !== intent.id;) {
-    requireCondition(child.value.generation > intent.value.generation && isRef(child.value.previous),
-      'research_plan_retry_stale', 'This refusal already has a different correction chain');
-    const previous = readResearchConsumerIntent(store, child.value.previous);
-    requireCondition(previous.value.generation + 1 === child.value.generation
-      && sameLogicalConsumerStep(previous.value, child.value)
-      && (previous.id === intent.id ? canonical(reference(previous)) === canonical(intentRef)
-        : planCorrectionTransportFailure(store, previous)),
-      'research_plan_retry_stale', 'Only a proven response-free transport failure can extend this correction');
-    chain.unshift(previous);
-    child = previous;
-  }
-  // Snapshot one eligible terminal at this external entry. A failure produced
-  // during this invocation is never a permit for another call inside it.
-  const retry = latest.id === intent.id || planCorrectionTransportFailure(store, latest) ? reference(latest) : null;
+  const { latest, chain, retry, failure: error } = readResponseCorrectionChain(intentRef, {
+    read: ref => readResearchConsumerIntent(store, ref),
+    latest: root => {
+      const found = findResearchConsumerIntent(store, project, 'analyst', root.value.rootKey, root.value.draft.id);
+      requireCondition(found, 'research_plan_retry_stale', 'The correction lost its logical operation');
+      return found;
+    },
+    previous: value => value.previous,
+    follows: (previous, next) => previous.generation + 1 === next.generation
+      && sameLogicalConsumerStep(previous, next),
+    formFailure: record => planResponseSyntaxFailure(store, record),
+    responseFreeFailure: record => planCorrectionTransportFailure(store, record),
+  }, { invalid: 'research_plan_retry_invalid', stale: 'research_plan_retry_stale' });
   const refusal = intent.value.refusal!;
   return { intent, latest, chain, retry, failure: { contract: 'plan-response-correction/v1', attempt: intentRef, code: error.code,
     details: { call: refusal.call, response: refusal.response, question: cursorSubject(intent.value, intent.id)!.planQuestionId,

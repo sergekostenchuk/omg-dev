@@ -16,6 +16,13 @@ interface RecordReferenceSemantics {
   refs?: readonly PathPattern[];
 }
 
+const responseCorrectionRefs: PathPattern[] = [
+  ['responseCorrection', 'root'], ['responseCorrection', 'previous'],
+  ...['root', 'call', 'request', 'response'].flatMap(field => [
+    ['responseCorrection', 'failure', field], ['context', 'failures', INDEX, field],
+  ] as PathPattern[]),
+];
+
 const contextLookupData = (prefix: readonly PathPatternSegment[]): PathPattern[] => [
   [...prefix, "focus", "value"],
   [...prefix, "workspace", "entries", INDEX, "result", "value"],
@@ -354,6 +361,7 @@ const RECORD_REFERENCE_SEMANTICS: readonly RecordReferenceSemantics[] = [
     ["binding", "environment"], ["binding", "inputs", INDEX], ["profile"], ["previous"], ["result"],
     ["workspace", "entries", INDEX, "result", "record"], ["workspace", "deliveryCoverage", INDEX, "record"]] },
   { kind: "discovery-final-application", contract: "discovery-final-application/v1", data: [], refs: [
+    ...responseCorrectionRefs,
     ["session"], ["profile"], ["guards", INDEX], ["call"], ["received"], ["after"],
     ["context", "finalContinuation", "prepared"], ["context", "finalContinuation", "execution"],
     ...finalSubjectRefs(["context", "finalContinuation", "subject"]),
@@ -370,6 +378,7 @@ const RECORD_REFERENCE_SEMANTICS: readonly RecordReferenceSemantics[] = [
     ["binding", "environment"], ["binding", "inputs", INDEX], ["profile"], ["previous"], ["result"],
     ["workspace", "entries", INDEX, "result", "record"], ["workspace", "deliveryCoverage", INDEX, "record"]] },
   { kind: "discovery-final-assessment-application", contract: "discovery-final-assessment-application/v1", data: [], refs: [
+    ...responseCorrectionRefs,
     ["session"], ["profile"], ["guards", INDEX], ["call"], ["received"], ["after"],
     ["context", "finalContinuation", "source"], ["context", "finalContinuation", "prepared"],
     ["context", "finalContinuation", "execution"], ...finalAssessmentSubjectRefs(["context", "finalContinuation", "subject"]),
@@ -383,6 +392,7 @@ const RECORD_REFERENCE_SEMANTICS: readonly RecordReferenceSemantics[] = [
     ["binding", "environment"], ["binding", "inputs", INDEX], ["profile"], ["previous"], ["result"],
     ["workspace", "entries", INDEX, "result", "record"], ["workspace", "deliveryCoverage", INDEX, "record"]] },
   { kind: "discovery-condition-evidence-application", contract: "discovery-condition-evidence-application/v1", data: [], refs: [
+    ...responseCorrectionRefs,
     ["session"], ["profile"], ["guards", INDEX], ["call"], ["received"], ["after"],
     ["context", "finalContinuation", "source"], ["context", "finalContinuation", "prepared"],
     ["context", "finalContinuation", "execution"], ...conditionEvidenceSubjectRefs(["context", "finalContinuation", "subject"]),
@@ -576,6 +586,30 @@ export function referenceSites(kind: string, value: unknown): ReferenceSite[] {
   const data = RECORD_REFERENCE_SEMANTICS
     .filter(rule => rule.kind === kind && rule.contract === contract)
     .flatMap(rule => rule.data);
+  // Only the saved correction era introduces raw refused model JSON here.
+  // Its proof addresses remain references; Ref-shaped response content is data.
+  // Records without that marker keep their historical enumeration unchanged.
+  if (object(value)) {
+    const cursor = object(value.cursor) ? value.cursor : null;
+    const managed = kind === 'research-consumer-intent'
+      && ['research-consumer-intent/v1', 'research-consumer-intent/v2'].includes(contract ?? '')
+      && cursor && object(cursor.responseCorrection) && isReference(cursor.responseCorrection);
+    const marker = object(value.responseCorrection) ? value.responseCorrection : null;
+    const application = ['assessment-application', 'discovery-final-application',
+      'discovery-final-assessment-application', 'discovery-condition-evidence-application'].includes(kind)
+      && contract === (kind === 'assessment-application' ? 'dossier-application/v1' : `${kind}/v1`)
+      && marker?.contract === 'application-response-correction/v1'
+      && Number.isSafeInteger(marker.generation) && (marker.generation as number) > 0
+      && object(marker.root) && isReference(marker.root)
+      && object(marker.previous) && isReference(marker.previous);
+    if (managed || application) {
+      const context = managed ? ['cursor', 'context'] : ['context'];
+      data.push(...['previousResponse', 'validation'].map(field =>
+        [...context, 'failures', INDEX, field] as PathPattern));
+      if (application) data.push(['responseCorrection', 'failure', 'previousResponse'],
+        ['responseCorrection', 'failure', 'validation']);
+    }
+  }
   const declared = RECORD_REFERENCE_SEMANTICS.find(rule => rule.kind === kind && rule.contract === contract)?.refs;
   const sites: ReferenceSite[] = [];
   const visit = (current: unknown, path: PathSegment[]): void => {

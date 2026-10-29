@@ -9,6 +9,7 @@ import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
 import { Store, type Write, type Revision } from '../src/storage/store.js';
 import { ProductEngine } from '../src/product/engine.js';
 import { preparedFeatures } from './product-fixture.js';
+import { retryDiscoveryResponse } from '../src/discovery/discovery-response-retry.js';
 import { configureReaderPilot } from '../src/discovery/reader-pilot.js';
 import { readBundle, readReaderResultAt, resumeReadBundleIntent, type ReaderResult } from '../src/discovery/reader.js';
 import { readResearchConsumerIntent, readResearchConsumerExecution, readResearchConsumerTurn,
@@ -386,7 +387,7 @@ usage:{inputTokens:4,outputTokens:1,cachedInputTokens:0,reasoningOutputTokens:0}
   assert.equal(store.list('model-call').length, 1, 'a revision number alone cannot buy a second call');
 });
 
-test('an invalid paid reader selection is a durable refusal, never a new purchase', async t => {
+test('L30 reader: ordinary replay keeps its refusal; one addressed correction resumes native reading for free', async t => {
   const root = mkdtempSync(join(tmpdir(), 'omg-d84a-invalid-'));
   const database = join(root, 'db.sqlite'), stores: Store[] = [];
   const open = () => { const db = new Store(database); stores.push(db); return db; };
@@ -426,6 +427,18 @@ usage:{inputTokens:4,outputTokens:1,cachedInputTokens:0,reasoningOutputTokens:0}
   assert.equal(readFileSync(wire, 'utf8').trim().split('\n').length, 1);
   assert.equal(reopened.list('model-call').length, 1);
   assert.deepEqual(reopened.get(refused.id), refused);
+  const selected=reference(refused);
+  assert.equal((await retryDiscoveryResponse(reopened,'p',selected,1,true)).kind,'pending');
+  writeFileSync(adapter,readFileSync(adapter,'utf8').replace('research:{selections:[],unresolved:[]}',
+    'research:{selections:[{sourceIndex:0,firstLine:1,lastLine:1}],unresolved:[]}'));
+  assert.equal((await retryDiscoveryResponse(reopened,'p',selected,1)).kind,'pending');
+  const result=await invoke(open());assert.ok(result);
+  assert.equal(store.list('reader-result').length,1);
+  const saved=store.list();
+  assert.equal((await retryDiscoveryResponse(open(),'p',selected,1)).kind,'applied');
+  assert.equal((await retryDiscoveryResponse(open(),'p',selected,1,true)).kind,'applied');
+  assert.deepEqual(store.list(),saved);
+  assert.equal(readFileSync(wire,'utf8').trim().split('\n').length,2);
 });
 
 test('changed source, including an unresolved-only reply, and dispatch refuse application after exact paid recovery', async t => {

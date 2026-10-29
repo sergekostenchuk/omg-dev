@@ -1,3 +1,5 @@
+import { retryDiscoveryResponse } from '../src/discovery/discovery-response-retry.js';
+import { answerBeforeContext } from './discovery-response-correction-fixture.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
@@ -468,4 +470,29 @@ test('final assessment paid: an authorized uncertain provider cannot be sent a s
     for (const store of [f.store, f.open()]) await refused(f, store,
       () => runDiscoveryFinalAssessmentExecution(store, 'p', f.paidResult, prepared));
   });
+});
+
+for (const incomplete of [false,true]) test(`L30 final assessment: ${incomplete?'early context answer':'malformed answer'} permits one addressed call, repeat and cold cannot buy another`,async t=>{
+  const {f,source,prepared}=await prepare(t,'insufficient_evidence','partial','Address one paid reviewer refusal',
+    incomplete?64_000:8_000_000,incomplete?400_000:9_000_000);
+  assert.equal((f.store.get<any>(prepared.id,prepared.revision)!).value.input.materialContract,'discovery-final-material/v1');
+  f.reply(incomplete?answer(source.packet.subject,'supported'):{});
+  const restore=incomplete?answerBeforeContext(f.root):()=>{};
+  await assert.rejects(()=>runDiscoveryFinalAssessmentExecution(f.store,'p',f.paidResult,prepared,{profile:f.profile}),
+    error=>error instanceof EngineError && error.code===(incomplete?'research_context_incomplete':'discovery_final_assessment_result_invalid'));
+  if(incomplete) assert.ok((f.wires().at(-1) as any).subject.working.materialAddresses.some((a:any)=>a.field==='finalMaterial'));
+  restore();
+  const application=f.store.list<any>('discovery-final-assessment-application').find(row=>row.value.state==='prepared')!;
+  assert.ok(application);const root=reference(f.store.get(application.id,1)!),old=f.store.history(application.id),before=f.wires().length;
+  assert.equal((await retryDiscoveryResponse(f.open(),'p',root,1,true)).kind,'pending');
+  assert.equal(f.wires().length,before);
+  f.reply(answer(source.packet.subject,'supported'));
+  const result=await retryDiscoveryResponse(f.open(),'p',root,1);
+  assert.equal(result.kind,incomplete?'pending':'applied');assert.equal(f.wires().length,before+1);
+  assert.ok(JSON.stringify(f.wires().at(-1)).includes('discovery-response-correction/v1'));
+  await fixed(f,f.store,async()=>{
+    assert.deepEqual(await retryDiscoveryResponse(f.open(),'p',root,1),result);
+    assert.deepEqual(await retryDiscoveryResponse(f.open(),'p',root,1,true),result);
+  });
+  assert.deepEqual(f.store.history(application.id),old);
 });

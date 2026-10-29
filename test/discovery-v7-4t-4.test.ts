@@ -1,7 +1,10 @@
 import { deliveredContract } from './discovery-response-contract-fixture.js';
+import { ProductEngine } from '../src/product/engine.js';
+import { retryDiscoveryResponse } from '../src/discovery/discovery-response-retry.js';
+import {stopRun} from '../src/om/run-control.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { writeFileSync } from 'node:fs';
+import { writeFileSync, readFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { hashJson } from '../src/canonical.js';
 import { reference, type Ref } from '../src/pipeline/contracts.js';
@@ -28,9 +31,16 @@ import { prepareVariantSession, runVariantSession, applyVariantSession, readVari
 import { VARIANT_SUBJECT_CONTRACT, VARIANT_CRITERIA, type VariantSubject, type VariantExecutionSession } from '../src/discovery/discovery-variants.js';
 import { continuationState, continuationMetadata, variantTransportFields, variantTransportGuards } from '../src/discovery/continuation-packet.js';
 import { researchSetup, produce, rand } from './discovery-v7-fixture.js';
+import { ProducerPolicySessions, issueProducerPolicyInvitation, setProjectProducerPolicy } from '../src/product/producer-policy-authority.js';
 
 const snapshot=(store:Store)=>store.list().flatMap(row=>store.history(row.id));
 const code=(expected:string)=>(error:unknown)=>error instanceof EngineError && error.code===expected;
+function ownerPolicy(store:Store,discovery:6|7,previous:Ref|null=null) {
+  const scope={project:'p',discovery,previous},sessions=new ProducerPolicySessions(store);
+  const login=sessions.exchange(issueProducerPolicyInvitation(store,scope));
+  try {return setProjectProducerPolicy(store,scope,login.authority).record;}
+  finally {sessions.revoke(login.bearer);}
+}
 const generation=()=>({action:'variants',variants:[{key:'one',title:'One bounded variant',proposal:{scope:'common'},
   criteria:Object.fromEntries(VARIANT_CRITERIA.map(key=>[key,{conclusion:'Bounded by the actual sweep',grounds:[],assumptions:[],unknowns:['No additional evidence beyond the saved sweep'],quantity:null}]))}],
   scale:Object.fromEntries(VARIANT_CRITERIA.map(key=>[key,'Same shared scale'])),comparison:'One bounded variant',
@@ -100,6 +110,108 @@ test('4T.4: real snapshot -> managed intent/call/output; cold repeated publicati
   const before=snapshot(f.store),cold=f.open();
   assert.deepEqual(readVariantExecutionSession(cold,'p',reference(result)),result);
   assert.deepEqual(await runVariantSession(cold,f.input),result);assert.deepEqual(snapshot(f.store),before);assert.equal(f.wires().length,calls+1);
+});
+
+test('L30 variants: exact paid form refusal -> one correction -> cold ordinary publication without another call',async t=>{
+  const f=await setup(t);
+  if(!f.store.get('project:p'))f.engine.execute({type:'create-project',project:'p',title:'Correction'});
+  const prepared=prepareVariantSession(f.store,f.input);
+  writeFileSync(f.settings,JSON.stringify({tokens:10,reply:{action:'variants',variants:[]}}));
+  await assert.rejects(()=>runVariantSession(f.store,f.input),code('discovery_variant_answer_invalid'));
+  const original=f.store.get<ResearchConsumerIntent>(prepared.intent.id)!,root=reference(original);
+  const calls=f.wires().length,before=snapshot(f.store);
+  for(const limit of [0,2])
+    await assert.rejects(()=>retryDiscoveryResponse(f.store,'p',root,limit),code('research_response_retry_invalid'));
+  assert.deepEqual(snapshot(f.store),before);assert.equal(f.wires().length,calls);
+  const restore=await f.engine.execute({type:'retry-discovery-response',project:'p',refusal:root,limit:1,restoreOnly:true}) as any;
+  assert.equal(restore.kind,'pending');assert.deepEqual(snapshot(f.store),before);assert.equal(f.wires().length,calls);
+  await assert.rejects(()=>retryDiscoveryResponse(f.store,'foreign',root,1),code('research_response_retry_invalid'));
+  writeFileSync(f.settings,JSON.stringify({tokens:10,reply:generation()}));
+  const applied=await f.engine.execute({type:'retry-discovery-response',project:'p',refusal:root,limit:1}) as any;
+  assert.equal(applied.kind,'applied');assert.equal(f.wires().length,calls+1);
+  const successor=f.store.get<ResearchConsumerIntent>(applied.intent.id)!;
+  assert.equal(successor.value.generation,1);assert.deepEqual(successor.value.previous,root);
+  assert.equal(successor.value.role.actor,prepared.intent.value.role.actor);
+  assert.deepEqual(f.store.get(root.id,root.revision),original);
+  const sent=f.wires().at(-1)!;
+  assert.ok(JSON.stringify(sent).includes('discovery-response-correction/v1'));
+  assert.ok(JSON.stringify(sent).includes('one to three variants'));
+  const paidHistory=snapshot(f.store),cold=f.open(),engine=new ProductEngine(cold);
+  assert.deepEqual(await engine.execute({type:'retry-discovery-response',project:'p',refusal:root,limit:1}),applied);
+  assert.deepEqual(await engine.execute({type:'retry-discovery-response',project:'p',refusal:root,limit:1,restoreOnly:true}),applied);
+  assert.equal((await runVariantSession(cold,f.input)).value.cursor,1);
+  assert.deepEqual(snapshot(cold),paidHistory);assert.equal(f.wires().length,calls+1);
+});
+
+test('L30 variants: a second invalid response ends the correction and cannot become a new root',async t=>{
+  const f=await setup(t),prepared=prepareVariantSession(f.store,f.input);
+  writeFileSync(f.settings,JSON.stringify({tokens:10,reply:{action:'variants',variants:[]}}));
+  await assert.rejects(()=>runVariantSession(f.store,f.input),code('discovery_variant_answer_invalid'));
+  const root=reference(f.store.get<ResearchConsumerIntent>(prepared.intent.id)!),calls=f.wires().length;
+  await assert.rejects(()=>retryDiscoveryResponse(f.store,'p',root,1),code('discovery_variant_answer_invalid'));
+  assert.equal(f.wires().length,calls+1);
+  await assert.rejects(()=>retryDiscoveryResponse(f.store,'p',root,1),code('discovery_variant_answer_invalid'));
+  const correction=f.store.list<ResearchConsumerIntent>('research-consumer-intent')
+    .find(row=>row.value.rootKey===prepared.intent.value.rootKey && row.value.generation===1)!;
+  await assert.rejects(()=>retryDiscoveryResponse(f.store,'p',reference(correction),1),code('research_response_retry_invalid'));
+  assert.equal(f.wires().length,calls+1);
+});
+
+test('L30 variants: a proved response-free provider failure extends only the same correction chain',async t=>{
+  const f=await setup(t),prepared=prepareVariantSession(f.store,f.input);
+  writeFileSync(f.settings,JSON.stringify({tokens:10,reply:{action:'variants',variants:[]}}));
+  await assert.rejects(()=>runVariantSession(f.store,f.input),code('discovery_variant_answer_invalid'));
+  const root=reference(f.store.get<ResearchConsumerIntent>(prepared.intent.id)!),calls=f.wires().length;
+  const adapter=f.environment.value.implementer.command!.args[0]!;
+  writeFileSync(adapter,readFileSync(adapter,'utf8').replace('const research=',
+    `if(settings.providerFail){console.error('Selected model is at capacity');process.exit(1);}const research=`));
+  writeFileSync(f.settings,JSON.stringify({tokens:10,providerFail:true}));
+  await assert.rejects(()=>retryDiscoveryResponse(f.store,'p',root,1),error=>error instanceof EngineError
+    && ['research_provider_failed','research_consumer_execution_refused'].includes(error.code));
+  assert.equal(f.wires().length,calls+1);
+  const failed=f.store.list<ResearchConsumerIntent>('research-consumer-intent')
+    .find(row=>row.value.rootKey===prepared.intent.value.rootKey && row.value.generation===1)!;
+  assert.equal(failed.value.refusal?.code,'provider_failed_without_response');
+  assert.equal((await retryDiscoveryResponse(f.open(),'p',root,1,true)).kind,'pending');
+  assert.equal(f.wires().length,calls+1);
+  writeFileSync(f.settings,JSON.stringify({tokens:10,reply:generation()}));
+  const result=await retryDiscoveryResponse(f.open(),'p',root,1);
+  assert.equal(result.kind,'applied');assert.equal(f.wires().length,calls+2);
+  assert.ok('intent' in result);
+  const corrected=f.store.get<ResearchConsumerIntent>(result.intent.id)!;
+  assert.equal(corrected.value.generation,2);assert.deepEqual(corrected.value.previous,reference(failed));
+  assert.deepEqual(await retryDiscoveryResponse(f.open(),'p',root,1),result);
+  assert.equal(f.wires().length,calls+2);
+});
+
+test('L30 variants: concurrent commands share one correcting generation and physical call',async t=>{
+  const f=await setup(t),prepared=prepareVariantSession(f.store,f.input);
+  writeFileSync(f.settings,JSON.stringify({tokens:10,reply:{action:'variants',variants:[]}}));
+  await assert.rejects(()=>runVariantSession(f.store,f.input),code('discovery_variant_answer_invalid'));
+  const root=reference(f.store.get<ResearchConsumerIntent>(prepared.intent.id)!),calls=f.wires().length;
+  writeFileSync(f.settings,JSON.stringify({tokens:10,reply:generation()}));
+  const results=await Promise.allSettled([retryDiscoveryResponse(f.store,'p',root,1),retryDiscoveryResponse(f.open(),'p',root,1)]);
+  assert.ok(results.some(result=>result.status==='fulfilled'));
+  assert.equal(f.wires().length,calls+1);
+  assert.equal((await retryDiscoveryResponse(f.open(),'p',root,1)).kind,'applied');
+  assert.equal(f.wires().length,calls+1);
+});
+
+for(const protection of ['stop','budget','policy'] as const)test(`L30 variants: ${protection} prevents a new correcting send`,async t=>{
+  const f=await setup(t),prepared=prepareVariantSession(f.store,f.input);
+  if(protection==='policy' && !f.store.get('project:p'))f.engine.execute({type:'create-project',project:'p',title:'Policy correction'});
+  const permission=protection==='policy'?ownerPolicy(f.store,7):null;
+  writeFileSync(f.settings,JSON.stringify({tokens:protection==='budget'?80_000_000:10,reply:{action:'variants',variants:[]}}));
+  await assert.rejects(()=>runVariantSession(f.store,f.input),code('discovery_variant_answer_invalid'));
+  const root=reference(f.store.get<ResearchConsumerIntent>(prepared.intent.id)!),calls=f.wires().length;
+  if(protection==='stop')assert.ok(stopRun(f.store,{project:'p'}).ok);
+  if(permission)ownerPolicy(f.store,6,reference(permission));
+  writeFileSync(f.settings,JSON.stringify({tokens:10,reply:generation()}));
+  await assert.rejects(()=>retryDiscoveryResponse(f.open(),'p',root,1),code(protection==='budget'?'discovery_budget_overrun':
+    protection==='policy'?'producer_policy_changed':'run_stopped'));
+  assert.equal(f.wires().length,calls);
+  assert.equal((await retryDiscoveryResponse(f.open(),'p',root,1,true)).kind,'pending');
+  assert.equal(f.wires().length,calls);
 });
 
 test('4T.4: a session-only cut resumes through the common preparer and buys only one result',async t=>{

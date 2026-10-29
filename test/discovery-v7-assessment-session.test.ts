@@ -1,3 +1,4 @@
+import { retryDiscoveryResponse } from '../src/discovery/discovery-response-retry.js';
 import { configureReaderPilot } from '../src/discovery/reader-pilot.js';
 import { assessmentSessionWithProof, assessmentRolePrompt, readAssessmentDispatchAdmission } from '../src/discovery/assessment-session.js';
 import { contextWorkspace } from '../src/discovery/context-workspace.js';
@@ -9,7 +10,7 @@ import { assessAttempts, readDiscoveryAssessment } from '../src/discovery/resear
 import { DISCOVERY_ASSESSMENT_CONTRACT_V2 } from '../src/discovery/research-model.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { writeFileSync } from 'node:fs';
+import { readFileSync, writeFileSync } from 'node:fs';
 import { type DiscoveryDraft, type Question } from '../src/discovery/discovery.js';
 import { reference } from '../src/pipeline/contracts.js';
 import { researchSetup, rand } from './discovery-v7-fixture.js';
@@ -300,4 +301,42 @@ test('A: a genuine profile from another project is refused before payment', asyn
   await assert.rejects(assessAttempts(f.store,f.subject.packet,f.subject.baseline,f.environment,f.root,undefined,pilot),
     {code:'discovery_assessment_invalid'});
   assert.equal(f.wires().length,sent);assert.equal(f.store.list('assessment-session').length,0);
+});
+
+for(const mode of ['correct','invalid','transport'] as const)test(`L30 attempts assessor: exact novelty refusal / ${mode}`,async t=>{
+  const invalidAgain=mode==='invalid',transport=mode==='transport';
+  const f=await packetFixture(t),correct=assessmentReply(f),invalid:any=structuredClone(correct);delete invalid.novelty;
+  writeFileSync(f.settings,JSON.stringify({tokens:10,reply:invalid}));
+  await assert.rejects(()=>assessmentRequest(f),{code:'discovery_novelty_invalid'});
+  const original=f.store.list<any>('assessment-application').find(row=>row.value.state==='model-refused')!;
+  assert.ok(original);const root=reference(original),before=f.wires().length;
+  assert.equal((await retryDiscoveryResponse(f.open(),'p',root,1,true)).kind,'pending');
+  assert.equal(f.wires().length,before);
+  if(transport) {
+    const adapter=f.environment.value.reviewer.command!.args[0]!,script=readFileSync(adapter,'utf8');
+    assert.ok(script.includes('const research='));
+    writeFileSync(adapter,script.replace('const research=',
+      "if(settings.providerFail){console.error('Selected model is at capacity');process.exit(1);}const research="));
+    writeFileSync(f.settings,JSON.stringify({tokens:10,providerFail:true}));
+    await assert.rejects(()=>retryDiscoveryResponse(f.open(),'p',root,1),{code:'research_provider_failed'});
+    assert.equal(f.wires().length,before+1);
+    assert.equal((await retryDiscoveryResponse(f.open(),'p',root,1,true)).kind,'pending');
+    assert.equal(f.wires().length,before+1);
+  }
+  writeFileSync(f.settings,JSON.stringify({tokens:10,reply:invalidAgain?invalid:correct}));
+  if(invalidAgain) {
+    await assert.rejects(()=>retryDiscoveryResponse(f.open(),'p',root,1),{code:'discovery_novelty_invalid'});
+    await assert.rejects(()=>retryDiscoveryResponse(f.open(),'p',root,1),{code:'discovery_novelty_invalid'});
+    const child=f.store.list<any>('assessment-application').find(row=>row.id!==original.id && row.value.state==='model-refused')!;
+    assert.ok(child);
+    await assert.rejects(()=>retryDiscoveryResponse(f.open(),'p',reference(child),1),{code:'research_response_retry_invalid'});
+  } else {
+    const result=await retryDiscoveryResponse(f.open(),'p',root,1);
+    assert.equal(result.kind,'applied');const saved=f.store.list();
+    assert.deepEqual(await retryDiscoveryResponse(f.open(),'p',root,1),result);
+    assert.deepEqual(await retryDiscoveryResponse(f.open(),'p',root,1,true),result);
+    assert.deepEqual(f.store.list(),saved);
+    assert.equal((await assessmentRequest(f,f.open())).value.verdict,'return');
+  }
+  assert.equal(f.wires().length,before+(transport?2:1));
 });
