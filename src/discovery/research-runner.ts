@@ -2012,6 +2012,9 @@ export class Researcher {
       "research_consumer_intent_invalid", "The research run belongs to another draft");
     // A correction owns only its analyst reply. Free local application may
     // finish that turn; any following external work belongs to an ordinary entry.
+    const ownsCorrection = (intent: Revision<ResearchConsumerIntent>): boolean => !!correction
+      && intent.id !== correction.intent.id
+      && readPlanResponseCorrection(this.store, project, reference(correction.intent)).latest.id === intent.id;
     const correctionBoundary = (): 'completed' | 'pending' | null => {
       if (!correction) return null;
       const target = this.store.get<ResearchTurn>(paidTurnId(id, correction.intent.value.cursor.turn));
@@ -2019,7 +2022,7 @@ export class Researcher {
       const checked = readResearchConsumerTurn(this.store, reference(target));
       const producer = readResearchConsumerIntent(this.store, checked.value.consumerIntent);
       requireCondition(run && run.value.turns >= checked.value.number
-        && canonical(producer.value.previous) === canonical(reference(correction.intent)),
+        && ownsCorrection(producer),
         'research_plan_retry_stale', 'The saved turn is not this refusal correction');
       if (checked.value.status === 'completed') return 'completed';
       return ['read_source', 'read_context', 'read', 'search', 'answer', 'pause'].includes(turnAction(checked.value).action)
@@ -2307,7 +2310,7 @@ export class Researcher {
           error: corrected === 'completed' ? 'The corrected response is applied; continue the ordinary research run'
             : 'The corrected analyst response is saved; its pending action requires an ordinary continuation' }) : run!;
         requireCondition(!correction || !outstanding || outstanding.value.kind === 'analyst'
-          && canonical(outstanding.value.previous) === canonical(reference(correction.intent)),
+          && ownsCorrection(outstanding),
           'research_plan_retry_stale', 'Correction cannot dispatch a different consumer');
         // Recover the original paid deep identity before current selection, actor,
         // allowance or coverage can select another cell. Its ordinary K then goes
@@ -2580,7 +2583,7 @@ export class Researcher {
         }
         const refused = intents.filter(row => row.value.state === "refused" && row.value.cursor.turn === (run?.value.turns ?? 0) + 1)
           .sort((a, b) => b.value.generation - a.value.generation)[0];
-        if (refused && (!correction || canonical(reference(refused)) !== canonical(reference(correction.intent))
+        if (refused && (!correction?.retry || canonical(reference(refused)) !== canonical(correction.retry)
           || options.restoreOnly)) throw new EngineError(refused.value.refusal!.code,
           `[${refused.id}] Paid response retained for this plan subject; call ${refused.value.refusal!.call.id}`);
         if (run && !correction) run = await this.checkpointV7Attempts(project,draftId,run,turns,owner,signal,
@@ -2740,7 +2743,7 @@ export class Researcher {
           guards: uniqueTransactionGuards([reference(run), reference(selection.draft), reference(selection.question),
             reference(environment), ...effective.guards, ...selection.draft.value.inputs, selection.planAnswer, ...selection.guards,
             ...(planningPilot ? [reference(planningPilot)] : []), ...selectedTurns.map(reference), ...sources.list().map(reference),
-            { id: paidTurnId(id, run.value.turns + 1), absent: true }]) }, correction ? [reference(correction.intent)] : [],
+            { id: paidTurnId(id, run.value.turns + 1), absent: true }]) }, correction?.retry ? [correction.retry] : [],
           options.contextContract && mode !== "planning" ? { contextContract: options.contextContract } : {});
       }
     } catch (error) {

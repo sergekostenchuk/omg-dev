@@ -16,7 +16,7 @@ import {parseCommand} from '../src/product/commands.js';
 import {ProducerPolicySessions, issueProducerPolicyInvitation, setProjectProducerPolicy} from '../src/product/producer-policy-authority.js';
 import {researchCall} from '../src/discovery/research-protocol.js';
 import {reference, type Ref} from '../src/pipeline/contracts.js';
-import {readResearchConsumerIntent, readResearchConsumerTurn, type ResearchConsumerIntent} from '../src/discovery/response-recovery.js';
+import {readPlanResponseCorrection, readResearchConsumerExecution, readResearchConsumerIntent, readResearchConsumerTurn, type ResearchConsumerIntent} from '../src/discovery/response-recovery.js';
 import {RESEARCH_READ_INSTRUCTION, RESEARCH_READ_SCHEMAS} from '../src/discovery/research-read-contract.js';
 import {continuationPrompt, planClaimsContract} from '../src/discovery/continuation-packet.js';
 import {researchAction} from '../src/discovery/research-consumer-transition.js';
@@ -39,6 +39,10 @@ async function world(t:test.TestContext, tokens=10, planning=false, readFirst=fa
   writeFileSync(adapter,`import {readFileSync,appendFileSync} from 'node:fs';
 const r=JSON.parse(readFileSync(0,'utf8')),s=JSON.parse(readFileSync(${JSON.stringify(settings)},'utf8'));
 appendFileSync(${JSON.stringify(wire)},JSON.stringify(r)+'\\n');
+if(s.providerFailure) {
+ console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,usage:{inputTokens:s.usage,outputTokens:0,cachedInputTokens:0,reasoningOutputTokens:0}}));
+ console.error(JSON.stringify({error:'provider_failed',message:'Selected model is at capacity'}));process.exit(1);
+}
 let action=s.action;
 if(s.assessmentVerdict && r.subject.assessmentSubject) {
  const packet=r.subject.assessmentSubject.packet;
@@ -112,7 +116,8 @@ usage:{inputTokens:s.usage,outputTokens:1,cachedInputTokens:0,reasoningOutputTok
   const commandRetry={type:'retry-plan-response' as const,project:'p',intent:reference(refused),limit:1 as const};
   const correct={action:'read_source',source:reference(source),start:0,end:source.value.content.length};
   reply(correct);
-  return {...f,draft,source,refused,wires,reply,correct,permitted,commandRetry,result};
+  return {...f,draft,source,refused,wires,reply,correct,permitted,commandRetry,result,
+    failProvider:(usage=10)=>writeFileSync(settings,JSON.stringify({providerFailure:true,usage}))};
 }
 
 test('forms: the unchanged parser and every plan continuation share complete read schemas',()=>{
@@ -399,4 +404,108 @@ test('LIVE-ASSESS-FORMS-01: blocking fact and unknown receive a real unknown ass
   const otherSource=f.discovery.evidence.document('p','other-original','A different original source','text/plain',0);
   mutate(copy=>{copy.methodology.facts[0].sources[0].original=reference(otherSource);});
   assert.deepEqual(readDiscoveryAssessment(f.open(),'p',reference(records[0]!)),paid);
+});
+
+
+async function failedCorrection(f: Awaited<ReturnType<typeof world>>, usage=10) {
+  f.failProvider(usage);
+  const result=await f.engine.execute(f.commandRetry) as any;
+  assert.equal(result.value.pauseCode,'research_provider_failed',JSON.stringify(result.value));
+  const proof=readPlanResponseCorrection(f.store,'p',f.commandRetry.intent);
+  assert.equal(proof.latest.value.state,'refused');
+  assert.equal(proof.latest.value.refusal?.code,'provider_failed_without_response');
+  assert.equal(readResearchConsumerExecution(f.store,'p',reference(proof.latest)).kind,'provider-failed');
+  assert.deepEqual(proof.retry,reference(proof.latest));
+  return proof;
+}
+
+test('LIVE-FORMS-02: transport generations preserve the syntax root, paid history and one send per entry; cold success is free',async t=>{
+  const f=await world(t),original=f.store.history(f.refused.id);
+  const first=await failedCorrection(f);assert.equal(f.wires().length,2);
+  const firstHistory=f.store.history(first.latest.id),firstCall=f.store.get(first.latest.value.call!.id);
+  const firstLedger=f.store.list<any>('research-budget-ledger')[0]!,account=f.store.list('research-budget')[0]!;
+  const second=await failedCorrection(f);assert.equal(f.wires().length,3);
+  assert.equal(second.latest.value.generation,2);
+  assert.deepEqual(second.latest.value.previous,reference(first.latest));
+  assert.deepEqual(second.chain.map(row=>row.id),[f.refused.id,first.latest.id,second.latest.id]);
+  f.reply(f.correct);
+  const cold=new ProductEngine(f.open()),result=await cold.execute(f.commandRetry) as any;
+  assert.equal(result.value.pauseCode,'research_plan_response_corrected',JSON.stringify(result.value));
+  assert.equal(f.wires().length,4);
+  const proof=readPlanResponseCorrection(f.store,'p',f.commandRetry.intent);
+  assert.equal(proof.latest.value.generation,3);assert.equal(proof.retry,null);
+  assert.equal(proof.latest.value.state,'applied');
+  assert.deepEqual(f.store.history(f.refused.id),original);assert.deepEqual(f.store.history(first.latest.id),firstHistory);
+  assert.deepEqual(f.store.get(firstCall!.id),firstCall);
+  assert.equal(f.store.list('research-budget').length,1);
+  assert.equal(f.store.list('research-budget-ledger').length,1);
+  assert.deepEqual(f.store.list('research-budget'),[account]);
+  const finalLedger=f.store.get<any>(firstLedger.id)!;
+  assert.deepEqual(finalLedger.value.assignments.slice(0,firstLedger.value.assignments.length),firstLedger.value.assignments);
+  assert.equal(finalLedger.value.assignments.length,firstLedger.value.assignments.length+2);
+  for(const request of f.wires().slice(1)) assert.ok(JSON.stringify(request).includes(f.refused.id));
+  const saved=f.store.list();
+  for(const restoreOnly of [true,false,true]) await new ProductEngine(f.open()).execute({...f.commandRetry,restoreOnly});
+  assert.equal(f.wires().length,4);assert.deepEqual(f.store.list(),saved);
+});
+
+test('LIVE-FORMS-02: a syntax-invalid transport successor ends correction and cannot be rebound as a fresh syntax root',async t=>{
+  const f=await world(t);await failedCorrection(f);
+  f.reply({action:'read_source',source:reference(f.source),purpose:'Still invalid'});
+  const results=await Promise.allSettled([f.engine.execute(f.commandRetry),new ProductEngine(f.open()).execute(f.commandRetry)]);
+  assert.ok(results.some(r=>r.status==='fulfilled'));assert.equal(f.wires().length,3);
+  const proof=readPlanResponseCorrection(f.store,'p',f.commandRetry.intent);
+  assert.equal(proof.latest.value.generation,2);assert.equal(proof.latest.value.refusal?.code,'research_response_invalid');
+  assert.equal(proof.retry,null);
+  for(const restoreOnly of [false,true,false]) await new ProductEngine(f.open()).execute({...f.commandRetry,restoreOnly});
+  await assert.rejects(Promise.resolve().then(()=>f.engine.execute({...f.commandRetry,intent:reference(proof.latest)})),
+    {code:'research_plan_retry_invalid'});
+  assert.equal(f.wires().length,3);assert.equal(f.store.list('research-consumer-intent').length,3);
+});
+
+for(const protection of ['restore','stop','policy','budget'] as const)
+test(`LIVE-FORMS-02: ${protection} prevents a transport successor dispatch`,async t=>{
+  const f=await world(t);await failedCorrection(f,protection==='budget'?20_000_000:10);
+  if(protection==='stop') stopRun(f.store,{project:'p'});
+  if(protection==='policy') policy(f.store,6,reference(f.permitted));
+  f.reply(f.correct);
+  const result=await new ProductEngine(f.open()).execute({...f.commandRetry,...(protection==='restore'?{restoreOnly:true}:{})}) as any;
+  assert.equal(result.value.status,'paused');assert.equal(f.wires().length,2);
+  assert.equal(result.value.pauseCode,{restore:'provider_failed_without_response',stop:'run_stopped',policy:'research_contract_upgrade_required',budget:'research_budget_exhausted'}[protection],JSON.stringify(result.value));
+});
+
+test('LIVE-FORMS-02: a transport correction need_owner remains pending without an assessor on repeat or restore',async t=>{
+  const f=await world(t,10,false,true);await failedCorrection(f);
+  f.reply({action:'need_owner',question:'industry',reason:'Choose the jurisdiction',searched:[reference(f.source)]});
+  const before=f.store.list('model-call').length,result=await f.engine.execute(f.commandRetry) as any;
+  assert.equal(result.value.pauseCode,'research_plan_response_pending',JSON.stringify(result.value));
+  assert.equal(f.store.list('model-call').length,before+1);assert.equal(f.wires().length,3);
+  const saved=f.store.list();
+  for(const restoreOnly of [false,true,false]) await new ProductEngine(f.open()).execute({...f.commandRetry,restoreOnly});
+  assert.deepEqual(f.store.list(),saved);assert.equal(f.wires().length,3);
+  f.reply({necessary:true,reason:'The consulted source does not name a jurisdiction'});
+  const ordinary=await f.engine.execute({type:'research-draft',project:'p',draftId:f.draft.id,maxTurns:1}) as any;
+  assert.equal(ordinary.value.status,'needs_owner',JSON.stringify(ordinary.value));assert.equal(f.wires().length,4);
+});
+
+test('LIVE-FORMS-02: a paid transport successor cut restores under stop before any new admission',async t=>{
+  const f=await world(t);await failedCorrection(f);f.reply(f.correct);
+  const write=f.store.writeMany.bind(f.store);let cut=false;
+  f.store.writeMany=((writes,guards=[])=>{
+    if(!cut&&writes.some(w=>w.kind==='research-turn'&&w.expected===0)){cut=true;throw new Error('cut after transport correction reply');}
+    return write(writes,guards);
+  }) as typeof f.store.writeMany;
+  await f.engine.execute(f.commandRetry);f.store.writeMany=write;
+  assert.equal(cut,true);assert.equal(f.wires().length,3);stopRun(f.store,{project:'p'});
+  const result=await new ProductEngine(f.open()).execute({...f.commandRetry,restoreOnly:true}) as any;
+  assert.equal(result.value.pauseCode,'research_plan_response_corrected',JSON.stringify(result.value));
+  assert.equal(f.wires().length,3);assert.equal(f.store.list('research-turn').length,1);
+});
+
+test('LIVE-FORMS-02: a substituted transport receipt cannot authorize a generation',async t=>{
+  const f=await world(t),proof=await failedCorrection(f),latest=proof.latest;
+  f.store.write<ResearchConsumerIntent>({id:latest.id,kind:latest.kind,expected:latest.revision,
+    value:{...latest.value,refusal:{...latest.value.refusal!,response:reference(f.source)}}});
+  await assert.rejects(Promise.resolve().then(()=>f.engine.execute(f.commandRetry)),{code:'research_plan_retry_invalid'});
+  assert.equal(f.wires().length,2);
 });

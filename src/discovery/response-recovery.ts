@@ -2282,17 +2282,56 @@ export function planResponseSyntaxFailure(store: Store, intent: Revision<Researc
   }
   return null;
 }
+/** A transport refusal is eligible only when the common paid reader proves no
+ * model response. A status/code alone cannot authorize another physical call. */
+function planCorrectionTransportFailure(store: Store, intent: Revision<ResearchConsumerIntent>): boolean {
+  const refusal = intent.value.state === 'refused' ? intent.value.refusal : null;
+  if (!refusal || !(refusal.kind === 'provider-failed' && refusal.code === 'provider_failed_without_response'
+    || refusal.kind === 'terminal' && refusal.code === 'research_provider_failed')) return false;
+  const paid = readResearchConsumerExecutionFromIntent(store, intent.value.projectId, intent);
+  if (paid.kind !== 'provider-failed' || paid.code !== 'provider_failed_without_response') return false;
+  requireCondition(canonical(refusal.call) === canonical(reference(paid.call))
+    && canonical(refusal.request) === canonical(paid.request)
+    && canonical(refusal.response) === canonical(paid.response)
+    && canonical(refusal.archive) === canonical(paid.archive),
+    'research_plan_retry_invalid', 'The transport refusal does not name its proven failed execution');
+  return true;
+}
 export function readPlanResponseCorrection(store: Store, project: string, intentRef: Ref) {
   const intent = readResearchConsumerIntent(store, intentRef);
   requireCondition(intent.value.projectId === project, 'research_plan_retry_invalid', 'The refused intent belongs to another project');
   const error = planResponseSyntaxFailure(store, intent);
   requireCondition(error, 'research_plan_retry_invalid', 'Correction requires a proven paid plan analyst syntax refusal');
+  // A syntax refusal produced by this correction is its final outcome, not a
+  // fresh root that the same command can use to obtain another content attempt.
+  for (let ancestor = intent; ancestor.value.previous;) {
+    const previous = readResearchConsumerIntent(store, ancestor.value.previous);
+    requireCondition(previous.value.generation + 1 === ancestor.value.generation
+      && sameLogicalConsumerStep(previous.value, ancestor.value),
+      'research_plan_retry_stale', 'The correction root lost its logical generation chain');
+    requireCondition(!planResponseSyntaxFailure(store, previous), 'research_plan_retry_invalid',
+      'A correcting syntax refusal cannot open a second content correction');
+    ancestor = previous;
+  }
   const latest = findResearchConsumerIntent(store, project, 'analyst', intent.value.rootKey, intent.value.draft.id)!;
-  requireCondition(latest.id === intent.id || latest.value.generation === intent.value.generation + 1
-    && canonical(latest.value.previous) === canonical(intentRef),
-    'research_plan_retry_stale', 'This refusal already has a different correction chain');
+  const chain = [latest];
+  for (let child = latest; child.id !== intent.id;) {
+    requireCondition(child.value.generation > intent.value.generation && isRef(child.value.previous),
+      'research_plan_retry_stale', 'This refusal already has a different correction chain');
+    const previous = readResearchConsumerIntent(store, child.value.previous);
+    requireCondition(previous.value.generation + 1 === child.value.generation
+      && sameLogicalConsumerStep(previous.value, child.value)
+      && (previous.id === intent.id ? canonical(reference(previous)) === canonical(intentRef)
+        : planCorrectionTransportFailure(store, previous)),
+      'research_plan_retry_stale', 'Only a proven response-free transport failure can extend this correction');
+    chain.unshift(previous);
+    child = previous;
+  }
+  // Snapshot one eligible terminal at this external entry. A failure produced
+  // during this invocation is never a permit for another call inside it.
+  const retry = latest.id === intent.id || planCorrectionTransportFailure(store, latest) ? reference(latest) : null;
   const refusal = intent.value.refusal!;
-  return { intent, latest, failure: { contract: 'plan-response-correction/v1', attempt: intentRef, code: error.code,
+  return { intent, latest, chain, retry, failure: { contract: 'plan-response-correction/v1', attempt: intentRef, code: error.code,
     details: { call: refusal.call, response: refusal.response, question: cursorSubject(intent.value, intent.id)!.planQuestionId,
       message: error.message, validation: error.details ?? null },
     instruction: 'Correct the syntax of this exact paid response using the supplied read action schema. Keep the same plan-question; the previous attempt and expense remain saved.' } };
