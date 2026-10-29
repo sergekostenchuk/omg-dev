@@ -500,6 +500,13 @@ export function readResearchAssessmentAt(store: Store, projectId: string, turnId
   // from the paid producer; on the genuine Store the pair is read as written. A captured or replayed evaluation view keeps
   // the full derivation and its read sequence.
   if (historicalReadsReachGenuine(store)) {
+    // The pair is read as written, its mandatory pre-dispatch origin M by its exact address: lost or damaged M is the same
+    // addressed refusal as ever (ОТСУТСТВИЕ), with no derivation.
+    const origin = readAssessmentPaidOrigin(store, projectId, binding.value.pending);
+    // M names the session's first application; a corrected or renewed binding may name a later one of the same session.
+    requireCondition(origin && origin.value.session === binding.value.session.id && same(origin.value.reads, binding.value.reads),
+      'research_assessment_binding_invalid',
+      `[${turnId}] The assessment lost its original pre-dispatch materials`);
     const saved = exact<ResearchAssessment>(store, assessmentRef, 'research-assessment');
     requireCondition(saved.revision === 1 && saved.id.startsWith('research-assessment:'),
       'research_assessment_binding_invalid', `[${turnId}] Saved assessment does not derive from its exact paid producer`);
