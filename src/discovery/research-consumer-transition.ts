@@ -1636,6 +1636,15 @@ export function deepPreparationRef(cursor: unknown): Ref | null {
   return ref;
 }
 
+export const DEEP_RESEARCH_CYCLE_CONTRACT = 'deep-research-cycle/v1' as const;
+/** Saved producer provenance selects the action cycle; old paid steps remain answer-only. */
+export function deepResearchCycle(cursor: unknown): boolean {
+  if (cursor === null || typeof cursor !== 'object' || !Object.hasOwn(cursor, 'deepResearchContract')) return false;
+  requireCondition((cursor as { deepResearchContract: unknown }).deepResearchContract === DEEP_RESEARCH_CYCLE_CONTRACT
+    && deepPreparationRef(cursor), 'discovery_deep_execution_invalid', 'Unknown or unbound deep research contract');
+  return true;
+}
+
 export function deepResearchRunId(project: string, preparation: Ref, actor: string): string {
   return `research-run:deep:${hashJson({ project, preparation, actor, purpose: 'analyst' })}`;
 }
@@ -1643,11 +1652,12 @@ export function deepResearchRunId(project: string, preparation: Ref, actor: stri
 /** One paid projection for application and historical proof. Preparation
  * provenance is supplied by the common 5.2 reader, never by a caller body. */
 export function projectPaidDeepResearch(before: ResearchRun, input: PaidTurnAdmission,
-  preparation: DeepPreparation) {
+  preparation: DeepPreparation, cycle = false) {
   requireCondition(input.subject && sameSubject(input.subject, preparation.cell.subject),
     'discovery_deep_preparation_invalid', 'The paid deep step must retain its preparation plan subject');
   const projected = projectPaidTurnAdmission(before, input);
-  const end = attemptEndOfAction(projected.turn.action, input.subject);
+  const end = cycle && turnAction(projected.turn).action !== 'answer' ? null
+    : attemptEndOfAction(projected.turn.action, input.subject);
   return { ...projected, end };
 }
 

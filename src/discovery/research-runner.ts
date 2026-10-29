@@ -17,7 +17,7 @@ import { producePartialDossier, produceStoppedPartialDossier, readPartialDossier
 import { readRunnerDossierAssessmentAt, runRunnerDossierAssessment } from './dossier-assessment-runner.js';
 import { produceSelectedDossier, readSelectedDossier, SELECTED_DOSSIER_KIND, type SelectedDossier, type ProvenSelectedDossier } from "./selected-dossier.js";
 import { DISCOVERY_DEEP_PREPARATION_CONTRACT, produceDeepPreparation, readDeepPreparation } from "./deep-research.js";
-import { prepareDeepResearch, resumeDeepResearch } from "./deep-research-execution.js";
+import { prepareDeepResearchCycle, resumeDeepResearchCycle, resumeDeepResearch } from "./deep-research-execution.js";
 import { withHistoricalReads } from "../history/proofs.js";
 import { readProjectMode } from "../product/project-mode.js";
 import { REQUEST_MANIFEST_CONTRACT, CONTEXT_PREPARATION_CONTRACT } from "./request-parts.js";
@@ -47,7 +47,7 @@ import { Discovery, type Decision, type DiscoveryDraft, type Question } from "./
 import type { PaidDiscoveryAttemptsAssessment, V7AttemptPacket, EarlyUnknown, ResearchAction, ResearchAssessment, ResearchRun, ResearchTurn } from "./research-model.js";
 import { researchAction, researchCall, prepareResearchEnvelope, withResearchRunControl } from "./research-protocol.js";
 import { admitRunControl, type RunControlHold } from '../om/run-control.js';
-import { turnAction, projectPaidTurnAdmission, projectPaidOwnerReview, projectPaidPause,
+import { deepResearchCycle, turnAction, projectPaidTurnAdmission, projectPaidOwnerReview, projectPaidPause,
   projectResearchTurnRevision, projectSourceReadingTurn, projectPaidLocalRefusal, projectRepeatedContextRead,
   projectAddressedWorkspace, ACTION_RESPONSE_REFUSAL_CODES, webResearchCapability, admittedResearchAction,
   projectSynthesisHandoffTurn, projectSynthesisHandoffIntent, acceptanceEraOf, acceptanceBindingId, EARLY_ACTIONS, EARLY_UNKNOWN, earlyUnknownEra,
@@ -2264,8 +2264,9 @@ export class Researcher {
       // Each unpaid admission owns a resumable exact pause, including the next
       // cell after this invocation's earlier paid work. Reservation alone
       // activates it; a preparation cut must not leave a live busy owner.
-      if (run!.value.status === 'running' || ((run!.value as BudgetReentryRun).budgetReentry
-        && run!.value.pauseCode === 'research_dossier_assessment_unavailable')) run = this.save(run!, { status: 'paused',
+      if (run!.value.status === 'running' || canonical(run!.value.owner) !== canonical(owner)
+        || ((run!.value as BudgetReentryRun).budgetReentry
+        && run!.value.pauseCode === 'research_dossier_assessment_unavailable')) run = this.save(run!, { status: 'paused', owner,
         pauseCode: 'research_deep_frontier_pending',
         error: canonical({ code: 'research_deep_frontier_pending',
           message: 'The missing exact cell awaits its managed reservation', ...details }) }, frontier.guards);
@@ -2273,11 +2274,11 @@ export class Researcher {
       const intent = withHistoricalReads(() => {
         const prepared = produceDeepPreparation(this.store, project,
           { contract: DISCOVERY_DEEP_PREPARATION_CONTRACT, cell: frontier.next!.cell, scope: value.scope });
-        return prepareDeepResearch(this.store, { projectId: project, deepPreparation: reference(prepared.record),
+        return prepareDeepResearchCycle(this.store, { projectId: project, deepPreparation: reference(prepared.record),
           environment: effective.environment, owner: reference(run!), turn: run!.value.turns + 1, guards: frontier.guards });
       });
       used++;
-      const result = await resumeDeepResearch(this.store, project, reference(intent), { allowance: 1, ...(signal ? { signal } : {}) });
+      const result = await resumeDeepResearchCycle(this.store, project, reference(intent), { allowance: 1, ...(signal ? { signal } : {}) });
       requireCondition(result, 'discovery_deep_frontier_invalid', 'An admitted deep step must retain its managed result');
       run = this.store.get<ResearchRun>(id)!;
       deepOperation = false;
@@ -2324,7 +2325,9 @@ export class Researcher {
         // through the existing shared MR/P checkpoint below.
         const turnIntent = recovery.turn?.value.consumerIntent;
         const deepIntent = outstanding ?? (isRef(turnIntent) ? intents.find(intent => intent.id === turnIntent.id) : null);
-        if (deepIntent && Object.hasOwn(deepIntent.value.cursor, 'deepPreparation')) {
+        if (deepIntent && Object.hasOwn(deepIntent.value.cursor, 'deepPreparation')
+          && (!deepResearchCycle(deepIntent.value.cursor) || deepIntent.value.state !== 'applied'
+            || deepIntent.value.outputs?.length === 3)) {
           deepOperation = true;
           const ref = deepIntent.value.cursor.deepPreparation;
           readDeepPreparation(this.store, project, ref);
@@ -2332,7 +2335,8 @@ export class Researcher {
           const restoreOnly = options.restoreOnly || producerContractEra('discovery', options.producerPolicy) !== 7 || used >= limit;
           if (unpaid && restoreOnly) return run!;
           if (unpaid) used++;
-          await resumeDeepResearch(this.store, project, reference(deepIntent),
+          const resume = deepResearchCycle(deepIntent.value.cursor) ? resumeDeepResearchCycle : resumeDeepResearch;
+          await resume(this.store, project, reference(deepIntent),
             { restoreOnly, allowance: restoreOnly ? 0 : 1, ...(signal ? { signal } : {}) });
           run = this.store.get<ResearchRun>(id)!;
           deepOperation = false;
@@ -2470,7 +2474,14 @@ export class Researcher {
           requireCondition(paid.kind === "response", "research_consumer_execution_failed", "The paid turn lost its response");
           const draft = this.store.get<DiscoveryDraft>(producer.value.draft.id, producer.value.draft.revision)!;
           const question = this.store.get<Question>(producer.value.question.id, producer.value.question.revision)!;
-          const sameTurns = turns.filter(row => sameSubject(planSubjectOf(row.value), subject));
+          const cycle = deepResearchCycle(producer.value.cursor);
+          const sameTurns = turns.filter(row => {
+            if (!sameSubject(planSubjectOf(row.value), subject)) return false;
+            if (!cycle) return true;
+            const origin = readResearchConsumerIntent(this.store, row.value.consumerIntent);
+            return deepResearchCycle(origin.value.cursor)
+              && canonical(origin.value.cursor.deepPreparation) === canonical(producer.value.cursor.deepPreparation);
+          });
           if (action.action === "read_plan") {
             requireCondition(producer.value.kind === "reading-planner" && turn.value.dispatchMode === "planning",
               "research_mode_invalid", "Only a paid planner may publish a v7 reading queue");
@@ -2552,13 +2563,16 @@ export class Researcher {
             const result = readResearchContext(this.store, draft, question.id, undefined,
               action.record, action.pointer, action.page, readMode);
             const workspace = projectAddressedWorkspace(turn.value,
-              readContextTurnHistoryAt(this.store, project, draft, reference(question), turns, turn.value.number), reference(question));
+              readContextTurnHistoryAt(this.store, project, draft, reference(question), cycle ? sameTurns : turns, turn.value.number), reference(question));
             addContextLookup(workspace, result, paid.subject.contextWorkspace);
             const record = readResearchContextRecordAt(this.store, draft, action);
             proof = { kind: "read-context", recordValue: contextRecordValue(this.store, record), record: action.record, maxChars: 300000 };
           } else if (action.action === "web_search" || action.action === "web_fetch") {
+            const savedEnvironment = cycle ? producer.value.guards.find(guard => guard.id === `environment:${project}` && isRef(guard)) : null;
+            requireCondition(!cycle || isRef(savedEnvironment), 'discovery_deep_environment_invalid',
+              'A deep web action needs its saved environment');
             await executeWebTurn({ store: this.store, projectId: project, stage: draft.value.stage,
-              environment: this.store.get<Environment>(`environment:${project}`)!, turn });
+              environment: this.store.get<Environment>(`environment:${project}`, isRef(savedEnvironment) ? savedEnvironment.revision : undefined)!, turn });
             continue;
           } else if (action.action === "need_owner") {
             requireCondition(action.question === subject.planQuestionId, "research_question_foreign", "The owner request names another subject");

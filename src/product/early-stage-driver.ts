@@ -572,6 +572,7 @@ export class EarlyStageDriver {
         catch (error) { return this.#entryFailure(request.project, error, turnsUsed); }
       }
       let stageResult: StageResearchResult;
+      let beforeStageTurns = 0;
       try {
         // Discovery owns the optional configuration and proves the stopped
         // route again under this execution's original hold.
@@ -611,9 +612,11 @@ export class EarlyStageDriver {
         }
         const restoreOnly = researchBeforeStageResult(draft.value)
           && !executionAdmission(this.engine.store, draft, 'new-research', this.#producerPolicy).admitted;
+        beforeStageTurns = readResearchRun(this.engine.store, request.project, draft.id)?.value.turns ?? 0;
         stageResult = await this.engine.stageResearch.run(request.project, draft.id, request.maxTurns - turnsUsed,
           { ...(restoreOnly ? { restoreOnly: true } : {}),
             ...(this.#producerPolicy ? { producerPolicy: this.#producerPolicy } : {}) });
+        admitRunControl(this.engine.store, request.project, execution.hold);
         if (restoreOnly) {
           admitRunControl(this.engine.store, request.project, execution.hold);
           const restored = readResearchRun(this.engine.store, request.project, draft.id);
@@ -624,6 +627,19 @@ export class EarlyStageDriver {
         }
       } catch (error) {
         if (error instanceof RunControlLost) return this.#controlOutcome(request.project, error, turnsUsed);
+        if (current.stage === 'discovery' && error instanceof EngineError && error.code === 'research_call_allowance') {
+          try { admitRunControl(this.engine.store, request.project, execution.hold); }
+          catch (control) { return this.#controlOutcome(request.project, control, turnsUsed); }
+          const paused = readResearchRun(this.engine.store, request.project, draft.id);
+          requireCondition(paused?.value.status === 'paused', 'research_consumer_intent_invalid',
+            'An exhausted invocation must retain its exact paused research owner');
+          turnsUsed += Math.max(0, paused.value.turns - beforeStageTurns);
+          const why = { code: error.code, target: draft.id, message: error.message };
+          const outcome = await this.#stageOutcome(request.project, current.stage, reference(draft), {
+            status: 'paused', stage: current.artifact ? reference(current.artifact) : null,
+            research: reference(paused), feedback: null, findings: [why], reason: why, turnsUsed });
+          return { ...outcome, turnsUsed, handoff: false };
+        }
         if (error instanceof EngineError) return { ...this.#base(request.project, "blocked", current.stage, reference(draft), [], null,
           reason(error.code, current.stage, error.message)), turnsUsed, handoff: false };
         throw error;

@@ -3,7 +3,7 @@ import { isInterpretationConsumer, requireInterpretationConsumer, interpretation
 import { historicalProof, withHistoricalReads } from '../history/proofs.js';
 import { genuineStore, provenStore } from '../storage/store-view.js';
 import { readDeepPreparation as proveDeepPreparation, requireCurrentDeepPreparation, type ProvenDeepPreparation } from './deep-research.js';
-import { deepPreparationRef, projectPaidDeepResearch } from './research-consumer-transition.js';
+import { deepPreparationRef, deepResearchCycle, projectPaidDeepResearch } from './research-consumer-transition.js';
 import { decodeVariantExecutionSession, decodeVariantSubject, readVariantNoneStructural, readVariantSetStructural,
   type VariantExecutionSession, type VariantPublication, type VariantPublicationRecord, type VariantSubject } from './discovery-variants.js';
 import { variantPublicationWrites, variantDecisionPublicationWrites, readVariantDecisionStructural, readVariantStateStructural,
@@ -3442,7 +3442,7 @@ function validateConsumerApplicationWrites(store: Store, intent: Revision<Resear
     const projected = deepResearchApplication(store, intent, physical, writes[0]?.expected);
     const shape = (write: Write) => ({ id: write.id, kind: write.kind, expected: write.expected, value: write.value });
     if (canonical(writes.map(shape)) !== canonical(projected.map(shape)))
-      consumerInvalid(intent.id, 'Deep application must publish its exact paid run, turn and attempt together');
+      consumerInvalid(intent.id, 'Deep application must publish exactly the outputs of its saved execution contract');
     return [];
   }
   if(isVariantConsumer(intent.value)) {
@@ -4717,6 +4717,9 @@ export function requireDeepConsumerBinding(store: Store, intent: Revision<Resear
   if (!first || !ref || canonical(first) !== canonical(ref) || intent.value.kind !== 'analyst'
     || canonical(original.value.owner) !== canonical(intent.value.owner))
     consumerInvalid(intent.id, 'The deep admission lost or substituted its immutable preparation');
+  const cycle = deepResearchCycle(original.value.cursor);
+  if (cycle !== deepResearchCycle(intent.value.cursor))
+    consumerInvalid(intent.id, 'The deep intent changed its saved execution contract');
   const proof = readManagedDeepPreparation(store, intent.value.projectId, ref);
   const subject = proof.preparation.value.cell.subject;
   const run = store.get<ResearchRun>(intent.value.owner.id, intent.value.owner.revision);
@@ -4735,6 +4738,29 @@ export function requireDeepConsumerBinding(store: Store, intent: Revision<Resear
     || canonical(reference(proof.draft)) !== canonical(intent.value.draft)
     || !intent.value.basis.some(basis => canonical(basis) === canonical(ref)))
     consumerInvalid(intent.id, 'Deep intent, transport and preparation must have one exact plan subject and draft');
+  if (cycle !== deepResearchCycle(context))
+    consumerInvalid(intent.id, 'The deep request lost its saved execution contract');
+  if (cycle) {
+    const history = intent.value.cursor.deepHistory;
+    if (!Array.isArray(history) || !history.every(isRef)
+      || canonical(original.value.cursor.deepHistory) !== canonical(history))
+      consumerInvalid(intent.id, 'The deep cycle lost its exact served history');
+    let priorNumber = 0;
+    const values = history.map((at: Ref) => {
+      const row = readResearchConsumerTurn(store, at) as Revision<ManagedResearchTurn>;
+      const previous = readResearchConsumerIntent(store, row.value.consumerIntent);
+      if (row.value.run !== run.id || row.value.status !== 'completed'
+        || row.value.number <= priorNumber || row.value.number >= turn
+        || !deepResearchCycle(previous.value.cursor)
+        || canonical(deepPreparationRef(previous.value.cursor)) !== canonical(ref))
+        consumerInvalid(intent.id, 'Deep history belongs to another cell, run or incomplete step');
+      priorNumber = row.value.number;
+      return row.value;
+    });
+    if (canonical(context.history) !== canonical(values)
+      || history.some((at: Ref) => !intent.value.basis.some(basis => canonical(basis) === canonical(at))))
+      consumerInvalid(intent.id, 'Deep context must contain exactly its proven served history');
+  }
   return proof;
 }
 function deepConsumerAdmission(store: Store, intent: ResearchConsumerIntent): TransactionGuard[] {
@@ -4791,8 +4817,14 @@ export function deepResearchApplication(store: Store, intent: Revision<ResearchC
   const projected = projectPaidDeepResearch(before.value, {
     runId: before.id, intent: reference(origin), response: paid.payload, question: intent.value.question,
     owner: before.value.owner, limit: before.value.limit,
-    context: consumerIntentContext(store, intent.value), subject: proof.preparation.value.cell.subject
-  }, proof.preparation.value);
+    context: consumerIntentContext(store, intent.value), subject: proof.preparation.value.cell.subject,
+    ...(deepResearchCycle(intent.value.cursor) ? { web: intentWebCapability(store, intent) } : {})
+  }, proof.preparation.value, deepResearchCycle(intent.value.cursor));
+  const writes: Write[] = [
+    { id: before.id, kind: before.kind, expected: before.revision, value: projected.run },
+    { id: managedTurnId(before.id, intent.value.cursor.turn), kind: 'research-turn', expected: 0, value: projected.turn }
+  ];
+  if (projected.end === null) return writes;
   const subject = proof.preparation.value.cell.subject;
   const attempt: V7Attempt = { contract: 'v7-attempt/v1', project: intent.value.projectId,
     draft: intent.value.draft, planAnswer: subject.planAnswer, planQuestionId: subject.planQuestionId,
@@ -4807,11 +4839,7 @@ export function deepResearchApplication(store: Store, intent: Revision<ResearchC
     const value = Reflect.get(target, property); return typeof value === 'function' ? value.bind(target) : value;
   } });
   proveAttempt(view, reference(record));
-  return [
-    { id: before.id, kind: before.kind, expected: before.revision, value: projected.run },
-    { id: managedTurnId(before.id, intent.value.cursor.turn), kind: 'research-turn', expected: 0, value: projected.turn },
-    { id, kind: record.kind, expected: 0, value: attempt }
-  ];
+  return [...writes, { id, kind: record.kind, expected: 0, value: attempt }];
 }
 
 export interface ProvenDeepResearchResult {

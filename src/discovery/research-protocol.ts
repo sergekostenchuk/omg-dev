@@ -724,6 +724,8 @@ async function dispatchResearchCall(role: RoleBinding, environment: Environment,
       'The dispatch and saved intent must declare the same deep preparation before replay');
     if (savedDeep) {
       const saved = consumerIntentContext(audit.store, consumerIntent.value, consumerIntent.id);
+      requireCondition(recordValue(context) && canonical(context.deepResearchContract ?? null) === canonical(saved.deepResearchContract ?? null),
+        'research_deep_subject_invalid', 'Paid deep replay retains its saved execution contract');
       requireCondition(['deepPreparation', 'deepCell', 'deepScope'].every(key =>
         recordValue(context) && Object.hasOwn(context, key) && canonical(context[key]) === canonical(saved[key])),
         'research_deep_subject_invalid', 'Paid deep replay retains its complete saved cell and scope');
