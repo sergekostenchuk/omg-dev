@@ -19,7 +19,8 @@ import { uniqueTransactionGuards } from '../src/runtime/environment.js';
 import { prepareResearchConsumerIntent, prepareResearchConsumerApplication, readResearchConsumerExecution } from '../src/discovery/response-recovery.js';
 import { projectPaidTurnAdmission, managedTurnId } from '../src/discovery/research-consumer-transition.js';
 import type { ResearchRun } from '../src/discovery/research-model.js';
-import type { Store } from '../src/storage/store.js';
+import { storeReads, type Store } from '../src/storage/store.js';
+import { captureView } from '../src/storage/store-view.js';
 const brief = '  Построить систему снабжения 30 площадок.\nСохранить правила организации и измеримый итог.\nИсследовать все оси, аналоги пока не проверены. 🧭  ';
 const snapshot = (store: Store) => {
   const db = new DatabaseSync(store.path, { readOnly: true });
@@ -277,6 +278,15 @@ test('A3 paid plan: managed historical reader reproduces the exact plan assessor
   for (const db of [f.store, f.open()]) {
     assert.deepEqual(readResearchAssessmentAt(db, 'p', turnId, reference(assessment)), assessment);
   }
+  // PROOF-SPEED-2 (owner rule 08.10): on the genuine Store the saved assessment is read as written; an opaque source still
+  // derives it in full from the paid producer — the same record, at a small part of the reads.
+  const derivedBefore = storeReads();
+  assert.deepEqual(readResearchAssessmentAt(captureView(f.store).view, 'p', turnId, reference(assessment)), assessment);
+  const derivedReads = storeReads() - derivedBefore, trustedBefore = storeReads();
+  readResearchAssessmentAt(f.store, 'p', turnId, reference(assessment));
+  assert.ok((storeReads() - trustedBefore) * 5 < derivedReads, 'the genuine Store reads the saved pair, never derives it again');
+  assert.throws(() => readResearchAssessmentAt(f.store, 'p', turnId, { ...reference(assessment), hash: '0'.repeat(64) }),
+    (error: unknown) => error instanceof EngineError && error.code === 'research_assessment_binding_invalid');
   assert.equal(snapshot(f.store), before); assert.deepEqual(f.wires(), sent);
   const briefQ = questionOf(f.store, draft, 'brief');
   f.discovery.reopen(briefQ.id, briefQ.revision);

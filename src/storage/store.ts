@@ -44,6 +44,9 @@ let physicalReads = 0;
 /** Reads made through get/list/history/identities of every Store in this process (S1.3, №2201; S1.4, №2302-1): a
  * historical proof compares them with the reads it observed, so any read it did not see keeps that proof incomplete. */
 export function storeReads(): number { return physicalReads; }
+/** PS2-INTEGRITY-01: one seal of the guarded end of a Store: `inspect` sees data_version under the lock; `sealed` runs while
+ * the lock is still held, the journal checkpointed; `abandoned` when the boundary could not be guarded. */
+export interface IntegritySeal { inspect(othersSeen: string): boolean; sealed(): void; abandoned(): void }
 /** PROOF-SPEED: the read-only view each atomicWrite hands its preparation, registered by atomicWrite itself, and the Store
  * whose own bound reads it serves inside that one transaction. */
 const atomicViews = new WeakMap<object, Store>();
@@ -174,6 +177,9 @@ export class Store {
   #db: DatabaseSync;
   #busy = false;
   #closed = false;
+  readonly #beforeClose: (() => void)[] = [];
+  readonly #seals: IntegritySeal[] = [];
+  readonly #afterClose: (() => void)[] = [];
   #commits = 0;
   /** PF3: this connection's area of the body cache, its prepared statements, the data_version it last saw, and whether
    * a writeMany transaction is open — inside it reads keep the previous uncached check. */
@@ -494,11 +500,17 @@ export class Store {
     this.#eventBoundary(sequence);
     physicalReads++;
     const token = observer?.begin(this);
-    const rows = this.#statement(`SELECT ${IDENTITY_COLUMNS} FROM revisions r JOIN events e USING(entity_id,revision)
-      WHERE e.sequence<=? ${kind === undefined ? '' : 'AND r.kind=?'} ${id === undefined ? '' : 'AND r.entity_id=?'}
-      ${history ? '' : `AND NOT EXISTS (SELECT 1 FROM events later WHERE later.entity_id=e.entity_id
-        AND later.sequence>e.sequence AND later.sequence<=?)`} ORDER BY r.entity_id,r.revision`)
-      .all(sequence, ...(kind === undefined ? [] : [kind]), ...(id === undefined ? [] : [id]), ...(history ? [] : [sequence]));
+    // PROOF-SPEED-2: the head at the cut is each id's last event up to it — one grouped pass over the events, never a scan of
+    // the later events for every earlier one (quadratic in the history).
+    const rows = (history
+      ? this.#statement(`SELECT ${IDENTITY_COLUMNS} FROM revisions r JOIN events e USING(entity_id,revision)
+      WHERE e.sequence<=? ${kind === undefined ? '' : 'AND r.kind=?'} ${id === undefined ? '' : 'AND r.entity_id=?'} ORDER BY r.entity_id,r.revision`)
+      : this.#statement(`SELECT ${IDENTITY_COLUMNS} FROM (SELECT max(sequence) AS last FROM events WHERE sequence<=?
+        ${id === undefined ? '' : 'AND entity_id=?'} GROUP BY entity_id) cut JOIN events e ON e.sequence=cut.last
+      JOIN revisions r USING(entity_id,revision) WHERE 1 ${kind === undefined ? '' : 'AND r.kind=?'} ORDER BY r.entity_id,r.revision`))
+      .all(sequence, ...(history
+        ? [...(kind === undefined ? [] : [kind]), ...(id === undefined ? [] : [id])]
+        : [...(id === undefined ? [] : [id]), ...(kind === undefined ? [] : [kind])]));
     const found = rows.map(row => ({id: String(row['entity_id']), revision: Number(row['revision']),
       kind: String(row['kind']), hash: String(row['sha256'])}));
     if (token) observer!.end(token, this, 'identities', history ? 'history' : 'list', id ?? kind, undefined, found);
@@ -550,6 +562,26 @@ export class Store {
     requireCondition(!this.#closed, "store_busy", "Store is closed or creating a snapshot");
     for (const row of this.#db.prepare("SELECT entity_id, revision, kind, body, sha256 FROM revisions ORDER BY entity_id, revision").iterate())
       yield { id: String(row['entity_id']), revision: Number(row['revision']), kind: String(row['kind']), body: String(row['body']), sha256: String(row['sha256']) };
+  }
+  /** PROOF-SPEED-2: one stored revision as written — body text, sha256 and kind — for the incremental om-fsck alone; null
+   * when the store holds no such revision. */
+  integrityRevision(id: string, revision: number): { kind: string; body: string; sha256: string } | null {
+    requireCondition(!this.#closed, "store_busy", "Store is closed or creating a snapshot");
+    const row = this.#statement("SELECT kind, body, sha256 FROM revisions WHERE entity_id = ? AND revision = ?").get(id, revision);
+    return row ? { kind: String(row['kind']), body: String(row['body']), sha256: String(row['sha256']) } : null;
+  }
+  /** PROOF-SPEED-2: how many revisions, events and heads the store holds, for the incremental om-fsck alone. */
+  integrityCounts(): { revisions: number; events: number; heads: number } {
+    requireCondition(!this.#closed, "store_busy", "Store is closed or creating a snapshot");
+    const row = this.#statement(`SELECT (SELECT count(*) FROM revisions) AS revisions, (SELECT count(*) FROM events) AS events,
+      (SELECT count(*) FROM heads) AS heads`).get()!;
+    return { revisions: Number(row['revisions']), events: Number(row['events']), heads: Number(row['heads']) };
+  }
+  /** PROOF-SPEED-2: the head revision of one id as stored, or null, for the incremental om-fsck alone. */
+  integrityHead(id: string): number | null {
+    requireCondition(!this.#closed, "store_busy", "Store is closed or creating a snapshot");
+    const row = this.#statement("SELECT revision FROM heads WHERE entity_id = ?").get(id);
+    return row ? Number(row['revision']) : null;
   }
   /**
    * NR1 (№3674 п.1): runs the integrity check (om-fsck) inside one read transaction, so its events, heads and revisions
@@ -675,6 +707,54 @@ export class Store {
   }
   close(): void {
     requireCondition(!this.#busy, "store_busy", "Wait for the snapshot before closing the store");
-    if (!this.#closed) { releaseArea(this.#bodies); this.#statements.clear(); this.#db.close(); this.#closed = true; }
+    if (!this.#closed) {
+      // PROOF-SPEED-2: what must read this connection as it ends — before its last checkpoint.
+      for (const before of this.#beforeClose.splice(0)) { try { before(); } catch { /* a technical note lost costs a full check */ } }
+      const seals = this.#seals.splice(0);
+      if (seals.length) this.#sealedEnd(seals);
+      releaseArea(this.#bodies); this.#statements.clear(); this.#db.close(); this.#closed = true;
+      // PROOF-SPEED-2: what must see the database file as this connection left it — after its last checkpoint.
+      for (const after of this.#afterClose.splice(0)) { try { after(); } catch { /* a technical note lost costs a full check */ } }
+    }
+  }
+  /**
+   * PS2-INTEGRITY-01 (map-2 №18491, №18514): the one guarded boundary of the integrity mark. Under one lock that keeps every
+   * other writer out until this connection is closed — EXCLUSIVE locking mode and an immediate write transaction, never
+   * waited for — each seal reads data_version (it moves with other connections' commits only), the journal is checkpointed
+   * and truncated, and the seals that held take the file's sign: no commit of anyone can fall between the comparison and
+   * the sign. A lock that cannot be taken, a checkpoint that cannot complete or any failure abandons every seal.
+   */
+  #sealedEnd(seals: readonly IntegritySeal[]): void {
+    let locked = false;
+    try {
+      this.#db.exec("PRAGMA busy_timeout=0; PRAGMA locking_mode=EXCLUSIVE");
+      this.#db.exec("BEGIN IMMEDIATE"); locked = true;
+      const seen = String(this.#db.prepare("PRAGMA data_version").get()!['data_version']);
+      const held = seals.filter(seal => seal.inspect(seen));
+      this.#db.exec("COMMIT"); locked = false;
+      const checkpoint = this.#db.prepare("PRAGMA wal_checkpoint(TRUNCATE)").get()!;
+      if (Number(checkpoint['busy']) !== 0) throw new EngineError("store_busy", "The journal could not be checkpointed under the lock");
+      for (const seal of seals) { if (held.includes(seal)) seal.sealed(); else seal.abandoned(); }
+    } catch {
+      if (locked) { try { this.#db.exec("ROLLBACK"); } catch { /* the connection closes next */ } }
+      for (const seal of seals) { try { seal.abandoned(); } catch { /* a technical note lost costs a full check */ } }
+    }
+  }
+  /** PS2-INTEGRITY-01: a seal taken at the guarded end of this Store (#sealedEnd); for the integrity mark alone. */
+  sealOnClose(seal: IntegritySeal): void {
+    requireCondition(!this.#closed && seal !== null && typeof seal === "object" && typeof seal.inspect === "function",
+      "store_busy", "Store is closed or creating a snapshot");
+    this.#seals.push(seal);
+  }
+  /** PROOF-SPEED-2: runs just before this Store closes — the connection still open, its last checkpoint not yet made; for
+   * the integrity mark alone. */
+  beforeClose(action: () => void): void {
+    requireCondition(!this.#closed && typeof action === "function", "store_busy", "Store is closed or creating a snapshot");
+    this.#beforeClose.push(action);
+  }
+  /** PROOF-SPEED-2: runs once this Store is closed and its file is as it left it; for the integrity mark alone. */
+  afterClose(action: () => void): void {
+    requireCondition(!this.#closed && typeof action === "function", "store_busy", "Store is closed or creating a snapshot");
+    this.#afterClose.push(action);
   }
 }

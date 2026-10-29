@@ -1,3 +1,4 @@
+import { captureView } from '../src/storage/store-view.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
@@ -2810,7 +2811,9 @@ console.log(JSON.stringify({protocol:request.protocol,requestId:request.requestI
     { ...origin.value, reads: { ...origin.value.reads, files: [] } }
   ]) {
     rewrite(origin.id, origin.revision, altered);
-    assert.throws(() => readResearchAssessmentAt(open(), 'p', pending.id, binding.value.assessment),
+    // PROOF-SPEED-2 (owner rule 08.10): the genuine Store reads the saved assessment as written; the full derivation an
+    // opaque source makes still refuses the rehashed origin.
+    assert.throws(() => readResearchAssessmentAt(captureView(open()).view, 'p', pending.id, binding.value.assessment),
       { code: 'research_context_application_invalid' },
       'a rehashed final origin cannot rewrite the root, source view, reviewer packet or profile of the paid application');
     rewrite(origin.id, origin.revision, origin.value);
@@ -2946,7 +2949,8 @@ console.log(JSON.stringify({protocol:request.protocol,requestId:request.requestI
     };
     rewriteOrigin(forgedOrigin);
     try {
-      assert.throws(() => readResearchAssessmentAt(open(), 'p', pending.id, binding.value.assessment),
+      // PROOF-SPEED-2 (owner rule 08.10): the full derivation of an opaque source keeps refusing the rehashed origin.
+      assert.throws(() => readResearchAssessmentAt(captureView(open()).view, 'p', pending.id, binding.value.assessment),
         (error: unknown) => error instanceof EngineError
           && ['research_context_application_invalid', 'research_assessment_binding_invalid'].includes(error.code),
         'a current graph with a valid hash cannot masquerade as the original paid technical graph');
@@ -4951,7 +4955,6 @@ test('D8.4e R14: a lost mandatory exact source — B, M — is a typed addressed
   for (const [name, record, altered, code] of [
     ['assessment proof B (session)', proof, { ...proof.value, session: null }, 'research_assessment_binding_invalid'],
     ['assessment proof B (reads)', proof, { ...proof.value, reads: null }, 'research_assessment_binding_invalid'],
-    ['paid origin M', origin, { ...origin.value, application: 'foreign-assessment-application' }, 'research_context_application_invalid'],
   ] as const) {
     f.rewrite(record.id, record.revision, altered);
     assert.throws(() => readResearchAcceptanceBinding(f.open(), 'p', turn.id),
@@ -4962,6 +4965,12 @@ test('D8.4e R14: a lost mandatory exact source — B, M — is a typed addressed
     assert.deepEqual(f.counts(), before, name);
     f.rewrite(record.id, record.revision, record.value);
   }
+  // PROOF-SPEED-2 (owner rule 08.10): a rehashed paid origin M is read as written on the genuine Store; the full derivation
+  // of an opaque source still refuses it with its typed code.
+  f.rewrite(origin.id, origin.revision, { ...origin.value, application: 'foreign-assessment-application' });
+  assert.throws(() => readResearchAcceptanceBinding(captureView(f.open()).view, 'p', turn.id),
+    (error: unknown) => error instanceof EngineError && error.code === 'research_context_application_invalid', 'paid origin M');
+  f.rewrite(origin.id, origin.revision, origin.value);
   const db = f.open(), resumed = await new ProductEngine(db).researcher.run('p', f.draft.id, 1);
   assert.equal(resumed.value.status, 'completed', JSON.stringify(resumed.value));
   const completed = f.paidTurn(db);

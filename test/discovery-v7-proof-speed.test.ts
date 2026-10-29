@@ -1,6 +1,6 @@
 import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
-import { writeFileSync } from 'node:fs';
+import { existsSync, writeFileSync } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
 import { canonical, hashJson } from '../src/canonical.js';
 import { reference } from '../src/pipeline/contracts.js';
@@ -17,7 +17,7 @@ import { projectAttemptPacket } from '../src/discovery/v7-attempt-assessment.js'
 import { applyDiscoveryAssessment, readV7AssessmentReplay, savedV7ProgressApplication, v7ProgressBaseline } from '../src/discovery/v7-progress.js';
 import { historicalProofCounters, historicalReadsReachGenuine, historicalTrace, pendingSnapshotView } from '../src/history/proofs.js';
 import { captureView, pendingOverlay } from '../src/storage/store-view.js';
-import { integrityId } from '../src/om/integrity.js';
+import { integrityId, integrityMarkPath } from '../src/om/integrity.js';
 import { ProductEngine } from '../src/product/engine.js';
 import { researchSetup, produce, rand } from './discovery-v7-fixture.js';
 
@@ -161,4 +161,77 @@ test('PROOF-SPEED: tampered bytes of a saved record stop a Discovery entry at om
   assert.equal(f.wires().length, calls, 'no model call');
   assert.deepEqual(reference(store.get<ResearchRun>(f.run)!), reference(run), 'the run did not move');
   assert.ok(store.get(integrityId('p')), 'the found damage is saved for the owner');
+});
+
+test('PROOF-SPEED-2 (map-2 №18436): an old body rewritten after a clean entry left its mark — same sha256 — stops the next cold entry at om-fsck', async t => {
+  const f = await applied(t);
+  const target = f.store.get(f.assessment.id, f.assessment.revision)!;
+  // A clean entry — the only connection, as in a pass — leaves its mark beside the file once its Store closes.
+  f.store.close();
+  const first = f.open();
+  await new ProductEngine(first).execute({ type: 'early-stage-run', project: 'p', maxTurns: 1, maxCalls: 1 });
+  first.close();
+  assert.ok(existsSync(integrityMarkPath(first, 'p')), 'the clean entry left its mark');
+  const calls = f.wires().length;
+  // The body changes, its sha256, the counts and the last event do not.
+  const db = new DatabaseSync(f.path);
+  for (const name of ['revisions_no_update', 'revisions_no_delete', 'events_no_update', 'events_no_delete']) db.exec(`DROP TRIGGER IF EXISTS ${name}`);
+  db.prepare('UPDATE revisions SET body = ? WHERE entity_id = ? AND revision = ?')
+    .run(JSON.stringify({ ...(target.value as object), forged: true }), target.id, target.revision);
+  db.close();
+  const store = f.open(), before = store.get<ResearchRun>(f.run)!;
+  const outcome = await new ProductEngine(store).execute({ type: 'early-stage-run', project: 'p', maxTurns: 1, maxCalls: 1 }) as
+    { end: string; reason: { code: string; message: string } | null; budget: { callsMade: number } };
+  assert.deepEqual([outcome.end, outcome.reason?.code, outcome.budget.callsMade], ['blocked', 'store_damaged', 0]);
+  assert.match(outcome.reason!.message, new RegExp(`revision_corrupt ${target.id}@${target.revision}`));
+  assert.equal(f.wires().length, calls, 'no model call');
+  assert.deepEqual(reference(store.get<ResearchRun>(f.run)!), reference(before), 'the run did not move');
+});
+
+test('PROOF-SPEED-2 (map-2 №18491): a change by another connection while the entry is still open leaves no mark — the next cold entry stops at om-fsck', async t => {
+  const f = await applied(t);
+  const target = f.store.get(f.assessment.id, f.assessment.revision)!;
+  f.store.close();
+  const first = f.open();
+  await new ProductEngine(first).execute({ type: 'early-stage-run', project: 'p', maxTurns: 1, maxCalls: 1 });
+  // While the entry's Store is still open, another connection rewrites an old body with the same sha256.
+  const db = new DatabaseSync(f.path);
+  for (const name of ['revisions_no_update', 'revisions_no_delete', 'events_no_update', 'events_no_delete']) db.exec(`DROP TRIGGER IF EXISTS ${name}`);
+  db.prepare('UPDATE revisions SET body = ? WHERE entity_id = ? AND revision = ?')
+    .run(JSON.stringify({ ...(target.value as object), forged: true }), target.id, target.revision);
+  db.close();
+  first.close();
+  assert.equal(existsSync(integrityMarkPath(first, 'p')), false, 'the file changed under the open entry: no mark');
+  const calls = f.wires().length, store = f.open(), before = store.get<ResearchRun>(f.run)!;
+  const outcome = await new ProductEngine(store).execute({ type: 'early-stage-run', project: 'p', maxTurns: 1, maxCalls: 1 }) as
+    { end: string; reason: { code: string; message: string } | null; budget: { callsMade: number } };
+  assert.deepEqual([outcome.end, outcome.reason?.code, outcome.budget.callsMade], ['blocked', 'store_damaged', 0]);
+  assert.match(outcome.reason!.message, new RegExp(`revision_corrupt ${target.id}@${target.revision}`));
+  assert.equal(f.wires().length, calls, 'no model call');
+  assert.deepEqual(reference(store.get<ResearchRun>(f.run)!), reference(before), 'the run did not move');
+});
+
+test('PROOF-SPEED-2 (map-2 №18514): an outside commit by a later close callback — same sha256 — leaves no mark; the next cold entry stops at om-fsck', async t => {
+  const f = await applied(t);
+  const target = f.store.get(f.assessment.id, f.assessment.revision)!;
+  f.store.close();
+  const first = f.open();
+  await new ProductEngine(first).execute({ type: 'early-stage-run', project: 'p', maxTurns: 1, maxCalls: 1 });
+  // A close callback registered after the mark's own commits the old body from outside, its sha256 kept.
+  first.beforeClose(() => {
+    const db = new DatabaseSync(f.path);
+    for (const name of ['revisions_no_update', 'revisions_no_delete', 'events_no_update', 'events_no_delete']) db.exec(`DROP TRIGGER IF EXISTS ${name}`);
+    db.prepare('UPDATE revisions SET body = ? WHERE entity_id = ? AND revision = ?')
+      .run(JSON.stringify({ ...(target.value as object), forged: true }), target.id, target.revision);
+    db.close();
+  });
+  first.close();
+  assert.equal(existsSync(integrityMarkPath(first, 'p')), false, 'the outside commit leaves no mark');
+  const calls = f.wires().length, store = f.open(), before = store.get<ResearchRun>(f.run)!;
+  const outcome = await new ProductEngine(store).execute({ type: 'early-stage-run', project: 'p', maxTurns: 1, maxCalls: 1 }) as
+    { end: string; reason: { code: string; message: string } | null; budget: { callsMade: number } };
+  assert.deepEqual([outcome.end, outcome.reason?.code, outcome.budget.callsMade], ['blocked', 'store_damaged', 0]);
+  assert.match(outcome.reason!.message, new RegExp(`revision_corrupt ${target.id}@${target.revision}`));
+  assert.equal(f.wires().length, calls, 'no model call');
+  assert.deepEqual(reference(store.get<ResearchRun>(f.run)!), reference(before), 'the run did not move');
 });

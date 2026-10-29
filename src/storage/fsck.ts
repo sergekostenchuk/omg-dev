@@ -34,6 +34,52 @@ export function checkStoreIntegrity(store: Store, additional?: IntegrityRecordCh
   // №3674 п.1: one committed snapshot for the whole check — never events of one moment and heads of another.
   return store.integritySnapshot(() => checkSnapshot(store, additional));
 }
+/**
+ * PROOF-SPEED-2 (owner rule 08.10, the database fingerprint): the same check of everything committed after `from` — each
+ * new body against its sha256, its line of revisions, the order of its events, the heads it moved and every reference it
+ * declares — in one snapshot; the history up to `from` was checked when that mark was saved. A store whose revisions and
+ * events no longer pair one to one (a row added beside the journal) is checked in full, in the same snapshot.
+ */
+export function checkStoreIntegritySince(store: Store, from: number, additional?: IntegrityRecordCheck): IntegrityReport {
+  requireCondition(store instanceof Store && Number.isSafeInteger(from) && from >= 0, "integrity_request_invalid", "The integrity check reads a store from a mark");
+  return store.integritySnapshot(() => {
+    const counts = store.integrityCounts();
+    if (counts.revisions !== counts.events) return checkSnapshot(store, additional);
+    const findings: IntegrityFinding[] = [];
+    const found = (code: IntegrityFindingCode, id: string, revision: number | null, message: string,
+      field: string | null = null, ref: IntegrityFinding["ref"] = null) => findings.push({ code, id, revision, field, ref, message });
+    const lastSequence = store.lastEvent(), events = store.events(from, lastSequence);
+    const seen = new Map<string, number>(), occurred = new Set<string>();
+    let references = 0;
+    for (const event of events) {
+      const key = `${event.id}\u0000${event.revision}`;
+      if (occurred.has(key)) found("event_duplicate", event.id, event.revision, `Event ${event.sequence} repeats a revision already made`);
+      occurred.add(key);
+      if (event.revision <= (seen.get(event.id) ?? 0)) found("event_order", event.id, event.revision, `Event ${event.sequence} makes a revision after a later one`);
+      seen.set(event.id, Math.max(seen.get(event.id) ?? 0, event.revision));
+      const row = store.integrityRevision(event.id, event.revision);
+      if (!row) { found("record_missing", event.id, event.revision, `Event ${event.sequence} names a revision the store does not hold`); continue; }
+      if (event.revision > 1 && !store.integrityRevision(event.id, event.revision - 1))
+        found("revision_gap", event.id, event.revision, `Revision ${event.revision} follows a missing revision`);
+      if (digest(row.body) !== row.sha256) found("revision_corrupt", event.id, event.revision, "The stored body is not the one its sha256 was written for");
+      let body: unknown;
+      try { body = JSON.parse(row.body); } catch { continue; }
+      additional?.record({ id: event.id, kind: row.kind, revision: event.revision, hash: row.sha256, value: body });
+      for (const { field, ref } of referenceSites(row.kind, body)) {
+        references++;
+        const target = store.integrityRevision(ref.id, ref.revision);
+        if (!target) found("reference_missing", event.id, event.revision, "A reference names a revision the store does not hold", field, ref);
+        else if (target.sha256 !== ref.hash) found("reference_forged", event.id, event.revision, "A reference names a revision the store holds with another hash",
+          field, ref);
+      }
+    }
+    for (const [id, revision] of seen)
+      if (store.integrityHead(id) !== revision || store.integrityRevision(id, revision + 1))
+        found("head_invalid", id, store.integrityHead(id), `The head is not the last revision ${revision}`);
+    findings.push(...(additional?.findings() ?? []));
+    return { lastSequence, revisions: events.length, events: events.length, references, findings };
+  });
+}
 function checkSnapshot(store: Store, additional?: IntegrityRecordCheck): IntegrityReport {
   const findings: IntegrityFinding[] = [];
   const found = (code: IntegrityFindingCode, id: string, revision: number | null, message: string,

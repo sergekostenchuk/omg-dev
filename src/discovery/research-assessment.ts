@@ -17,7 +17,7 @@ import { discoveryContext, requireDiscoveryProposal } from './discovery-outcome.
 import { v7FrameAssessment, v7FrameAssessmentBasis, V7_FRAME_ASSESSMENT_INSTRUCTION } from './v7-frame-assessment.js';
 import { Ajv } from "ajv";
 import { Store, type Revision, type TransactionGuard, type Write } from "../storage/store.js";
-import { historicalProof, historicalSourceOverGenuine } from "../history/proofs.js";
+import { historicalProof, historicalReadsReachGenuine, historicalSourceOverGenuine } from "../history/proofs.js";
 import { isProxy } from "node:util/types";
 import { Evidence } from "../evidence/evidence.js";
 import { reference, isRef, stageId, uniqueRefs, type Ref, type Finding, type StageArtifact } from "../pipeline/contracts.js";
@@ -496,6 +496,15 @@ export async function readResearchAssessmentWithHandoffAt(store: Store, projectI
 export function readResearchAssessmentAt(store: Store, projectId: string, turnId: string,
   assessmentRef: Ref): Revision<ResearchAssessment> {
   const { binding, draft } = checkedAssessmentBinding(store, projectId, turnId, assessmentRef);
+  // PROOF-SPEED-2 (owner rule 08.10): the binding was written in one batch with the assessment, after its whole derivation
+  // from the paid producer; on the genuine Store the pair is read as written. A captured or replayed evaluation view keeps
+  // the full derivation and its read sequence.
+  if (historicalReadsReachGenuine(store)) {
+    const saved = exact<ResearchAssessment>(store, assessmentRef, 'research-assessment');
+    requireCondition(saved.revision === 1 && saved.id.startsWith('research-assessment:'),
+      'research_assessment_binding_invalid', `[${turnId}] Saved assessment does not derive from its exact paid producer`);
+    return saved;
+  }
   const value = binding.value;
   const question = exact<Question>(store, value.question, 'question');
   const environment = exact<Environment>(store, value.environment, 'environment');
