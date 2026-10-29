@@ -131,6 +131,10 @@ h1 b{color:var(--accent);font-weight:600}
 .scard .mark,.node .mark{position:absolute;right:-7px;top:-7px;width:18px;height:18px;border-radius:50%;display:grid;place-items:center;font:600 10px var(--mono);border:1.5px solid var(--warn);background:var(--raised);color:var(--warn)}
 .scard .done,.node .done{position:absolute;right:16px;top:-9px;height:18px;padding:0 6px;border-radius:9px;display:flex;align-items:center;font:600 9.5px var(--mono);border:1.5px solid var(--ok);background:var(--raised);color:var(--ok);white-space:nowrap;letter-spacing:.02em}
 .done.acc2{border-style:dashed}
+.scard .g29,.node .g29{position:absolute;left:16px;top:-9px;height:18px;padding:0 6px;border-radius:9px;display:flex;align-items:center;font:600 9.5px var(--mono);border:1.5px solid var(--bad);background:var(--bg);color:var(--bad);z-index:2}
+.g29.fixed{border-color:var(--ok);color:var(--ok)}
+.detail dd.g29d{color:var(--bad)}
+.detail dd.g29d.fixed{color:var(--ok)}
 .detail dd.done{color:var(--ok)}
 select.chip{appearance:none;-webkit-appearance:none;padding-right:22px;background-image:linear-gradient(45deg,transparent 50%,currentColor 50%),linear-gradient(135deg,currentColor 50%,transparent 50%);background-position:calc(100% - 12px) 55%,calc(100% - 8px) 55%;background-size:4px 4px;background-repeat:no-repeat}
 
@@ -289,6 +293,7 @@ html.fslock,html.fslock body{overflow:hidden}
     <button class="chip" data-mode="" aria-pressed="true">Весь поток</button>
     <button class="chip" data-mode="chain" aria-pressed="false">Цепочка фактов</button>
     <button class="chip" data-mode="gaps" aria-pressed="false">Пробелы</button>
+    <button class="chip" data-mode="g2910" aria-pressed="false" title="Пробелы, найденные живым проходом hx5 и репетицией 28–29.10">Пробелы 29-10</button>
     <button class="chip" data-mode="done" aria-pressed="false">Сделано</button>
     <select class="chip" id="doneDate" aria-label="Сделано за дату"><option value="">все даты</option></select>
     <span class="sep" aria-hidden="true"></span>
@@ -1746,6 +1751,13 @@ research-stage(project, draftId, maxTurns)
   <div class="block">
     <div class="bh2"><h2>Итог</h2><small>предложение оркестратора · классы — по Codex №4585 и №4587 · не выдано</small></div>
     <div class="grid">
+      <section class="sec wide" id="g2910">
+        <h3>Пробелы 29-10 <small>найдены живым проходом hx5 и репетицией на заглушке 28–29.10 · на карте — красная отметка «! Lnn» слева над карточкой, зелёная «✓» — исправлено · кнопка «Пробелы 29-10» в панели · реестр: PREPARATIONS/OM-DESIGN/code/V7-LIVE-REGISTRY.md</small></h3>
+        <div class="tw"><table>
+          <thead><tr><th>№</th><th>Карточки</th><th>Что не так</th><th>Как решаем</th><th>Кто</th><th>Состояние</th></tr></thead>
+          <tbody id="g29Rows"></tbody>
+        </table></div>
+      </section>
       <section class="sec wide" id="done">
         <h3>Сделано по датам <small>на карте — зелёная отметка «✓ дата» рядом с «!»; кнопка «Сделано» и выбор даты в панели; сплошная рамка — влито, пунктир — принято ревью и ждёт вливания</small></h3>
         <div class="tw"><table>
@@ -2089,6 +2101,28 @@ research-stage(project, draftId, maxTurns)
   /* привязка строк «Сделано» к карточкам, для задач без упоминания в карточке (21–22.10) */
   var DONEAT={"DRY6-03": ["om.b1.start"], "DRY6-01": ["con.c5"], "DRY6-02": ["om.s.recover"], "OC1": ["disc.d5"], "DR0": ["ndisc.d8"], "DR1b": ["ndisc.d0"], "DR1a": ["in.a"], "DRS1a": ["ndisc.d3.n7"], "DR2": ["ndisc.d7.n4"], "PROC1": ["run.t.group"], "G1": ["disc.d7", "con.c6", "map.m6", "spec.p6", "feat.f6"], "G5b": ["om.r1.model"], "DR3a1": ["ndisc.d2.n1", "ndisc.d3.n4"], "DR3a2": ["ndisc.d3.n4"], "DR3c-a1": ["ndisc.d1.n3"], "G2a": ["con.c1", "map.m1", "spec.p1", "feat.f1"], "G2b": ["om.m8.repo"], "G5a": ["disc.s"], "G7": ["om.b1.start"], "G6": ["om.r0.phase"], "G4a": ["disc.d7"], "G4b": ["con.c1", "map.m1", "spec.p1", "feat.f1"], "G3a+G3b": ["om.b1.save"], "FIX-D": ["spec.p6"], "FIX-A": ["in.c"], "FIX-B": ["in.c"], "LG61": ["ndisc.d3.n2", "disc.d2"], "LG22": ["om.r1.route"], "GITSRC1": ["om.m8.repo"], "GITSRC2": ["om.m8.repo"], "GITSRC3": ["om.m8.repo"], "GITSRC4": ["om.m8.repo"], "LAYERGATE1": ["om.l1.graph"], "HASH1": ["om.l2.form", "om.l3.form"], "HASH2": ["run.t.inputs"], "LG13": ["om.b1.horizon"], "LG12": ["om.s.close"], "LG11": ["om.l2.c5", "om.l3.c5"], "LG13-pre P1b-2": ["om.b1.gaps"], "LG13-pre P1b-3": ["om.b1.gaps"], "DR3c-a2": ["ndisc.d1.n3"], "DR3c-a3": ["ndisc.d1.n3"], "DR3a3-K": ["ndisc.d3.n4"], "LG18": ["om.l2.g4b"], "LG18b": ["om.l2.g4b"], "DR3b-M": ["ndisc.d3.n9"], "DR3a3-C": ["ndisc.d3.n4"], "LG15": ["om.l3.neighbors", "om.s.cont"], "DR3a3-R": ["ndisc.d3.n6"], "DR3c-a4": ["ndisc.d1.n3", "ndisc.d3.n5"], "LG13R": ["om.b1.horizon"], "DR3b-T": ["ndisc.d3.n9"], "S3-route": ["ndisc.d3.n2"], "S1": ["ndisc.d3.n4"], "LG30": ["om.r0.phase"], "LG23": ["run.t.stage"], "DRS1a2": ["ndisc.d3.n7"], "S2": ["ndisc.d3.n7"], "DR4-M": ["ndisc.d4.n1", "ndisc.d4.n4"], "DR3b-M2": ["ndisc.d3.n4"], "LG32": ["disc.d7"], "DR3b-T2": ["ndisc.d3.n4", "ndisc.d3.n9"], "S3": ["ndisc.d3.n2"], "S4": ["ndisc.d3.n7"], "LG40": ["run.s", "om.m8.derive"], "GITSRC5": ["om.m8.repo"], "G7FIX": ["om.s.close"], "LG33": ["disc.d7"], "DR3b-A": ["ndisc.d3.n9"], "G7CTX": ["om.s.close"], "LG05": ["om.s.analyze", "om.s.cont", "om.s.owner"], "RJ1": ["om.s.close"], "LG06": ["om.s.stop", "om.s.analyze"], "S5": ["ndisc.d3.n4"], "S6.1": ["ndisc.d3.n7"], "S6.2": ["ndisc.d3.n6"], "MR.1": ["ndisc.d3.n9", "ndisc.d3.n4"], "MR.2": ["ndisc.d3.n9"], "MR.3": ["ndisc.d3.n9"], "MR.4": ["ndisc.d3.n9"], "MR.5": ["ndisc.d3.n9"], "P.1": ["ndisc.d3.n6"], "P.2": ["ndisc.d3.n5"], "7a.1": ["ndisc.d7.n1", "ndisc.d7.n2"], "LG16a": ["om.l2.c5", "om.l3.c5"], "6.1": ["ndisc.d6.n4", "ndisc.d6.n3"], "6.2-F": ["ndisc.d6.n2"], "S6.3": ["ndisc.d3.n2"], "9.1-F": ["ndisc.k.n2"], "2b.1-F": ["ndisc.d1.n5"], "5.1-F": ["ndisc.d5.n1"], "5.2-F": ["ndisc.d5.n2"], "7b.2-F": ["ndisc.d7.n4"], "LG16b-1": ["om.l2.obl"], "S6.4": ["ndisc.d3.n2"], "S6.9": ["ndisc.d8.n1"], "P.3": ["ndisc.d3.n6"], "LG62": ["ndisc.d3.n1"], "S6.5": ["ndisc.d3.n2"], "P.4": ["ndisc.d3.n9"], "P.5": ["ndisc.d3.n6"], "LG83": ["ndisc.d3.n1"], "S6.6": ["ndisc.d3.n4"], "6.2-D": ["ndisc.d6.n2"], "LG07 группа 1": ["om.s.close"], "S6.7": ["ndisc.d3.n4"], "LG07 группа 2": ["om.s.close"], "S6.8": ["ndisc.d3.n4"], "LG07 m3": ["om.s.close"], "LG07 m3c": ["om.s.close"], "4T.2-T": ["ndisc.d4.n1"], "LG08": ["om.l3.g5"], "LG07 sr-a": ["om.s.close"], "LG07 sr-b": ["om.s.close"], "LG09": ["om.m8.tree", "om.m8.rec"], "LG07 sr-c": ["om.s.close"], "LG07 m3d": ["om.s.close"], "LG07 ag-a": ["om.l2.g4b"], "LG07 st-a": ["om.s.close"], "LG07 sc-a": ["om.s.close"], "LG07 gl-a": ["om.s.close"], "LG07 ag-b": ["om.l2.g4b"], "LG07 sc-b": ["om.s.close"], "LG60": ["ndisc.d3.n4"], "LG07 gl-b": ["om.s.close"], "R.1": ["ndisc.d3.n6", "ndisc.d3.n9"], "LG07 oh-a": ["om.s.close"], "LG19 t1": ["om.s.close"], "LG10": ["om.l3.cand"], "LG07 sr-origin": ["om.s.close"], "LG07 rg-rest-a": ["om.s.close"], "LG07 mc-helper": ["om.s.close"], "LG17 t1": ["om.r1.e5"], "R.2": ["ndisc.d3.n5"], "LG07 ag-rest": ["om.l2.g4b"], "R.3": ["ndisc.d3.n5"], "LG07 sc-rest": ["om.s.close"], "LG07 rg-rest-b2": ["om.s.close"], "LG07 gl-rest": ["om.s.close"], "DRS2.1": ["ndisc.d3.n6"], "4T.1": ["ndisc.d3.n8"], "4T.3": ["ndisc.d4.n1"], "4T.4": ["ndisc.d4.n1"], "DRS2.3": ["ndisc.d8.n1"], "4B.1": ["ndisc.d3.n8", "ndisc.d4.n4"], "4B.2": ["ndisc.d4.n4"], "4O.3": ["ndisc.d4.n4"], "4P.1": ["ndisc.d4.n4"], "4P.2": ["ndisc.d4.n4"], "4R.1": ["ndisc.d3", "ndisc.d4"], "4R.2": ["ndisc.d4", "ndisc.d5"], "4R.3": ["ndisc.d8.n1"], "5.1": ["ndisc.d5.n1"], "5.2": ["ndisc.d5.n2"], "5.3–5.5": ["ndisc.d5.n2"], "5.6": ["ndisc.d5.n2", "ndisc.d5.n4"], "5.7 ч.1": ["ndisc.d5.n3"], "BUDGET-REENTRY": ["ndisc.d5"], "6.3": ["ndisc.d6.n4"], "6.4": ["ndisc.d6.n6"], "6.5": ["ndisc.d6.n6"], "6.6": ["ndisc.d6.n4", "ndisc.d6.n6"], "8.8": ["ndisc.d8.n1"], "DR6": ["ndisc.d6"], "2b.1": ["ndisc.d1.n5"], "2b-T / 2b-R": ["ndisc.d1.n5"], "2b-P / 2b-SES": ["ndisc.d1.n5"], "2b CHOICE-FORM": ["ndisc.d1.n5"], "7a.2": ["ndisc.d7.n1", "ndisc.d7.n2"], "7a.3": ["ndisc.d7.n5"], "FINAL-PAID": ["ndisc.d7.n1", "ndisc.d7.n7", "ndisc.d7.n3", "ndisc.d7.n2"], "7a.4": ["ndisc.d7.n5"], "7b.1+7b.2": ["ndisc.d7.n6", "ndisc.d7.n4"], "7b.3 вариант A": ["ndisc.d7.n4"], "7b.4": ["ndisc.d7.n6", "ndisc.d7.n4"], "7b.3-class": ["ndisc.d7.n4", "ndisc.d7.n2", "ndisc.d7.n5"], "9.5": ["ndisc.k.n2"], "KEEPER-FORMS": ["ndisc.k.n2"], "KEEPER-CONSTITUTION-SOURCE": ["ndisc.k.n1"], "KEEPER-STAGE-PAIR-SOURCE": ["ndisc.k.n2"], "KEEPER-BLOCK-PAIR-SOURCE": ["ndisc.k.n2"], "CHOICE-EDITIONS": ["ndisc.d7.n4"], "D6-RUNNER-ASSESSMENT": ["ndisc.d6.n6"], "KEEPER-PREPARED-SESSION": ["ndisc.k.n2"], "A2 FRAME": ["ndisc.d0.n3", "ndisc.d1.n1", "ndisc.d1.n3", "ndisc.d1.n4"], "A1 FINAL-PROJECTION": ["ndisc.d7.n7"], "B2 RESEARCH-RETURN": ["ndisc.d5.n3"], "D1 INTERPRETATIONS": ["ndisc.d1.n5"], "C1 ACCEPTED-PROJECTION": ["ndisc.d8.n7"], "B3 EVIDENCE-CONDITIONS": ["ndisc.d7.n4"], "C4 OWNER-SUMMARY": ["ndisc.d8.n1"], "C2 CONCEPT-ROOT": ["ndisc.d8.n2"], "C3 DOWNSTREAM-HANDOFF": ["ndisc.d8.n3", "ndisc.d8.n4", "ndisc.d8.n5", "ndisc.d8.n6"], "B0 RESEARCH-ENTRY": ["ndisc.d1.n1", "ndisc.d1.n3", "ndisc.d1.n4", "ndisc.d2.n1", "ndisc.d2.n5"], "B1 D7-DRIVER-FINALIZATION": ["ndisc.d6.n6", "ndisc.d7.n1", "ndisc.d7.n2", "ndisc.d7.n3", "ndisc.d7.n5", "ndisc.d7.n6"], "A3 PLAN-COVERAGE": ["ndisc.d2.n1", "ndisc.d2.n5"]};
   var DST={merged:"влито",accepted:"принято",no:"откачено",work:"в работе"};
+  var G29ST={fixed:"исправлено, влито",work:"в работе",queue:"в очереди",owner:"ждёт решения владельца"};
+  var G2910=[
+    {id:"L1",cards:["ndisc.d0.n1"],st:"fixed",who:"codex-worker",what:"Не было продуктового входа в Discovery v7 для проекта — только тестовый обход.",fix:"Отдельная команда владельца owner-producer-policy включает v7 для одного проекта; без неё — v6 (LIVE-ENTRY, s88)."},
+    {id:"L2",cards:["ndisc.d3.n2"],st:"fixed",who:"codex-worker",what:"Модели не показана точная форма действия «прочитать источник» (read_source: start/end, без лишних полей) — живой проход встал 01:17.",fix:"Полные формы действий чтения доставляются в запрос аналитика и планировщика (LIVE-FORMS, s89)."},
+    {id:"L3",cards:["ndisc.d3.n4"],st:"fixed",who:"codex-worker",what:"После неверного по форме ответа аналитика плана выхода не было — каждый вход повторял тот же отказ.",fix:"Команда retry-plan-response: одна исправляющая попытка с точной ошибкой и формой; старая попытка и расход сохраняются (s89)."},
+    {id:"L4",cards:["ndisc.d3.n3","ndisc.d3.n4"],st:"fixed",who:"codex-worker",what:"Не доставлялась форма «утверждений» (5 видов оснований, planQuestions, valueHash, ссылки на чтения).",fix:"Общая закрытая схема claims в запросе; ссылки и valueHash выводит продукт из реально прочитанного текста (s89)."},
+    {id:"L5",cards:["ndisc.d3.n9"],st:"fixed",who:"codex-worker",what:"Оценщику попыток не доставлены форма новизны/возврата и три правила (unknown у блокирующего, significance, original).",fix:"Форма и правила оценщика доставляются явно; валидаторы не ослаблены (s90)."},
+    {id:"L6",cards:["ndisc.d3.n4"],st:"fixed",who:"codex-worker",what:"Сбой провайдера («model at capacity») на исправляющем вызове — тупик, единственная попытка сгорала.",fix:"Доказанная цепочка транспортных повторов той же исправляющей попытки; новая синтаксическая ошибка по-прежнему завершает (LIVE-FORMS-02, s91)."},
+    {id:"L7",cards:["ndisc.d4.n1","ndisc.d4.n2","ndisc.d4.n3"],st:"work",who:"codex-worker",what:"Роль «предложить варианты»: в запросе нет формы ответа, шести критериев и правил — модель не может ответить правильно (репетиция, вход 18).",fix:"Доставить закрытую форму вариантов (1–3, критерии value/user/payer/costAndTime/risk/mandateFit, scale, recommendation, searchLimits) — LIVE-FORMS-03."},
+    {id:"L8",cards:["ndisc.d4.n4"],st:"work",who:"codex-worker",what:"Неверный ответ на шаге вариантов — тупиковая пауза без двери повтора.",fix:"Одна адресная исправляющая попытка с точной ошибкой и формой, как retry-plan-response — LIVE-FORMS-03."},
+    {id:"L9",cards:["ndisc.d6.n4","ndisc.d7.n1","ndisc.d7.n5"],st:"work",who:"codex-worker",what:"Не сверено, доставлены ли формы ответов всех остальных ролей (escalation-assessor, досье, итог, оценка итога).",fix:"Одним заходом сравнить декодер каждой роли с фактическим запросом и доставить недостающее — LIVE-FORMS-03; проверка репетицией."},
+    {id:"L10",cards:["ndisc.d5.n2","ndisc.d5.n1"],st:"work",who:"codex-worker2",what:"Глубокий проход — одношаговый ответ: нет веб-поиска, чтения страниц и каталога источников, факт с источником невозможен.",fix:"Настоящий цикл: web_search → web_fetch → Source → read_source → ответ со ссылками на общем механизме обычного исследования (DEEP-RESEARCH)."},
+    {id:"L11",cards:["ndisc.d3.n6","ndisc.d3.n9"],st:"owner",who:"—",what:"Каждый шаг заново доказывает всю историю попыток: шаг растёт с 1 до 73 с к 31-му входу на заглушке.",fix:"Запоминать проверку записи по неизменяемому хэшу — решение владельца после замера полной репетиции."},
+    {id:"L12",cards:[],st:"work",who:"Sonnet",what:"Антибан: ровная пауза между вызовами оставляет след автоматизации.",fix:"Случайная пауза 30–50 с, строго один вызов за раз (обвязка, ревью map-2)."},
+    {id:"L13",cards:[],st:"queue",who:"Sonnet",what:"Запасной слой автоповторов провайдера в обвязке: ноль расхода без доказательства, повтор после сигнала остановки.",fix:"Исправить TRANSPORT-02/03 по ревью map-2."},
+    {id:"L14",cards:[],st:"work",who:"Sonnet",what:"Не проверено, что каждый промпт роли прямо говорит, что и в какой форме ответить.",fix:"Аудит фактических запросов всех ролей: инструкция, форма, правила, данные — таблица PROMPTS-AUDIT.md."},
+    {id:"L15",cards:[],st:"work",who:"Sonnet",what:"Неизвестно время и число шагов полной репетиции до концепции.",fix:"Замер полной репетиции (11 вопросов) — основание для решения по L11."},
+    {id:"L16",cards:["ndisc.k.n3"],st:"queue",who:"Sonnet",what:"Тестовый файл поправки конституции: 4 сценария по 64–69 с, файл дольше 900 с.",fix:"Разрезать по сохранённым точкам, проверки сохранить."},
+    {id:"L17",cards:["ndisc.k.n2"],st:"queue",who:"codex-worker3",what:"Старые тесты K.n2: подготовка L3 дольше 60 с; ожидание устаревшего кода отказа.",fix:"Исправить в рамках K.n2."},
+    {id:"L19",cards:["ndisc.d7.n5"],st:"queue",who:"—",what:"Тест №1395 (оценка исправленного итога B1) до 97 с под нагрузкой.",fix:"После v7: кеш исторических чтений (LATER-V7)."}
+  ];
+
   /* two-row snake layout for sub-block schemes; empty labels stay hidden */
   function snake(list,k){list.forEach(function(n,i){if(i<k){n.x=i*220;n.y=0;}else{n.x=(k-1-(i-k))*220;n.y=200;}});return list;}
   function lbl(e){if(e.l==null)e.l="";return e;}
@@ -3686,6 +3720,32 @@ research-stage(project, draftId, maxTurns)
     DONE.map(function(x){return x.date;}).filter(function(v,i,a){return a.indexOf(v)===i;}).forEach(function(d){var o=document.createElement("option");o.value=d;o.textContent=d;sel.appendChild(o);});
     sel.addEventListener("change",function(){doneDate=sel.value;renderDone();apply();});})();
 
+  /* ---------- gaps 29-10: defects found by the hx5 live pass and the stub rehearsal ---------- */
+  function g29Own(k){return G2910.filter(function(x){return x.cards.indexOf(k)>=0;});}
+  function g29Of(k){
+    if(IT[k].kind==="node")return g29Own(k);
+    var seen={},out=[];
+    ORDER.forEach(function(c){if(c===k||c.indexOf(k+".")===0)g29Own(c).forEach(function(x){if(!seen[x.id]){seen[x.id]=1;out.push(x);}});});
+    return out;
+  }
+  function renderG29(){
+    ORDER.forEach(function(k){
+      var el=IT[k].kind==="node"?nodeEl[k]:cardEl[k];if(!el)return;
+      var old=el.querySelector(":scope > .g29");if(old)old.remove();
+      var list=g29Of(k);if(!list.length)return;
+      var open=list.filter(function(x){return x.st!=="fixed";});
+      var s=document.createElement("span");s.className="g29"+(open.length?"":" fixed");
+      s.title=list.map(function(x){return x.id+" — "+G29ST[x.st]+": "+x.what;}).join("\n");
+      s.textContent=(open.length?"! ":"✓ ")+list.map(function(x){return x.id;}).join(" ");
+      el.appendChild(s);
+    });
+    var tb=document.getElementById("g29Rows");if(!tb)return;tb.innerHTML="";
+    G2910.forEach(function(x){var tr=document.createElement("tr");
+      var cards=x.cards.map(function(c){return IT[c]?IT[c].t:c;}).join(" · ")||"обвязка / процесс";
+      [x.id,cards,x.what,x.fix,x.who,G29ST[x.st]].forEach(function(v){var td=document.createElement("td");td.textContent=v;tr.appendChild(td);});
+      tb.appendChild(tr);});
+  }
+
   /* ---------- highlight ---------- */
   var sel=null,mode="";
   function visibleKeys(){return ORDER.filter(function(k){return shown(k)&&(IT[k].kind==="node"||!opened(k));});}
@@ -3696,6 +3756,8 @@ research-stage(project, draftId, maxTurns)
     if(sel){ns={};ns[sel]=1;es={};drawn.forEach(function(d,i){if(d.a===sel||d.b===sel){es[i]=1;ns[d.a]=1;ns[d.b]=1;}});}
     else if(mode==="done"){ns={};es={};vis.forEach(function(k){if(doneOf(k).length)ns[k]=1;});}
     else if(mode==="gaps"){ns={};es={};vis.forEach(function(k){if(IT[k].kind==="node"?IT[k].g:anyGap(k))ns[k]=1;});}
+    else if(mode==="g2910"){ns={};es={};vis.forEach(function(k){if(g29Of(k).length)ns[k]=1;});
+      var gs=document.getElementById("g2910");if(gs)gs.scrollIntoView({block:"nearest"});}
     else if(mode==="chain"){ns={};es={};
       vis.forEach(function(k){if(CHAIN.some(function(c){return under(c,k);}))ns[k]=1;});
       drawn.forEach(function(d,i){if(ns[d.a]&&ns[d.b])es[i]=1;});}
@@ -3716,6 +3778,7 @@ research-stage(project, draftId, maxTurns)
       '<h2>'+esc(it.t)+'</h2><div class="io">'+esc(it.io[0])+'<i>→</i>'+esc(it.io[1])+'</div><dl>';
     (it.d||[]).forEach(function(r){h+='<div><dt>'+esc(r[0])+'</dt><dd'+(r[2]===GAP?' class="gap"':r[2]===TASK?' class="task"':'')+'>'+esc(r[1])+'</dd></div>';});
     doneOf(key).forEach(function(x){h+='<div><dt>Сделано · '+esc(x.date)+'</dt><dd class="done">'+esc(x.id)+' — '+esc(DST[x.st])+' ('+esc(x.ref)+'): '+esc(x.what)+'</dd></div>';});
+    g29Of(key).forEach(function(x){var c=x.st==="fixed"?' fixed':'';h+='<div><dt>Пробел 29-10 · '+esc(x.id)+'</dt><dd class="g29d'+c+'">'+esc(x.what)+'</dd></div><div><dt>Как решаем · '+esc(G29ST[x.st])+'</dt><dd class="g29d'+c+'">'+esc(x.fix)+' — '+esc(x.who)+'</dd></div>';});
     h+='</dl>';
     var inc=drawn.filter(function(d){return d.b===key;}),out=drawn.filter(function(d){return d.a===key;});
     if(inc.length||out.length){h+='<div class="links">';
@@ -4064,6 +4127,7 @@ research-stage(project, draftId, maxTurns)
 
   renderDoneTable();
   renderDone();
+  renderG29();
   layout();fit();
   if(document.fonts&&document.fonts.ready)document.fonts.ready.then(function(){layout();fit();});
 })();
