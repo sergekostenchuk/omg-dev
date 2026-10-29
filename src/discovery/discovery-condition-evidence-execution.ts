@@ -1,5 +1,7 @@
+import { pendingContextWorkspace } from './context-workspace.js';
+import { finalMaterialAdmission, finalMaterialProjection, finalMaterialEra, finalWorkspace, packFinalMaterial, recordFinalMaterialWorkspace, finalTechnicalLookup } from './final-material.js';
 import { conditionEvidenceResponseContract } from './discovery-response-contract.js';
-import { canonical, digest, hashJson } from '../canonical.js';
+import { canonical, hashJson } from '../canonical.js';
 import { EngineError, requireCondition } from '../errors.js';
 import { isRef, reference, type Ref } from '../pipeline/contracts.js';
 import type { Environment, RoleBinding } from '../runtime/environment.js';
@@ -137,9 +139,11 @@ function readEvidenceRequestArchive(store: Store, prepared: Revision<ConditionEv
     && same(capacity.mandatory.archive.record, prepared.value.archive),
   'The assessment admission lost its exact archive');
   const address = capacity.mandatory.archive;
-  const original = readFinalCapacityProjection(store, address.record, address.pointer);
+  const minimum = readFinalCapacityProjection(store, address.record, address.pointer);
+  const original = address.pointer === '/body/admission' ? readFinalCapacityProjection(store, address.record, '/body/request') : minimum;
   const originalText = canonical(original);
-  valid(digest(originalText) === address.hash, 'The assessment archive differs from its exact hash');
+  valid(hashJson(minimum as never) === address.hash
+    && (address.pointer !== '/body/admission' || same(minimum, finalMaterialAdmission(original))), 'The assessment archive differs from its exact hash');
   return { capacity, original, originalText };
 }
 
@@ -203,11 +207,13 @@ export function readConditionEvidenceDispatchLeaf(store: Store, applicationRef: 
     && (!profile || profile.value.projectId === value.projectId),
   'The assessment runtime or exact grounds differ from its preparation');
   const marker = conditionEvidenceContinuation(store, session);
-  valid(keys(app.context, ['finalContinuation', 'request', 'schema', 'resultCapacity', 'contextWorkspace'])
+  valid(keys(app.context, ['finalContinuation', 'request', 'schema', 'resultCapacity', 'contextWorkspace',
+    ...(finalMaterialEra(prepared.value.input) ? ['finalMaterial'] : [])])
+    && (!finalMaterialEra(prepared.value.input) || same(app.context.finalMaterial,finalMaterialProjection(original.packet)))
     && same(app.context.finalContinuation, marker) && canonical(app.context.request) === originalText
     && same(app.context.schema, prepared.value.envelope.packet.schema)
     && same(app.context.resultCapacity, prepared.value.envelope.capacity)
-    && same(app.context.contextWorkspace, value.workspace.entries.map(entry => entry.result))
+    && same(app.context.contextWorkspace, finalWorkspace(prepared.value.input, value.workspace))
     && app.prompt === value.prompt && same(app.role, value.role) && same(app.dispatch, value.dispatch)
     && same(app.profile, value.profile) && app.state === 'prepared' && app.call === null
     && app.received === null && app.after === null && Array.isArray(app.guards)
@@ -278,6 +284,9 @@ export function prepareConditionEvidenceContextPacker(store: Store,
         resultCapacity: structuredClone(context.resultCapacity), contextWorkspace: structuredClone(context.contextWorkspace),
         working: { archive, deliveryContract: 'research-delivery/v1',
           instruction: 'Read each exact omitted address with read_context and continue through every page before returning a final result.' } };
+      if (finalMaterialEra(prepared.value.input))
+        packFinalMaterial(packet, context.request, archive, prepared.value.archive, packetLimit, session.value.workspace);
+      else {
       const originals = addressArchivedMaterials(packet, archive, ['request'], packetLimit,
         () => prepared.value.archive, 2048);
       // Leave room for a positive original fragment after the newest context
@@ -285,6 +294,7 @@ export function prepareConditionEvidenceContextPacker(store: Store,
       // make the shared material delivery fail on the next paid turn.
       packContextWorkspace(packet, packetLimit, packetLimit, undefined, originals.length ? 8192 : 1024);
       serveArchivedMaterial(packet, originals, packetLimit, 512);
+      }
       requirePacketMaterialDelivery(packet, archive, resolve);
       valid(JSON.stringify(packet).length <= packetLimit, 'The assessment transport packet exceeds its saved limit');
       return packet;
@@ -314,24 +324,26 @@ async function physicalEvidenceOutcome(store: Store, project: string, applicatio
 async function projectEvidenceStep(store: Store, admission: ReturnType<typeof readConditionEvidenceDispatchLeaf>,
   paid: Awaited<ReturnType<typeof physicalEvidenceOutcome>>['paid']) {
   const { session, application, draft, question } = admission;
-  let workspace = contextWorkspace(session.value.workspace), result: Ref | null = null, output: Write | null = null;
+  const materialEra = finalMaterialEra(admission.prepared.value.input);
+  let workspace = contextWorkspace(materialEra ? recordFinalMaterialWorkspace(session.value.workspace, paid.subject) : session.value.workspace), result: Ref | null = null, output: Write | null = null;
   const response = paid.payload;
   if (object(response) && response.action === 'read_context') {
     const action = researchAction(response);
     valid(action.action === 'read_context', 'An assessment lookup must retain its exact address');
     const addresses = paid.subject.working?.materialAddresses;
-    valid(Array.isArray(addresses) && addresses.some((address: Record<string, any>) =>
+    valid((finalMaterialEra(admission.prepared.value.input) && finalTechnicalLookup(paid.subject, admission.context.request, action))
+      || Array.isArray(addresses) && addresses.some((address: Record<string, any>) =>
       same(address.record, action.record)
       && (action.pointer === address.pointer || action.pointer.startsWith(`${address.pointer}/`))),
     'An assessment lookup must address material of this exact paid packet');
     const lookup = readResearchContextOutcomeAt(store, draft, question, action,
       admission.profile?.value.maxRequestChars ?? 300000, 'bounded');
-    workspace = addContextLookup(workspace, lookup, paid.subject.contextWorkspace, undefined, paid.subject);
+    workspace = addContextLookup(workspace, lookup, paid.subject.contextWorkspace, undefined, materialEra ? undefined : paid.subject);
   } else {
-    requireCompleteContextPacket(workspace, paid.subject);
+    requireCompleteContextPacket(materialEra ? pendingContextWorkspace(session.value.workspace) : workspace, paid.subject);
     const checked = checkConditionEvidenceReply(store, session.value.projectId, session.value.subject,
       admission.prepared.value.input.resultLimitChars, admission.context.resultCapacity, response);
-    workspace = contextProgress(workspace, paid.subject);
+    workspace = contextProgress(workspace, materialEra ? undefined : paid.subject);
     const value: ConditionEvidencePaidResult = { contract: CONDITION_EVIDENCE_PAID_RESULT,
       projectId: session.value.projectId, source: session.value.source, prepared: session.value.prepared,
       subject: session.value.subject, session: reference(session), application: reference(application),
@@ -540,8 +552,9 @@ export async function runConditionEvidenceExecution(store: Store, project: strin
     const marker: ConditionEvidenceContinuation = { subject: session.value.subject, source: exactSource,
       prepared: reference(prepared), execution: createSession ? reference(origin) : reference(exact<ConditionEvidenceExecution>(
         store, reference(origin), CONDITION_EVIDENCE_EXECUTION_KIND)) };
-    const context = { finalContinuation: marker, request: original, schema: prepared.value.envelope.packet.schema,
-      resultCapacity: capacity, contextWorkspace: session.value.workspace.entries.map(entry => entry.result) };
+    const context = { ...(finalMaterialEra(prepared.value.input) ? {finalMaterial:finalMaterialProjection(original.packet)} : {}),
+      finalContinuation: marker, request: original, schema: prepared.value.envelope.packet.schema,
+      resultCapacity: capacity, contextWorkspace: finalWorkspace(prepared.value.input, session.value.workspace) };
     const partial = { session, source, prepared, proven: source, draft, question, environment, profile };
     const guards = currentConditionEvidenceGuards(store, project,
       partial as unknown as Awaited<ReturnType<typeof readConditionEvidenceDispatchAdmission>>);

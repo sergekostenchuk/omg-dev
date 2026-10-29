@@ -1,3 +1,4 @@
+import { finalMaterialAdmission, finalMaterialArchive, finalMaterialEra, finalMaterialPointer, type FinalMaterialContract } from './final-material.js';
 import { canonical, hashJson } from '../canonical.js';
 import { EngineError, requireCondition } from '../errors.js';
 import type { Ref } from '../pipeline/contracts.js';
@@ -78,11 +79,11 @@ function admission(packet: DiscoveryFinalPacket, schema: Record<string, unknown>
 
 /** The shared archive producer derives its address solely from the freshly
  * proven final packet and its unchanged result declaration. */
-function archiveFor(store: Store, packet: DiscoveryFinalPacket, minimum: Record<string, unknown>) {
+function archiveFor(store: Store, packet: DiscoveryFinalPacket, minimum: Record<string, unknown>, era = false) {
   const staged = prepareArchiveParts(store, { projectId: packet.subject.projectId,
-    draft: packet.subject.basis.draft, question: packet.subject.basis.brief.question }, { request: minimum });
+    draft: packet.subject.basis.draft, question: packet.subject.basis.brief.question }, finalMaterialArchive(minimum, era));
   valid(staged.archive.revision === 1, 'The final result archive must be immutable');
-  return { staged, address: { record: staged.archive, pointer: '/body/request', hash: hashJson(minimum) } };
+  return { staged, address: { record: staged.archive, pointer: finalMaterialPointer(era), hash: hashJson(era ? finalMaterialAdmission(minimum) : minimum) } };
 }
 
 function savedArchiveProjection(store: Store, address: { record: Ref; pointer: string; hash: string },
@@ -125,22 +126,25 @@ export function projectDiscoveryFinal(packet: DiscoveryFinalPacket, reply: unkno
  * The limit comes from the caller's admission; it is not a physical wire claim. */
 export async function prepareDiscoveryFinalResultTransport(store: Store, project: string,
   subject: unknown, envelopeLimitChars: number,
-  options?: { archive: 'staged' }, form: FinalBundleContract = V7_FINAL_CONTRACT): Promise<DiscoveryFinalResultTransport> {
+  options?: { archive: 'staged'; materialContract?: FinalMaterialContract }, form: FinalBundleContract = V7_FINAL_CONTRACT): Promise<DiscoveryFinalResultTransport> {
   const version = formOf(form);
   const packet = await requireDiscoveryFinalSubject(store, project, subject);
   const schema = declaration(packet, version);
-  valid(options === undefined || keys(options, ['archive']) && options.archive === 'staged',
+  valid(options === undefined || (keys(options, ['archive']) || keys(options, ['archive','materialContract'])) && options.archive === 'staged',
     'The final result archive option has an unknown form');
   const input = admission(packet, schema, envelopeLimitChars);
   if (options) {
-    const prepared = archiveFor(store, packet, input.mandatoryEnvelope);
+    const original = input.mandatoryEnvelope;
+    const era = finalMaterialEra(options);
+    const prepared = archiveFor(store, packet, input.mandatoryEnvelope, era);
+    if (era) input.mandatoryEnvelope = finalMaterialAdmission(input.mandatoryEnvelope);
     // `subject` is reserved by the common physical builder for a V7PlanSubject.
     // A D7 subject is a different contract, so retain its complete value under
     // its own name rather than masquerading as an admitted plan question.
     const bindings = { projectId: packet.subject.projectId, finalSubject: packet.subject };
     const capacity = buildResearchResultCapacity({ ...input, bindings, mandatoryArchive: prepared.address });
     return { contract: DISCOVERY_FINAL_RESULT, subject: structuredClone(packet.subject), packet, schema, capacity,
-      archive: { ref: prepared.staged.archive, projection: structuredClone(input.mandatoryEnvelope),
+      archive: { ref: prepared.staged.archive, projection: structuredClone(original),
         writes: prepared.staged.writes, guards: prepared.staged.guards } };
   }
   const capacity = buildResearchResultCapacity(input);
@@ -157,11 +161,13 @@ export async function requireDiscoveryFinalResultCapacity(store: Store, project:
   catch { throw new EngineError('discovery_final_subject_invalid', 'The final subject must be a stable data value'); }
   try { capacitySnapshot = JSON.parse(canonical(saved)); }
   catch { throw new EngineError('research_capacity_invalid', 'The result admission must be a stable data value'); }
-  const proven = await prepareDiscoveryFinalResultTransport(store, project, subjectSnapshot, limit, { archive: 'staged' }, form);
+  const proven = await prepareDiscoveryFinalResultTransport(store, project, subjectSnapshot, limit, { archive: 'staged', ...(typeof capacitySnapshot === 'object' && capacitySnapshot !== null
+    && (capacitySnapshot as any).mandatory?.archive?.pointer === '/body/admission' ? {materialContract:'discovery-final-material/v1' as const} : {}) }, form);
   valid(proven.archive && 'archive' in proven.capacity.mandatory,
     'The final result admission lost its exact archive');
   const address = proven.capacity.mandatory.archive;
   const input = admission(proven.packet, proven.schema, limit);
+  if (address.pointer === '/body/admission') input.mandatoryEnvelope = finalMaterialAdmission(input.mandatoryEnvelope);
   const projection = savedArchiveProjection(store, address, input.mandatoryEnvelope);
   const bindings = { projectId: proven.subject.projectId, finalSubject: proven.subject };
   requireResearchResultCapacity(capacitySnapshot, { ...input, bindings, mandatoryArchive: address }, (record, pointer) => {
@@ -199,7 +205,9 @@ export async function checkDiscoveryFinalResearchReply(store: Store, project: st
   const input = admission(packet, schema, envelopeLimitChars);
   const mandatory = object(capacity) && object(capacity.mandatory) ? capacity.mandatory : null;
   if (mandatory && Object.hasOwn(mandatory, 'archive')) {
-    const prepared = archiveFor(store, packet, input.mandatoryEnvelope);
+    const era = mandatory.archive?.pointer === '/body/admission';
+    const prepared = archiveFor(store, packet, input.mandatoryEnvelope, era);
+    if (era) input.mandatoryEnvelope = finalMaterialAdmission(input.mandatoryEnvelope);
     valid(same(mandatory.archive, prepared.address), 'The result capacity names another archive or pointer');
     const projection = savedArchiveProjection(store, prepared.address, input.mandatoryEnvelope);
     const bindings = { projectId: packet.subject.projectId, finalSubject: packet.subject };

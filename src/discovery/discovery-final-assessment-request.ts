@@ -1,3 +1,4 @@
+import { finalMaterialAdmission, finalMaterialArchive, finalMaterialEra, finalMaterialPointer, type FinalMaterialContract } from './final-material.js';
 import { canonical, hashJson, HASH_PATTERN } from '../canonical.js';
 import { EngineError, requireCondition } from '../errors.js';
 import { reference, type Ref } from '../pipeline/contracts.js';
@@ -80,11 +81,11 @@ function admission(packet: DiscoveryFinalAssessmentPacket, schema: Record<string
 }
 
 /** The shared archive producer derives its address solely from the freshly proven packet and its declaration. */
-function archiveFor(store: Store, packet: DiscoveryFinalAssessmentPacket, minimum: Record<string, unknown>) {
+function archiveFor(store: Store, packet: DiscoveryFinalAssessmentPacket, minimum: Record<string, unknown>, era = false) {
   const staged = prepareArchiveParts(store, { projectId: packet.subject.projectId,
-    draft: packet.final.subject.basis.draft, question: packet.final.subject.basis.brief.question }, { request: minimum });
+    draft: packet.final.subject.basis.draft, question: packet.final.subject.basis.brief.question }, finalMaterialArchive(minimum, era));
   valid(staged.archive.revision === 1, 'The final assessment archive must be immutable');
-  return { staged, address: { record: staged.archive, pointer: '/body/request', hash: hashJson(minimum as never) } };
+  return { staged, address: { record: staged.archive, pointer: finalMaterialPointer(era), hash: hashJson((era ? finalMaterialAdmission(minimum) : minimum) as never) } };
 }
 function savedArchiveProjection(store: Store, address: { record: Ref; pointer: string; hash: string },
   minimum: Record<string, unknown>): Record<string, unknown> {
@@ -93,23 +94,27 @@ function savedArchiveProjection(store: Store, address: { record: Ref; pointer: s
     && same(reference(row), address.record) && hashJson(row.value as never) === address.record.hash,
   'The exact final assessment archive is missing or changed');
   const body = readArchiveBody(store, row).body;
-  valid(address.pointer === '/body/request' && same(body.request, minimum) && hashJson(body.request as never) === address.hash,
+  const projection = address.pointer === '/body/admission' ? body.admission : body.request;
+  valid(same(projection, minimum) && hashJson(projection as never) === address.hash,
     'The saved final assessment request differs from the proven packet and schema');
-  return body.request;
+  return projection;
 }
 
 /** A read-only transport from the exact subject, proven again; the limit is the caller's result admission. */
 export async function prepareDiscoveryFinalAssessmentTransport(store: Store, project: string, subject: unknown,
-  envelopeLimitChars: number, options?: { archive: 'staged' }): Promise<DiscoveryFinalAssessmentTransport> {
+  envelopeLimitChars: number, options?: { archive: 'staged'; materialContract?: FinalMaterialContract }): Promise<DiscoveryFinalAssessmentTransport> {
   const packet = await requireDiscoveryFinalAssessmentSubject(store, project, subject);
-  valid(options === undefined || keys(options, ['archive']) && options.archive === 'staged',
+  valid(options === undefined || (keys(options, ['archive']) || keys(options, ['archive','materialContract'])) && options.archive === 'staged',
     'The final assessment archive option has an unknown form');
   const schema = declaration(packet), input = admission(packet, schema, envelopeLimitChars);
   if (options) {
-    const prepared = archiveFor(store, packet, input.mandatoryEnvelope);
+    const original = input.mandatoryEnvelope;
+    const era = finalMaterialEra(options);
+    const prepared = archiveFor(store, packet, input.mandatoryEnvelope, era);
+    if (era) input.mandatoryEnvelope = finalMaterialAdmission(input.mandatoryEnvelope);
     const capacity = buildResearchResultCapacity({ ...input, mandatoryArchive: prepared.address });
     return { contract: DISCOVERY_FINAL_ASSESSMENT_RESULT, subject: structuredClone(packet.subject), packet, schema, capacity,
-      archive: { ref: prepared.staged.archive, projection: structuredClone(input.mandatoryEnvelope),
+      archive: { ref: prepared.staged.archive, projection: structuredClone(original),
         writes: prepared.staged.writes, guards: prepared.staged.guards } };
   }
   return { contract: DISCOVERY_FINAL_ASSESSMENT_RESULT, subject: structuredClone(packet.subject), packet, schema,
@@ -131,7 +136,9 @@ export async function checkDiscoveryFinalAssessmentReply(store: Store, project: 
   try { capacity = JSON.parse(canonical(saved)); } catch { valid(false, 'The result capacity is not a plain JSON value'); }
   const mandatory = object(capacity) && object(capacity.mandatory) ? capacity.mandatory : null;
   if (mandatory && Object.hasOwn(mandatory, 'archive')) {
-    const prepared = archiveFor(store, packet, input.mandatoryEnvelope);
+    const era = mandatory.archive?.pointer === '/body/admission';
+    const prepared = archiveFor(store, packet, input.mandatoryEnvelope, era);
+    if (era) input.mandatoryEnvelope = finalMaterialAdmission(input.mandatoryEnvelope);
     valid(same(mandatory.archive, prepared.address), 'The result capacity names another archive or pointer');
     const projection = savedArchiveProjection(store, prepared.address, input.mandatoryEnvelope);
     requireResearchResultCapacity(capacity, { ...input, mandatoryArchive: prepared.address }, (record, pointer) => {

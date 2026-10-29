@@ -1,3 +1,4 @@
+import { requireFinalMaterialDelivery, finalMaterialEra } from './final-material.js';
 import { producerDispatchPolicy, producerDispatchGuards } from './project-producer-policy.js';
 import { isInterpretationConsumer, requireInterpretationConsumer, requireInterpretationNewDispatch } from './interpretation-execution.js';
 import { dossierSessionTransport, dossierTransportDelivery, packetDossierSubject, requireDossierTransportContext } from './continuation-packet.js';
@@ -419,14 +420,14 @@ function preparedAssessmentCall(reservation: AssessmentReservation | null, call:
 export function prepareResearchEnvelope(role: RoleBinding, environment: Environment, prompt: string,
   context: unknown, audit?: Pick<ResearchCallAudit, 'store' | 'draftId' | 'questionId' | 'purpose' | 'pilot' | 'contextContract'>,
   capacity?: Record<string, any>, requestId = '00000000-0000-0000-0000-000000000000',
-  requestContract?: string, requestLimitChars?: number) {
+  requestContract?: string, requestLimitChars?: number, preflightPacker?: (limit: number) => Record<string, any>) {
   requireCondition(!packetDossierSubject(context) && !packetDossierSubject(capacity?.bindings)
     && audit?.purpose !== 'dossier-assessor', 'discovery_dossier_transport_invalid',
   'A dossier needs the asynchronous envelope preflight');
   requireCondition(requestLimitChars === undefined || Number.isSafeInteger(requestLimitChars) && requestLimitChars > 0,
     'research_request_limit_invalid', 'A separate physical request limit must be a positive safe integer');
   return buildResearchEnvelope(role, environment, prompt, context, audit, capacity, requestId, requestContract,
-    undefined, requestLimitChars);
+    undefined, requestLimitChars, undefined, preflightPacker);
 }
 
 /** Callable dossier preflight: accepted async proof, ordinary capacity arithmetic,
@@ -470,7 +471,8 @@ function buildResearchEnvelope(role: RoleBinding, environment: Environment, prom
   context: unknown, audit?: Pick<ResearchCallAudit, 'store' | 'draftId' | 'questionId' | 'purpose' | 'pilot' | 'contextContract'>,
   capacity?: Record<string, any>, requestId = '00000000-0000-0000-0000-000000000000',
   requestContract?: string, dossier?: Awaited<ReturnType<typeof prepareDossierContextPacker>>,
-  requestLimitChars?: number, final?: ReturnType<typeof prepareDiscoveryFinalContextPacker>) {
+  requestLimitChars?: number, final?: ReturnType<typeof prepareDiscoveryFinalContextPacker>,
+  preflightPacker?: (limit: number) => Record<string, any>) {
   const draft = audit?.store.get<DiscoveryDraft>(audit.draftId);
   const planSubject = final ? null : packetPlanSubject(capacity?.bindings ?? {});
   const assessmentSubject = packetAssessmentSubject(context);
@@ -522,7 +524,7 @@ function buildResearchEnvelope(role: RoleBinding, environment: Environment, prom
   const overhead = JSON.stringify(outputLimit).length + 32 + Math.max(JSON.stringify({ ...envelope, subject: {} }).length,
     controls && !consolidating ? JSON.stringify({...envelope,prompt:finalInstruction,subject:{}}).length : 0) + (packetState ? 4000 : 0);
   const subjectFor = (limit: number) => {
-    const packed = final ? final.pack(limit) : dossier ? dossier.pack(audit!.draftId, audit!.questionId!, packingContext, limit,
+    const packed = final ? final.pack(limit) : preflightPacker ? preflightPacker(limit) : dossier ? dossier.pack(audit!.draftId, audit!.questionId!, packingContext, limit,
       { common:true, purpose:audit!.purpose }) : packetState ? workingContext(audit!.store, environment.projectId, audit!.draftId, audit!.questionId!, packingContext,
       limit, { common: true, purpose: audit!.purpose, ...(planSubject?{subject:planSubject}:{}), ...(assessmentSubject?{assessmentSubject}:{}),
         ...(variantSubject?{variantSubject,actor:role.actor}:{}), ...(deepPreparation?{deepPreparation}:{}), continuation: !packetState.initial,
@@ -548,7 +550,7 @@ function buildResearchEnvelope(role: RoleBinding, environment: Environment, prom
   }
   // Keep RD2b's measured transport adjustment in the single real builder used
   // by both preflight and dispatch; the result marker is already in subject.
-  for (let attempt = 0; (packetState || dossier) && input.length > physicalLimit && attempt < 4; attempt += 1) {
+  for (let attempt = 0; (packetState || dossier || preflightPacker) && input.length > physicalLimit && attempt < 4; attempt += 1) {
     subjectLimit -= input.length - physicalLimit + 128;
     subject = subjectFor(subjectLimit);
     if (!consolidating && (subject as any)?.contextControls?.mode === 'finalization') envelope.prompt = finalInstruction;
@@ -1433,6 +1435,8 @@ async function resumeFinalResearchCall(store: Store, applicationRef: Ref, kind: 
     'context_reference_foreign', 'A final page lost its exact original binding');
     return contextValue({ body: readArchiveBody(store, row).body }, pointer);
   });
+  if (finalMaterialEra(admitted.prepared.value.input))
+    requireFinalMaterialDelivery(wire.subject, admitted.context.request, admitted.prepared.value.archive);
   requireContextDelivery(admitted.context.contextWorkspace, wire.subject);
   const current = kind === 'condition-evidence'
     ? currentConditionEvidenceGuards(store, claim.value.projectId, admitted as Awaited<ReturnType<typeof readConditionEvidenceDispatchAdmission>>)

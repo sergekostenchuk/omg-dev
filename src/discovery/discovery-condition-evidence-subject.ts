@@ -1,3 +1,4 @@
+import { finalMaterialAdmission, finalMaterialArchive, finalMaterialEra, finalMaterialPointer, type FinalMaterialContract } from './final-material.js';
 import { canonical, hashJson, HASH_PATTERN, type Json } from '../canonical.js';
 import { EngineError, requireCondition } from '../errors.js';
 import { isRef, reference, type Ref } from '../pipeline/contracts.js';
@@ -157,20 +158,21 @@ function admission(packet: ConditionEvidencePacket, schema: Record<string, unkno
     envelopeLimitChars: limit, mandatoryEnvelope: { contract: CONDITION_EVIDENCE_RESULT, subject: packet.subject, packet, schema },
     forms: [{ kind: FORM }] };
 }
-function archiveFor(store: Store, packet: ConditionEvidencePacket, minimum: Record<string, unknown>) {
+function archiveFor(store: Store, packet: ConditionEvidencePacket, minimum: Record<string, unknown>, era = false) {
   const staged = prepareArchiveParts(store, { projectId: packet.subject.projectId, draft: packet.subject.final.basis.draft,
-    question: packet.subject.final.basis.brief.question }, { request: minimum });
+    question: packet.subject.final.basis.brief.question }, finalMaterialArchive(minimum, era));
   requireCondition(staged.archive.revision === 1, 'discovery_condition_evidence_invalid', 'The evidence archive must be immutable');
-  return { staged, address: { record: staged.archive, pointer: '/body/request', hash: hashJson(minimum as never) } };
+  return { staged, address: { record: staged.archive, pointer: finalMaterialPointer(era), hash: hashJson((era ? finalMaterialAdmission(minimum) : minimum) as never) } };
 }
 function savedArchiveProjection(store: Store, address: { record: Ref; pointer: string; hash: string }, minimum: Record<string, unknown>) {
   const row = store.get(address.record.id, address.record.revision);
   if (row?.kind !== 'research-context' || row.revision !== 1 || !same(reference(row), address.record) || hashJson(row.value as never) !== address.record.hash)
     invalid('archive', 'The exact evidence archive is missing or changed');
   const body = readArchiveBody(store, row!).body;
-  if (address.pointer !== '/body/request' || !same(body.request, minimum) || hashJson(body.request as never) !== address.hash)
+  const projection = address.pointer === '/body/admission' ? body.admission : body.request;
+  if (!same(projection, minimum) || hashJson(projection as never) !== address.hash)
     invalid('archive', 'The saved evidence request differs from the proven packet and schema');
-  return body.request as Record<string, unknown>;
+  return projection as Record<string, unknown>;
 }
 
 /** The closed decoder of the assessor's answer against the exact proven packet. */
@@ -210,14 +212,17 @@ export function projectConditionEvidence(input: { packet: ConditionEvidencePacke
 
 /** A read-only transport from the exact subject, proven again; the limit is the caller's result admission. */
 export function prepareConditionEvidenceTransport(store: Store, project: string, subject: unknown, envelopeLimitChars: number,
-  options?: { archive: 'staged' }): ConditionEvidenceTransport {
+  options?: { archive: 'staged'; materialContract?: FinalMaterialContract }): ConditionEvidenceTransport {
   const packet = requireConditionEvidenceSubject(store, project, subject);
   const schema = declaration(packet), input = admission(packet, schema, envelopeLimitChars);
   if (options) {
-    const prepared = archiveFor(store, packet, input.mandatoryEnvelope);
+    const original = input.mandatoryEnvelope;
+    const era = finalMaterialEra(options);
+    const prepared = archiveFor(store, packet, input.mandatoryEnvelope, era);
+    if (era) input.mandatoryEnvelope = finalMaterialAdmission(input.mandatoryEnvelope);
     const capacity = buildResearchResultCapacity({ ...input, mandatoryArchive: prepared.address });
     return { contract: CONDITION_EVIDENCE_RESULT, subject: structuredClone(packet.subject), packet, schema, capacity,
-      archive: { ref: prepared.staged.archive, projection: structuredClone(input.mandatoryEnvelope),
+      archive: { ref: prepared.staged.archive, projection: structuredClone(original),
         writes: prepared.staged.writes, guards: prepared.staged.guards } };
   }
   return { contract: CONDITION_EVIDENCE_RESULT, subject: structuredClone(packet.subject), packet, schema, capacity: buildResearchResultCapacity(input) };
@@ -230,7 +235,9 @@ export function checkConditionEvidenceReply(store: Store, project: string, subje
   const capacity = snapshot(saved, 'capacity') as Record<string, any>;
   const mandatory = object(capacity) && object(capacity.mandatory) ? capacity.mandatory : null;
   if (mandatory && Object.hasOwn(mandatory, 'archive')) {
-    const prepared = archiveFor(store, packet, input.mandatoryEnvelope);
+    const era = mandatory.archive?.pointer === '/body/admission';
+    const prepared = archiveFor(store, packet, input.mandatoryEnvelope, era);
+    if (era) input.mandatoryEnvelope = finalMaterialAdmission(input.mandatoryEnvelope);
     if (!same(mandatory.archive, prepared.address)) invalid('capacity', 'The result capacity names another archive or pointer');
     const projection = savedArchiveProjection(store, prepared.address, input.mandatoryEnvelope);
     requireResearchResultCapacity(capacity, { ...input, mandatoryArchive: prepared.address }, (record, pointer) => {

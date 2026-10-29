@@ -452,7 +452,7 @@ import { DISCOVERY_FINAL_SESSION_KIND, prepareDiscoveryFinalSession, readDiscove
 
 const RESULT_LIMIT = 10_000_000;
 function finalInput(f: Paid): DiscoveryFinalEnvelopeInput {
-  return { prompt: 'Build the exact final Discovery package from the saved mandate and assessed dossier.',
+  return { materialContract:'discovery-final-material/v1', prompt: 'Build the exact final Discovery package from the saved mandate and assessed dossier.',
     packetChars: 24_000, limitChars: 64_000, resultLimitChars: RESULT_LIMIT,
     environment: reference(f.environment), role: structuredClone(f.environment.value.implementer) };
 }
@@ -493,7 +493,7 @@ test('final pack: real owner selected retains the complete paid D6 and both bloc
   assert.equal(original.packet.brief.text,ORIGINAL_BRIEF);
   assert.ok(JSON.stringify(original.packet).includes(LARGE_COUNTERARGUMENT));
   const wire=JSON.parse(cell.value.envelope.input),packet=wire.subject;
-  assert.ok(packet.working.materialAddresses.some((address:any)=>address.field==='request'));
+  assert.ok(packet.working.materialAddresses.some((address:any)=>address.field==='finalMaterial'));
   assert.ok(packet.materialDelivery?.[0]);
   assert.ok((packet.materialDelivery[0].served.end-packet.materialDelivery[0].served.offset)>0);
   assert.ok(JSON.stringify(original).length>cell.value.envelope.measuredChars);
@@ -537,15 +537,24 @@ test('final pack: paid return with nonempty partial remains partial and does not
   },'cross-store');
 });
 
-test('final pack: exact physical envelope boundary and refusal before any archive or session write',async()=>{
+test('final pack: exact legacy boundary and adaptive material pages refuse before any archive or session write',async()=>{
   const input=finalInput(negative);
   await unchanged(negative,negative.store,async()=>{
     const staged=await stageDiscoveryFinalEnvelope(negative.store,'p',partialPacket.subject,input);
     const length=staged.envelope.input.length;
     assert.ok(length>input.packetChars);
     const exact={...input,limitChars:length};
-    assert.equal((await stageDiscoveryFinalEnvelope(negative.store,'p',partialPacket.subject,exact)).envelope.input.length,length);
-    await assert.rejects(()=>prepareDiscoveryFinalSession(negative.store,'p',partialPacket.subject,{...exact,limitChars:length-1}),
+    assert.ok((await stageDiscoveryFinalEnvelope(negative.store,'p',partialPacket.subject,exact)).envelope.measuredChars<=length);
+    const {materialContract:_era,...legacy}=input;
+    const old=await stageDiscoveryFinalEnvelope(negative.store,'p',partialPacket.subject,legacy);
+    const legacyExact={...legacy,limitChars:old.envelope.measuredChars};
+    assert.equal((await stageDiscoveryFinalEnvelope(negative.store,'p',partialPacket.subject,legacyExact)).envelope.measuredChars,old.envelope.measuredChars);
+    await assert.rejects(()=>stageDiscoveryFinalEnvelope(negative.store,'p',partialPacket.subject,{...legacyExact,limitChars:legacyExact.limitChars-1}),
+      error=>error instanceof EngineError&&error.code==='discovery_final_envelope_limit');
+    const smaller=await stageDiscoveryFinalEnvelope(negative.store,'p',partialPacket.subject,{...exact,limitChars:length-1});
+    assert.ok(smaller.envelope.measuredChars<=length-1,'new transport shrinks the page to the actual physical remainder');
+    assert.deepEqual(smaller.projection,staged.projection);
+    await assert.rejects(()=>prepareDiscoveryFinalSession(negative.store,'p',partialPacket.subject,{...input,prompt:'p'.repeat(input.limitChars)}),
       error=>error instanceof EngineError&&error.code==='discovery_final_envelope_limit');
     assert.deepEqual(await prepareDiscoveryFinalEnvelope(negative.store,'p',partialPacket.subject,partialInput),partialCell.value.envelope);
   },'full');
@@ -555,7 +564,10 @@ test('final pack: exact physical envelope boundary and refusal before any archiv
     assert.ok(staged.writes.some(write=>write.kind==='research-context'), 'A new exact archive must still be staged');
     const limitChars=staged.envelope.input.length-1;
     assert.ok(limitChars>freshInput.packetChars);
-    await assert.rejects(()=>prepareDiscoveryFinalSession(owner.store,'p',ownerPacket.subject,{...freshInput,limitChars}),
+    const bounded=await stageDiscoveryFinalEnvelope(owner.store,'p',ownerPacket.subject,{...freshInput,limitChars});
+    assert.ok(bounded.envelope.measuredChars<=limitChars);
+    assert.deepEqual(bounded.projection,staged.projection);
+    await assert.rejects(()=>prepareDiscoveryFinalSession(owner.store,'p',ownerPacket.subject,{...freshInput,prompt:'p'.repeat(freshInput.limitChars)}),
       error=>error instanceof EngineError&&error.code==='discovery_final_envelope_limit');
   },'full');
 });
@@ -584,11 +596,11 @@ test('final pack: archived and inline result admission prove the same D6 with in
     assert.deepEqual((await checkDiscoveryFinalResearchReply(negative.store,'p',partialPacket,RESULT_LIMIT,
       partialCell.value.envelope.capacity,reply)).normalized,reply);
     await assert.rejects(()=>checked(negative.store,partialPacket,ownerTransport,reply),e=>e instanceof EngineError);
-    let limit=LIMIT,transport=await prepareDiscoveryFinalResultTransport(negative.store,'p',partialPacket.subject,limit,{archive:'staged'});
+    let limit=LIMIT,transport=await prepareDiscoveryFinalResultTransport(negative.store,'p',partialPacket.subject,limit,{archive:'staged',materialContract:'discovery-final-material/v1'});
     for(let i=0;i<10;i++) {
       const next=transport.capacity.forms[0]!.minimumChars+JSON.stringify(reply).length;
       if(next===limit)break;
-      limit=next;transport=await prepareDiscoveryFinalResultTransport(negative.store,'p',partialPacket.subject,limit,{archive:'staged'});
+      limit=next;transport=await prepareDiscoveryFinalResultTransport(negative.store,'p',partialPacket.subject,limit,{archive:'staged',materialContract:'discovery-final-material/v1'});
     }
     const exact=await checkDiscoveryFinalResearchReply(negative.store,'p',partialPacket,limit,transport.capacity,reply);
     assert.equal(exact.measurement.requiredChars,limit);assert.equal(exact.measurement.fits,true);

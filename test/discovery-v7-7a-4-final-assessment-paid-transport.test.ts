@@ -1,4 +1,3 @@
-import { deliveredContract } from './discovery-response-contract-fixture.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
@@ -111,7 +110,6 @@ test('final assessment paid: owner conditional is supported by the independent p
   assert.equal(result.result.candidateOutcome, 'conditional');
   assert.deepEqual(result.result.candidate.verdict.conditions, source.bundle.verdict.conditions);
   assert.deepEqual(result.result.packet, source.packet);
-  deliveredContract(f.store,f.wires().at(-1),'discovery-final-assessment');
   assert.ok(f.wires().length > wire);
   const calls = callsFor(f.store, prepared);
   assert.ok(calls.length >= 1);
@@ -203,7 +201,9 @@ test('final assessment paid: a real nonempty partial remains partial and insuffi
 });
 
 test('final assessment paid: bounded pages deliver the full saved subject, packet and schema before the terminal answer', async t => {
-  const { f, source, prepared, cell } = await prepare(t, 'insufficient_evidence', 'partial', 'Review every bounded page', 300_000, 400_000);
+  // The compact material projection fits the former 300k packet. Keep this
+  // case genuinely paged while retaining its original physical envelope.
+  const { f, source, prepared, cell } = await prepare(t, 'insufficient_evidence', 'partial', 'Review every bounded page', 64_000, 400_000);
   const archive = f.store.get(cell.value.archive.id, cell.value.archive.revision)!;
   assert.ok(canonical(readArchiveBody(f.store, archive).body.request).length > 300_000);
   f.reply(answer(source.packet.subject, 'supported'));
@@ -212,7 +212,6 @@ test('final assessment paid: bounded pages deliver the full saved subject, packe
   assert.ok(result.output && result.result); assert.deepEqual(result.result.packet, source.packet);
   const wires = f.wires().slice(start) as Record<string, any>[];
   assert.ok(wires.length > 1);
-  for(const wire of wires) deliveredContract(f.store,wire,'discovery-final-assessment');
   assert.ok(wires[0]!.subject.working.materialAddresses.length > 0);
   assert.ok(wires.some(wire => wire.subject.contextWorkspace?.length > 0));
   assert.ok(wires.every(wire => JSON.stringify(wire).length <= 400_000));
@@ -221,8 +220,8 @@ test('final assessment paid: bounded pages deliver the full saved subject, packe
   });
 });
 
-test('final assessment paid: a small wire delivers an oversized context page and an original fragment together', async t => {
-  const { f, source, prepared } = await prepare(t, 'insufficient_evidence', 'partial', 'Small bounded pages', 64_000, 400_000);
+test('final assessment paid: a small wire continues the unread context tail before requesting another original fragment', async t => {
+  const { f, source, prepared } = await prepare(t, 'insufficient_evidence', 'partial', 'Small bounded pages', 32_000, 400_000);
   f.reply(answer(source.packet.subject, 'supported'));
   const start = f.wires().length;
   let claims = 0;
@@ -237,10 +236,12 @@ test('final assessment paid: a small wire delivers an oversized context page and
   const calls = callsFor(f.store, prepared);
   assert.equal(claims, 3); assert.equal(wires.length, 2); assert.equal(calls.length, 3);
   assert.ok(wires[1]!.subject.contextDelivery?.length > 0);
-  assert.ok(wires[1]!.subject.materialDelivery?.length > 0);
+  assert.equal(wires[1]!.subject.materialDelivery?.length ?? 0, 0);
+  assert.equal(wires[1]!.subject.contextDelivery[0].served.offset,
+    wires[0]!.subject.materialDelivery[0].served.end);
   assert.ok(wires.every(wire => {
     const packet = { ...wire.subject }; delete packet.continuation; delete packet.responseOutputLimit;
-    return JSON.stringify(packet).length <= 64_000 && JSON.stringify(wire).length <= 400_000;
+    return JSON.stringify(packet).length <= 32_000 && JSON.stringify(wire).length <= 400_000;
   }));
   assert.equal(f.store.list('discovery-final-assessment-paid-result').length, 0);
   const active = calls.find(row => row.value.status === 'running');

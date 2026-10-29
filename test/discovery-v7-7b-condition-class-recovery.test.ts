@@ -99,8 +99,10 @@ test('7b.3-class bounded recovery: a paid multi-page assessment of a v8 candidat
   f.reply({ action: 'answer', question: 'reader', value: { type: 'impossible', code: 'source_unavailable', evidence: [], text: 'Calibration' }, citations: [] });
   await researchCall(f.environment.value.reviewer, f.environment.value, 'Measure the independent reviewer', {}, undefined,
     { store: f.store, draftId: f.data.calibration.draft.id, questionId: f.data.calibration.question.id, purpose: 'assessor' });
+  // The content projection now fits the former 64k packet. Keep this a paged
+  // recovery scenario rather than expecting three calls from a complete delivery.
   const cell = await prepareDiscoveryFinalAssessmentSession(f.store, 'p', packet.subject, { prompt: 'Small bounded pages',
-    packetChars: 64_000, limitChars: 400_000, resultLimitChars: 10_000_000, environment: reference(f.environment), role: f.environment.value.reviewer });
+    packetChars: 58_000, limitChars: 400_000, resultLimitChars: 10_000_000, environment: reference(f.environment), role: f.environment.value.reviewer });
   const prepared = reference(cell);
   assert.deepEqual(cell.value.subject.candidate.verdict.conditions, CLASSED, 'the complete classed candidate is the subject');
   f.reply({ contract: DISCOVERY_FINAL_ASSESSMENT_RESULT, subject: packet.subject, verdict: 'supported', reasons: ['Reviewed'],
@@ -161,6 +163,7 @@ test('7b.3-class bounded recovery: a paid multi-page assessment of a v8 candidat
   assert.equal(f.wires().length, start + 3, 'the kept claim is the one sent');
   const paid = money(f.store), sent = canonical(f.wires() as never);
   const restored = await runDiscoveryFinalAssessmentExecution(f.store, 'p', f.paidResult, prepared, { restoreOnly: true, allowance: 0 });
+  assert.ok(restored.output && restored.result, 'the resumed third response completes the fully covered assessment');
   assert.equal(money(f.store), paid, 'applying the saved response pays nothing'); assert.equal(canonical(f.wires() as never), sent);
   for (const store of [f.store, f.open()])
     assert.deepEqual((await fixed(f, store, () => runDiscoveryFinalAssessmentExecution(store, 'p', f.paidResult, prepared,

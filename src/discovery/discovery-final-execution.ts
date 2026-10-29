@@ -1,5 +1,7 @@
+import { pendingContextWorkspace } from './context-workspace.js';
+import { finalMaterialAdmission, finalMaterialProjection, finalMaterialEra, finalWorkspace, packFinalMaterial, recordFinalMaterialWorkspace, finalTechnicalLookup } from './final-material.js';
 import { finalResponseContract } from './discovery-response-contract.js';
-import { canonical, digest, hashJson } from '../canonical.js';
+import { canonical, hashJson } from '../canonical.js';
 import { EngineError, requireCondition } from '../errors.js';
 import { isRef, reference, type Ref } from '../pipeline/contracts.js';
 import { Environments, transactionGuardsCurrent, uniqueTransactionGuards,
@@ -137,10 +139,12 @@ function readFinalRequestArchive(store: Store, prepared: Revision<DiscoveryFinal
   valid(capacity?.mandatory && 'archive' in capacity.mandatory
     && same(capacity.mandatory.archive.record, prepared.value.archive), 'The final result capacity lost its archive');
   const archive = capacity.mandatory.archive;
-  const original = readFinalCapacityProjection(store, archive.record, archive.pointer);
+  const minimum = readFinalCapacityProjection(store, archive.record, archive.pointer);
+  const original = archive.pointer === '/body/admission' ? readFinalCapacityProjection(store, archive.record, '/body/request') : minimum;
   // One snapshot establishes both its saved hash and exact comparison.
   const originalText = canonical(original);
-  valid(digest(originalText) === archive.hash, 'The final capacity archive differs from its exact hash');
+  valid(hashJson(minimum as never) === archive.hash
+    && (archive.pointer !== '/body/admission' || same(minimum, finalMaterialAdmission(original))), 'The final capacity archive differs from its exact hash');
   return { capacity, original, originalText };
 }
 
@@ -196,12 +200,14 @@ export function readDiscoveryFinalDispatchLeaf(store: Store, applicationRef: Ref
     && (!profile || profile.value.projectId === value.projectId),
   'The final execution runtime or exact research grounds differ from its preparation');
   const marker = finalContinuation(store, session);
-  valid(keys(app.context, ['finalContinuation', 'request', 'schema', 'resultCapacity', 'contextWorkspace'])
+  valid(keys(app.context, ['finalContinuation', 'request', 'schema', 'resultCapacity', 'contextWorkspace',
+    ...(finalMaterialEra(prepared.value.input) ? ['finalMaterial'] : [])])
+    && (!finalMaterialEra(prepared.value.input) || same(app.context.finalMaterial,finalMaterialProjection(original.packet)))
     && same(app.context.finalContinuation, marker)
     && canonical(app.context.request) === originalText
     && same(app.context.schema, prepared.value.envelope.packet.schema)
     && same(app.context.resultCapacity, prepared.value.envelope.capacity)
-    && same(app.context.contextWorkspace, value.workspace.entries.map(entry => entry.result))
+    && same(app.context.contextWorkspace, finalWorkspace(prepared.value.input, value.workspace))
     && app.prompt === value.prompt && same(app.role, value.role) && same(app.dispatch, value.dispatch)
     && same(app.profile, value.profile) && app.state === 'prepared' && app.call === null
     && app.received === null && app.after === null && Array.isArray(app.guards)
@@ -284,10 +290,14 @@ export function prepareDiscoveryFinalContextPacker(store: Store,
         working: { archive, deliveryContract: 'research-delivery/v1',
           instruction: 'Read each exact omitted address with read_context and continue through every page before returning a final result.' },
       };
+      if (finalMaterialEra(prepared.value.input))
+        packFinalMaterial(packet, context.request, archive, prepared.value.archive, packetLimit, session.value.workspace);
+      else {
       const originals = addressArchivedMaterials(packet, archive, ['request'], packetLimit,
         () => prepared.value.archive, 2048);
       packContextWorkspace(packet, packetLimit, packetLimit, undefined, 1024);
       serveArchivedMaterial(packet, originals, packetLimit, 512);
+      }
       requirePacketMaterialDelivery(packet, archive, resolve);
       valid(JSON.stringify(packet).length <= packetLimit, 'The final transport packet exceeds its saved limit');
       return packet;
@@ -379,7 +389,8 @@ async function physicalFinalOutcome(store: Store, project: string, application: 
 async function projectFinalStep(store: Store, admission: ReturnType<typeof readDiscoveryFinalDispatchLeaf>,
   paid: Awaited<ReturnType<typeof physicalFinalOutcome>>['paid']) {
   const { session, application, draft, question } = admission;
-  let workspace = contextWorkspace(session.value.workspace);
+  const materialEra = finalMaterialEra(admission.prepared.value.input);
+  let workspace = contextWorkspace(materialEra ? recordFinalMaterialWorkspace(session.value.workspace, paid.subject) : session.value.workspace);
   let result: Ref | null = null;
   let output: Write | null = null;
   const response = paid.payload;
@@ -387,19 +398,20 @@ async function projectFinalStep(store: Store, admission: ReturnType<typeof readD
     const action = researchAction(response);
     valid(action.action === 'read_context', 'A final lookup must retain its exact address');
     const addresses = paid.subject.working?.materialAddresses;
-    valid(Array.isArray(addresses) && addresses.some((address: Record<string, any>) =>
+    valid((finalMaterialEra(admission.prepared.value.input) && finalTechnicalLookup(paid.subject, admission.context.request, action))
+      || Array.isArray(addresses) && addresses.some((address: Record<string, any>) =>
       same(address.record, action.record)
       && (action.pointer === address.pointer || action.pointer.startsWith(`${address.pointer}/`))),
     'A final lookup must address material of this exact paid packet');
     const lookup = readResearchContextOutcomeAt(store, draft, question, action,
       admission.profile?.value.maxRequestChars ?? 300000, 'bounded');
-    workspace = addContextLookup(workspace, lookup, paid.subject.contextWorkspace, undefined, paid.subject);
+    workspace = addContextLookup(workspace, lookup, paid.subject.contextWorkspace, undefined, materialEra ? undefined : paid.subject);
   } else {
-    requireCompleteContextPacket(workspace, paid.subject);
+    requireCompleteContextPacket(materialEra ? pendingContextWorkspace(session.value.workspace) : workspace, paid.subject);
     const checked = await checkDiscoveryFinalResearchReply(store, session.value.projectId,
       admission.context.request.packet, admission.prepared.value.input.resultLimitChars,
       admission.context.resultCapacity, response, admission.prepared.value.input.form ?? V7_FINAL_CONTRACT);
-    workspace = contextProgress(workspace, paid.subject);
+    workspace = contextProgress(workspace, materialEra ? undefined : paid.subject);
     const value: DiscoveryFinalPaidResult = { contract: DISCOVERY_FINAL_PAID_RESULT,
       projectId: session.value.projectId, prepared: session.value.prepared,
       subject: session.value.subject, session: reference(session), application: reference(application),
@@ -591,8 +603,9 @@ export async function runDiscoveryFinalExecution(store: Store, project: string, 
     const marker = { subject: session.value.subject, prepared: reference(prepared),
       execution: createSession ? reference(origin) : reference(exact<DiscoveryFinalExecution>(store,
         reference(origin), DISCOVERY_FINAL_EXECUTION_KIND)) };
-    const context = { finalContinuation: marker, request: original, schema: prepared.value.envelope.packet.schema,
-      resultCapacity: capacity, contextWorkspace: session.value.workspace.entries.map(entry => entry.result) };
+    const context = { ...(finalMaterialEra(prepared.value.input) ? {finalMaterial:finalMaterialProjection(original.packet)} : {}),
+      finalContinuation: marker, request: original, schema: prepared.value.envelope.packet.schema,
+      resultCapacity: capacity, contextWorkspace: finalWorkspace(prepared.value.input, session.value.workspace) };
     const partial = { session, prepared, proven, draft, question, environment, profile };
     const guards = currentDiscoveryFinalGuards(store, project,
       partial as unknown as Awaited<ReturnType<typeof readDiscoveryFinalDispatchAdmission>>);

@@ -171,6 +171,34 @@ export function requireCompleteContextPacket(state: ContextWorkspace, packet: Re
   }
 }
 
+/** New transports may deliver only the remaining part of an already proved
+ * lookup. Its exact original and total stay pinned; old callers retain their
+ * existing workspace and delivery sequence. */
+export function pendingContextWorkspace(state: ContextWorkspace): ContextWorkspace {
+  const pending = state.entries.flatMap(entry => {
+    const item = coverageShape(entry.result), coverage = state.deliveryCoverage?.find(row => row.address === item.address);
+    requireCondition(!coverage || coverage.total === item.total,
+      'research_context_invalid', 'Pending context pages disagree about their saved original');
+    const offset = nextUnserved(coverage, item.offset, item.end);
+    if (offset >= item.end) return [];
+    const end = Math.min(item.end, coverage?.ranges.find(range => range.offset > offset)?.offset ?? item.end);
+    if (offset === item.offset && end === item.end) return [entry];
+    const value = item.encoding === 'canonical-json' && entry.result.page?.encoding !== 'canonical-json'
+      ? canonical(entry.result.value) : entry.result.value as string | unknown[];
+    const result: ContextLookup = {record:entry.result.record,pointer:entry.result.pointer,
+      value:value.slice(offset-item.offset,end-item.offset),page:{offset,end,total:item.total,unit:item.unit,
+        next:end < item.total ? end : null,...(item.encoding === 'canonical-json' ? {encoding:'canonical-json' as const} : {})}};
+    return [{key:contextLookupKey(result),result}];
+  });
+  // Overlapping paid lookups can converge to the same uncovered tail. Deliver
+  // that exact range once, retaining its newest position and every saved original.
+  const unique = new Map<string, ContextWorkspace['entries'][number]>();
+  for (const entry of pending) { unique.delete(entry.key); unique.set(entry.key, entry); }
+  const entries = [...unique.values()];
+  return {...state,entries,...(state.checkpointedKeys ? {
+    checkpointedKeys:state.checkpointedKeys.filter(key => entries.some(entry => entry.key === key))} : {})};
+}
+
 /** Packet archives change on every invocation. A lookup's identity belongs to
  * the selected original value and selector, not the envelope containing it. */
 export function contextLookupKey(result: ContextLookup): string {

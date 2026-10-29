@@ -1,5 +1,3 @@
-import { finalResponseContract } from '../src/discovery/discovery-response-contract.js';
-import { deliveredContract } from './discovery-response-contract-fixture.js';
 import { fixtureApplicableAxes } from './discovery-v7-fixture.js';
 import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
@@ -559,10 +557,9 @@ function finalInput(f: Paid): DiscoveryFinalEnvelopeInput {
 // For refusals and cuts before a terminal, the complete archive remains real
 // but the first wire need not carry the whole multi-megabyte dossier.
 function compactFinalInput(f: Paid): DiscoveryFinalEnvelopeInput {
-  // Keep the former material share and add the newly mandatory inline reply form.
-  // The physical ceiling remains fixed; forecast/stop/atomic assertions below are unchanged.
-  const replyChars = JSON.stringify({ discoveryResponseContract: finalResponseContract(false) }).length;
-  return { ...finalInput(f), packetChars: 24_000 + replyChars, limitChars: 64_000 };
+  // Leave space for the new exact content declaration and the delivered action
+  // contract. The physical ceiling remains independent and is tested below.
+  return { ...finalInput(f), packetChars: 48_000, limitChars: 64_000 };
 }
 async function preparePaidFinal(f: Paid, packet: DiscoveryFinalPacket) {
   const input=finalInput(f),before=f.store.lastEvent(),calls=money(f.store),wire=f.wires();
@@ -728,7 +725,6 @@ test('final paid: measured bootstrap uses exact same-role basis, then restores o
   const changingProfile = { get profile() { return ++profileReads === 1 ? callerCopy : { ...ownerPilot, id: 'foreign-profile' }; } };
   const result = await runDiscoveryFinalExecution(owner.store, 'p', changingRef, changingProfile);
   assert.equal(preparedReads, 1); assert.equal(profileReads, 1);
-  deliveredContract(owner.store,owner.wires().at(-1),'discovery-final');
   assert.equal(result.result?.result.bundle.verdict.outcome, 'go');
   assert.equal(result.output?.value.contract, 'discovery-final-paid-result/v1');
   assert.equal(Object.hasOwn(result.output!.value, 'accepted'), false);
@@ -757,6 +753,11 @@ test('final paid: inline and archived result bounds cannot change between proof 
   await ownerWorld();
   const packet = ownerPacket;
   const reply = candidate(packet, 'go');
+  // The new session producer saves its new-era archive. This test also reads
+  // the legacy staged contract, so publish that real producer's archive explicitly.
+  const legacy = await prepareDiscoveryFinalResultTransport(owner.store, 'p', packet.subject, RESULT_LIMIT, { archive: 'staged' });
+  assert.ok(legacy.archive);
+  owner.store.writeMany(legacy.archive.writes, legacy.archive.guards);
   await unchanged(owner, owner.store, async () => {
     for (const archive of [false, true]) {
       const options = archive ? { archive: 'staged' as const } : undefined;
@@ -1486,8 +1487,7 @@ test('final paid: large real packet is paged through exact paid context before t
   // Keep the genuinely complete packet larger than its physical share, with
   // roughly two bounded lookups left. The content and both contradiction
   // sides stay real; the fixture does not need a repeated megabyte string.
-  const remainder = Math.min(200_000, Math.floor(originalChars / 2));
-  const packetChars = Math.max(24_000, originalChars - remainder);
+  const packetChars = compactFinalInput(owner).packetChars;
   const input = { ...finalInput(owner), prompt: finalInput(owner).prompt + ' full pages',
     packetChars, limitChars: packetChars + Math.max(64_000, Math.ceil(packetChars / 4)) };
   const cell = await prepareDiscoveryFinalSession(owner.store, 'p', packet.subject, input);

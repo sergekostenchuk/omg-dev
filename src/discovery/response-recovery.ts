@@ -1,3 +1,4 @@
+import { requireFinalMaterialDelivery, finalMaterialEra } from './final-material.js';
 import { variantResearchReturn, readVariantResearchReturnAt, researchReturnMaterial } from './discovery-research-return.js';
 import { isInterpretationConsumer, requireInterpretationConsumer, interpretationApplication } from './interpretation-execution.js';
 import { historicalProof, withHistoricalReads } from '../history/proofs.js';
@@ -3789,12 +3790,14 @@ function researchExecution(store: Store, project: string, callRef: Ref,
   const state = synthesis ? { offset: session.value['offset'], materialOffset: session.value['materialOffset'] ?? 0 }
     : dossier || final ? {} : { offset: session.value['offset'], candidateOffset: session.value['candidateOffset'] ?? 0, total: JSON.stringify(body.observations).length };
   if (final) {
-    requireContextDelivery(workspace.entries.map(entry => entry.result), request.subject);
     requireCondition(isRef(appRef), 'discovery_final_execution_invalid', 'The final call lost its exact application');
     // A final-only wrapper may have just read this leaf itself. Its private
     // argument is never supplied by callers and applies only to this read.
     const admission = finalAdmission ?? (conditionEvidence ? readConditionEvidenceDispatchLeaf(store, appRef)
       : finalAssessment ? readDiscoveryFinalAssessmentDispatchLeaf(store, appRef) : readDiscoveryFinalDispatchLeaf(store, appRef));
+    requireContextDelivery(admission.context.contextWorkspace, request.subject);
+    if (finalMaterialEra(admission.prepared.value.input))
+      requireFinalMaterialDelivery(request.subject, admission.context.request, admission.prepared.value.archive);
     const claim = store.get<ModelCall>(call.id, 1);
     requireCondition(canonical(reference(admission.application)) === canonical(appRef)
       && canonical(reference(admission.session)) === canonical(reference(session))
@@ -3811,7 +3814,7 @@ function researchExecution(store: Store, project: string, callRef: Ref,
       && canonical(request.subject.subject) === canonical(admission.session.value.subject)
       && canonical(request.subject.schema) === canonical(body.schema)
       && canonical(request.subject.resultCapacity) === canonical(body.resultCapacity)
-      && canonical(body.contextWorkspace) === canonical(workspace.entries.map(entry => entry.result))
+      && canonical(body.contextWorkspace) === canonical(admission.context.contextWorkspace)
       && !workspace.blocked
       && request.prompt === (call.value.packet.kind === 'continuation'
         ? continuationPrompt(purpose, admission.prompt) : admission.prompt),

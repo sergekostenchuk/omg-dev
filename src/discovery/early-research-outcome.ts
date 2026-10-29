@@ -1,3 +1,4 @@
+import { FINAL_MATERIAL_CONTRACT, finalMaterialAdmission, finalMaterialProjection } from './final-material.js';
 import { planBasisOf } from './v7-plan-assessment.js';
 import { requireDossierAssessmentSubject } from './dossier-assessment.js';
 import { DOSSIER_ASSESSMENT_RESULT_CONTRACT } from './research-model.js';
@@ -367,7 +368,7 @@ export function readFinalCapacityProjection(store: Store, record: Ref, pointer: 
   let snapshot: Ref;
   try { snapshot = JSON.parse(canonical(record)); }
   catch { throw new EngineError('research_capacity_invalid', 'The final admission needs its exact request address'); }
-  requireCondition(isRef(snapshot) && pointer === '/body/request', 'research_capacity_invalid',
+  requireCondition(isRef(snapshot) && (pointer === '/body/request' || pointer === '/body/admission'), 'research_capacity_invalid',
     'The final admission needs its exact request address');
   const saved = store.get<Record<string, any>>(snapshot.id, snapshot.revision);
   requireCondition(saved?.kind === 'research-context' && saved.revision === 1
@@ -375,6 +376,16 @@ export function readFinalCapacityProjection(store: Store, record: Ref, pointer: 
     && saved.value?.contract === ARCHIVE_PARTS_CONTRACT,
   'research_capacity_invalid', 'The exact immutable final admission archive is missing or foreign');
   const body = readArchiveBody(store, saved).body;
+  if (Object.hasOwn(body, 'admission')) {
+    requireCondition(canonical(Object.keys(body).sort()) === canonical(['admission','finalMaterial','request'])
+      && body.admission?.materialContract === FINAL_MATERIAL_CONTRACT
+      && body.request !== null && typeof body.request === 'object' && !Array.isArray(body.request)
+      && canonical(body.admission) === canonical(finalMaterialAdmission(body.request))
+      && canonical(body.finalMaterial) === canonical(finalMaterialProjection(body.request.packet)),
+    'research_capacity_invalid', 'The new final archive lost its exact full request or content projection');
+    return (pointer === '/body/admission' ? body.admission : body.request) as Record<string, unknown>;
+  }
+  requireCondition(pointer === '/body/request', 'research_capacity_invalid', 'An old final archive has no new material declaration');
   requireCondition(Object.keys(body).length === 1 && body.request !== null
     && typeof body.request === 'object' && !Array.isArray(body.request),
   'research_capacity_invalid', 'The final archive lost its complete request');

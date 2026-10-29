@@ -1,3 +1,4 @@
+import { FINAL_MATERIAL_CONTRACT } from './final-material.js';
 import { canonical, hashJson } from '../canonical.js';
 import { EngineError, requireCondition } from '../errors.js';
 import { isRef, reference, type Ref } from '../pipeline/contracts.js';
@@ -86,7 +87,7 @@ export async function readDiscoveryFinalSessionAt(store: Store, project: string,
  * and physical bounds pass. A race/restart reads the same winning cell. */
 export async function prepareDiscoveryFinalSession(store: Store, project: string,
   subject: unknown, rawInput: unknown): Promise<Revision<DiscoveryFinalSession>> {
-  const input = decodeDiscoveryFinalEnvelopeInput(rawInput);
+  const input = decodeDiscoveryFinalEnvelopeInput({materialContract:FINAL_MATERIAL_CONTRACT,...rawInput as object});
   const staged = await stageDiscoveryFinalEnvelope(store, project, subject, input);
   const value = valueFor(project, input, staged), id = sessionId(project, value);
   const existing = store.get<DiscoveryFinalSession>(id);

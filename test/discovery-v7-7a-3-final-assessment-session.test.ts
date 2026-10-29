@@ -421,7 +421,7 @@ async function partialWorld() {
 
 const RESULT_LIMIT = 10_000_000;
 function assessmentInput(f: Paid, packetChars = 24_000): DiscoveryFinalAssessmentEnvelopeInput {
-  return { prompt: 'Assess the exact D7 bundle against the saved dossier and the verbatim assignment.',
+  return { materialContract:'discovery-final-material/v1', prompt: 'Assess the exact D7 bundle against the saved dossier and the verbatim assignment.',
     packetChars, limitChars: 400_000, resultLimitChars: RESULT_LIMIT,
     environment: reference(f.environment), role: structuredClone(f.environment.value.reviewer) };
 }
@@ -491,9 +491,13 @@ test('7a.3 session partial: a large request keeps its archive parts, read exactl
   const packet = await prepareDiscoveryFinalAssessmentSubject(negative.store, 'p', reference(partialD6), candidate(partialFinal.dossier.manifest.ref, 'no_go'));
   const input = assessmentInput(negative);
   const staged = await stageDiscoveryFinalAssessmentEnvelope(negative.store, 'p', packet.subject, input);
-  // One character less than the whole wire refuses before any archive, part or session is written.
+  // New transport uses the measured remainder; the complete original stays exact.
+  await unchanged(negative,negative.store,async()=>{
+    const bounded=await stageDiscoveryFinalAssessmentEnvelope(negative.store,'p',packet.subject,{...input,limitChars:staged.envelope.input.length-1});
+    assert.ok(bounded.envelope.measuredChars<=staged.envelope.input.length-1);assert.deepEqual(bounded.projection,staged.projection);
+  });
   await unchanged(negative, negative.store, () => assert.rejects(() => prepareDiscoveryFinalAssessmentSession(negative.store, 'p', packet.subject,
-    { ...input, limitChars: staged.envelope.input.length - 1 }), refusal('discovery_final_assessment_envelope_limit')));
+    { ...input, prompt:'p'.repeat(input.limitChars) }), refusal('discovery_final_assessment_envelope_limit')));
   await unchanged(negative, negative.store, () => assert.rejects(() => prepareDiscoveryFinalAssessmentSession(negative.store, 'p', packet.subject,
     { ...input, resultLimitChars: 10 }), refusal()));
   // A failed session write leaves no half of the preparation: the archive and its parts belong to the same write.

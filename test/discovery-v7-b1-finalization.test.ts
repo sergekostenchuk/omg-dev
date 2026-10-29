@@ -6,6 +6,7 @@ import { readRunnerDossierAssessmentAt } from '../src/discovery/dossier-assessme
 import { readDiscoveryFinalizationAt, readRunnerFinalizationAt } from '../src/discovery/discovery-finalization-runner.js';
 import { V9_FINAL_CONTRACT } from '../src/discovery/v7-final-contracts.js';
 import { DOSSIER_MATERIAL_CONTRACT } from '../src/discovery/dossier-material.js';
+import { FINAL_MATERIAL_CONTRACT, finalMaterialProjection } from '../src/discovery/final-material.js';
 import { acceptDiscoveryFinal, FinalAcceptanceSessions, issueFinalAcceptanceInvitation } from '../src/product/owner-authority.js';
 import { B1_BRIEF, bypassFinalizedWorld, dossierWorld, finalizationWorld, finalizationAdapter as adapter, waitingOwnerWorld, type FinalizationWorld as World } from './discovery-v7-b1-finalization-fixture.js';
 import { all, completed, money } from './discovery-v7-dossier-seed.js';
@@ -43,6 +44,10 @@ test('B1 recovery: one ordinary invocation shares its two calls across D6 and D7
   assert.equal(sent[0]!.subject.dossierMaterial.packetHash, hashJson(f.dossier as never));
   assert.equal(Object.hasOwn(sent[0]!.subject, 'dossierPacket'), false);
   assert.equal(sent[1]!.subject.contract, 'discovery-final-envelope/v1');
+  assert.equal(sent[1]!.subject.request.materialContract, FINAL_MATERIAL_CONTRACT);
+  assert.equal(Object.hasOwn(sent[1]!.subject.request, 'packet'), false);
+  assert.equal(sent[1]!.subject.request.packetHash, hashJson(proof.final!.packet.final as never));
+  assert.deepEqual(sent[1]!.subject.finalMaterial, finalMaterialProjection(proof.final!.packet.final));
   const cash = money(f.store), wires = f.wires();
   const restored = await researcher.run('p', f.v.draft.id, 1, undefined, { restoreOnly: true });
   assert.deepEqual(restored, first); assert.deepEqual(money(f.store), cash); assert.deepEqual(f.wires(), wires);

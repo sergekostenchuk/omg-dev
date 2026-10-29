@@ -14,6 +14,7 @@ import { returnDiscoveryResearch } from '../src/discovery/discovery-research-ret
 import { Researcher } from '../src/discovery/research-runner.js';
 import { prepareDossierAssessmentSubject } from '../src/discovery/dossier-assessment.js';
 import { DOSSIER_MATERIAL_CONTRACT } from '../src/discovery/dossier-material.js';
+import { FINAL_MATERIAL_CONTRACT } from '../src/discovery/final-material.js';
 import { produceSelectedDossier } from '../src/discovery/selected-dossier.js';
 import { producePartialDossier } from '../src/discovery/dossier-manifest.js';
 import { publishVariantHandoff } from '../src/discovery/discovery-outcome.js';
@@ -89,7 +90,16 @@ export async function finalizationAdapter(f: Awaited<ReturnType<typeof dossierWo
   const candidateModule = pathToFileURL(join(process.cwd(), 'dist/test/discovery-v7-final-paid-seed.js')).href;
   writeFileSync(path, `import {finalCandidate} from ${JSON.stringify(candidateModule)};\n` + script.replace('const research=', 'let research=').replace(output,
     `if(r.subject.dossierPacket||r.subject.dossierMaterialContract===${JSON.stringify(DOSSIER_MATERIAL_CONTRACT)})research=${JSON.stringify(f.dossierReply)};
-if(r.subject.contract==='discovery-final-envelope/v1'){if(!r.subject.request?.packet)throw new Error('B1 fixture requires the delivered full final packet');research=finalCandidate(r.subject.request.packet,settings.reply?.bundle?.verdict?.outcome??settings.reply?.b1Outcome,undefined,'discovery-final/v9');}
+if(r.subject.contract==='discovery-final-envelope/v1'){
+  const material=r.subject.finalMaterial,content=material?.content,dossier=content?.dossier;
+  // The reply factory reads only delivered content. It neither resolves an archive
+  // out of band nor presents the projected view to an engine proof as a full packet.
+  const projected=material?.contract===${JSON.stringify(FINAL_MATERIAL_CONTRACT)}&&dossier?.contract===${JSON.stringify(DOSSIER_MATERIAL_CONTRACT)}
+    ? {...content,dossier:{...dossier.packet,manifest:dossier.records[dossier.packet.manifest.recordIndex]}}:null;
+  const packet=r.subject.request?.packet??projected;
+  if(!packet?.dossier?.manifest?.ref||!Array.isArray(packet.dossier.materials))throw new Error('B1 fixture requires the delivered final content');
+  research=finalCandidate(packet,settings.reply?.bundle?.verdict?.outcome??settings.reply?.b1Outcome,undefined,'discovery-final/v9');
+}
 if(r.subject.contract==='discovery-final-assessment-envelope/v1'){const subject=r.subject.finalContinuation.subject,bases=[{candidate:'/verdict'}];research={contract:'discovery-final-assessment-result/v1',subject,verdict:${JSON.stringify(verdict)},reasons:['Independent exact final review'],bases,return:${verdict === 'supported' ? 'null' : "{targets:bases,reason:'Revise the final decision on its exact grounds',bases}"},classes:[]};}\n${output}`));
 }
 

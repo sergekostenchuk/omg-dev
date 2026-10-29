@@ -1,3 +1,5 @@
+import { FINAL_MATERIAL_CONTRACT, finalMaterialAdmission, finalMaterialArchive, finalMaterialEra, finalMaterialPointer, packFinalMaterial, type FinalMaterialContract } from './final-material.js';
+import { contextWorkspace } from './context-workspace.js';
 import { canonical, hashJson } from '../canonical.js';
 import { EngineError, requireCondition } from '../errors.js';
 import { isRef, reference, type Ref } from '../pipeline/contracts.js';
@@ -22,6 +24,7 @@ const DELIVERY_INSTRUCTION = 'The full original request is retained in working.a
   + 'a fragment is not the complete original and omitted material is not absent.';
 
 export interface ConditionEvidenceEnvelopeInput {
+  materialContract?: FinalMaterialContract;
   prompt: string; packetChars: number; limitChars: number; resultLimitChars: number; environment: Ref; role: RoleBinding;
 }
 export interface ConditionEvidenceEnvelope {
@@ -51,8 +54,10 @@ function snapshot(value: unknown, field: string): unknown {
 }
 
 export function decodeConditionEvidenceEnvelopeInput(value: unknown): ConditionEvidenceEnvelopeInput {
-  valid(keys(value, ['prompt', 'packetChars', 'limitChars', 'resultLimitChars', 'environment', 'role']),
+  valid(keys(value, ['prompt', 'packetChars', 'limitChars', 'resultLimitChars', 'environment', 'role'])
+    || keys(value, ['prompt', 'packetChars', 'limitChars', 'resultLimitChars', 'environment', 'role','materialContract']),
     'The evidence preparation needs its complete closed input');
+  finalMaterialEra(value);
   valid(typeof value.prompt === 'string' && value.prompt.trim().length > 0, 'The evidence instruction is required');
   for (const field of ['packetChars', 'limitChars', 'resultLimitChars'] as const)
     valid(Number.isSafeInteger(value[field]) && value[field] > 0, 'Evidence bounds must be positive safe integers');
@@ -71,27 +76,40 @@ export function stageConditionEvidenceEnvelope(store: Store, project: string, su
   const environment = readEnvironmentAt(store, project, input.environment);
   valid(same(input.role, environment.value.reviewer), 'The role is not the assessor of the exact saved environment');
   valid(environment.value.implementer.actor !== environment.value.reviewer.actor, 'The evidence assessment requires an actor other than the implementer');
-  const result = prepareConditionEvidenceTransport(store, project, subject, input.resultLimitChars, { archive: 'staged' });
+  const result = prepareConditionEvidenceTransport(store, project, subject, input.resultLimitChars, { archive: 'staged', ...(input.materialContract ? {materialContract:input.materialContract} : {}) });
   valid(result.archive && 'archive' in result.capacity.mandatory, 'The result admission lost its exact staged projection');
-  const original = result.archive.projection, body = { request: original };
+  const original = result.archive.projection, body = finalMaterialArchive(original, finalMaterialEra(input));
   const staged = { archive: result.archive.ref, writes: result.archive.writes, guards: result.archive.guards };
-  const packet: Record<string, any> = { contract: CONDITION_EVIDENCE_ENVELOPE, subject: structuredClone(result.subject),
-    schema: structuredClone(result.schema), request: structuredClone(original),
-    working: { archive: staged.archive, deliveryContract: 'research-delivery/v1', instruction: DELIVERY_INSTRUCTION } };
-  const addressed = addressArchivedMaterials(packet, staged.archive, ['request'], input.packetChars, () => staged.archive, 1024);
-  serveArchivedMaterial(packet, addressed, input.packetChars, 512);
-  requireCondition(JSON.stringify(packet).length <= input.packetChars, 'discovery_condition_evidence_packet_limit',
-    'The bounded evidence packet exceeds its declared physical share');
-  requirePacketMaterialDelivery(packet, staged.archive, (record, pointer) => {
-    valid(same(record, staged.archive), 'An addressed original belongs to another archive');
-    return contextValue({ body }, pointer);
-  });
+  const pack = (limit: number): Record<string, any> => {
+    const packet: Record<string, any> = { contract: CONDITION_EVIDENCE_ENVELOPE, subject: structuredClone(result.subject),
+      schema: structuredClone(result.schema), request: structuredClone(original),
+      working: { archive: staged.archive, deliveryContract: 'research-delivery/v1', instruction: DELIVERY_INSTRUCTION } };
+    if (finalMaterialEra(input)) packFinalMaterial(packet, original, staged.archive, staged.archive, limit, contextWorkspace());
+    else {
+    const addressed = addressArchivedMaterials(packet, staged.archive, ['request'], limit, () => staged.archive, 1024);
+    serveArchivedMaterial(packet, addressed, limit, 512);
+    }
+    requireCondition(JSON.stringify(packet).length <= limit, 'discovery_condition_evidence_packet_limit',
+      'The bounded evidence packet exceeds its declared physical share');
+    requirePacketMaterialDelivery(packet, staged.archive, (record, pointer) => {
+      valid(same(record, staged.archive), 'An addressed original belongs to another archive');
+      return contextValue({ body }, pointer);
+    });
+    return packet;
+  };
+  let packet = pack(input.packetChars);
   let wire: ReturnType<typeof prepareResearchEnvelope>;
   try {
     wire = prepareResearchEnvelope(input.role, environment.value, input.prompt, packet, undefined,
-      result.capacity as unknown as Record<string, any>, undefined, undefined, input.limitChars);
+      result.capacity as unknown as Record<string, any>, undefined, undefined, input.limitChars, finalMaterialEra(input) ? limit => {
+        // Count the actual capacity wrapper, then let the common wire builder
+        // refine the complete physical envelope without changing saved bounds.
+        packet = pack(Math.min(input.packetChars, limit - JSON.stringify({resultCapacity:result.capacity}).length - 32));
+        return {...packet,resultCapacity:result.capacity};
+      } : undefined);
   } catch (error) {
-    if (error instanceof EngineError && error.code === 'pilot_request_limit') throw limitRefusal({ limitChars: input.limitChars });
+    if (error instanceof EngineError && (error.code === 'pilot_request_limit' || finalMaterialEra(input)
+      && ['pilot_core_limit','research_context_capacity','discovery_condition_evidence_packet_limit'].includes(error.code))) throw limitRefusal({ limitChars: input.limitChars });
     throw error;
   }
   if (wire.input.length > input.limitChars) throw limitRefusal({ limitChars: input.limitChars, measuredChars: wire.input.length });
@@ -106,8 +124,8 @@ function requireSavedArchive(store: Store, expected: ConditionEvidenceEnvelope, 
   valid(row?.kind === 'research-context' && same(reference(row), expected.archive) && hashJson(row.value as never) === expected.archive.hash,
     'The exact evidence archive is missing or changed');
   const body = readArchiveBody(store, row).body, mandatory = expected.capacity.mandatory;
-  valid('archive' in mandatory && same(mandatory.archive.record, expected.archive) && mandatory.archive.pointer === '/body/request'
-    && mandatory.archive.hash === hashJson(projection as never) && same(body.request, projection),
+  valid('archive' in mandatory && same(mandatory.archive.record, expected.archive) && mandatory.archive.pointer === finalMaterialPointer(finalMaterialEra((expected.packet.request as any) ?? {}))
+    && mandatory.archive.hash === hashJson((mandatory.archive.pointer === '/body/admission' ? finalMaterialAdmission(projection) : projection) as never) && same(body.request, projection),
   'The saved evidence archive does not contain the proven complete request');
   requirePacketMaterialDelivery(expected.packet, expected.archive, (record, pointer) => {
     valid(same(record, expected.archive), 'The material address names another archive');
@@ -142,7 +160,7 @@ export function readConditionEvidenceSessionAt(store: Store, project: string, re
 /** Save the archive, its parts and the prepared session in one guarded write after every proof; a repeat, a restart
  * or a lost race reads the same exact winner. */
 export function prepareConditionEvidenceSession(store: Store, project: string, subject: unknown, rawInput: unknown): Revision<ConditionEvidenceSession> {
-  const input = decodeConditionEvidenceEnvelopeInput(snapshot(rawInput, 'preparation input'));
+  const input = decodeConditionEvidenceEnvelopeInput({materialContract:FINAL_MATERIAL_CONTRACT,...snapshot(rawInput, 'preparation input') as object});
   const staged = stageConditionEvidenceEnvelope(store, project, snapshot(subject, 'subject'), input);
   const value = valueFor(project, input, staged), id = sessionId(project, value);
   const existing = store.get<ConditionEvidenceSession>(id);
