@@ -238,9 +238,11 @@ test("2b-P the physical limit refuses with zero staged writes — heads, calls, 
     assert.equal(f.store.list().filter(row => row.kind === "research-context").length, 0,
       "a refused envelope left no staged archive");
     // The shared envelope builder's own physical check: the complete input
-    // exceeding the declared bound refuses before any archive write.
+    // exceeding the declared bound refuses before any archive write. The reply
+    // form now consumes packet space too: keep the core admitted while the
+    // full physical envelope still has only 500 characters of headroom.
     assert.equal(code(() => prepareFrameInterpretationEnvelope(f.store, req,
-      { prompt: "Build the interpretations set.", packetChars: 4500, limitChars: 5000,
+      { prompt: "Build the interpretations set.", packetChars: 6000, limitChars: 6500,
         role: ROLE, environment: environmentOf(project) })),
       "pilot_request_limit");
     assert.equal(f.store.list().filter(row => row.kind === "research-context").length, 0);

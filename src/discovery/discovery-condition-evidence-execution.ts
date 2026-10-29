@@ -1,3 +1,4 @@
+import { conditionEvidenceResponseContract } from './discovery-response-contract.js';
 import { canonical, digest, hashJson } from '../canonical.js';
 import { EngineError, requireCondition } from '../errors.js';
 import { isRef, reference, type Ref } from '../pipeline/contracts.js';
@@ -255,6 +256,8 @@ export function prepareConditionEvidenceContextPacker(store: Store,
   const { session, prepared, context } = admission;
   const staged = prepareArchiveParts(store, { projectId: session.value.projectId,
     draft: session.value.binding.draft, question: session.value.binding.question }, structuredClone(context));
+  // This small supplement stays inline: the paid archive retains its historical context exactly.
+  const discoveryResponseContract = conditionEvidenceResponseContract();
   const records = new Map<string, Revision<any>>();
   for (const write of staged.writes as Write[]) records.set(write.id, { id: write.id, kind: write.kind,
     revision: write.expected + 1, hash: hashJson(write.value as never), value: write.value });
@@ -270,7 +273,7 @@ export function prepareConditionEvidenceContextPacker(store: Store,
     pack(limit: number): Record<string, any> {
       const packetLimit = Math.min(limit, prepared.value.input.packetChars);
       const packet: Record<string, any> = { contract: 'discovery-condition-evidence-envelope/v1',
-        subject: structuredClone(session.value.subject), schema: structuredClone(context.schema),
+        subject: structuredClone(session.value.subject), schema: structuredClone(context.schema), discoveryResponseContract,
         request: structuredClone(context.request), finalContinuation: structuredClone(context.finalContinuation),
         resultCapacity: structuredClone(context.resultCapacity), contextWorkspace: structuredClone(context.contextWorkspace),
         working: { archive, deliveryContract: 'research-delivery/v1',

@@ -1,3 +1,4 @@
+import { deliveredContract } from './discovery-response-contract-fixture.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { writeFileSync } from 'node:fs';
@@ -167,6 +168,9 @@ test('5.3 managed deep carries full exact cell, scope and preparation through ca
   const f=await ready(t),intent=prepareDeepResearch(f.store,f.input),context=consumerIntentContext(f.store,intent.value);
   assert.deepEqual(intent.value.cursor.resultCapacity.bindings.deepPreparation,reference(f.preparation));
   const result=(await runDeepResearch(f.store,f.input))!,wire=f.wires().at(-1)!.subject;
+  const replyContract=deliveredContract(f.store,wire,'analyst');
+  assert.equal(replyContract.schema.properties.action.const,'answer');
+  assert.match(replyContract.instruction,/does not execute intermediate reads/);
   const archive=f.store.get<any>(result.archive.id,result.archive.revision)!;
   const body=readArchiveBody(f.store,archive).body;
   for(const actual of [context,body,wire]){

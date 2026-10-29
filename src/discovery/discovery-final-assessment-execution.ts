@@ -1,3 +1,4 @@
+import { finalResponseContract } from './discovery-response-contract.js';
 import { canonical, digest, hashJson } from '../canonical.js';
 import { EngineError, requireCondition } from '../errors.js';
 import { isRef, reference, type Ref } from '../pipeline/contracts.js';
@@ -262,6 +263,8 @@ export function currentDiscoveryFinalAssessmentGuards(store: Store, project: str
 export function prepareDiscoveryFinalAssessmentContextPacker(store: Store,
   admission: Awaited<ReturnType<typeof readDiscoveryFinalAssessmentDispatchAdmission>>) {
   const { session, prepared, context } = admission;
+  // This small supplement stays inline: the paid archive retains its historical context exactly.
+  const discoveryResponseContract = finalResponseContract(true);
   const staged = prepareArchiveParts(store, { projectId: session.value.projectId,
     draft: session.value.binding.draft, question: session.value.binding.question }, structuredClone(context));
   const records = new Map<string, Revision<any>>();
@@ -279,7 +282,7 @@ export function prepareDiscoveryFinalAssessmentContextPacker(store: Store,
     pack(limit: number): Record<string, any> {
       const packetLimit = Math.min(limit, prepared.value.input.packetChars);
       const packet: Record<string, any> = { contract: 'discovery-final-assessment-envelope/v1',
-        subject: structuredClone(session.value.subject), schema: structuredClone(context.schema),
+        subject: structuredClone(session.value.subject), schema: structuredClone(context.schema), discoveryResponseContract,
         request: structuredClone(context.request), finalContinuation: structuredClone(context.finalContinuation),
         resultCapacity: structuredClone(context.resultCapacity), contextWorkspace: structuredClone(context.contextWorkspace),
         working: { archive, deliveryContract: 'research-delivery/v1',

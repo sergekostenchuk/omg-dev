@@ -1,3 +1,4 @@
+import { deliveredContract } from './discovery-response-contract-fixture.js';
 import { fixturePlanAxes, fixturePlanCoverage } from "./discovery-v7-fixture.js";
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -264,6 +265,11 @@ test("S5 paid chain: initial page → v2 checkpoint → final page → each of t
     const result = await paidRun(f, subject, [first, second]);
     assert.deepEqual(result, { ...endOf(ENDS[kind]), question: ids[index] }, `${kind}: the session result is the attempt end`);
     assert.equal(f.calls() - before, 2, `${kind}: two paid pages`);
+    const sent=readFileSync(join(f.root,"wire.ndjson"),"utf8").trim().split("\n").map(line=>JSON.parse(line));
+    const last=sent.at(-1);assert.equal(last.subject.dispatchMode,"synthesis");
+    const reply=deliveredContract(f.store,last,"analyst",result);
+    assert.deepEqual(reply.schema.oneOf.map((form:any)=>form.properties.action.const).sort(),
+      ['answer','checkpoint','read_context','need_research','need_owner','pause'].sort());
     const session = f.store.list<any>("synthesis-session").find(row => row.value.binding.subject.planQuestionId === ids[index])!;
     const proven = readSynthesisSessionV3(f.open(), reference(session));
     assert.equal(proven.value.notes.length, 1);
@@ -399,6 +405,9 @@ test("S5 consolidation: after a real profile change leaves the notes no room, a 
   const session = readSynthesisSessionV3(f.open(), reference(f.store.list<any>("synthesis-session")[0]!));
   const consolidated = session.value.notes.filter(note => note.consolidated);
   assert.ok(consolidated.length >= 1, "a paid consolidation step ran");
+  const sent=readFileSync(join(f.root,"wire.ndjson"),"utf8").trim().split("\n").map(line=>JSON.parse(line));
+  const consolidation=sent.find(row=>row.subject.dispatchMode==="consolidation");
+  assert.ok(consolidation);deliveredContract(f.store,consolidation,"consolidation");
   for (const note of consolidated) {
     const record = f.store.get<any>(note.checkpoint.id)!;
     assert.ok(record.id.startsWith("research-checkpoint:v2:"));

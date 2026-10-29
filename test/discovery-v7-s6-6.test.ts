@@ -289,6 +289,12 @@ test('S6.6: a real paid consolidation resumes in restore-only before another syn
  const session=readSynthesisSessionV3(f.open(),reference(sessions(f.store)[0]!));assert.ok(session.value.notes.some(note=>note.consolidated));
  f.finishFrontier();const completed=await f.run(3,f.open());assert.equal(completed.value.status,'paused');assert.equal(completed.value.pauseCode,'project_mode_unset',JSON.stringify(completed.value));
  assert.equal(f.wires().filter(w=>!w.subject.assessmentSubject).length,calls+1);
+ const synthesis=f.wires().filter(w=>w.subject.dispatchMode==='synthesis').at(-1)!.subject;
+ assert.ok(synthesis.discoveryResponseContract, 'The response form fits beside retained conclusions');
+ if (!synthesis.discoveryClaims) {
+  const claims=synthesis.materialDelivery.find((entry:any)=>entry.original.pointer==='/body/discoveryClaims');
+  assert.equal(claims.served.end,claims.served.total,'The complete claim schema is delivered without another paid read');
+ }
  assert.equal(f.wires().filter(w=>w.subject.assessmentSubject).length,1);assert.equal(f.wires().filter(row=>row.subject.dispatchMode==='planning').length,1);
  for(const turn of f.store.list<any>('research-turn'))readResearchConsumerTurn(f.open(),reference(turn));
  const before=snapshot(f);await f.run(3,f.open(),false);assert.deepEqual(snapshot(f),before);

@@ -1,3 +1,5 @@
+import { compactResponseSchema } from '../src/discovery/research-action-contract.js';
+import { deliveredContract } from './discovery-response-contract-fixture.js';
 import {configureReaderPilot} from '../src/discovery/reader-pilot.js';
 import test from 'node:test';
 import {Ajv} from 'ajv';
@@ -29,6 +31,29 @@ function policy(store:Store, discovery:6|7, previous:Ref|null=null) {
   try {return setProjectProducerPolicy(store,scope,session.authority).record;}
   finally {sessions.revoke(session.bearer);}
 }
+function assertDeliveredClaimsSchema(actual:any) {
+  const expand=(schema:any)=>{
+    const definitions=schema.$defs??{};
+    const visit=(value:any,path=new Set<string>()):any=>{
+      if(Array.isArray(value)) return value.map(item=>visit(item,path));
+      if(value===null || typeof value!=='object') return value;
+      if(Object.hasOwn(value,'$ref')) {
+        assert.equal(Object.keys(value).length,1,'A compact reference replaces one complete shape');
+        assert.ok(typeof value.$ref==='string' && value.$ref.startsWith('#/$defs/'),'Only saved local definitions are used');
+        const key=value.$ref.slice('#/$defs/'.length);
+        assert.ok(Object.hasOwn(definitions,key),`Missing definition ${key}`);
+        assert.ok(!path.has(key),`Cyclic definition ${key}`);
+        return visit(definitions[key],new Set([...path,key]));
+      }
+      return Object.fromEntries(Object.entries(value).filter(([key])=>key!=='$defs')
+        .map(([key,item])=>[key,visit(item,path)]));
+    };
+    return visit(schema);
+  };
+  assert.ok(JSON.stringify(actual).includes('"$ref":"#/$defs/responseShape'),'Repeated response shapes are delivered by exact local references');
+  assert.deepEqual(expand(actual),expand(V7_CLAIMS_SCHEMA));
+}
+
 async function world(t:test.TestContext, tokens=10, planning=false, readFirst=false, assessor: false|'supported'|'return'|'fact-unknown'=false) {
   const f=discoveryFixture(t,'omg-live-forms-',true);
   f.engine.execute({type:'create-project',project:'p',title:'Forms'});
@@ -211,10 +236,11 @@ test('forms: a paid correction cut is recovered under stop without another dispa
 
 test('forms: the actual v7 planning request delivers full read contracts without opening analyst correction for a planner',async t=>{
   const f=await world(t,10,true),request=JSON.stringify(f.wires()[0]);
+  deliveredContract(f.store,f.wires()[0],'reading-planner',{action:'synthesize',question:'industry'});
   assert.equal(f.refused.value.kind,'reading-planner');
   for(const token of ['UTF-16','read_source','additionalProperties','required','read_bundle','read_context']) assert.ok(request.includes(token),token);
   assert.ok(request.includes('Choose what to read'));
-  assert.deepEqual(f.wires()[0].subject.discoveryClaims.schema,V7_CLAIMS_SCHEMA);
+  assertDeliveredClaimsSchema(f.wires()[0].subject.discoveryClaims.schema);
   await assert.rejects(Promise.resolve().then(()=>f.engine.execute(f.commandRetry)),{code:'research_plan_retry_invalid'});
   assert.equal(f.wires().length,1);
 });
@@ -246,6 +272,7 @@ test('LIVE-FORMS-01: need_owner correction keeps its pending turn without purcha
   f.reply({necessary:true,reason:'An explicit jurisdiction choice is unavailable from the consulted source'});
   const ordinary=await cold.execute({type:'research-draft',project:'p',draftId:f.draft.id,maxTurns:1}) as any;
   assert.equal(ordinary.value.status,'needs_owner',JSON.stringify(ordinary.value));
+  deliveredContract(f.store,f.wires().at(-1),'escalation-assessor',{necessary:true,reason:'Owner information is unavailable'});
   assert.equal(f.wires().length,3);assert.equal(f.store.list('model-call').length,before+2);
   await cold.execute(f.commandRetry);assert.equal(f.wires().length,3);
 });
@@ -259,7 +286,8 @@ test('claims delivery: all five closed basis forms match the existing structural
     unknown:{origin:'Plan research',unknownId:'u-1',question:'Which jurisdiction?',affects:['rules'],consumer:'concept',
       blocksCurrentStage:true,moment:'feasibility',closeCriterion:'Owner names the actual operating jurisdiction'},
     'owner-decision':{authority:ref}};
-  const validate=new Ajv({strict:true}).compile(V7_CLAIMS_SCHEMA as object);
+  for (const schema of [V7_CLAIMS_SCHEMA, compactResponseSchema(V7_CLAIMS_SCHEMA as Record<string, unknown>)]) {
+  const validate=new Ajv({strict:true}).compile(schema as object);
   const context={project:'p',planAnswer:ref,planQuestionId:'industry',projectRef:(r:Ref)=>r.id===ref.id&&r.hash===ref.hash&&r.revision===1};
   const branch=(V7_CLAIMS_SCHEMA as any).properties.claims.items.oneOf;
   assert.deepEqual(branch.map((b:any)=>b.properties.kind.const),Object.keys(bases));
@@ -282,12 +310,13 @@ test('claims delivery: all five closed basis forms match the existing structural
     assert.equal(validate({claims:[extra]}),false);assert.throws(()=>checkV7Claims([extra],context),{code:'attempt_invalid'});
   }
   assert.equal(validate({claims:[]}),false);assert.throws(()=>checkV7Claims([],context),{code:'attempt_claims_empty'});
+  }
 });
 
 test('claims delivery: the actual continuation carries full forms and real source pins; ordinary submitted records unknown and fact',async t=>{
   const f=await world(t);
   const oldRefusal=f.store.history(f.refused.id);
-  assert.deepEqual(f.wires()[0].subject.discoveryClaims.schema,V7_CLAIMS_SCHEMA);
+  assertDeliveredClaimsSchema(f.wires()[0].subject.discoveryClaims.schema);
   assert.deepEqual(f.wires()[0].subject.discoveryClaims.sources,[]);
   await f.engine.execute(f.commandRetry);
   const subject=f.refused.value.cursor.subject!;
@@ -303,7 +332,7 @@ test('claims delivery: the actual continuation carries full forms and real sourc
   assert.equal(f.wires().length,3);
   const request=f.wires()[2],form=request.subject.discoveryClaims;
   assert.ok(form,JSON.stringify(request.subject).slice(0,700));
-  assert.deepEqual(form.schema,V7_CLAIMS_SCHEMA);assert.deepEqual(form.subject,subject);
+  assertDeliveredClaimsSchema(form.schema);assert.deepEqual(form.subject,subject);
   assert.deepEqual(form.sources,[claims[1]!.basis.source]);
   for(const field of ['planQuestions','valueHash','closeCriterion','howToVerify','UTF-16'])
     assert.ok(JSON.stringify(request).includes(field),field);

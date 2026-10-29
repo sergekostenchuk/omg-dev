@@ -1,3 +1,4 @@
+import { deliveredContract } from './discovery-response-contract-fixture.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { writeFileSync } from 'node:fs';
@@ -88,6 +89,8 @@ async function pay(f:Setup,store=f.store) {
 test('4T.4: real snapshot -> managed intent/call/output; cold repeated publication does not pay or change K/N',async t=>{
   const f=await setup(t),calls=f.wires().length,attempts=f.store.list('research-attempt'),states=f.store.list('v7-progress-state');
   const result=await runVariantSession(f.store,f.input);assert.equal(result.value.cursor,1);assert.ok(result.value.result);
+  assert.ok(f.wires().at(-1)!.subject.discoveryResponseContract, 'one-reply variants receive the full form inline');
+  deliveredContract(f.store,f.wires().at(-1),'variant-proposal',generation());
   assert.equal(f.wires().length,calls+1);assert.deepEqual(f.store.list('research-attempt'),attempts);assert.deepEqual(f.store.list('v7-progress-state'),states);
   const origin=readResearchConsumerIntent(f.store,result.value.result!.intent);assert.equal(origin.value.state,'running');
   assert.deepEqual(origin.value.cursor.resultCapacity.forms.map((form:any)=>form.kind),['variants','no_variants']);
@@ -333,7 +336,7 @@ test('4T.4: no_variants keeps its exact paid negative result in the same executi
   writeFileSync(f.settings,JSON.stringify({tokens:10,reply:{action:'no_variants',
     reasons:[{code:'bounded_none',message:'This saved sweep supports no variant',grounds:[reference(f.saved)]}],searchLimits:['Exact saved sweep'],unknowns:[]}}));
   const result=await runVariantSession(f.store,f.input),paid=readResearchConsumerExecution(f.store,'p',result.value.result!.intent);
-  assert.equal(paid.kind,'response');if(paid.kind==='response')assert.equal((paid.payload as any).action,'no_variants');
+  assert.equal(paid.kind,'response');if(paid.kind==='response'){assert.equal((paid.payload as any).action,'no_variants');deliveredContract(f.store,f.wires().at(-1),'variant-proposal',paid.payload);}
   assert.equal(f.wires().length,calls+1);const before=snapshot(f.store);
   assert.deepEqual(await runVariantSession(f.open(),f.input),result);assert.deepEqual(snapshot(f.store),before);
   assert.equal(f.wires().length,calls+1);

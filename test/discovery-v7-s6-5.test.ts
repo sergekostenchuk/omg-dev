@@ -1,3 +1,4 @@
+import { deliveredContract } from './discovery-response-contract-fixture.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { writeFileSync, readFileSync } from 'node:fs';
@@ -156,6 +157,8 @@ async function finishQueueOnce(f:Interrupted,expectedCalls:number){
   const cold=f.open();
   for(const turn of ownTurns(cold))assert.deepEqual(readResearchConsumerTurn(cold,reference(turn)),turn);
   assert.equal(f.wires().length,expectedCalls);
+  const readerWire=f.wires().find((wire:any)=>wire.subject?.role==='reader');
+  assert.ok(readerWire);deliveredContract(f.store,readerWire,'reader',readerReply);
   const history=f.history(),calls=f.store.list('model-call'),ledger=f.store.list('research-budget-ledger');
   await f.run(2,f.open(),false);
   assert.deepEqual(f.history(),history);assert.deepEqual(f.store.list('model-call'),calls);

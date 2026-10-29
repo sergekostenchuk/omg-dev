@@ -1,3 +1,4 @@
+import { finalResponseContract } from './discovery-response-contract.js';
 import { canonical, digest, hashJson } from '../canonical.js';
 import { EngineError, requireCondition } from '../errors.js';
 import { isRef, reference, type Ref } from '../pipeline/contracts.js';
@@ -249,6 +250,8 @@ export async function readDiscoveryFinalDispatchAdmission(store: Store, applicat
 export function prepareDiscoveryFinalContextPacker(store: Store,
   admission: Awaited<ReturnType<typeof readDiscoveryFinalDispatchAdmission>>) {
   const { session, prepared, context } = admission;
+  // This small supplement stays inline: the paid archive retains its historical context exactly.
+  const discoveryResponseContract = finalResponseContract(false);
   const staged = prepareArchiveParts(store, {
     projectId: session.value.projectId, draft: session.value.binding.draft,
     question: session.value.binding.question,
@@ -274,7 +277,7 @@ export function prepareDiscoveryFinalContextPacker(store: Store,
       const packetLimit = Math.min(limit, prepared.value.input.packetChars);
       const packet: Record<string, any> = {
         contract: 'discovery-final-envelope/v1', subject: structuredClone(session.value.subject),
-        schema: structuredClone(context.schema), request: structuredClone(context.request),
+        schema: structuredClone(context.schema), discoveryResponseContract, request: structuredClone(context.request),
         finalContinuation: structuredClone(context.finalContinuation),
         resultCapacity: structuredClone(context.resultCapacity),
         contextWorkspace: structuredClone(context.contextWorkspace),

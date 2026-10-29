@@ -1,3 +1,4 @@
+import { discoveryResponseContract } from './discovery-response-contract.js';
 import { hasDiscoveryHandoff, requireDiscoveryHandoff } from './discovery-handoff.js';
 import { conceptBasisMaterial } from './research-context.js';
 import { planBasisOf } from './v7-plan-assessment.js';
@@ -358,6 +359,10 @@ function packWorkingContext(store: Store, projectId: string, draftId: string, qu
       discoveryClaims: planClaimsContract(store, projectId, planSubject!, body['history'] ?? []),
       ...(Object.hasOwn(body,'questions')?{questions:[planContract]}:{})};
   }
+  if (draft.value.stage === 'discovery' && draft.value.contractVersion === 7) {
+    const reply = discoveryResponseContract(options.purpose ?? '', body);
+    if (reply) body = { ...body, discoveryResponseContract: reply };
+  }
   if ((planSubject || assessmentSubject) && options.previous) {
     const previous = store.get<Archive>(options.previous.id,options.previous.revision);
     requireCondition(previous?.hash === options.previous.hash && previous.value.projectId === projectId
@@ -428,8 +433,14 @@ function packWorkingContext(store: Store, projectId: string, draftId: string, qu
   const metadata: Omit<Archive, 'body'> = { projectId, draft: reference(draft), question: reference(question), ...(planSubject?{subject:planSubject}:{}),...(variantSubject?{variantSubject,purpose:options.purpose!,actor:options.actor!}:{}) };
   let archive = archiveWriter(store, compact, metadata, body, archiveGuards);
   let archivedBody = body;
+  // Synthesis must keep its reply guidance beside the retained conclusions.
+  const responseFormMayRead = !['variant-proposal', 'variant-decision', 'escalation-assessor', 'reader', 'consolidation', 'synthesis']
+    .includes(body.discoveryResponseContract?.purpose ?? '')
+    && body.dispatchMode !== 'synthesis'
+    && !(deep && !Object.hasOwn(body, 'deepResearchContract'));
   const exactArchivedFields = (packet: Record<string, any>, fields: string[]) => fields.filter(field =>
     Object.hasOwn(packet, field) && packet[field] !== undefined
+      && (field !== 'discoveryResponseContract' || responseFormMayRead)
       && Object.hasOwn(archivedBody, field)
       && canonical(packet[field]) === canonical(archivedBody[field]));
   const materialRecord = (field: string, material: unknown): Ref => {
@@ -477,6 +488,11 @@ function packWorkingContext(store: Store, projectId: string, draftId: string, qu
         || packet.working?.materialAddresses?.some((a:any)=>a.field==='dossierReplyContract'
           && a.valueHash===hashJson(archivedBody.dossierReplyContract))),
       'discovery_dossier_transport_invalid', 'The wire lost its exact dossier reply contract or address');
+    if (archivedBody.discoveryResponseContract) requireCondition(
+      canonical(packet.discoveryResponseContract ?? null) === canonical(archivedBody.discoveryResponseContract)
+      || packet.working?.materialAddresses?.some((a:any) => a.field === 'discoveryResponseContract'
+        && a.valueHash === hashJson(archivedBody.discoveryResponseContract)),
+      'research_response_contract_missing', 'The request lost its complete response contract or exact address');
     if (variantFields) Object.assign(packet,variantFields);
     if (deepFields) Object.assign(packet,deepFields);
     if (deep) requireCondition(canonical(packetDeepPreparation(packet)) === canonical(deep)
@@ -553,6 +569,7 @@ function packWorkingContext(store: Store, projectId: string, draftId: string, qu
     const goal = body['consolidation'];
     const active = activeSynthesisNotes(body['synthesisNotes']);
     const makePacket = (count: number, bounded: boolean) => ({ dispatchMode: 'consolidation', question: projectedQuestion, ...neighborMaterial,
+      ...(body.discoveryResponseContract ? { discoveryResponseContract: body.discoveryResponseContract } : {}),
       ...(Object.hasOwn(body, 'resultCapacity') ? { resultCapacity: body['resultCapacity'] } : {}),
       ...(relatedResearch === undefined ? {} : { discoveryContext: relatedResearch }),
       synthesisSession: body['synthesisSession'], synthesisState: body['synthesisState'],
@@ -591,6 +608,7 @@ function packWorkingContext(store: Store, projectId: string, draftId: string, qu
             encoding: 'canonical-json' as const } };
         const fragmentPacket: Record<string, any> = {
           dispatchMode: 'consolidation', question: projectedQuestion, ...neighborMaterial,
+          ...(body.discoveryResponseContract ? { discoveryResponseContract: body.discoveryResponseContract } : {}),
           ...(Object.hasOwn(body, 'resultCapacity') ? { resultCapacity: body['resultCapacity'] } : {}),
           ...(relatedResearch === undefined ? {} : { discoveryContext: relatedResearch }),
           synthesisSession: body['synthesisSession'], synthesisState: body['synthesisState'],
@@ -637,10 +655,15 @@ function packWorkingContext(store: Store, projectId: string, draftId: string, qu
     // positive first fragment out before the planner measures it.
     const fullHistory = Object.hasOwn(initial, 'history') ? initial.history : undefined;
     if (fullHistory !== undefined) delete initial.history;
+    // The workspace has its own addressed-page packer below. Its full archive
+    // must not force small reply forms into new mandatory material reads.
+    const fullWorkspace = initial.contextWorkspace;
+    delete initial.contextWorkspace;
     const addressed = addressArchivedMaterials(initial, reference(archive),
-      exactArchivedFields(initial, ['dossierPacket', 'dossierReplyContract', 'dossierNotes', 'fields', 'discoveryContext', 'discoveryBasisCatalogue', 'planBasis', 'v7Frame',
+      exactArchivedFields(initial, ['discoveryResponseContract', 'assessmentClassification', 'discoveryClaims', 'dossierPacket', 'dossierReplyContract', 'dossierNotes', 'fields', 'discoveryContext', 'discoveryBasisCatalogue', 'planBasis', 'v7Frame',
         'prerequisites', 'operationMap', 'inventory', 'consumerFeedback', 'request', 'frameRequest', 'sourceCatalogue']),
       maxChars, materialRecord);
+    if (fullWorkspace !== undefined) initial.contextWorkspace = fullWorkspace;
     packContextWorkspace(initial,maxChars,options.contextChars,undefined,
       addressed.length || fullHistory !== undefined ? 4096 : 1024);
     if (fullHistory !== undefined) {
@@ -735,10 +758,10 @@ function packWorkingContext(store: Store, projectId: string, draftId: string, qu
     delete body['synthesisNotes']; delete body['assessmentNotes']; delete body['checkpoints'];
   }
   if (body['dispatchMode'] === "planning" && !options.continuation) {
-    const side = { ...(relatedResearch === undefined ? {} : { discoveryContext: relatedResearch }),
+    const side = { ...(body.discoveryResponseContract ? {discoveryResponseContract:body.discoveryResponseContract} : {}), ...(relatedResearch === undefined ? {} : { discoveryContext: relatedResearch }),
       ...(relatedCatalogue === undefined ? {} : { discoveryBasisCatalogue: relatedCatalogue }),
       ...(planBasis ? { planBasis } : {}), ...(neighborMaterial ?? {}) };
-    const fullReserved = (relatedResearch === undefined ? 0 : JSON.stringify({discoveryContext:relatedResearch}).length)
+    const fullReserved = (body.discoveryResponseContract ? JSON.stringify({discoveryResponseContract:body.discoveryResponseContract}).length : 0) + (relatedResearch === undefined ? 0 : JSON.stringify({discoveryContext:relatedResearch}).length)
       + (relatedCatalogue === undefined ? 0 : JSON.stringify({discoveryBasisCatalogue:relatedCatalogue}).length)
       + (planBasis ? JSON.stringify({planBasis}).length : 0)
       + (neighborMaterial ? JSON.stringify(neighborMaterial).length : 0);
@@ -748,12 +771,12 @@ function packWorkingContext(store: Store, projectId: string, draftId: string, qu
       options.contextChars,archivedBody);
     Object.assign(packet, side);
     const addressed = addressArchivedMaterials(packet, reference(archive),
-      exactArchivedFields(packet, ['discoveryContext', 'discoveryBasisCatalogue', 'planBasis', 'stageNeighbors']),
+      exactArchivedFields(packet, ['discoveryResponseContract', 'discoveryContext', 'discoveryBasisCatalogue', 'planBasis', 'stageNeighbors']),
       maxChars, materialRecord);
     if (!packet.materialDelivery) serveArchivedMaterial(packet, addressed, maxChars);
     return finish(packet);
   }
-  const mandatory = [...(variantFields?Object.keys(variantFields):[]),"assessmentClassification","discoveryClaims","managedDossier","dossierNotes","dossierSubject","dossierPacket","dossierResultTransport","dossierReplyContract","assessmentDelivery","deepPreparation","deepCell","deepScope","variantSubject", "assessmentSubject", "resultCapacity", "assessmentContextContract", "stageNeighbors", "discoveryContext", "discoveryBasisCatalogue", "planBasis", "webResearch", "answerContext", "contextWorkspace", "savedEvidence", "conclusions", "conclusionCitations", "conclusionRefs", "conclusionUnresolved", "conclusionEncoding", "contextControls", "contextCorrection", "currentRead", "originals", "corrections", "request", "candidate", "proposalChanges", "purpose", "sources", "questions", "prerequisites", "operationMap", "researchMissing", "fields", "mapStatusFindings", "mapStatus", "researchScope", "role", "stage", "level", "consumer", "contextEncoding", "allowedConsumers", "gapFields", "graphBase",
+  const mandatory = [...(variantFields?Object.keys(variantFields):[]),"discoveryResponseContract","assessmentClassification","discoveryClaims","managedDossier","dossierNotes","dossierSubject","dossierPacket","dossierResultTransport","dossierReplyContract","assessmentDelivery","deepResearchContract","deepPreparation","deepCell","deepScope","variantSubject", "assessmentSubject", "resultCapacity", "assessmentContextContract", "stageNeighbors", "discoveryContext", "discoveryBasisCatalogue", "planBasis", "webResearch", "answerContext", "contextWorkspace", "savedEvidence", "conclusions", "conclusionCitations", "conclusionRefs", "conclusionUnresolved", "conclusionEncoding", "contextControls", "contextCorrection", "currentRead", "originals", "corrections", "request", "candidate", "proposalChanges", "purpose", "sources", "questions", "prerequisites", "operationMap", "researchMissing", "fields", "mapStatusFindings", "mapStatus", "researchScope", "role", "stage", "level", "consumer", "contextEncoding", "allowedConsumers", "gapFields", "graphBase",
     "core", "map", "draft", "question", "value", "representation", "consumerFeedback", "assessmentState", "openGaps", "failures", "unresolvedEvidence", "dispatchMode", "readPlanStatus", "sourceCatalogue", "sourceLocations", "bases", "runtimeProofs", "synthesisState", "synthesisNotes", "previousProposalRef"];
   if(body['assessmentState']) mandatory.splice(mandatory.indexOf("value"),1);
   if(frameMaterial !== undefined) mandatory.push('v7Frame');
@@ -768,8 +791,10 @@ function packWorkingContext(store: Store, projectId: string, draftId: string, qu
     }), omitted: [] as string[] };
   // Defaults preserve the action protocol's collection shapes, not completeness.
   Object.assign(packet, { readings: [], directReadings: [], history: [], observations: [], checkpoints: [] });
+  const fullWorkspace = packet.contextWorkspace;
+  delete packet.contextWorkspace;
   const addressedCore = addressArchivedMaterials(packet, reference(archive),
-    exactArchivedFields(packet, ['assessmentClassification', 'discoveryClaims', 'dossierPacket', 'dossierReplyContract', 'dossierNotes', 'fields', 'discoveryContext', 'discoveryBasisCatalogue', 'planBasis', 'stageNeighbors', 'v7Frame',
+    exactArchivedFields(packet, ['discoveryResponseContract', 'assessmentClassification', 'discoveryClaims', 'dossierPacket', 'dossierReplyContract', 'dossierNotes', 'fields', 'discoveryContext', 'discoveryBasisCatalogue', 'planBasis', 'stageNeighbors', 'v7Frame',
       'prerequisites', 'operationMap', 'inventory', 'request', 'consumerFeedback',
       'answerContext', 'currentRead', 'originals', 'corrections', 'researchScope',
       'mapStatus', 'mapStatusFindings', 'readPlanStatus', 'openGaps', 'failures', 'sourceCatalogue',
@@ -777,6 +802,7 @@ function packWorkingContext(store: Store, projectId: string, draftId: string, qu
       'candidate', 'proposalChanges']).filter(field => field !== 'failures'
         || !body['assessmentState'] || JSON.stringify(body['failures']).length > Math.floor(maxChars / 3)),
     maxChars, materialRecord);
+  if (fullWorkspace !== undefined) packet.contextWorkspace = fullWorkspace;
   const retained = body['contextControls']?.version === 2 && body['synthesisState'];
   const conclusionKeys = ['conclusions','conclusionCitations','conclusionRefs','conclusionUnresolved','conclusionEncoding'];
   const carry = Object.fromEntries(conclusionKeys.filter(key => Object.hasOwn(packet,key)).map(key => [key,packet[key]]));

@@ -1,3 +1,4 @@
+import { deliveredContract } from './discovery-response-contract-fixture.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { canonical } from '../src/canonical.js';
@@ -85,6 +86,7 @@ async function assess(f: World, edition: AcceptedDiscovery, claim: ClaimAddress,
   f.reply(answer(packet.subject, verdict, claim));
   const paid = await runConditionEvidenceExecution(f.store, 'p', reference(edition.manifest), reference(prepared), { profile: f.profile });
   assert.ok(paid.output && paid.result); assert.equal(paid.result.verdict, verdict);
+  deliveredContract(f.store, f.wires().at(-1), 'discovery-condition-evidence');
   return { packet, prepared: reference(prepared), paid, output: reference(paid.output) };
 }
 const request = (edition: AcceptedDiscovery, evidence: Ref, conditionId = 'evidence-1') =>

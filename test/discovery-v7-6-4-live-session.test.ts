@@ -1,3 +1,4 @@
+import { deliveredContract } from './discovery-response-contract-fixture.js';
 import { fixtureApplicableAxes } from './discovery-v7-fixture.js';
 import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
@@ -407,7 +408,8 @@ for(const model of [false,true])test(`live dossier: real ${model?'model':'owner'
   assert.doesNotMatch(calls[1]!.value.budget!.estimate.explanation!,/bootstrap/);
   assert.deepEqual(calls[1]!.value.budget!.estimate.basis,[reference(first)]);
   assert.equal(calls[2]!.value.budget!.estimate.basis.length,2);
-  const sent=f.wires().slice(wires);assert.equal(sent[0].subject.managedDossier.step,0);
+  const sent=f.wires().slice(wires);for(const request of sent)deliveredContract(f.store,request,"dossier-assessor");
+  assert.equal(sent[0].subject.managedDossier.step,0);
   assert.equal(sent[0].subject.resultCapacity.envelopeLimitChars,profile.value.maxRequestChars);
   assert.equal(sent[1].subject.contextWorkspace[0].record.id,(sent[0].subject.working.materialAddresses?.[0]?.record??sent[0].subject.working.archive).id);
   assert.ok(sent.at(-1).subject.dossierNotes.length);assert.deepEqual(sent.at(-1).subject.dossierSubject,packet.subject);

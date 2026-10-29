@@ -1,3 +1,4 @@
+import { deliveredContract } from './discovery-response-contract-fixture.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { writeFileSync } from 'node:fs';
@@ -125,6 +126,7 @@ test('4B.2: bypass buys one managed model decision over the exact proven set —
   assert.equal(f.wires().length, sent + 1, 'one paid decision');
   const [v1] = membersOf(f);
   const decision = f.store.list<VariantModelDecision>('discovery-variant-model-decision').find(row => row.value.projectId === f.project)!;
+  deliveredContract(f.store,f.wires().at(-1),'variant-decision',choose('v1'));
   assert.deepEqual(decision.value.outcome, { kind: 'choose', member: reference(v1!), reason: 'The model chooses v1' }, 'the chosen key, not the recommended v2');
   assert.equal(decision.id, variantRecordId('discovery-variant-model-decision', decision.value));
   assert.deepEqual([decision.value.set, decision.value.mode, decision.value.expectedSelection, decision.value.previous],
@@ -147,6 +149,7 @@ test('4B.2: reject_all is a decision without a member', async t => {
   f.reply({ action: 'reject_all', reason: 'No variant fits the mandate' });
   await runVariantSession(f.store, f.decisionInput(reference(bypass)));
   const decision = f.store.list<VariantModelDecision>('discovery-variant-model-decision').find(row => row.value.projectId === f.project)!;
+  deliveredContract(f.store,f.wires().at(-1),'variant-decision',{action:'reject_all',reason:'No variant fits the mandate'});
   assert.deepEqual(decision.value.outcome, { kind: 'reject_all', reason: 'No variant fits the mandate' });
   assert.equal(readVariantModelDecision(f.store, f.project, reference(decision)).verification, 'proven');
 });

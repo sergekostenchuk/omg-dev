@@ -125,6 +125,10 @@ test('D1 recovery: bounded generation reads every delivered request page before 
   const done=await f.run(f.store,24);ready(done);
   const sent=f.sent().slice(start);assert.ok(sent.length>1);assert.ok(sent.some(w=>w.subject.materialDelivery?.length));
   assert.ok(sent.every(w=>JSON.stringify(w).length<=60000));
+  for (const request of sent) {
+    assert.ok(request.subject.discoveryResponseContract, 'The reply form is available without a new context read');
+    assert.ok(!request.subject.working?.materialAddresses?.some((item:any)=>item.field==='discoveryResponseContract'));
+  }
   const saved=JSON.parse(readFileSync(join(f.root,'received.json'),'utf8'));
   assert.ok(Object.keys(saved.chunks).length>1);
   let text='',offset=0;while(saved.chunks[offset]){text+=saved.chunks[offset];offset=text.length;}

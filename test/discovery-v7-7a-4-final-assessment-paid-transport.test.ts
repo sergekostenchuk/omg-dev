@@ -1,3 +1,4 @@
+import { deliveredContract } from './discovery-response-contract-fixture.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
@@ -110,6 +111,7 @@ test('final assessment paid: owner conditional is supported by the independent p
   assert.equal(result.result.candidateOutcome, 'conditional');
   assert.deepEqual(result.result.candidate.verdict.conditions, source.bundle.verdict.conditions);
   assert.deepEqual(result.result.packet, source.packet);
+  deliveredContract(f.store,f.wires().at(-1),'discovery-final-assessment');
   assert.ok(f.wires().length > wire);
   const calls = callsFor(f.store, prepared);
   assert.ok(calls.length >= 1);
@@ -210,6 +212,7 @@ test('final assessment paid: bounded pages deliver the full saved subject, packe
   assert.ok(result.output && result.result); assert.deepEqual(result.result.packet, source.packet);
   const wires = f.wires().slice(start) as Record<string, any>[];
   assert.ok(wires.length > 1);
+  for(const wire of wires) deliveredContract(f.store,wire,'discovery-final-assessment');
   assert.ok(wires[0]!.subject.working.materialAddresses.length > 0);
   assert.ok(wires.some(wire => wire.subject.contextWorkspace?.length > 0));
   assert.ok(wires.every(wire => JSON.stringify(wire).length <= 400_000));

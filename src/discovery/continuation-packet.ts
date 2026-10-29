@@ -1,3 +1,4 @@
+import { compactResponseSchema } from './research-action-contract.js';
 import { RESEARCH_READ_INSTRUCTION } from './research-read-contract.js';
 import { requireResearchResultCapacity, type ResearchResultCapacity } from './research-delivery.js';
 import { requireDossierAssessmentSubject, requireDossierAssessmentPacket } from './dossier-assessment.js';
@@ -658,7 +659,7 @@ export function planClaimsContract(store: Store, project: string, subject: V7Pla
       sources.set(canonical(pin), pin);
     }
   }
-  return { contract: DISCOVERY_CLAIMS_CONTRACT, schema: V7_CLAIMS_SCHEMA,
+  return { contract: DISCOVERY_CLAIMS_CONTRACT, schema: compactResponseSchema(V7_CLAIMS_SCHEMA as Record<string, unknown>),
     instruction: V7_CLAIMS_INSTRUCTION, subject, sources: [...sources.values()] };
 }
 

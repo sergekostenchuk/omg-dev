@@ -1,4 +1,4 @@
-import { RESEARCH_READ_SCHEMAS } from './research-read-contract.js';
+import { RESEARCH_ACTION_SCHEMA, READER_REPLY_SCHEMA } from './research-action-contract.js';
 import { decodeVariantDecisionAnswer, decodeVariantExecutionSession, decodeVariantGeneration, type VariantExecutionSession } from './discovery-variants.js';
 import type { AssessmentTransportSubject } from './continuation-packet.js';
 import { DISCOVERY_ASSESSMENT_CONTRACT_V2, DISCOVERY_ASSESSMENT_CONTRACT_V3, type DiscoveryAttemptsAssessmentV2, type DiscoveryAttemptsAssessmentV3, type PaidDiscoveryAttemptsAssessment } from './research-model.js';
@@ -61,50 +61,14 @@ const object = (properties: Record<string, unknown>) => ({ type: 'object', addit
 const text = { type: 'string', minLength: 1 };
 const ref = object({ id: text, revision: { type: 'integer', minimum: 1 },
   hash: { type: 'string', pattern: '^[a-f0-9]{64}$' } });
-const selector = { oneOf: [object({ kind: { const: 'json-pointer' }, pointer: { type: 'string' } }),
-  object({ kind: { const: 'text-range' }, start: { type: 'integer', minimum: 0 },
-    end: { type: 'integer', minimum: 1 } })] };
-// Keep the wire schema here so both the producer and historical reader use
-// this parser without importing layer-delta (which imports consumer modules).
-const deltaKeys = ['nodes', 'connectors', 'contracts', 'artifacts', 'edges', 'journeys',
-  'joins', 'anchors', 'tests', 'packets', 'transfers', 'researchObligations'] as const;
-const deltaCollections = (items: object) => ({ type: 'object', additionalProperties: false,
-  properties: Object.fromEntries(deltaKeys.map(key => [key, { type: 'array', items }])) });
-const answerDelta = object({ action: { const: 'answer_delta' }, question: text, base: ref,
-  upserts: deltaCollections({ type: 'object', required: ['id'], properties: { id: text } }),
-  removes: deltaCollections(text),
-  citations: { type: 'array', minItems: 1, items: object({ source: ref, selector }) } });
-answerDelta.properties['revises'] = ref;
-answerDelta.properties['horizon'] = { type: 'array', minItems: 1, uniqueItems: true, items: text };
 let actionValidator: ValidateFunction<ResearchAction> | undefined;
 const validateAction = (value: unknown): value is ResearchAction =>
-  (actionValidator ??= new Ajv({ allErrors: true }).compile<ResearchAction>({ oneOf: [
-  ...RESEARCH_READ_SCHEMAS,
-  object({ action: { const: 'read_plan' }, question: text,
-    reads: { type: 'array', minItems: 1, maxItems: 16, items: { oneOf: RESEARCH_READ_SCHEMAS } } }),
-  object({ action: { const: 'synthesize' }, question: text }),
-  object({ action: { const: 'need_research' }, question: text,
-    missing: { type: 'array', minItems: 1, items: text } }),
-  answerDelta,
-  object({ action: { const: 'checkpoint' }, question: text, value: {},
-    citations: { type: 'array', items: object({ source: ref, selector }) },
-    unresolved: { type: 'array', items: text } }),
-  object({ action: { const: 'answer' }, question: text, value: {},
-    citations: { type: 'array', minItems: 1, items: object({ source: ref, selector }) } }),
-  object({ action: { const: 'need_owner' }, question: text, reason: text,
-    searched: { type: 'array', minItems: 1, items: ref } }),
-  object({ action: { const: 'pause' }, reason: text })
-] }))(value);
+  (actionValidator ??= new Ajv({ allErrors: true }).compile<ResearchAction>(RESEARCH_ACTION_SCHEMA))(value);
 
 let readerReplyValidator: ValidateFunction<{ selections: ReaderSelection[]; unresolved: string[] }> | undefined;
 const validateReaderReply = (value: unknown): value is { selections: ReaderSelection[]; unresolved: string[] } =>
   (readerReplyValidator ??= new Ajv({ allErrors: true }).compile<{
-    selections: ReaderSelection[]; unresolved: string[] }>(object({
-    selections: { type: 'array', items: { oneOf: [
-      object({ source: ref, firstLine: { type: 'integer', minimum: 1 }, lastLine: { type: 'integer', minimum: 1 } }),
-      object({ sourceIndex: { type: 'integer', minimum: 0 },
-        firstLine: { type: 'integer', minimum: 1 }, lastLine: { type: 'integer', minimum: 1 } })] } },
-    unresolved: { type: 'array', items: text } })))(value);
+    selections: ReaderSelection[]; unresolved: string[] }>(READER_REPLY_SCHEMA))(value);
 
 /** A sibling field may advance the draft without changing this reader task. */
 export function readerDraftEquivalent(store: Store, before: Ref, after: Ref, question: Ref): boolean {

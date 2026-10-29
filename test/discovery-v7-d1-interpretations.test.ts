@@ -1,3 +1,4 @@
+import { deliveredContract } from './discovery-response-contract-fixture.js';
 import {spawnSync} from 'node:child_process';
 import {fileURLToPath} from 'node:url';
 import test, {type TestContext} from 'node:test';
@@ -94,6 +95,7 @@ test('D1: questions preserves consequences, waits for scoped owner choice, then 
 test('D1: bypass pays distinct generation, choice and application; the model decision never becomes owner authority',async t=>{
   const f=await world(t,'material','bypass'),before=f.sent().length;
   const done=await f.run();ready(done);assert.equal(done.callsUsed,4);assert.equal(f.sent().length-before,4);
+  for (const [i,purpose] of ['frame-interpretation-request','frame-interpretation-choice','frame-interpretation-choice','assessor'].entries()) deliveredContract(f.store,f.sent()[before+i],purpose);
   const chosen=f.store.list<any>('interpretation-decision')[0]!;assert.equal(chosen.value.origin.kind,'model');
   readInterpretationDecisionAt(f.store,'p',reference(chosen));assert.equal(f.store.list('owner-session-grant').filter(r=>(r.value as any).contract==='interpretation-choice-grant/v1').length,0);
   const again=await f.run(f.open(),0,true);ready(again);assert.equal(again.callsUsed,0);assert.equal(f.sent().length-before,4);
