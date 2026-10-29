@@ -13,6 +13,7 @@ import { readRunnerFinalizationAt } from '../src/discovery/discovery-finalizatio
 import { returnDiscoveryResearch } from '../src/discovery/discovery-research-return.js';
 import { Researcher } from '../src/discovery/research-runner.js';
 import { prepareDossierAssessmentSubject } from '../src/discovery/dossier-assessment.js';
+import { DOSSIER_MATERIAL_CONTRACT } from '../src/discovery/dossier-material.js';
 import { produceSelectedDossier } from '../src/discovery/selected-dossier.js';
 import { producePartialDossier } from '../src/discovery/dossier-manifest.js';
 import { publishVariantHandoff } from '../src/discovery/discovery-outcome.js';
@@ -87,7 +88,7 @@ export async function finalizationAdapter(f: Awaited<ReturnType<typeof dossierWo
   assert.ok(script.includes(output));
   const candidateModule = pathToFileURL(join(process.cwd(), 'dist/test/discovery-v7-final-paid-seed.js')).href;
   writeFileSync(path, `import {finalCandidate} from ${JSON.stringify(candidateModule)};\n` + script.replace('const research=', 'let research=').replace(output,
-    `if(r.subject.dossierPacket)research=${JSON.stringify(f.dossierReply)};
+    `if(r.subject.dossierPacket||r.subject.dossierMaterialContract===${JSON.stringify(DOSSIER_MATERIAL_CONTRACT)})research=${JSON.stringify(f.dossierReply)};
 if(r.subject.contract==='discovery-final-envelope/v1'){if(!r.subject.request?.packet)throw new Error('B1 fixture requires the delivered full final packet');research=finalCandidate(r.subject.request.packet,settings.reply?.bundle?.verdict?.outcome??settings.reply?.b1Outcome,undefined,'discovery-final/v9');}
 if(r.subject.contract==='discovery-final-assessment-envelope/v1'){const subject=r.subject.finalContinuation.subject,bases=[{candidate:'/verdict'}];research={contract:'discovery-final-assessment-result/v1',subject,verdict:${JSON.stringify(verdict)},reasons:['Independent exact final review'],bases,return:${verdict === 'supported' ? 'null' : "{targets:bases,reason:'Revise the final decision on its exact grounds',bases}"},classes:[]};}\n${output}`));
 }

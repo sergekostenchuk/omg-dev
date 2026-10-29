@@ -5,6 +5,7 @@ import { Researcher } from '../src/discovery/research-runner.js';
 import { readRunnerDossierAssessmentAt } from '../src/discovery/dossier-assessment-runner.js';
 import { readDiscoveryFinalizationAt, readRunnerFinalizationAt } from '../src/discovery/discovery-finalization-runner.js';
 import { V9_FINAL_CONTRACT } from '../src/discovery/v7-final-contracts.js';
+import { DOSSIER_MATERIAL_CONTRACT } from '../src/discovery/dossier-material.js';
 import { acceptDiscoveryFinal, FinalAcceptanceSessions, issueFinalAcceptanceInvitation } from '../src/product/owner-authority.js';
 import { B1_BRIEF, bypassFinalizedWorld, dossierWorld, finalizationWorld, finalizationAdapter as adapter, waitingOwnerWorld, type FinalizationWorld as World } from './discovery-v7-b1-finalization-fixture.js';
 import { all, completed, money } from './discovery-v7-dossier-seed.js';
@@ -30,12 +31,18 @@ test('B1 fixture: optional original brief keys preserve absence, spaces, Unicode
 
 test('B1 recovery: one ordinary invocation shares its two calls across D6 and D7, leaving the reviewer unpaid', async t => {
   const f = await dossierWorld(t); await adapter(f, 'go');
-  const before = new Set(f.store.list('model-call').map(row => row.id));
+  const before = new Set(f.store.list('model-call').map(row => row.id)), wireStart = f.wires().length;
   const researcher = new Researcher(f.store, f.discovery, f.engine.environments);
   const first = await researcher.run('p', f.v.draft.id, 2, undefined, { producerPolicy: { discovery: 7 } });
   const proof = await readRunnerFinalizationAt(f.store, 'p', reference(first));
   assert.equal(f.store.list('model-call').filter(row => !before.has(row.id)).length, 2);
   assert.equal(proof.status, 'assessing'); assert.ok(proof.final); assert.equal(proof.assessment, null);
+  const sent = f.wires().slice(wireStart) as Array<{ subject: Record<string, any> }>;
+  assert.equal(sent.length, 2);
+  assert.equal(sent[0]!.subject.dossierMaterialContract, DOSSIER_MATERIAL_CONTRACT);
+  assert.equal(sent[0]!.subject.dossierMaterial.packetHash, hashJson(f.dossier as never));
+  assert.equal(Object.hasOwn(sent[0]!.subject, 'dossierPacket'), false);
+  assert.equal(sent[1]!.subject.contract, 'discovery-final-envelope/v1');
   const cash = money(f.store), wires = f.wires();
   const restored = await researcher.run('p', f.v.draft.id, 1, undefined, { restoreOnly: true });
   assert.deepEqual(restored, first); assert.deepEqual(money(f.store), cash); assert.deepEqual(f.wires(), wires);
