@@ -22,7 +22,7 @@ import { withHistoricalReads } from "../history/proofs.js";
 import { readProjectMode } from "../product/project-mode.js";
 import { REQUEST_MANIFEST_CONTRACT, CONTEXT_PREPARATION_CONTRACT } from "./request-parts.js";
 import { currentPlan, deepPlanSelection, v7CheckpointPrefixes, planAttemptSelection, planOwnerSubject, rejectedPlanOwnerRequest, provePlanQuestions, selectV7AnalystRecovery } from "./v7-plan-questions.js";
-import { applyDiscoveryAssessment, v7ProgressBaseline } from "./v7-progress.js";
+import { applyDiscoveryAssessment, savedV7ProgressApplication, v7ProgressBaseline } from "./v7-progress.js";
 import { projectAttemptPacket, proveAttemptPacket, attemptAccountKey } from "./v7-attempt-assessment.js";
 import { recordV7Attempt } from "./v7-attempts.js";
 import { planSubjectOf, sameSubject, attemptEndOfAction, addressedQuestionId, V7_PLAN_SUBJECT_CONTRACT, type V7PlanSubject } from "./v7-managed-attempt.js";
@@ -1771,6 +1771,13 @@ export class Researcher {
       for (const identity of this.store.identities('list','discovery-assessment')) {
         const row = this.store.get<PaidDiscoveryAttemptsAssessment>(identity.id,1);
         if (!row || row.value?.projectId !== project || !belongs(row.value.subject?.packet)) continue;
+        // PROOF-SPEED (owner rule 08.10): an assessment whose atomic application is already saved was proved and
+        // applied when that application was written; only its accounting is taken here. Only a new one is proved.
+        if (savedV7ProgressApplication(this.store,reference(row))) {
+          published.add(row.value.session.id);
+          for (const entry of row.value.subject.packet.entries) accounted.add(canonical(entry.attempt));
+          continue;
+        }
         const paid = readDiscoveryAssessment(this.store,project,reference(row));
         requireCondition(proveAttemptPacket(this.store,paid.value.subject.packet).run === run.id,
           'discovery_assessment_subject_invalid','The saved checkpoint belongs to another run');

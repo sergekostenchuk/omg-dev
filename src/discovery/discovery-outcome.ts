@@ -1,4 +1,4 @@
-import { withHistoricalReads, pendingSnapshotView } from '../history/proofs.js';
+import { withHistoricalReads } from '../history/proofs.js';
 import { currentPlan, proveAttempt, provePlanQuestions } from "./v7-plan-questions.js";
 import type { ResearchAssessment, ResearchRun, PaidDiscoveryAttemptsAssessment, V7ProgressApplication, V7ProgressState,
   V7ProgressSubject, V7ProgressSummary } from './research-model.js';
@@ -909,14 +909,15 @@ async function deepStopProjection(store: Store, project: string, handoff: Ref, b
       .filter(row => row.value.projectId === project && row.value.draft.id === draft.id && row.value.cursor.run === run.id)
       .map(row => readResearchConsumerIntent(store, reference(row)));
     for (const intent of intents) {
-      const deep = withHistoricalReads(() => requireDeepConsumerBinding(store, intent));
-      const successor = intents.find(row => isRef(row.value.previous) && same(row.value.previous, reference(intent)));
       if (intent.value.state === 'prepared') {
-        stopRequire(deep && successor && withHistoricalReads(() => requireDeepConsumerBinding(store, successor)),
+        const successor = intents.find(row => isRef(row.value.previous) && same(row.value.previous, reference(intent)));
+        stopRequire(withHistoricalReads(() => requireDeepConsumerBinding(store, intent)) && successor
+          && withHistoricalReads(() => requireDeepConsumerBinding(store, successor)),
           'An unpaid prepared admission cannot become a terminal frontier');
       } else {
+        // PROOF-SPEED (owner rule 08.10): an applied or refused intent is recovered work the engine wrote after proving its
+        // execution and deep binding; its saved state decides here, it is not proved again (om-fsck at the entry guards it).
         stopRequire(intent.value.state === 'applied' || intent.value.state === 'refused', 'Begun work must be recovered before stopping');
-        readResearchConsumerExecution(pendingSnapshotView(store, [intent]), project, reference(intent));
       }
     }
     const states: Ref[] = [];

@@ -7,7 +7,7 @@ import { runDossierAssessmentSession, readDossierAssessmentSessionAt, DOSSIER_AP
 import type { ModelCall } from '../runtime/model-usage.js';
 import { packetAssessmentSubject, methodologyAssessmentTransport, requirementsAssessmentTransport, assessmentQuestionContract, type AssessmentTransportSubject } from './continuation-packet.js';
 import { proveAttemptPacket, checkProgressBaseline, baselineGuards, checkDiscoveryAssessmentForm,
-  DISCOVERY_ASSESSMENT_KIND, type ProvenAttemptPacket } from './v7-attempt-assessment.js';
+  DISCOVERY_ASSESSMENT_KIND, savedV7ProgressApplication, type ProvenAttemptPacket } from './v7-attempt-assessment.js';
 import { resolveClaimAddress, type ClaimAddress } from './claim-address.js';
 import { DISCOVERY_ASSESSMENT_CONTRACT_V2, DISCOVERY_ASSESSMENT_CONTRACT_V3, type V7AttemptPacket, type V7ProgressBaseline,
   type DiscoveryAttemptsAssessmentV2, type DiscoveryAttemptsAssessmentV3, type PaidDiscoveryAttemptsAssessment } from './research-model.js';
@@ -719,6 +719,16 @@ export function readDiscoveryAssessment(store: Store, projectId: string, ref: Re
   const exact = plainExactRef(ref);
   if (!historicalSourceOverGenuine(store) || typeof projectId !== 'string' || projectId.trim().length === 0 || !exact)
     return deriveDiscoveryAssessment(store, projectId, ref);
+  // PROOF-SPEED (owner rule 08.10): an assessment P has already applied was proved in full before its application was
+  // written; it is read as written, by its exact Ref, kind and hash. Only an unapplied one is derived.
+  if (savedV7ProgressApplication(store, exact)) {
+    const saved = store.get<PaidDiscoveryAttemptsAssessment>(exact.id, exact.revision);
+    requireCondition(saved?.kind === DISCOVERY_ASSESSMENT_KIND && saved.revision === 1 && same(reference(saved), exact)
+      && saved.hash === hashJson(saved.value) && saved.value !== null && typeof saved.value === 'object'
+      && saved.value.projectId === projectId,
+      'discovery_assessment_invalid', 'The exact discovery assessment is absent, changed or foreign');
+    return structuredClone(saved!);
+  }
   // Every entry receives its own copy, also inside one withHistoricalReads region where the kept value is shared.
   return structuredClone(historicalProof(store, { reader: 'discovery.assessment-read/v1', project: projectId, ref: exact },
     source => deriveDiscoveryAssessment(source, projectId, exact),

@@ -5,13 +5,13 @@ import { DISCOVERY_ASSESSMENT_CONTRACT_V3, type PaidDiscoveryAttemptsAssessment,
   V7_PROGRESS_BASELINE_CONTRACT, type V7ProgressBaseline, type V7ProgressState, type V7ProgressApplication,
   type V7AttemptAccount, type V7ProgressEvent, type V7ProgressSubject, type V7ProgressSummary } from './research-model.js';
 import type { Store, Revision, Write, TransactionGuard } from '../storage/store.js';
-import { historicalProof, pendingSnapshotView, withHistoricalReads } from '../history/proofs.js';
+import { historicalProof, historicalReadsReachGenuine, pendingSnapshotView, withHistoricalReads } from '../history/proofs.js';
 import { closureFactClaims, requireMethodologyClosure } from './assessment-methodology.js';
 import { proveClaimAddress, resolveClaimAddress, type ClaimAddress } from './claim-address.js';
 import { readDiscoveryAssessment } from './research-assessment.js';
 import { readResearchConsumerTurn } from './response-recovery.js';
 import { managedTurnId } from './research-consumer-transition.js';
-import { attemptAccountKey, progressEventKey, v7ProgressStateId, baselineGuards, checkDiscoveryAssessmentForm,
+import { attemptAccountKey, progressEventKey, v7ProgressStateId, v7ProgressApplicationId, savedV7ProgressApplication, baselineGuards, checkDiscoveryAssessmentForm,
   claimContentKey, constraintContentKey, transitionContentKey, type V7AssessmentSubject } from './v7-attempt-assessment.js';
 import { V7_ATTEMPT_KIND } from './v7-contracts.js';
 
@@ -193,7 +193,8 @@ export const ATTEMPT_ACCOUNT_KIND = 'v7-attempt-account';
 export const PROGRESS_EVENT_KIND = 'research-progress-event';
 const STATE_KIND = 'v7-progress-state';
 const same = (a: unknown, b: unknown) => canonical(a) === canonical(b);
-const appId = (ref: Ref) => `v7-progress-application:${hashJson(ref)}`;
+const appId = v7ProgressApplicationId;
+export { savedV7ProgressApplication };
 function fail(code: string, field: string, reason: string): never {
   throw new EngineError(code, `[${field}] ${reason}`, { field, reason });
 }
@@ -429,7 +430,28 @@ function project(store: Store, paid: Revision<PaidDiscoveryAttemptsAssessment>,
   return { application, state, accounts, events };
 }
 
-function readApplication(store: Store, ref: Ref): Derived {
+/** PROOF-SPEED (owner rule 08.10): on the genuine Store a saved application is read as P wrote it — its exact record and
+ * the state and accounts of the same atomic batch, each by its exact address, kind, hash and link back — and is never
+ * derived again from the whole earlier chain; om-fsck at the entry guards those bytes. A captured or replayed evaluation
+ * view keeps the full derivation and so its read sequence. */
+function savedApplication(store: Store, ref: Ref): Derived & { saved: true } {
+  const app = exact<V7ProgressApplication>(store, ref, PROGRESS_APPLICATION_KIND), v = app.value;
+  need(v?.subject && typeof v.subject.project === 'string' && v.contract === 'v7-progress-application/v1' && app.revision === 1 && isRef(v.assessment)
+    && (v.previous === null || isRef(v.previous)) && Array.isArray(v.attempts) && v.attempts.every(isRef),
+    'application', 'The application needs its complete versioned provenance');
+  const own = (row: Revision<{ application?: unknown }> | null, kind: string): boolean => row !== null && row.kind === kind
+    && hashJson(row.value) === row.hash && same(row.value?.application, reference(app));
+  const state = store.get<V7ProgressState>(v7ProgressStateId(v.subject), (v.previous?.revision ?? 0) + 1);
+  need(own(state, STATE_KIND), STATE_KIND, 'The atomic result is absent or differs from its exact application');
+  const accounts = v.attempts.map(attempt => {
+    const account = store.get<V7AttemptAccount>(attemptAccountKey(v.subject, attempt), 1);
+    need(own(account, ATTEMPT_ACCOUNT_KIND), ATTEMPT_ACCOUNT_KIND, 'The atomic result is absent or differs from its exact application');
+    return account!;
+  });
+  return { application: app, state: state!, accounts, events: [], saved: true };
+}
+function readApplication(store: Store, ref: Ref): Derived & { saved?: true } {
+  if (historicalReadsReachGenuine(store)) return savedApplication(store, ref);
   return historicalProof(store, { reader: 'discovery.v7-progress.application/v1', project: ref.id, ref }, source => {
     const app = exact<V7ProgressApplication>(source, ref, PROGRESS_APPLICATION_KIND), v = app.value;
     need(v?.subject && typeof v.subject.project === 'string' && v.contract === 'v7-progress-application/v1' && app.revision === 1 && isRef(v.assessment)
@@ -469,7 +491,9 @@ function readEvent(store: Store, ref: Ref): Revision<V7ProgressEvent> {
   need(event.value?.contract === 'research-progress-event/v1' && isRef(event.value.application),
     'event', 'The event needs its exact atomic application');
   const proof = readApplication(store, event.value.application);
-  need(proof.events.some(r => same(r, event)), 'event', 'The event is not a derived atomic result');
+  // A saved application names its events only by their own link back (savedApplication); a derived one lists them.
+  need(proof.saved ? same(event.value.application, reference(proof.application)) : proof.events.some(r => same(r, event)),
+    'event', 'The event is not a derived atomic result');
   return event;
 }
 export function readV7ProgressStateAt(store: Store, ref: Ref): Revision<V7ProgressState> {

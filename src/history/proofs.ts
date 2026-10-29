@@ -6,7 +6,7 @@ import { performance } from "node:perf_hooks";
 import { canonical, digest, hashJson, type Json } from "../canonical.js";
 import { EngineError } from "../errors.js";
 import { isRef, reference, type Ref } from "../pipeline/contracts.js";
-import { observeStore, Store, storeReads, type ProofCacheNode, type ProofCacheRecord, type Revision, type StoreEvent } from "../storage/store.js";
+import { atomicViewStore, observeStore, Store, storeReads, type ProofCacheNode, type ProofCacheRecord, type Revision, type StoreEvent } from "../storage/store.js";
 import { genuineStore, observePendingReads, observeTraceReads, pendingLayer, pendingOverlay, pendingSelections, pendingWithin, provenStore, readServer, tracedChain, transparentTrace } from "../storage/store-view.js";
 import { gitCalls } from "../runtime/environment.js";
 
@@ -108,6 +108,18 @@ function sourceView(store: Store): Store {
  * view, a pending or evaluation overlay, a changed Store and a transparent trace made elsewhere all answer false. */
 export function historicalSourceOverGenuine(store: unknown): boolean {
   return store instanceof Store && genuineStore(sourceView(store));
+}
+/** PROOF-SPEED (L11/L22): the same over trusted recovery snapshots too (pendingSnapshotView), whose other reads fall
+ * through to their source, and over the read-only view of an atomicWrite, whose reads are the Store's own in one
+ * transaction. True only where a read reaches the genuine Store itself — there a head read is a dependency on every later
+ * revision of that id. A captured or replayed evaluation view, any other Proxy or overlay answers false and keeps its own
+ * read sequence. Only a boolean, like historicalSourceOverGenuine. */
+export function historicalReadsReachGenuine(store: unknown): boolean {
+  if (!(store instanceof Store)) return false;
+  let source = sourceView(store);
+  for (let base = snapshotBases.get(source) ?? atomicViewStore(source); base; base = snapshotBases.get(source) ?? atomicViewStore(source))
+    source = sourceView(base);
+  return genuineStore(source);
 }
 /** One identity of a source in proof keys, events and replay (№2194-3): the genuine Store beneath proven write-only
  * views, whose reads are exactly its reads; any other source keeps its own identity. */

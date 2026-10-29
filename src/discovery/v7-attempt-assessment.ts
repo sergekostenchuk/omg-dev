@@ -4,6 +4,7 @@ import { isRef, reference, type Ref } from "../pipeline/contracts.js";
 import { EngineError } from "../errors.js";
 import type { Store, Revision, TransactionGuard } from "../storage/store.js";
 import { readExact } from "./projection-reader.js";
+import { historicalReadsReachGenuine } from "../history/proofs.js";
 import { proveAttempt, type V7AttemptProof, type V7PlanQuestion } from "./v7-plan-questions.js";
 import { V7_ATTEMPT_KIND } from "./v7-contracts.js";
 import { ATTEMPT_BINDING_KIND, attemptBindingId, type ResearchAttemptBinding } from "./v7-managed-attempt.js";
@@ -15,7 +16,7 @@ import { variantOwnerActContent } from "./variant-scope.js";
 import type { Source } from "../evidence/evidence.js";
 import { DISCOVERY_ASSESSMENT_CONTRACT, V7_ATTEMPT_PACKET_CONTRACT, V7_PROGRESS_BASELINE_CONTRACT,
   type VersionedDiscoveryAttemptsAssessment, DISCOVERY_ASSESSMENT_CONTRACT_V2, DISCOVERY_ASSESSMENT_CONTRACT_V3, type V7AttemptPacket, type V7AttemptPacketEntry, type V7Novelty,
-  type V7ProgressBaseline, type V7QuestionTransition } from "./research-model.js";
+  type V7ProgressBaseline, type V7QuestionTransition, type V7ProgressApplication } from "./research-model.js";
 
 /* DR3b-M (codex-omg №7546 §1, the M slice): the subject, the forms and the keys of a v7 attempts assessment.
  *
@@ -61,6 +62,18 @@ function noveltyInvalid(field: string, reason: string, details: Record<string, u
 export function v7ProgressStateId(subject: V7AssessmentSubject): string {
   return `v7-progress-state:${hashJson({ project: subject.project, planAnswer: canonical(subject.planAnswer),
     planQuestionId: subject.planQuestionId })}`;
+}
+/** The address of the atomic progress application of one exact paid assessment. */
+export function v7ProgressApplicationId(paid: Ref): string {
+  return `v7-progress-application:${hashJson(paid)}`;
+}
+/** PROOF-SPEED (owner rule 08.10): the saved atomic application of exactly this paid assessment, or null. It is read by
+ * its exact address, kind and hash and never derived again: P wrote it only after proving the assessment and its whole
+ * projection, and om-fsck at the entry guards its bytes. */
+export function savedV7ProgressApplication(store: Store, paid: Ref): Revision<V7ProgressApplication> | null {
+  const row = store.get<V7ProgressApplication>(v7ProgressApplicationId(paid), 1);
+  return row && row.kind === "v7-progress-application" && hashJson(row.value) === row.hash && obj(row.value)
+    && canonical(row.value.assessment) === canonical(paid) ? row : null;
 }
 /** The attempt accounting key (№7546 §1.2): one application of a result to one exact attempt of one plan-question —
  * a second assessment, an overlapping packet or a recovery of the same attempt never counts it again. */
@@ -152,7 +165,11 @@ function proveEntries(store: Store, subject: V7AssessmentSubject, entries: unkno
   const runs = new Set(proven.map(item => item.original.value.run));
   if (runs.size !== 1) subjectInvalid(`${at}.run`, "the packet attempts belong to different research runs");
   const run = proven[0]!.original.value.run;
-  const runRecord = store.get<{ projectId?: unknown; draftId?: unknown }>(run);
+  // PROOF-SPEED (L11/L22): projectId and draftId are the run's identity (its id hashes both) and never change, so on the
+  // genuine Store its first revision is read — a head read made every saved assessment's proof depend on each later run
+  // step and re-derived the whole history at every entry. A captured or replayed evaluation view keeps its read sequence.
+  const runRecord = historicalReadsReachGenuine(store)
+    ? store.get<{ projectId?: unknown; draftId?: unknown }>(run, 1) : store.get<{ projectId?: unknown; draftId?: unknown }>(run);
   if (runRecord === null || runRecord.kind !== "research-run" || runRecord.value.projectId !== subject.project
     || !proven.every(item => item.attempt.draft.id === runRecord.value.draftId))
     subjectInvalid(`${at}.run`, "the research run is not the run of the attempts' project and draft", { run });

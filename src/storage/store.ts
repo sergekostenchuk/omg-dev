@@ -44,6 +44,12 @@ let physicalReads = 0;
 /** Reads made through get/list/history/identities of every Store in this process (S1.3, №2201; S1.4, №2302-1): a
  * historical proof compares them with the reads it observed, so any read it did not see keeps that proof incomplete. */
 export function storeReads(): number { return physicalReads; }
+/** PROOF-SPEED: the read-only view each atomicWrite hands its preparation, registered by atomicWrite itself, and the Store
+ * whose own bound reads it serves inside that one transaction. */
+const atomicViews = new WeakMap<object, Store>();
+export function atomicViewStore(view: unknown): Store | null {
+  return typeof view === 'object' && view !== null ? atomicViews.get(view) ?? null : null;
+}
 export type StoreReadMethod = 'get' | 'list' | 'history' | 'identities';
 /** The selection an identities() call applies: get one id or revision, list every head or one kind, prefix the
  * literal entity_id range of heads (Q4, №2563-3) — never decoded bodies, so excluded corrupt rows stay unread. */
@@ -391,6 +397,7 @@ export class Store {
           : { value: name === 'proofCacheWrite' ? () => null : reads.has(name) ? (Reflect.get(this, name, this) as (...args: never[]) => unknown).bind(this) : denied });
       }
       Object.freeze(methods); Object.freeze(view);
+      atomicViews.set(view, this);
       const batch = prepare(view);
       requireCondition(batch !== null && typeof batch === 'object' && typeof (batch as any).then !== 'function'
         && Array.isArray(batch.writes), 'store_atomic_prepare_invalid', 'Atomic preparation returns a synchronous batch');

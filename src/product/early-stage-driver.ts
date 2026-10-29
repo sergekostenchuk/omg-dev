@@ -17,6 +17,7 @@ import { isRef, predecessor, reference, stageId, STAGES, uniqueRefs, type Ref, t
 import type { Revision, TransactionGuard, Write } from "../storage/store.js";
 import { storeView } from "../storage/store-view.js";
 import { continuePass, startPass, type PassOutcome } from "../om/run-driver.js";
+import { integrityGate } from "../om/integrity.js";
 import { readRun, runId, type RunRecord } from "../om/run.js";
 import { readOmInput, readAcceptedUpstreamStageAt, type OmInputRecord } from "../om/input.js";
 import { acquireRunExecution, admitRunControl, releaseRunExecution, readRunControl, RunControlGate, RunControlLost, type RunExecution } from "../om/run-control.js";
@@ -121,6 +122,13 @@ export class EarlyStageDriver {
 
   async run(request: EarlyStageRequest): Promise<EarlyStageOutcome> {
     const { project, maxTurns, maxCalls } = request;
+    // PROOF-SPEED (owner rule 08.10): every entry of a Discovery pass is its start or continue, so om-fsck runs here as at
+    // om-start/om-continue; damage found stops the entry for the owner. Saved history is not proved again on the way.
+    if (typeof project === "string" && project.length > 0) {
+      const damaged = integrityGate(this.engine.store, project);
+      if (damaged && !damaged.ok) return this.#result(project, "blocked", null, null, [], null,
+        refusalReason(damaged.refusal), 0, maxTurns, maxCalls, 0, null);
+    }
     let inspected: ResolvedInput | PreparedInstruction | null;
     try {
       inspected = this.#inspectInput(request);

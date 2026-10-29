@@ -130,9 +130,10 @@ test('nested assessment proof: a trace over a genuine Store reuses the kept exac
   const proof = readDiscoveryAssessment(fresh, 'p', ref);
   assert.deepEqual(readDiscoveryAssessment(passing, 'p', ref), proof);
   // A nested trace the proof module made over the genuine Store reuses the kept proof of this exact Ref.
+  // PROOF-SPEED (owner rule 08.10): an applied assessment is read as written — one exact read of its record, no derivation.
   for (let i = 0; i < 3; i++)
-    assert.equal(readsOf(t, fresh, first!.id, () => readDiscoveryAssessment(historicalTrace(fresh), 'p', ref)), 0,
-      'a nested trace over the genuine Store reuses the kept proof');
+    assert.ok(readsOf(t, fresh, first!.id, () => readDiscoveryAssessment(historicalTrace(fresh), 'p', ref)) <= 1,
+      'a nested trace over the genuine Store reads the saved assessment once, never derives it');
   assert.deepEqual(readDiscoveryAssessment(historicalTrace(historicalTrace(fresh)), 'p', ref), proof);
   // Independent results, also inside one explicit region and for the deriving entry.
   const region = new Store(f.store.path); t.after(() => region.close());

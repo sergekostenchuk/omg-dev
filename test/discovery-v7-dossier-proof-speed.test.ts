@@ -41,6 +41,7 @@ import { producePartialDossier } from '../src/discovery/dossier-manifest.js';
 import { publishVariantHandoff } from '../src/discovery/discovery-outcome.js';
 import { prepareDossierAssessmentSubject } from '../src/discovery/dossier-assessment.js';
 import { historicalProofCounters, historicalTrace, pendingSnapshotView } from '../src/history/proofs.js';
+import { captureView } from '../src/storage/store-view.js';
 import { researchSetup, produce, rand, validPlan, type PlanQuestion } from './discovery-v7-fixture.js';
 import { answerDiscoveryFixture } from './product-fixture.js';
 
@@ -249,7 +250,9 @@ test('dossier proof speed: thirteen claims of two attempts prove each paid asses
   let single = 0, singlePhysical = 0;
   for (const item of evidence) {
     const store = emptyCache(f, t), before = storeReads();
-    const reads = await countReads(item.ids, () => readDiscoveryAssessment(store, 'p', item.ref));
+    // PROOF-SPEED (owner rule 08.10): on the genuine Store an applied assessment is read as written; the full derivation this
+    // baseline counts is the one an opaque source still makes.
+    const reads = await countReads(item.ids, () => readDiscoveryAssessment(captureView(store).view, 'p', item.ref));
     singlePhysical += storeReads() - before;
     assert.ok(reads > 0, 'a derivation reads the evidence of its assessment');
     single += reads;
@@ -264,7 +267,7 @@ test('dossier proof speed: thirteen claims of two attempts prove each paid asses
   t.diagnostic(`evidence reads: ${single} for one derivation of each of ${evidence.length} assessments, ${reads} for one cold dossier read over ${coldPacket.materials.length} claims; `
     + `Store reads: ${singlePhysical} for the derivations, ${coldPhysical} for the dossier read`);
   assert.ok(coldPacket.materials.length >= 13);
-  assert.ok(reads >= single && reads <= 4 * single, `${reads} evidence reads in one cold dossier read against ${single} for one derivation of each assessment`);
+  assert.ok(reads <= 4 * single, `${reads} evidence reads in one cold dossier read against ${single} for one derivation of each assessment`);
   // Nothing else in the read proves again either: the whole of it costs a handful of derivations' worth of Store reads (here under
   // five, with the application and plan proofs it also needs), not a proof per claim (more than twenty before the proofs were shared).
   assert.ok(coldPhysical <= 8 * singlePhysical, `${coldPhysical} Store reads in one cold dossier read against ${singlePhysical} for one derivation of each assessment`);
@@ -369,7 +372,9 @@ test('dossier proof speed: a head the shared proofs read changes after a success
   f.store.write({ id: act.id, kind: act.kind, expected: act.revision, value: { ...act.value, questionAfter: null } });
   const after = shared();
   assert.deepEqual(after, unshared(), 'the kept proofs were proved again and answer as the unshared reads do');
-  assert.ok(after.every(item => 'refused' in item), `the read after the change refuses: ${JSON.stringify(after)}`);
+  // PROOF-SPEED (owner rule 08.10): the applied assessment is history read as written — a later head does not reinterpret it;
+  // the attempt proof, still derived, refuses on the moved head, and so does the dossier read.
+  assert.deepEqual(after, [{ ok: true }, { refused: 'plan_questions_invalid' }], `the read after the change: ${JSON.stringify(after)}`);
   await assert.rejects(prepareDossierAssessmentSubject(f.store, 'p', root), EngineError);
 });
 
