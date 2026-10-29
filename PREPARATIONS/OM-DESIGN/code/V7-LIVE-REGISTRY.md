@@ -51,6 +51,7 @@
 | L40 | репетиция f5j (conditional), остановка 6 | Условие итога вида evidence нечем разрешить: runConditionEvidenceExecution (discovery-condition-evidence-execution.ts:443) вызывают только тесты, команды CLI/engine и шага раннера нет; discovery-final-condition с claims → discovery_condition_evidence_unproven. owner_choice работает (owner-final-condition) | codex-worker | в очереди после L30/L36: команда + шаг Driver; транспорт — как L34 |
 | L41 | репетиция f5k (return оценщика итога) | Возврат итога — тупик потока: returned/revise-final, повторный early-stage-run без вызова (~167 с ЦП); nextRunnerFinalReturn ждёт запись discovery-research-return, которую создаёт только явная команда (research-runner.ts ~2056) | codex-worker | в очереди после L30/L36/L40: один исправляющий вызов производителя итога в потоке |
 | L42 | Opus, репетиция f4a (PROOF-SPEED-2) | Недетерминизм пакета досье: dossier-assessment.ts:120 сортирует grounds по canonical(ref) — по хэшу записи с pid/временем model-call; граница страницы плавает, исход 30-го входа и число входов разные от запуска к запуску | codex-worker2 | в очереди (мелкое, после L34/L35): устойчивый ключ сортировки |
+| L43 | репетиция f5m (4 вопроса) | Повторный read_context уже доставленной страницы → blocked research_no_progress «Requested context is already delivered…»; повторный вход 17 с ЦП без вызова — роль заблокирована навсегда (класс L30) | codex-worker | в очереди: в общую дверь L30/L36 |
 | L19 | известное | Тест №1395 до 97 с под нагрузкой | — | после v7 (LATER-V7) |
 
 ## Хранитель (план v7)
@@ -65,3 +66,4 @@
    - 29.10 ~10:40 (Sonnet №18421): на f5 (s93p + FORMS-03 + DEEP + L29), 2 вопроса, до concept_started ДОШЛИ, proof.mjs proven=true, 41 вызов заглушки, ≈24,8 мин чистого времени. С обходами L34/L35/чтения страниц; итог 257 с и оценка итога + старт 927 с → L37. Без обходов — после L34–L37.
 2. Плавающий антибан (L12) принят map-2.
 3. Новый живой проход с чистой базы.
+   - 29.10 ~11:50 (Sonnet №18531): conditional только с owner_choice → дверь владельца owner-final-condition → concept_started (proof proven). Процедура: ~/REPORTS/review/v7-live-hx5/OPERATOR-CONDITIONS.md. 4 вопроса: до оценки досье 57 входов / 566 с, досье 669 845 зн., L29 постранично работает.
