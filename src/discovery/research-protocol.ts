@@ -1,6 +1,7 @@
 import { producerDispatchPolicy, producerDispatchGuards } from './project-producer-policy.js';
 import { isInterpretationConsumer, requireInterpretationConsumer, requireInterpretationNewDispatch } from './interpretation-execution.js';
 import { dossierSessionTransport, dossierTransportDelivery, packetDossierSubject, requireDossierTransportContext } from './continuation-packet.js';
+import { dossierMaterialEra, DOSSIER_MATERIAL_CONTRACT, type DossierPagingState } from './dossier-material.js';
 import { prepareDossierContextPacker } from './working-context.js';
 import { requireDossierTransportArchive } from './continuation-packet.js';
 import { readArchiveBody } from './request-parts.js';
@@ -432,10 +433,10 @@ export function prepareResearchEnvelope(role: RoleBinding, environment: Environm
  * and the same measured wire builder and addressed material delivery. */
 export async function prepareDossierResearchEnvelope(role: RoleBinding, environment: Environment, prompt: string,
   context: unknown, audit: Pick<ResearchCallAudit, 'store' | 'draftId' | 'questionId' | 'purpose' | 'pilot'>,
-  capacity?: Record<string, any>, requestId = '00000000-0000-0000-0000-000000000000', stageArchives = false) {
+  capacity?: Record<string, any>, requestId = '00000000-0000-0000-0000-000000000000', stageArchives = false, paging?: DossierPagingState) {
   requireCondition(audit?.store && audit.purpose === 'dossier-assessor' && audit.questionId,
     'discovery_dossier_transport_invalid', 'Dossier preflight needs its explicitly separate audited purpose');
-  const prepared = await prepareDossierContextPacker(audit.store, environment.projectId, context);
+  const prepared = await prepareDossierContextPacker(audit.store, environment.projectId, context, paging);
   const draft = audit.store.get<DiscoveryDraft>(audit.draftId), question = audit.store.get<Question>(audit.questionId);
   requireCondition(draft?.kind === 'discovery-draft' && question?.kind === 'question'
     && draft.value.projectId === environment.projectId && question.value.projectId === environment.projectId
@@ -884,7 +885,9 @@ async function dispatchResearchCall(role: RoleBinding, environment: Environment,
     packAudit = consumerIntent?.value.contract === CONSUMER_INTENT_V2 ? { ...rest, contextContract: ARCHIVE_PARTS_CONTRACT } : rest;
   }
   const dossierEnvelope=dossier
-    ? await prepareDossierResearchEnvelope(role,environment,prompt,context,packAudit!,capacity,requestId,true) : null;
+    ? await prepareDossierResearchEnvelope(role,environment,prompt,context,packAudit!,capacity,requestId,true,
+      assessment?.kind === 'dossier' && dossierMaterialEra(assessment.session.value)
+        ? {contract:DOSSIER_MATERIAL_CONTRACT,coverage:assessment.session.value.workspace!.deliveryCoverage ?? []} : undefined) : null;
   const finalPacker = assessment?.kind === 'final' ? prepareDiscoveryFinalContextPacker(audit!.store, assessment.admission)
     : assessment?.kind === 'final-assessment' ? prepareDiscoveryFinalAssessmentContextPacker(audit!.store, assessment.admission)
     : assessment?.kind === 'condition-evidence' ? prepareConditionEvidenceContextPacker(audit!.store, assessment.admission) : null;

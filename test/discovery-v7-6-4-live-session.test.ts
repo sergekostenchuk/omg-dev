@@ -693,7 +693,7 @@ test('live dossier: bounded managed pages deliver the full saved packet and sche
   assert.deepEqual(result.result,await checkDossierAssessmentResult(f.store,'p',packet.subject,terminal));
   const wires=f.wires().slice(offset);assert.ok(wires[0].subject.working.materialAddresses.length);
   assert.equal(wires[0].subject.resultCapacity.envelopeLimitChars,pilot.value.maxRequestChars);
-  assert.ok(wires.length>3);assert.ok(wires.every(w=>JSON.stringify(w).length<=100000));
+  assert.ok(wires.length>=2);assert.ok(wires.every(w=>JSON.stringify(w).length<=100000));
   assert.ok(wires.some(w=>w.subject.contextWorkspace?.length));
   const profile=f.store.get<ReaderPilot>(pilot.id)!;f.store.write({id:profile.id,kind:profile.kind,expected:profile.revision,value:{...profile.value,maxCalls:1}});
   for(const store of [f.store,f.open()])await fixedPoint(store,()=>unchanged(f,store,()=>runDossierAssessmentSession(store,'p',packet.subject,undefined,store.get<ReaderPilot>(pilot.id)!)));

@@ -3831,7 +3831,7 @@ function researchExecution(store: Store, project: string, callRef: Ref,
       && canonical((call.value as unknown as Record<string,unknown>).dossierSubject) === canonical(body.dossierSubject)
       && canonical((call.value as unknown as Record<string,unknown>).managedDossier) === canonical(body.managedDossier)
       && canonical(body.dossierNotes) === canonical(session.value.notes)
-      && canonical(body.contextWorkspace ?? []) === canonical(workspace.entries.map(entry => entry.result))
+      && canonical(body.contextWorkspace ?? []) === canonical(admission.context.contextWorkspace ?? [])
       && !workspace.blocked && request.prompt === admission.prompt
       && !Object.hasOwn(body,'assessmentSession') && !Object.hasOwn(body,'assessmentSubject')
       && !Object.hasOwn(request.subject,'assessmentSession') && !Object.hasOwn(request.subject,'assessmentSubject'),

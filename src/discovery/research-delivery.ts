@@ -1,6 +1,7 @@
 import { canonical, digest, hashJson } from '../canonical.js';
 import { isRef, type Ref } from '../pipeline/contracts.js';
 import { EngineError, requireCondition } from '../errors.js';
+import type { ContextCoverage } from './context-workspace.js';
 
 /** A partial transport of one immutable lookup. It never replaces the lookup
  * in the archive or claims that a JSON fragment is the complete value. */
@@ -368,7 +369,8 @@ export function requirePacketMaterialDelivery(packet: Record<string, any>, archi
     const value = resolve(address.record, address.pointer);
     requireCondition(canonical(value) === canonical(resolve(archive, address.pointer)),
       'research_context_undelivered', 'The addressed original differs from this packet archive');
-    const encoding = Array.isArray(value) ? 'array-items' : typeof value === 'string' ? 'utf16-string' : 'canonical-json';
+    const encoding = packet.working?.materialPaging === 'covered-material/v1' ? 'canonical-json'
+      : Array.isArray(value) ? 'array-items' : typeof value === 'string' ? 'utf16-string' : 'canonical-json';
     const total = encoding === 'canonical-json' ? canonical(value).length : (value as string | unknown[]).length;
     requireCondition(address.valueHash === hashJson(value) && address.encoding === encoding
       && address.unit === (encoding === 'array-items' ? 'items' : 'utf16') && address.total === total,
@@ -394,7 +396,7 @@ export function requirePacketMaterialDelivery(packet: Record<string, any>, archi
       'research_context_undelivered', 'The partial note needs an exact canonical JSON page');
     requireResearchDelivery({ record: entry.original.record, pointer: entry.original.pointer, value,
       ...(packet.consolidation?.deliveryContract === 'consolidation-fragment/v1'
-        ? { page: fragmentPage! } : {}) }, key, entry);
+        || packet.working?.materialPaging === 'covered-material/v1' ? { page: fragmentPage! } : {}) }, key, entry);
     if (addresses?.length) requireCondition(addresses.some((address: ResearchMaterialAddress) =>
       address.pointer === entry.original.pointer && address.valueHash === entry.original.valueHash)
       || packet.dispatchMode === 'planning' && packet.working?.navigationAddresses?.some((address: {
@@ -408,21 +410,23 @@ export function requirePacketMaterialDelivery(packet: Record<string, any>, archi
  * One positive fragment is chosen after the context workspace gets its space. */
 export function addressArchivedMaterials(packet: Record<string, any>, archive: Ref,
   fields: string[], maxChars: number, stableRecord: (field: string, value: unknown) => Ref,
-  reserveChars = 4096): AddressedOriginal[] {
+  reserveChars = 4096, paging?: { pageChars: number }): AddressedOriginal[] {
   const originals: AddressedOriginal[] = [];
   const working = packet.working as Record<string, any> | undefined;
   requireCondition(working && canonical(working.archive) === canonical(archive),
     'research_context_invalid', 'Material addresses need the exact packet archive');
+  if (paging) working.materialPaging = 'covered-material/v1';
   for (const field of [...fields].sort((left, right) =>
     (packet[right] === undefined ? 0 : JSON.stringify(packet[right]).length)
       - (packet[left] === undefined ? 0 : JSON.stringify(packet[left]).length))) {
     if (!Object.hasOwn(packet, field)) continue;
     const value = packet[field];
     if (value === '' || Array.isArray(value) && value.length === 0) continue;
-    if (JSON.stringify(value).length <= Math.floor(maxChars / 3)
+    if (JSON.stringify(value).length <= Math.min(Math.floor(maxChars / 3), paging?.pageChars ?? Infinity)
       && JSON.stringify(packet).length <= maxChars - reserveChars) continue;
     const pointer = `/body/${field.replaceAll('~', '~0').replaceAll('/', '~1')}`;
-    const encoding = Array.isArray(value) ? 'array-items' : typeof value === 'string' ? 'utf16-string' : 'canonical-json';
+    const encoding = packet.working?.materialPaging === 'covered-material/v1' ? 'canonical-json'
+      : Array.isArray(value) ? 'array-items' : typeof value === 'string' ? 'utf16-string' : 'canonical-json';
     const record = stableRecord(field, value);
     const original = { record, pointer, value };
     originals.push(original);
@@ -439,14 +443,41 @@ export function addressArchivedMaterials(packet: Record<string, any>, archive: R
 }
 
 export function serveArchivedMaterial(packet: Record<string, any>, originals: AddressedOriginal[],
-  maxChars: number, reserveChars = 1024): void {
+  maxChars: number, reserveChars = 1024, paging?: { coverage: ContextCoverage[]; pageChars: number }): void {
   if (!originals.length) return;
-  const original = originals[0]!;
+  let original = originals[0]!;
+  if (paging) {
+    requireCondition(Number.isSafeInteger(paging.pageChars) && paging.pageChars > 0,
+      'research_context_invalid', 'Material page capacity must be positive');
+    packet.working.materialPaging = 'covered-material/v1';
+    let chosen: AddressedOriginal | undefined;
+    for (const candidate of originals) {
+      // Canonical JSON pages retain the complete original hash, with an exact slice selector.
+      const total = canonical(candidate.value).length;
+      const address = hashJson({record:candidate.record,pointer:candidate.pointer,unit:'utf16',encoding:'canonical-json'});
+      const coverage = paging.coverage.find(item => item.address === address);
+      requireCondition(!coverage || coverage.total === total, 'research_context_invalid', 'Coverage differs from the exact material');
+      let offset = 0, end = total;
+      for (const range of coverage?.ranges ?? []) {
+        requireCondition(Number.isSafeInteger(range.offset) && Number.isSafeInteger(range.end)
+          && range.offset >= 0 && range.end >= range.offset && range.end <= total, 'research_context_invalid', 'Invalid covered interval');
+        if (range.end <= offset) continue;
+        if (range.offset > offset) { end = range.offset; break; }
+        offset = range.end;
+      }
+      if (offset >= total) continue;
+      chosen = {...candidate,page:{offset,end,total,unit:'utf16',encoding:'canonical-json',next:end < total ? end : null}};
+      break;
+    }
+    if (!chosen) { delete packet.materialDelivery; return; }
+    original = chosen;
+  }
   const key = hashJson({ record: original.record, pointer: original.pointer, value: original.value });
   const available = maxChars - reserveChars - JSON.stringify(packet).length;
   const delivery = available > 0 ? planResearchDelivery(original, key, maxChars, available, candidate => {
     packet.materialDelivery = [candidate];
-    return JSON.stringify(packet).length <= maxChars - reserveChars;
+    return JSON.stringify(packet).length <= maxChars - reserveChars
+      && (!paging || JSON.stringify(candidate).length <= paging.pageChars);
   }) : null;
   if (!delivery) throw new EngineError('pilot_core_limit',
     'No positive part of the saved original fits beside the required question and addresses',

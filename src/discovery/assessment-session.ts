@@ -1,3 +1,4 @@
+import { DOSSIER_MATERIAL_CONTRACT, dossierMaterialEra, dossierMaterialProjection, pendingDossierWorkspace } from './dossier-material.js';
 import { requireDossierAssessmentSubject } from './dossier-assessment.js';
 import { requireDossierReplyCapacity, dossierSessionTransport, dossierTransportDelivery, DOSSIER_SESSION_TRANSPORT, DOSSIER_RESULT_TRANSPORT } from './continuation-packet.js';
 import { resumeDossierResearchCall, prepareDossierResearchEnvelope } from './research-protocol.js';
@@ -1592,8 +1593,9 @@ function dossierMarker(session:Ref) {
 }
 function dossierContext(session:Revision<DossierAssessmentSession>) {
   return {dossierSubject:session.value.subject,dossierResultTransport:DOSSIER_RESULT_TRANSPORT,
+    ...(dossierMaterialEra(session.value) ? {dossierMaterialContract:DOSSIER_MATERIAL_CONTRACT} : {}),
     managedDossier:dossierMarker(reference(session)),dossierNotes:session.value.notes,
-    contextWorkspace:session.value.workspace.entries.map(entry=>entry.result)};
+    contextWorkspace:(dossierMaterialEra(session.value) ? pendingDossierWorkspace(session.value.workspace) : session.value.workspace).entries.map(entry=>entry.result)};
 }
 /** Leaf proof shared with the physical reader. It never calls that reader or the full session history. */
 export function readDossierDispatchAdmission(store:Store, applicationRef:Ref) {
@@ -1606,6 +1608,8 @@ export function readDossierDispatchAdmission(store:Store, applicationRef:Ref) {
     && application.id===dossierApplicationId(reference(session)) && value.step===session.revision-1
     && value.offset===0 && Array.isArray(value.notes) && object(value.workspace)
     && Array.isArray(value.workspace.entries), 'The dossier session lost its own exact cursor');
+  const dictionaryEra = dossierMaterialEra(value);
+  dossierRequire(dictionaryEra === dossierMaterialEra(app.context), 'The dossier material era changed');
   const packet=app.context?.dossierPacket;
   dossierRequire(object(packet) && object(packet.basis) && object(packet.basis.draft) && isRef(packet.basis.draft.ref) && same(packet.subject,value.subject),'The dossier admission lost its saved complete packet');
   const first=dossierExact<DossierAssessmentSession>(store,{id:session.id,revision:1,hash:store.get(session.id,1)?.hash??''},'assessment-session');
@@ -1613,6 +1617,7 @@ export function readDossierDispatchAdmission(store:Store, applicationRef:Ref) {
     dossierRequire(same(value[key],first.value[key]),'The original dossier runtime or subject changed');
   dossierRequire(first.value.step===0 && first.value.previous===null && first.value.result===null
     && same(first.value.notes,[]) && same(first.value.workspace,contextWorkspace()),'The dossier origin is not an initial session');
+  dossierRequire(dictionaryEra === dossierMaterialEra(first.value), 'The original dossier material era changed');
   const binding=value.binding;
   dossierRequire(object(binding) && isRef(binding.draft) && isRef(binding.question) && isRef(binding.environment)
     && Array.isArray(binding.inputs) && binding.inputs.every(isRef),'The dossier lost its exact research binding');
@@ -1633,7 +1638,8 @@ export function readDossierDispatchAdmission(store:Store, applicationRef:Ref) {
   const marker=dossierSessionTransport(app.context);
   dossierRequire(marker && same(marker,dossierMarker(reference(session))) && same(app.context.dossierSubject,value.subject)
     && same(app.context.dossierPacket,packet) && same(app.context.dossierNotes,value.notes)
-    && same(app.context.contextWorkspace??[],value.workspace.entries.map(entry=>entry.result))
+    && same(app.context.contextWorkspace??[],dossierContext(session).contextWorkspace)
+    && (!dictionaryEra || same(app.context.dossierMaterial,dossierMaterialProjection(packet as any)))
     && same(app.context.assessmentDelivery,dossierTransportDelivery(app.context)),
     'The dossier application lost its exact subject, material or delivery cursor');
   // One accepted reply checker proves the entire saved capacity, not a caller declaration.
@@ -1666,13 +1672,22 @@ async function dossierPhysicalOutcome(store:Store, admission:Awaited<ReturnType<
   const outcome=readResearchExecution(store,session.value.projectId,received,session,draft,question,admission.role,session.value.profile);
   requirePhysicalIdentity(initial,outcome.call);
   dossierRequire(outcome.kind==='response','A non-response cannot evaluate a dossier');
+  if (dossierMaterialEra(session.value)) {
+    const wire=outcome.subject;
+    dossierRequire(dossierMaterialEra(wire) && !Object.hasOwn(wire,'dossierPacket')
+      && (Object.hasOwn(wire,'dossierMaterial') ? same(wire.dossierMaterial,admission.context.dossierMaterial)
+        : wire.working?.materialAddresses?.some((address:any) => address.field === 'dossierMaterial'
+          && address.pointer === '/body/dossierMaterial' && address.valueHash === hashJson(admission.context.dossierMaterial))),
+      'The paid packet lost its exact dictionary delivery');
+  }
   return outcome;
 }
 async function advanceDossierSession(store:Store,admission:Awaited<ReturnType<typeof readDossierDispatchAdmission>>,
   paid:Awaited<ReturnType<typeof dossierPhysicalOutcome>>) {
   const {session,application,draft,question}=admission,current=session.value;
   const checked=await checkDossierResearchReply(store,current.projectId,current.subject,application.value.context.resultCapacity,paid.payload);
-  let workspace=current.workspace,notes=current.notes,result:DossierAssessmentProjection|null=null;
+  const dictionaryEra = dossierMaterialEra(current);
+  let workspace=dictionaryEra ? pendingDossierWorkspace(current.workspace) : current.workspace,notes=current.notes,result:DossierAssessmentProjection|null=null;
   if(checked.terminal) {
     requireCompleteContextPacket(workspace,paid.subject);
     result=checked.projection;
@@ -1682,7 +1697,9 @@ async function advanceDossierSession(store:Store,admission:Awaited<ReturnType<ty
     dossierRequire(action.action==='read_context','A dossier lookup must retain its exact address');
     const addresses=paid.subject.working?.materialAddresses??[];
     dossierRequire((same(action.record,paid.archive) && (action.pointer==='/body/dossierPacket'
-      || action.pointer==='/body/dossierReplyContract') || addresses.some((address:any)=>same(address.record,action.record)
+      || action.pointer==='/body/dossierReplyContract'
+      || dictionaryEra && application.value.context.dossierMaterial.records.some((row:any) => row.technical
+        && (action.pointer === row.technical.pointer || action.pointer.startsWith(row.technical.pointer+'/')))) || addresses.some((address:any)=>same(address.record,action.record)
         && (action.pointer===address.pointer || action.pointer.startsWith(address.pointer+'/')))),
       'The requested page is not an address of this paid dossier');
     const lookup=readResearchContextOutcomeAt(store,draft,question,action,admission.profile?.value.maxRequestChars??300000,'bounded');
@@ -1691,6 +1708,8 @@ async function advanceDossierSession(store:Store,admission:Awaited<ReturnType<ty
     notes=[...notes,{archive:paid.archive,response:checked.normalized} as unknown as Json];
     workspace=contextProgress(workspace,paid.subject);
   }
+  if (dictionaryEra) workspace = {...workspace, entries:[...current.workspace.entries,
+    ...workspace.entries.filter(entry => !current.workspace.entries.some(prior => prior.key === entry.key))]};
   return {...current,step:current.step+1,workspace,notes,result,previous:reference(application),
     application:result?application.id:dossierApplicationId({id:session.id,revision:session.revision+1,hash:''})} satisfies DossierAssessmentSession;
 }
@@ -1775,6 +1794,7 @@ export async function runDossierAssessmentSession(store:Store,project:string,sub
       'A new dossier session needs an exact profile of its own project');
     const role=resolveRoleMode('reviewer',environment.value.reviewer,'research');
     const value:DossierAssessmentSession={contract:DOSSIER_SESSION,projectId:project,subject:packet.subject,
+      dossierMaterialContract:DOSSIER_MATERIAL_CONTRACT,
       binding:{draft:reference(draft),question:reference(question),environment:reference(environment),inputs:draft.value.inputs},
       role,dispatch:environment.value,profile:profile?reference(profile):null,
       prompt:DOSSIER_PROMPT,
@@ -1805,7 +1825,8 @@ export async function runDossierAssessmentSession(store:Store,project:string,sub
       const guards=uniqueTransactionGuards([...inherited,...dispatchGuards,...effective.guards,...effective.admissionGuards,reference(draft),reference(question),
         reference(runtime),...draft.value.inputs,...(profile?[reference(profile)]:[])]);
       const built=await prepareDossierResearchEnvelope(value.role,value.dispatch,value.prompt,dossierContext(session),
-        {store,draftId:draft.id,questionId:question.id,purpose:'dossier-assessor',...(profile?{pilot:profile}:{})},undefined,undefined,true);
+        {store,draftId:draft.id,questionId:question.id,purpose:'dossier-assessor',...(profile?{pilot:profile}:{})},undefined,undefined,true, dossierMaterialEra(value)
+          ? {contract:DOSSIER_MATERIAL_CONTRACT,coverage:value.workspace.deliveryCoverage ?? []} : undefined);
       const archive=built.archives.records.get(built.subject.working.archive.id)??dossierExact<any>(store,built.subject.working.archive,'research-context');
       const app:DossierAssessmentApplication={contract:DOSSIER_APPLICATION,projectId:project,session:reference(session),
         context:archive.value.body,prompt:value.prompt,role:value.role,dispatch:value.dispatch,profile:value.profile,

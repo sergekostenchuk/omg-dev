@@ -21,7 +21,7 @@ import { isRef, reference, stageId, type Ref } from "../pipeline/contracts.js";
 import { requireCondition, EngineError } from "../errors.js";
 import { planningContext, requirePlanningNavigation } from "./planning-context.js";
 import { contextTable } from "./context-tables.js";
-import { contextLookupKey, packContextWorkspace, requireExactContextWorkspace, type ContextLookup } from "./context-workspace.js";
+import { contextLookupKey, recordContextPacket, packContextWorkspace, requireExactContextWorkspace, type ContextLookup } from "./context-workspace.js";
 import { exactContextLookup, projectResearchContextSelection, type ProjectedContextRead } from './research-consumer-transition.js';
 import { readReaderResultAt } from './reader.js';
 import { priorEvidenceSources, packPriorEvidence } from './prior-evidence-summary.js';
@@ -126,6 +126,8 @@ function conclusionSources(body: Record<string, any>, archive: Ref, questionId: 
       ? [{ record: archive, pointer: `/body/history/${index}/action`, value: turn.action }] : []);
 }
 
+import { dossierMaterialEra, dossierMaterialProjection, type DossierPagingState } from './dossier-material.js';
+
 type WorkingOptions = { continuation?: boolean; common?: boolean; previous?: Ref; contextChars?: number; extractedChars?:number; purpose?: string; subject?: V7PlanSubject | null; assessmentSubject?: AssessmentTransportSubject | null; variantSubject?: VariantSubject | null; actor?: string;
     /** 5.3: the exact saved deep preparation of this analyst step; the packer proves it through the shared 5.2 admission. */
     deepPreparation?: Ref | null;
@@ -142,9 +144,19 @@ export function workingContext(store: Store, projectId: string, draftId: string,
 
 /** One operation-scoped proof feeds the existing packer. Archives are staged
  * until the final measured envelope fits; a capacity refusal has no writes. */
-export async function prepareDossierContextPacker(store: Store, projectId: string, context: unknown) {
+export async function prepareDossierContextPacker(store: Store, projectId: string, context: unknown, paging?: DossierPagingState) {
+  if (paging) {
+    requireCondition(Array.isArray(paging.coverage), 'discovery_dossier_transport_invalid', 'Saved delivery coverage is required');
+    context = JSON.parse(canonical(context));
+    paging = structuredClone(paging); // Capture the admitted cursor before the asynchronous dossier proof.
+  }
   const packet = await proveDossierTransportContext(store, projectId, context);
-  const normalized = { ...(context as Record<string, unknown>), dossierSubject: packet.subject, dossierPacket: packet, purpose:'dossier-assessor',
+  const dictionaryEra = dossierMaterialEra(context as Record<string, unknown>);
+  requireCondition(dictionaryEra === !!paging && (!paging || paging.contract === (context as any).dossierMaterialContract),
+    'discovery_dossier_transport_invalid', 'Dictionary delivery needs the proven session coverage');
+  const coverage = paging ? structuredClone(paging.coverage) : undefined;
+  const normalized = { ...(context as Record<string, unknown>),
+    ...(dictionaryEra ? {dossierMaterial:dossierMaterialProjection(packet)} : {}), dossierSubject: packet.subject, dossierPacket: packet, purpose:'dossier-assessor',
     assessmentDelivery: dossierTransportDelivery(context),
     ...(dossierResultTransport(context) ? {dossierResultTransport:DOSSIER_RESULT_TRANSPORT, dossierReplyContract:dossierReplyContract(packet)} : {}) };
   const writes = new Map<string, Write>(), records = new Map<string, Revision<any>>();
@@ -163,8 +175,10 @@ export async function prepareDossierContextPacker(store: Store, projectId: strin
     return row;
   };
   return { packet: structuredClone(packet), context: structuredClone(normalized),
+    // The measured subject limit already excludes the outer wire. The common
+    // material planner subtracts mandatory context and its reserve before choosing a page.
     pack: (draftId: string, questionId: string, body: unknown, limit: number, options: WorkingOptions) =>
-      packWorkingContext(store, projectId, draftId, questionId, body, limit, options, packet, stage, records),
+      packWorkingContext(store, projectId, draftId, questionId, body, limit, options, packet, stage, records, null, coverage ? {coverage,pageChars:limit} : undefined),
     staged: () => ({writes:[...writes.values()],guards,records}),
     commit: () => { if (writes.size) store.writeMany([...writes.values()], guards); } };
 }
@@ -245,7 +259,8 @@ export function prepareFrameInterpretationContextPacker(store: Store, projectId:
 function packWorkingContext(store: Store, projectId: string, draftId: string, questionId: string,
   context: unknown, maxChars: number, options: WorkingOptions = {}, dossier: DossierAssessmentPacket | null = null,
   archiveWriter: ArchiveWriter = saveArchive, staged = new Map<string, Revision<any>>(),
-  provenBasis: { draft: Revision<DiscoveryDraft>; question: Revision<Question> } | null = null): Record<string, any> {
+  provenBasis: { draft: Revision<DiscoveryDraft>; question: Revision<Question> } | null = null,
+  materialPaging?: {coverage: import('./context-workspace.js').ContextCoverage[]; pageChars:number}): Record<string, any> {
   let draft = store.get<DiscoveryDraft>(draftId), question = store.get<Question>(questionId);
   if (provenBasis) {
     // DR2b 2b-PACK (№15208): the request branch binds the exact proven
@@ -448,6 +463,15 @@ function packWorkingContext(store: Store, projectId: string, draftId: string, qu
       archiveGuards);
     return reference(saved);
   };
+  const deliverMaterial = (packet:Record<string,any>, originals:Parameters<typeof serveArchivedMaterial>[1], reserve=1024) => {
+    let paging = materialPaging;
+    if (paging) {
+      const workspace = {entries:(body.contextWorkspace ?? []).map((result:ContextLookup) => ({key:contextLookupKey(result),result})),
+        sinceProgress:0,deliveryCoverage:paging.coverage};
+      paging = {...paging,coverage:recordContextPacket(workspace,packet).deliveryCoverage ?? []};
+    }
+    serveArchivedMaterial(packet, originals, maxChars, reserve, paging);
+  };
   const sourceNavigation = hasStructuredSources ? structuredCatalogue(inventory, reference(archive), maxChars) : null;
   const plannerCorrections = options.common && options.continuation && body['dispatchMode'] === 'planning'
     ? correctionIndex(body['history'] as any[] ?? [], reference(archive)) : null;
@@ -645,6 +669,7 @@ function packWorkingContext(store: Store, projectId: string, draftId: string, qu
   if (options.common && !options.continuation && !body['core'] && !body['synthesisState'] && !body['assessmentState']) {
     const {priorEvidence:_priorEvidence,priorEvidenceSources:_priorEvidenceSources,...initialBody}=body;
     const initial:Record<string,any>={...initialBody,working:{archive:reference(archive),deliveryContract:'research-delivery/v1',instruction,sections:contextSections(archivedBody)}};
+    if (materialPaging) delete initial.dossierPacket; // The full packet remains in the immutable archive.
     if (initial.inventory) {
       if (sourceNavigation) delete initial.inventory;
       else delete initial.sourceCatalogue;
@@ -660,18 +685,18 @@ function packWorkingContext(store: Store, projectId: string, draftId: string, qu
     const fullWorkspace = initial.contextWorkspace;
     delete initial.contextWorkspace;
     const addressed = addressArchivedMaterials(initial, reference(archive),
-      exactArchivedFields(initial, ['discoveryResponseContract', 'assessmentClassification', 'discoveryClaims', 'dossierPacket', 'dossierReplyContract', 'dossierNotes', 'fields', 'discoveryContext', 'discoveryBasisCatalogue', 'planBasis', 'v7Frame',
+      exactArchivedFields(initial, ['discoveryResponseContract', 'assessmentClassification', 'discoveryClaims', 'dossierPacket', 'dossierMaterial', 'dossierReplyContract', 'dossierNotes', 'fields', 'discoveryContext', 'discoveryBasisCatalogue', 'planBasis', 'v7Frame',
         'prerequisites', 'operationMap', 'inventory', 'consumerFeedback', 'request', 'frameRequest', 'sourceCatalogue']),
-      maxChars, materialRecord);
+      maxChars, materialRecord, 4096, materialPaging);
     if (fullWorkspace !== undefined) initial.contextWorkspace = fullWorkspace;
-    packContextWorkspace(initial,maxChars,options.contextChars,undefined,
+    packContextWorkspace(initial,maxChars,materialPaging ? Math.min(options.contextChars ?? maxChars,materialPaging.pageChars) : options.contextChars,undefined,
       addressed.length || fullHistory !== undefined ? 4096 : 1024);
     if (fullHistory !== undefined) {
       initial.history = fullHistory;
       addressed.push(...addressArchivedMaterials(initial, reference(archive),
         exactArchivedFields(initial, ['history']), maxChars, materialRecord));
     }
-    serveArchivedMaterial(initial, addressed, maxChars);
+    deliverMaterial(initial, addressed);
     packPriorEvidence(initial,priorSources,reference(archive),maxChars);
     requireCondition(JSON.stringify(initial).length<=maxChars,'pilot_core_limit','Initial question context exceeds its declared envelope bound');
     return finish(initial);
@@ -772,11 +797,11 @@ function packWorkingContext(store: Store, projectId: string, draftId: string, qu
     Object.assign(packet, side);
     const addressed = addressArchivedMaterials(packet, reference(archive),
       exactArchivedFields(packet, ['discoveryResponseContract', 'discoveryContext', 'discoveryBasisCatalogue', 'planBasis', 'stageNeighbors']),
-      maxChars, materialRecord);
+      maxChars, materialRecord, 4096, materialPaging);
     if (!packet.materialDelivery) serveArchivedMaterial(packet, addressed, maxChars);
     return finish(packet);
   }
-  const mandatory = [...(variantFields?Object.keys(variantFields):[]),"discoveryResponseContract","assessmentClassification","discoveryClaims","managedDossier","dossierNotes","dossierSubject","dossierPacket","dossierResultTransport","dossierReplyContract","assessmentDelivery","deepResearchContract","deepPreparation","deepCell","deepScope","variantSubject", "assessmentSubject", "resultCapacity", "assessmentContextContract", "stageNeighbors", "discoveryContext", "discoveryBasisCatalogue", "planBasis", "webResearch", "answerContext", "contextWorkspace", "savedEvidence", "conclusions", "conclusionCitations", "conclusionRefs", "conclusionUnresolved", "conclusionEncoding", "contextControls", "contextCorrection", "currentRead", "originals", "corrections", "request", "candidate", "proposalChanges", "purpose", "sources", "questions", "prerequisites", "operationMap", "researchMissing", "fields", "mapStatusFindings", "mapStatus", "researchScope", "role", "stage", "level", "consumer", "contextEncoding", "allowedConsumers", "gapFields", "graphBase",
+  const mandatory = [...(variantFields?Object.keys(variantFields):[]),"discoveryResponseContract","assessmentClassification","discoveryClaims","managedDossier","dossierNotes","dossierSubject","dossierPacket","dossierMaterial","dossierMaterialContract","dossierResultTransport","dossierReplyContract","assessmentDelivery","deepResearchContract","deepPreparation","deepCell","deepScope","variantSubject", "assessmentSubject", "resultCapacity", "assessmentContextContract", "stageNeighbors", "discoveryContext", "discoveryBasisCatalogue", "planBasis", "webResearch", "answerContext", "contextWorkspace", "savedEvidence", "conclusions", "conclusionCitations", "conclusionRefs", "conclusionUnresolved", "conclusionEncoding", "contextControls", "contextCorrection", "currentRead", "originals", "corrections", "request", "candidate", "proposalChanges", "purpose", "sources", "questions", "prerequisites", "operationMap", "researchMissing", "fields", "mapStatusFindings", "mapStatus", "researchScope", "role", "stage", "level", "consumer", "contextEncoding", "allowedConsumers", "gapFields", "graphBase",
     "core", "map", "draft", "question", "value", "representation", "consumerFeedback", "assessmentState", "openGaps", "failures", "unresolvedEvidence", "dispatchMode", "readPlanStatus", "sourceCatalogue", "sourceLocations", "bases", "runtimeProofs", "synthesisState", "synthesisNotes", "previousProposalRef"];
   if(body['assessmentState']) mandatory.splice(mandatory.indexOf("value"),1);
   if(frameMaterial !== undefined) mandatory.push('v7Frame');
@@ -791,17 +816,18 @@ function packWorkingContext(store: Store, projectId: string, draftId: string, qu
     }), omitted: [] as string[] };
   // Defaults preserve the action protocol's collection shapes, not completeness.
   Object.assign(packet, { readings: [], directReadings: [], history: [], observations: [], checkpoints: [] });
+  if (materialPaging) delete packet.dossierPacket;
   const fullWorkspace = packet.contextWorkspace;
   delete packet.contextWorkspace;
   const addressedCore = addressArchivedMaterials(packet, reference(archive),
-    exactArchivedFields(packet, ['discoveryResponseContract', 'assessmentClassification', 'discoveryClaims', 'dossierPacket', 'dossierReplyContract', 'dossierNotes', 'fields', 'discoveryContext', 'discoveryBasisCatalogue', 'planBasis', 'stageNeighbors', 'v7Frame',
+    exactArchivedFields(packet, ['discoveryResponseContract', 'assessmentClassification', 'discoveryClaims', 'dossierPacket', 'dossierMaterial', 'dossierReplyContract', 'dossierNotes', 'fields', 'discoveryContext', 'discoveryBasisCatalogue', 'planBasis', 'stageNeighbors', 'v7Frame',
       'prerequisites', 'operationMap', 'inventory', 'request', 'consumerFeedback',
       'answerContext', 'currentRead', 'originals', 'corrections', 'researchScope',
       'mapStatus', 'mapStatusFindings', 'readPlanStatus', 'openGaps', 'failures', 'sourceCatalogue',
       'savedEvidence', 'unresolvedEvidence', 'webResearch', 'synthesisNotes',
       'candidate', 'proposalChanges']).filter(field => field !== 'failures'
         || !body['assessmentState'] || JSON.stringify(body['failures']).length > Math.floor(maxChars / 3)),
-    maxChars, materialRecord);
+    maxChars, materialRecord, 4096, materialPaging);
   if (fullWorkspace !== undefined) packet.contextWorkspace = fullWorkspace;
   const retained = body['contextControls']?.version === 2 && body['synthesisState'];
   const conclusionKeys = ['conclusions','conclusionCitations','conclusionRefs','conclusionUnresolved','conclusionEncoding'];
@@ -817,7 +843,7 @@ function packWorkingContext(store: Store, projectId: string, draftId: string, qu
     packet.working.omitted = [...new Set([...packet.working.omitted, 'conclusions'])];
     packet.working.instruction += ' conclusionOrigins names the exact saved material behind the omitted conclusions; read those addresses before relying on an incomplete conclusion.';
   }
-  packContextWorkspace(packet,maxChars,options.contextChars,
+  packContextWorkspace(packet,maxChars,materialPaging ? Math.min(options.contextChars ?? maxChars,materialPaging.pageChars) : options.contextChars,
     retained ? {checkpointedKeys:body['contextCheckpointedKeys']??[]} : undefined,
     addressedConclusions.length || addressedCore.length ? 4096 : 1024);
   // Only one material fragment occupies this slot. If a full saved field is
@@ -825,8 +851,7 @@ function packWorkingContext(store: Store, projectId: string, draftId: string, qu
   // their exact source addresses without consuming that same space twice.
   // The plan's addressed frame/mandate shares each assessor page with candidate and evidence.
   // Use the common delivery reserve so one large basis fragment cannot consume their progress space.
-  if (addressedCore.length) serveArchivedMaterial(packet, addressedCore, maxChars,
-    planBasis && body['assessmentState'] ? 8192 : 1024);
+  if (addressedCore.length) deliverMaterial(packet, addressedCore, planBasis && body['assessmentState'] ? 8192 : 1024);
   else if (addressedConclusions.length) packAddressedValue(packet, 'conclusions',
     addressedConclusions[addressedConclusions.length - 1]!, maxChars);
   if (retained) {

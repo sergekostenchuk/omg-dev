@@ -1,3 +1,4 @@
+import { dossierMaterialEra, dossierMaterialProjection } from './dossier-material.js';
 import { compactResponseSchema } from './research-action-contract.js';
 import { RESEARCH_READ_INSTRUCTION } from './research-read-contract.js';
 import { requireResearchResultCapacity, type ResearchResultCapacity } from './research-delivery.js';
@@ -245,6 +246,8 @@ export function packetDossierSubject(container: unknown): DossierAssessmentSubje
 export function requireDossierTransportContext(container: unknown, required = false) {
   dossierResultTransport(container);
   const managed=dossierSessionTransport(container);
+  if (container && typeof container === 'object') requireCondition(!dossierMaterialEra(container as Record<string,unknown>) || managed,
+    'discovery_dossier_transport_invalid', 'Dictionary material requires a saved managed dossier session');
   requireCondition(!managed || dossierResultTransport(container),
     'discovery_dossier_session_invalid','Managed dossier dispatch needs the accepted result transport era');
   const subject = packetDossierSubject(container);
@@ -280,6 +283,9 @@ export async function proveDossierTransportContext(store: Store, project: string
   if (dossierResultTransport(container) && Object.hasOwn(container as object,'dossierReplyContract'))
     requireCondition(canonical((container as any).dossierReplyContract) === canonical(dossierReplyContract(packet)),
       'discovery_dossier_transport_invalid', 'Caller cannot substitute the dossier reply schema or subject');
+  if (dossierMaterialEra(container as Record<string,unknown>) && Object.hasOwn(container as object,'dossierMaterial'))
+    requireCondition(canonical((container as any).dossierMaterial) === canonical(dossierMaterialProjection(packet)),
+      'discovery_dossier_transport_invalid', 'The dossier dictionary differs from its complete proven packet');
   return packet;
 }
 
